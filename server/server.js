@@ -4,6 +4,7 @@ const http = require('http')
 const { getWatchlist, listCompanies, getCompany, applyManualRefresh } = require('./data/mockData')
 const { buildRefreshState } = require('./utils/refresh-policy')
 const { evaluateRefreshState, allowManualRefresh, recordManualRefreshAttempt } = require('./services/refresh-rules')
+const { getHealthState } = require('./services/health')
 const { createIfindClient } = require('./adapters/ifindAdapter')
 
 const PORT = Number(process.env.PORT || 4173)
@@ -191,6 +192,10 @@ async function routeApi(req, res, pathname, query) {
   const segments = parseSegments(pathname)
   if (segments[0] !== 'api') {
     return false
+  }
+  if (segments.length === 2 && segments[1] === 'health' && req.method === 'GET') {
+    formatJson(res, getHealthState())
+    return true
   }
   if (segments[1] === 'watchlist' && req.method === 'GET') {
     await apiGetWatchlist(req, res)

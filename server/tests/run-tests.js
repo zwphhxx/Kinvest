@@ -1,6 +1,7 @@
 const tests = [
   require('./refresh-policy.test'),
-  require('./refresh-rules.test')
+  require('./refresh-rules.test'),
+  require('./health.test')
 ]
 
 let hasFailure = false
