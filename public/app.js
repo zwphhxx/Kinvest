@@ -126,7 +126,6 @@ function renderFinance(company) {
   }
 
   const row = rows[0]
-  const values = rows.map((it) => it.values)
   const columns = [
     ['revenue', '营业收入'],
     ['grossMargin', '毛利率'],
@@ -145,7 +144,7 @@ function renderFinance(company) {
 
   const header = `<tr><th>期间</th>${columns.map((item) => `<th>${item[1]}</th>`).join('')}</tr>`
   const body = rows.map((r) => {
-    const cols = columns.map(([key, label]) => {
+    const cols = columns.map(([key]) => {
       const value = r.values[key]
       const formatted = typeof value === 'number' ? (Number.isInteger(value) ? value.toLocaleString('zh-CN') : value.toLocaleString('zh-CN')) : '—'
       return `<td>${formatted}</td>`

@@ -4,7 +4,7 @@ function getHealthState(now = new Date()) {
   try {
     const result = openDb().prepare('SELECT 1 AS ready').get()
     if (!result || result.ready !== 1) throw new Error('SQLite health query failed')
-  } catch (err) {
+  } catch {
     throw new Error('SQLite health query failed')
   }
 

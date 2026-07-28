@@ -2,7 +2,6 @@ const fs = require('fs')
 const path = require('path')
 const http = require('http')
 const { getWatchlist, listCompanies, getCompany, applyManualRefresh } = require('./data/mockData')
-const { buildRefreshState } = require('./utils/refresh-policy')
 const { evaluateRefreshState, allowManualRefresh, recordManualRefreshAttempt } = require('./services/refresh-rules')
 const { getHealthState } = require('./services/health')
 const { createIfindClient } = require('./adapters/ifindAdapter')
@@ -50,13 +49,6 @@ function toApiError(message, code = 400) {
     error: message,
     code
   }
-}
-
-function safeJson(item) {
-  if (item === undefined || item === null) {
-    return null
-  }
-  return item
 }
 
 async function withMeta(company) {
@@ -196,7 +188,7 @@ async function routeApi(req, res, pathname, query) {
   if (segments.length === 2 && segments[1] === 'health' && req.method === 'GET') {
     try {
       formatJson(res, getHealthState())
-    } catch (err) {
+    } catch {
       if (!res.headersSent) {
         formatJson(res, {
           success: false,

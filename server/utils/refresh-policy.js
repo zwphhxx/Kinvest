@@ -34,6 +34,7 @@ function isTradingSession(status) {
 
 function buildRefreshState(snapshot, now = new Date(), options = {}) {
   const nowTime = now instanceof Date ? now : new Date(now)
+  /** @type {{ autoIntervalMinutes: number, manualCooldownMs: number, dailyManualLimit?: number }} */
   const cfg = {
     autoIntervalMinutes: 10,
     manualCooldownMs: 2 * MS_IN_MINUTE,
@@ -57,7 +58,7 @@ function buildRefreshState(snapshot, now = new Date(), options = {}) {
   const dailyManualLimit = clampNumber(pricing.dailyManualLimit, cfg.dailyManualLimit || 100)
   const manualLimitReached = dailyManualCount >= dailyManualLimit
   const canManualRefresh = canRefreshByCooldown && !manualLimitReached
-  const dataFresh = Boolean(pricing.lastSuccessAt && ((nowTime - new Date(pricing.lastSuccessAt)) / MS_IN_MINUTE) < cfg.autoIntervalMinutes)
+  const dataFresh = Boolean(pricing.lastSuccessAt && ((nowTime.getTime() - new Date(pricing.lastSuccessAt).getTime()) / MS_IN_MINUTE) < cfg.autoIntervalMinutes)
 
   return {
     marketState,

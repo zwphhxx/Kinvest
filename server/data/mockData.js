@@ -440,7 +440,6 @@ function listCompanies() {
 
 function applyManualRefresh(company) {
   const snapshot = clone(company.marketSnapshot)
-  const lastManual = new Date(snapshot.lastManualRefreshAt || now)
   snapshot.lastManualRefreshAt = new Date(now)
   snapshot.fetchedAt = new Date(now)
   snapshot.sourceTime = new Date(now)
