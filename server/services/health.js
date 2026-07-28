@@ -1,8 +1,10 @@
 const { openDb } = require('../db/refresh-db')
 
-function getHealthState(now = new Date()) {
+function getHealthState(now = new Date(), database) {
   try {
-    openDb().prepare('SELECT 1 AS ready').get()
+    const db = database === undefined ? openDb() : database
+    const result = db.prepare('SELECT 1 AS ready').get()
+    if (!result || Number(result.ready) !== 1) throw new Error('SQLite health query failed')
   } catch (err) {
     throw new Error('SQLite health query failed')
   }

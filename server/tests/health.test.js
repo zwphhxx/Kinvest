@@ -18,6 +18,21 @@ function run() {
       timestamp: '2026-07-28T10:00:00.000Z'
     })
     assert.strictEqual(fs.existsSync(dbFile), true)
+
+    const failedProbeDb = {
+      prepare() {
+        return {
+          get() {
+            return { ready: 0 }
+          }
+        }
+      }
+    }
+
+    assert.throws(
+      () => getHealthState(new Date('2026-07-28T10:00:00.000Z'), failedProbeDb),
+      { message: 'SQLite health query failed' }
+    )
   } finally {
     resetDbForTests(dbFile)
   }
