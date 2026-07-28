@@ -3,6 +3,8 @@ const path = require('path')
 const http = require('http')
 const { getWatchlist, listCompanies, getCompany, applyManualRefresh } = require('./data/mockData')
 const { buildRefreshState } = require('./utils/refresh-policy')
+const { evaluateRefreshState, allowManualRefresh, recordManualRefreshAttempt } = require('./services/refresh-rules')
+const { createIfindClient } = require('./adapters/ifindAdapter')
 
 const PORT = Number(process.env.PORT || 4173)
 const ROOT = path.join(__dirname, '..')
@@ -56,25 +58,9 @@ function safeJson(item) {
   return item
 }
 
-function withMeta(company) {
+async function withMeta(company) {
   if (!company) return null
-  const refresh = buildRefreshState(
-    {
-      market: {
-        isOpen: company.marketSnapshot.isOpen,
-        nextAutoRefreshAt: company.marketSnapshot.nextAutoRefreshAt
-      },
-      pricing: {
-        sourceTime: company.marketSnapshot.sourceTime,
-        fetchedAt: company.marketSnapshot.fetchedAt,
-        lastManualRefreshAt: company.marketSnapshot.lastManualRefreshAt,
-        dailyManualCount: company.marketSnapshot.dailyManualCount,
-        dailyManualLimit: company.marketSnapshot.dailyManualLimit,
-        fromCache: company.marketSnapshot.fromCache,
-        lastSuccessAt: company.marketSnapshot.lastSuccessAt
-      }
-    }
-  )
+  const refresh = evaluateRefreshState(company)
 
   return {
     ...company,
@@ -87,7 +73,8 @@ function withMeta(company) {
   }
 }
 
-function createCompanySummary(company) {
+async function createCompanySummary(company) {
+  const refresh = evaluateRefreshState(company)
   return {
     securityCode: company.securityCode,
     nameZh: company.nameZh,
@@ -96,31 +83,17 @@ function createCompanySummary(company) {
     sector: company.sector,
     symbol: company.symbol,
     quote: company.quote,
-    refreshState: buildRefreshState({
-      market: {
-        isOpen: company.marketSnapshot.isOpen,
-        nextAutoRefreshAt: company.marketSnapshot.nextAutoRefreshAt
-      },
-      pricing: {
-        sourceTime: company.marketSnapshot.sourceTime,
-        fetchedAt: company.marketSnapshot.fetchedAt,
-        lastManualRefreshAt: company.marketSnapshot.lastManualRefreshAt,
-        dailyManualCount: company.marketSnapshot.dailyManualCount,
-        dailyManualLimit: company.marketSnapshot.dailyManualLimit,
-        fromCache: company.marketSnapshot.fromCache,
-        lastSuccessAt: company.marketSnapshot.lastSuccessAt
-      }
-    })
+    refreshState: refresh
   }
 }
 
 async function apiGetWatchlist(req, res) {
   const list = getWatchlist()
   const companies = listCompanies()
-  const summaries = companies.filter((c) => list.includes(c.securityCode)).map((c) => {
+  const summaries = await Promise.all(companies.filter((c) => list.includes(c.securityCode)).map(async (c) => {
     const data = getCompany(c.securityCode)
     return createCompanySummary(data)
-  })
+  }))
   formatJson(res, {
     success: true,
     data: summaries
@@ -133,10 +106,8 @@ async function apiSearch(req, res, query) {
     formatJson(res, { success: true, data: [] })
     return
   }
-  const all = listCompanies()
-  const result = all.filter((item) => {
-    return item.nameZh.toLowerCase().includes(q) || item.symbol.toLowerCase().includes(q) || item.securityCode.toLowerCase().includes(q)
-  })
+  const client = createIfindClient()
+  const result = await client.searchCompanies(q)
   formatJson(res, { success: true, data: result })
 }
 
@@ -146,7 +117,8 @@ async function apiCompany(req, res, code) {
     formatJson(res, toApiError(`未找到公司：${code}`, 404), 404)
     return
   }
-  formatJson(res, { success: true, data: withMeta(company) })
+  const data = await withMeta(company)
+  formatJson(res, { success: true, data })
 }
 
 async function apiRefresh(req, res, code) {
@@ -155,22 +127,23 @@ async function apiRefresh(req, res, code) {
     formatJson(res, toApiError(`未找到公司：${code}`, 404), 404)
     return
   }
-  const state = buildRefreshState({
-    market: { isOpen: company.marketSnapshot.isOpen, nextAutoRefreshAt: company.marketSnapshot.nextAutoRefreshAt },
-    pricing: company.marketSnapshot
-  })
-  if (!state.canManualRefresh) {
+  const state = evaluateRefreshState(company)
+  const allow = allowManualRefresh(company.securityCode, company)
+  if (!allow.allow) {
     formatJson(res, {
       success: false,
-      error: state.manualCooldownStatus,
+      error: allow.reason === 'daily_limit'
+        ? '今日手动刷新额度已达上限'
+        : state.manualCooldownStatus,
       state
     }, 409)
     return
   }
   company.marketSnapshot = applyManualRefresh(company)
+  recordManualRefreshAttempt(company.securityCode, allow, company)
   formatJson(res, {
     success: true,
-    data: withMeta(company),
+    data: await withMeta(company),
     warning: '演示环境仅刷新快照时间与缓存标记，不调用外部接口。'
   })
 }

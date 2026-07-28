@@ -1,5 +1,6 @@
 const tests = [
-  require('./refresh-policy.test')
+  require('./refresh-policy.test'),
+  require('./refresh-rules.test')
 ]
 
 let hasFailure = false

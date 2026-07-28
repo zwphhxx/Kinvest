@@ -4,4 +4,5 @@ coverage/
 tmp/
 dist/
 *.log
-
+*.sqlite
+*.sqlite-journal
