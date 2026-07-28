@@ -2,7 +2,8 @@ const tests = [
   require('./refresh-policy.test'),
   require('./refresh-rules.test'),
   require('./health.test'),
-  require('./build.test')
+  require('./build.test'),
+  require('./deploy-contract.test')
 ]
 
 async function main() {
