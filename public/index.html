@@ -1,0 +1,102 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>Kinvest 家庭投资看板</title>
+  <link rel="stylesheet" href="/app.css" />
+</head>
+<body>
+  <div class="shell">
+    <header class="topbar">
+      <div>
+        <p class="eyebrow">家庭投资看板 v0.1（模拟）</p>
+        <h1>家庭投资看板</h1>
+        <p class="subline">默认展示：来源事实 + 确定性计算；AI 观点仅在深度研究页</p>
+      </div>
+      <a class="chip" href="/research.html?code=09888.HK">深度研究入口示例</a>
+    </header>
+
+    <section class="status-block card" id="global-status">加载中...</section>
+
+    <section class="toolbar card">
+      <label class="field">
+        <span>搜索公司 / 代码</span>
+        <div class="input-row">
+          <input id="search-input" type="text" placeholder="如 09888.HK、AAPL.US、阿里巴巴" />
+          <button id="search-btn" type="button">搜索</button>
+        </div>
+      </label>
+      <p id="search-hint" class="hint">仅展示本地索引与授权口径范围；未命中显示“暂未配置”。</p>
+    </section>
+
+    <section class="watchlist-layout">
+      <div class="card">
+        <h2>家庭关注清单</h2>
+        <div id="watchlist" class="list"></div>
+      </div>
+
+      <aside class="card">
+        <h2>搜索结果</h2>
+        <div id="search-results" class="list"></div>
+      </aside>
+    </section>
+
+    <main id="company-panel" class="card">
+      <h2>公司数据页（默认只显示可核验数据）</h2>
+      <div id="company-empty">选择一家公司后显示完整面板</div>
+      <div id="company-content" class="hidden">
+        <div class="pill-row" id="company-head"></div>
+
+        <section class="section">
+          <h3>行情与估值（原始来源数据）</h3>
+          <div id="market-status" class="muted"></div>
+          <div id="market-data" class="kpis"></div>
+          <div id="valuation-thermometer" class="thermometer"></div>
+        </section>
+
+        <section class="section">
+          <h3>财务与完整披露口径</h3>
+          <div id="finance-controls" class="chip-group">
+            <button class="chip-btn active" data-tab="annual">年度</button>
+            <button class="chip-btn" data-tab="quarter">季度</button>
+          </div>
+          <div id="finance-table-wrap"></div>
+        </section>
+
+        <section class="section">
+          <h3>经营异常信号（确定性）</h3>
+          <div id="anomaly-list"></div>
+        </section>
+
+        <section class="section">
+          <h3>业务构成细分（按验证口径展示）</h3>
+          <div id="breakdown-table"></div>
+        </section>
+
+        <section class="section">
+          <h3>公告与披露清单（原始来源）</h3>
+          <div id="announcement-list"></div>
+        </section>
+
+        <section class="section">
+          <h3>资讯与舆情清单（原始来源，仅字段）</h3>
+          <div id="news-list"></div>
+        </section>
+
+        <section class="section">
+          <h3>宏观映射入口（仅原始序列）</h3>
+          <div id="macro-table"></div>
+        </section>
+
+        <div class="actions">
+          <button id="refresh-btn" type="button">手动刷新（仅报价）</button>
+          <a id="research-link" href="#" class="chip">生成深度研究（AI）</a>
+        </div>
+      </div>
+    </main>
+  </div>
+
+  <script src="/app.js" defer></script>
+</body>
+</html>

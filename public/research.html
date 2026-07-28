@@ -1,0 +1,100 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>Kinvest 深度研究</title>
+  <link rel="stylesheet" href="/app.css" />
+  <style>
+    .research-wrap { max-width: 980px; margin: 0 auto; padding: 20px; }
+    .meta-line { display: flex; flex-wrap: wrap; gap: 8px; }
+    .status-box { background: #f8fafb; border: 1px dashed #ccdde8; border-radius: 12px; padding: 10px; }
+    .status-box p { margin: 6px 0; }
+  </style>
+</head>
+<body>
+  <div class="research-wrap">
+    <header class="card">
+      <p class="eyebrow">AI生成（示例版）</p>
+      <h1>深度研究页</h1>
+      <p id="research-header" class="subline">加载中…</p>
+      <p><a href="/" class="chip">返回公司页</a></p>
+    </header>
+
+    <section id="research-body" class="card">
+      <h2>研究快照（不可变版本）</h2>
+      <div id="research-meta" class="status-box"></div>
+      <section class="section">
+        <h3>核心观点</h3>
+        <p id="thesis"></p>
+      </section>
+      <section class="section">
+        <h3>多头逻辑</h3>
+        <ul id="bulls"></ul>
+      </section>
+      <section class="section">
+        <h3>反方观点与主要风险</h3>
+        <ul id="bears"></ul>
+      </section>
+      <section class="section">
+        <h3>催化剂与证伪条件</h3>
+        <div id="catalysts"></div>
+      </section>
+      <section class="section">
+        <h3>异常原因与后续观察</h3>
+        <p id="invalidation"></p>
+      </section>
+    </section>
+
+    <section class="card">
+      <h2>引用与追溯</h2>
+      <p>所有数字标签应可回链到公司数据页（示例）：</p>
+      <a id="back-link" href="/" class="chip">查看对应公司数据</a>
+      <p class="tag meta">仅模型输出，不替代来源数字；模型失败不影响公司数据页。</p>
+    </section>
+  </div>
+
+  <script>
+    const params = new URLSearchParams(window.location.search)
+    const code = params.get('code') || '09888.HK'
+
+    function safeGet(url, options = {}) {
+      return fetch(url, options).then(async (res) => {
+        const body = await res.json()
+        if (!res.ok) {
+          throw new Error(body.error || '请求失败')
+        }
+        return body
+      })
+    }
+
+    async function loadResearch() {
+      const data = await safeGet(`/api/research/${code}`)
+      if (!data.success) {
+        document.getElementById('research-header').textContent = data.data.message || '无可用研究'
+        return
+      }
+      const d = data.data
+      document.getElementById('research-header').textContent = `${d.nameZh || code} · 版本 ${d.version} · 数据快照 ${new Date(d.snapshotTime).toLocaleString('zh-CN')}`
+      document.getElementById('research-meta').innerHTML = `
+        <p class="muted">生成时间：${new Date(d.generatedAt).toLocaleString('zh-CN')}</p>
+        <p class="muted">引用公告：${d.citedAnnouncementsCount} 条｜引用资讯：${d.citedNewsCount} 条</p>
+        <p class="tag ai">标签：${d.tags.join(' / ')}</p>
+      `
+      document.getElementById('thesis').textContent = d.sections.thesis
+      document.getElementById('bulls').innerHTML = d.sections.bulls.map((x) => `<li>${x}</li>`).join('')
+      document.getElementById('bears').innerHTML = d.sections.bears.map((x) => `<li>${x}</li>`).join('')
+      document.getElementById('catalysts').innerHTML = `
+        <p class="muted">催化剂：${d.sections.catalysts.join('；')}</p>
+        <p class="muted">待证伪：${d.sections.invalidation.join('；')}</p>
+      `
+      document.getElementById('invalidation').textContent = d.sections.invalidation.join('；')
+      document.getElementById('back-link').href = `/?code=${code}#company-content`
+    }
+
+    loadResearch().catch((err) => {
+      document.getElementById('research-header').textContent = `加载失败：${err.message}`
+    })
+  </script>
+</body>
+</html>

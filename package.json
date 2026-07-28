@@ -1,0 +1,10 @@
+{
+  "name": "kinvest-family-dashboard",
+  "private": true,
+  "version": "0.1.0",
+  "type": "commonjs",
+  "scripts": {
+    "dev": "node server/server.js",
+    "test": "node server/tests/run-tests.js"
+  }
+}
