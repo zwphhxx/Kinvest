@@ -194,7 +194,17 @@ async function routeApi(req, res, pathname, query) {
     return false
   }
   if (segments.length === 2 && segments[1] === 'health' && req.method === 'GET') {
-    formatJson(res, getHealthState())
+    try {
+      formatJson(res, getHealthState())
+    } catch (err) {
+      if (!res.headersSent) {
+        formatJson(res, {
+          success: false,
+          error: 'Health check failed',
+          code: 503
+        }, 503)
+      }
+    }
     return true
   }
   if (segments[1] === 'watchlist' && req.method === 'GET') {
