@@ -264,7 +264,8 @@ function renderCompany(company) {
   el.companyContent.classList.remove('hidden')
 
   renderCompanyHead(company)
-  el.researchLink.href = `/research.html?code=${company.securityCode}`
+  const researchLink = /** @type {HTMLAnchorElement} */ (el.researchLink)
+  researchLink.href = `/research.html?code=${company.securityCode}`
   renderMarket(company)
   renderFinance(company)
   renderAnomalies(company.anomalies || [])
@@ -272,7 +273,8 @@ function renderCompany(company) {
   renderAnnouncements(company.announcements || [])
   renderNews(company.news || [])
   renderMacro(company.macro || [])
-  el.refreshBtn.disabled = !company.refreshState.canManualRefresh
+  const refreshButton = /** @type {HTMLButtonElement} */ (el.refreshBtn)
+  refreshButton.disabled = !company.refreshState.canManualRefresh
 }
 
 function renderSearchResults(items) {
@@ -331,7 +333,7 @@ async function doRefresh() {
 
 function bindEvents() {
   el.searchBtn.addEventListener('click', async () => {
-    const q = el.searchInput.value.trim()
+    const q = /** @type {HTMLInputElement} */ (el.searchInput).value.trim()
     if (!q) {
       el.searchResults.innerHTML = ''
       return
@@ -352,7 +354,7 @@ function bindEvents() {
     btn.addEventListener('click', () => {
       el.financeButtons.forEach((x) => x.classList.remove('active'))
       btn.classList.add('active')
-      state.financeMode = btn.dataset.tab
+      state.financeMode = /** @type {HTMLElement} */ (btn).dataset.tab
       if (state.currentCompany) {
         renderFinance(state.currentCompany)
       }

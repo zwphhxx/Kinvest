@@ -3,47 +3,28 @@ const path = require('path')
 
 const repositoryRoot = path.resolve(__dirname, '..')
 const distDirectory = path.join(repositoryRoot, 'dist')
-
-function shouldCopy(filename) {
-  return !filename.endsWith('.sqlite') && !filename.endsWith('.sqlite-journal')
-}
-
-function copyDirectory(source, destination) {
-  fs.mkdirSync(destination, { recursive: true })
-
-  const entries = fs
-    .readdirSync(source, { withFileTypes: true })
-    .sort((left, right) => left.name.localeCompare(right.name))
-
-  for (const entry of entries) {
-    if (!shouldCopy(entry.name)) {
-      continue
-    }
-
-    const sourcePath = path.join(source, entry.name)
-    const destinationPath = path.join(destination, entry.name)
-
-    if (entry.isDirectory()) {
-      copyDirectory(sourcePath, destinationPath)
-    } else if (entry.isFile()) {
-      fs.copyFileSync(sourcePath, destinationPath)
-    }
-  }
-}
+const runtimeFiles = [
+  'server/server.js',
+  'server/adapters/ifindAdapter.js',
+  'server/data/mockData.js',
+  'server/db/refresh-db.js',
+  'server/services/health.js',
+  'server/services/refresh-rules.js',
+  'server/utils/refresh-policy.js',
+  'public/index.html',
+  'public/research.html',
+  'public/app.css',
+  'public/app.js'
+].sort()
 
 fs.rmSync(distDirectory, { recursive: true, force: true })
-copyDirectory(
-  path.join(repositoryRoot, 'server'),
-  path.join(distDirectory, 'server')
-)
-copyDirectory(
-  path.join(repositoryRoot, 'public'),
-  path.join(distDirectory, 'public')
-)
-fs.rmSync(path.join(distDirectory, 'server', 'tests'), {
-  recursive: true,
-  force: true
-})
+
+for (const relativePath of runtimeFiles) {
+  const sourcePath = path.join(repositoryRoot, relativePath)
+  const destinationPath = path.join(distDirectory, relativePath)
+  fs.mkdirSync(path.dirname(destinationPath), { recursive: true })
+  fs.copyFileSync(sourcePath, destinationPath)
+}
 
 const packageJson = require(path.join(repositoryRoot, 'package.json'))
 const distPackageJson = {

@@ -6,17 +6,18 @@
     "target": "ES2022",
     "module": "CommonJS",
     "moduleResolution": "Node",
+    "lib": [
+      "ES2022",
+      "DOM",
+      "DOM.Iterable"
+    ],
     "skipLibCheck": true,
-    "strict": false,
-    "paths": {
-      "punycode": [
-        "./node_modules/@types/node/punycode.d.ts"
-      ]
-    }
+    "strict": false
   },
   "include": [
     "server/**/*.js",
-    "scripts/**/*.js"
+    "scripts/**/*.js",
+    "public/**/*.js"
   ],
   "exclude": [
     "dist",

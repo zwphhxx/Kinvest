@@ -7,18 +7,20 @@
     "dev": "node server/server.js",
     "start": "node server/server.js",
     "test": "node server/tests/run-tests.js",
-    "lint": "eslint server scripts public/app.js",
+    "lint": "eslint server scripts public",
     "typecheck": "tsc -p jsconfig.json",
     "build": "node scripts/build.js",
     "check": "npm run build && npm test && npm run lint && npm run typecheck"
   },
   "engines": {
-    "node": ">=22"
+    "node": ">=22.13.0"
   },
+  "packageManager": "npm@11.12.1",
   "devDependencies": {
-    "@eslint/js": "9.32.0",
+    "@eslint/js": "10.0.1",
     "@types/node": "24.1.0",
-    "eslint": "9.32.0",
+    "@types/punycode": "2.1.4",
+    "eslint": "10.8.0",
     "globals": "16.3.0",
     "typescript": "5.8.3"
   }
