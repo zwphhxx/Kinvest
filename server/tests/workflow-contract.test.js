@@ -415,6 +415,10 @@ function run() {
   assert.match(bootstrap, /grep -Eq '[^']*docker/)
   assert.match(bootstrap, /^APP_UID='10001'$/m)
   assert.match(bootstrap, /^APP_GID='10001'$/m)
+  assert.match(
+    bootstrap,
+    /for command in docker setpriv install useradd passwd visudo realpath flock timeout wc grep getent stat; do/
+  )
   assert.match(bootstrap, /getent passwd "\$APP_UID"/)
   assert.match(bootstrap, /getent group "\$APP_GID"/)
   assert.doesNotMatch(bootstrap, /\bAPP_(?:UID|GID)='1000'\b/)

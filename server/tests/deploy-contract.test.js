@@ -10,6 +10,10 @@ function readRootFile(relativePath) {
   return fs.readFileSync(path.join(rootDir, relativePath), 'utf8')
 }
 
+function writeExecutable(filePath, source) {
+  fs.writeFileSync(filePath, source, { mode: 0o755 })
+}
+
 function stageBody(dockerfile, stageName) {
   const stages = dockerfile.split(/(?=^FROM\s)/m)
   const stage = stages.find((candidate) => new RegExp(`\\sAS\\s+${stageName}\\s*$`, 'mi').test(candidate.split('\n')[0]))
@@ -132,6 +136,173 @@ function assertRelativeProbeWorksInsideRestrictedParent() {
   }
 }
 
+function runPrepareFixture(prepareSource, { files, running = false }) {
+  const fixtureRoot = fs.mkdtempSync(path.join(os.tmpdir(), 'kinvest-data-migration-'))
+  const fixtureDataDir = path.join(fixtureRoot, 'data')
+  const fakeBin = path.join(fixtureRoot, 'bin')
+  const fakeState = path.join(fixtureRoot, 'state')
+  const chownLog = path.join(fakeState, 'chown.log')
+
+  fs.mkdirSync(fixtureDataDir)
+  fs.mkdirSync(fakeBin)
+  fs.mkdirSync(fakeState)
+  const dataDir = fs.realpathSync(fixtureDataDir)
+  const unrelatedPath = path.join(dataDir, 'family-notes.txt')
+  fs.writeFileSync(unrelatedPath, 'must remain untouched', { mode: 0o640 })
+
+  for (const file of files) {
+    const filePath = path.join(dataDir, file.name)
+
+    if (file.kind === 'symlink') {
+      const targetPath = path.join(fixtureRoot, `${file.name}.target`)
+      fs.writeFileSync(targetPath, file.content || 'target')
+      fs.symlinkSync(targetPath, filePath)
+      continue
+    }
+
+    fs.writeFileSync(filePath, file.content || file.name, { mode: 0o640 })
+    fs.writeFileSync(path.join(fakeState, `${file.name}.owner`), `${file.owner || '1000:1000'}\n`)
+    fs.writeFileSync(path.join(fakeState, `${file.name}.links`), `${file.kind === 'hardlink' ? 2 : 1}\n`)
+
+    if (file.kind === 'hardlink') {
+      fs.linkSync(filePath, path.join(dataDir, `${file.name}.unrelated-hardlink`))
+    }
+  }
+
+  writeExecutable(
+    path.join(fakeBin, 'id'),
+    `#!/bin/sh
+if [ "\${1:-}" = '-u' ]; then
+  printf '%s\\n' '0'
+  exit 0
+fi
+exec /usr/bin/id "$@"
+`
+  )
+
+  writeExecutable(
+    path.join(fakeBin, 'install'),
+    `#!/bin/sh
+exit 0
+`
+  )
+
+  writeExecutable(
+    path.join(fakeBin, 'chown'),
+    `#!/bin/sh
+target=''
+for argument in "$@"; do
+  target="$argument"
+done
+printf '%s\\n' "$target" >> "$PREPARE_FAKE_STATE/chown.log"
+if [ "$target" != '.' ]; then
+  base="\${target##*/}"
+  : > "$PREPARE_FAKE_STATE/$base.migrated"
+fi
+`
+  )
+
+  writeExecutable(
+    path.join(fakeBin, 'chmod'),
+    `#!/bin/sh
+mode="$1"
+shift
+if [ "\${1:-}" = '--' ]; then
+  shift
+fi
+exec /bin/chmod "$mode" "$@"
+`
+  )
+
+  writeExecutable(
+    path.join(fakeBin, 'stat'),
+    `#!/bin/sh
+format=''
+target=''
+while [ "$#" -gt 0 ]; do
+  if [ "$1" = '-c' ]; then
+    shift
+    format="$1"
+  elif [ "$1" != '--' ]; then
+    target="$1"
+  fi
+  shift
+done
+base="\${target##*/}"
+case "$format" in
+  '%u:%g')
+    if [ -f "$PREPARE_FAKE_STATE/$base.migrated" ]; then
+      printf '%s\\n' '10001:10001'
+    else
+      cat "$PREPARE_FAKE_STATE/$base.owner"
+    fi
+    ;;
+  '%h')
+    cat "$PREPARE_FAKE_STATE/$base.links"
+    ;;
+  *)
+    exit 91
+    ;;
+esac
+`
+  )
+
+  writeExecutable(
+    path.join(fakeBin, 'setpriv'),
+    `#!/bin/sh
+while [ "$#" -gt 0 ]; do
+  case "$1" in
+    --reuid=*|--regid=*|--clear-groups) shift ;;
+    *) exec "$@" ;;
+  esac
+done
+exit 92
+`
+  )
+
+  writeExecutable(
+    path.join(fakeBin, 'docker'),
+    `#!/bin/sh
+if [ "$PREPARE_RUNNING" = 'true' ]; then
+  printf '%s\\n' 'kinvest'
+fi
+`
+  )
+
+  const instrumentedSource = prepareSource.replace(
+    "DATA_DIR='/root/docker/kinvest/data'",
+    `DATA_DIR='${dataDir}'`
+  )
+  const scriptPath = path.join(fixtureRoot, 'prepare-data-dir.sh')
+  writeExecutable(scriptPath, instrumentedSource)
+
+  const unrelatedBefore = fs.statSync(unrelatedPath)
+  const result = spawnSync(scriptPath, [], {
+    encoding: 'utf8',
+    env: {
+      ...process.env,
+      PATH: `${fakeBin}:${process.env.PATH}`,
+      PREPARE_FAKE_STATE: fakeState,
+      PREPARE_RUNNING: String(running)
+    }
+  })
+
+  return {
+    chownTargets() {
+      return fs.existsSync(chownLog)
+        ? fs.readFileSync(chownLog, 'utf8').trim().split('\n').filter(Boolean)
+        : []
+    },
+    cleanup() {
+      fs.rmSync(fixtureRoot, { recursive: true, force: true })
+    },
+    dataDir,
+    result,
+    unrelatedBefore,
+    unrelatedPath
+  }
+}
+
 async function run() {
   const dockerfile = readRootFile('Dockerfile')
   const compose = readRootFile('deploy/server/docker-compose.yml')
@@ -236,7 +407,15 @@ async function run() {
   assert.doesNotMatch(prepareScript, /\$\{?KINVEST_DATA_DIR\b/)
   assert.doesNotMatch(runtimeStage, /\b1000(?::1000)?\b/)
   assert.doesNotMatch(kinvestService, /\b1000(?::1000)?\b/)
-  assert.doesNotMatch(prepareScript, /\b1000(?::1000)?\b/)
+  assert.match(
+    prepareScript,
+    /^SQLITE_FILES='kinvest\.sqlite kinvest\.sqlite-wal kinvest\.sqlite-shm kinvest\.sqlite-journal'$/m
+  )
+  assert.match(prepareScript, /stat -c '%u:%g'/)
+  assert.match(prepareScript, /stat -c '%h'/)
+  assert.match(prepareScript, /docker ps/)
+  assert.doesNotMatch(prepareScript, /kinvest\.sqlite\*/)
+  assert.doesNotMatch(prepareScript, /\b(?:find|xargs)\b/)
 
   const installIndex = prepareScript.indexOf('install -d -m 0750 -- "$DATA_DIR"')
   const cdIndex = prepareScript.indexOf('cd -P -- "$DATA_DIR"')
@@ -250,6 +429,80 @@ async function run() {
   assert.doesNotMatch(loweredProbeInvocation, /\/root|"\$DATA_DIR"/)
 
   assertRelativeProbeWorksInsideRestrictedParent()
+
+  const migration = runPrepareFixture(prepareScript, {
+    files: [
+      { name: 'kinvest.sqlite', owner: '1000:1000', content: 'main database content' },
+      { name: 'kinvest.sqlite-wal', owner: '1000:1000', content: 'wal content' },
+      { name: 'kinvest.sqlite-shm', owner: '1000:1000', content: 'shm content' }
+    ]
+  })
+  try {
+    assert.equal(migration.result.status, 0, migration.result.stderr)
+    assert.deepEqual(
+      migration.chownTargets().filter((target) => target !== '.'),
+      ['kinvest.sqlite', 'kinvest.sqlite-wal', 'kinvest.sqlite-shm']
+    )
+    assert.equal(fs.readFileSync(path.join(migration.dataDir, 'kinvest.sqlite'), 'utf8'), 'main database content')
+    assert.equal(fs.readFileSync(path.join(migration.dataDir, 'kinvest.sqlite-wal'), 'utf8'), 'wal content')
+    assert.equal(fs.readFileSync(path.join(migration.dataDir, 'kinvest.sqlite-shm'), 'utf8'), 'shm content')
+    for (const name of ['kinvest.sqlite', 'kinvest.sqlite-wal', 'kinvest.sqlite-shm']) {
+      assert.equal(fs.statSync(path.join(migration.dataDir, name)).mode & 0o777, 0o600)
+    }
+    const unrelatedAfter = fs.statSync(migration.unrelatedPath)
+    assert.equal(unrelatedAfter.uid, migration.unrelatedBefore.uid)
+    assert.equal(unrelatedAfter.gid, migration.unrelatedBefore.gid)
+    assert.equal(unrelatedAfter.mode & 0o777, migration.unrelatedBefore.mode & 0o777)
+    assert.equal(fs.readFileSync(migration.unrelatedPath, 'utf8'), 'must remain untouched')
+    assert.equal(migration.chownTargets().includes('family-notes.txt'), false)
+  } finally {
+    migration.cleanup()
+  }
+
+  const unknownOwner = runPrepareFixture(prepareScript, {
+    files: [{ name: 'kinvest.sqlite', owner: '2000:2000' }]
+  })
+  try {
+    assert.equal(unknownOwner.result.status, 1)
+    assert.match(unknownOwner.result.stderr, /unexpected owner 2000:2000/)
+    assert.equal(unknownOwner.chownTargets().includes('kinvest.sqlite'), false)
+  } finally {
+    unknownOwner.cleanup()
+  }
+
+  const symlink = runPrepareFixture(prepareScript, {
+    files: [{ name: 'kinvest.sqlite', kind: 'symlink' }]
+  })
+  try {
+    assert.equal(symlink.result.status, 1)
+    assert.match(symlink.result.stderr, /symlinked SQLite file/)
+    assert.equal(symlink.chownTargets().includes('kinvest.sqlite'), false)
+  } finally {
+    symlink.cleanup()
+  }
+
+  const hardlink = runPrepareFixture(prepareScript, {
+    files: [{ name: 'kinvest.sqlite', kind: 'hardlink', owner: '1000:1000' }]
+  })
+  try {
+    assert.equal(hardlink.result.status, 1)
+    assert.match(hardlink.result.stderr, /multiple hard links/)
+    assert.equal(hardlink.chownTargets().includes('kinvest.sqlite'), false)
+  } finally {
+    hardlink.cleanup()
+  }
+
+  const runningLegacy = runPrepareFixture(prepareScript, {
+    files: [{ name: 'kinvest.sqlite', owner: '1000:1000' }],
+    running: true
+  })
+  try {
+    assert.equal(runningLegacy.result.status, 1)
+    assert.match(runningLegacy.result.stderr, /Kinvest container is running.*stop it first/i)
+    assert.equal(runningLegacy.chownTargets().includes('kinvest.sqlite'), false)
+  } finally {
+    runningLegacy.cleanup()
+  }
 
   assert.match(dockerignore, /^\.env$/m)
   assert.match(dockerignore, /^\*\.sqlite$/m)

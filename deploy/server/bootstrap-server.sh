@@ -19,7 +19,7 @@ if [[ "$(id -u)" -ne 0 ]]; then
   exit 1
 fi
 
-for command in docker setpriv install useradd passwd visudo realpath flock timeout wc grep getent; do
+for command in docker setpriv install useradd passwd visudo realpath flock timeout wc grep getent stat; do
   if ! command -v "$command" >/dev/null 2>&1; then
     printf '%s\n' "required command is unavailable: $command" >&2
     exit 1
