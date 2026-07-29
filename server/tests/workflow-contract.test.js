@@ -300,7 +300,7 @@ exit 0
 `
   )
 
-  for (const command of ['setpriv', 'install', 'useradd', 'passwd', 'visudo']) {
+  for (const command of ['setpriv', 'install', 'useradd', 'groupadd', 'passwd', 'visudo']) {
     writeExecutable(
       path.join(fakeBin, command),
       `#!/bin/sh
@@ -310,7 +310,7 @@ exit 90
     )
   }
 
-  for (const command of ['flock', 'timeout']) {
+  for (const command of ['flock', 'timeout', 'mktemp', 'stat', 'fuser']) {
     writeExecutable(path.join(fakeBin, command), '#!/bin/sh\nexit 0\n')
   }
 
@@ -333,6 +333,178 @@ exit 90
       fs.rmSync(fixtureRoot, { recursive: true, force: true })
     },
     mutationMarker,
+    result
+  }
+}
+
+function runBootstrapUserFixture({ existing }) {
+  const rawFixtureRoot = fs.mkdtempSync(path.join(os.tmpdir(), 'kinvest-bootstrap-user-'))
+  const fixtureRoot = fs.realpathSync(rawFixtureRoot)
+  const fakeBin = path.join(fixtureRoot, 'bin')
+  const fakeState = path.join(fixtureRoot, 'state')
+  const sourceDir = path.join(fixtureRoot, 'source')
+  const dockerRoot = path.join(fixtureRoot, 'docker')
+  const deployHome = path.join(fixtureRoot, 'home/kinvest-deploy')
+  const localSbin = path.join(fixtureRoot, 'usr/local/sbin')
+  const sudoersDir = path.join(fixtureRoot, 'etc/sudoers.d')
+  const publicKeyFile = path.join(fixtureRoot, 'deploy.pub')
+
+  for (const directory of [fakeBin, fakeState, sourceDir, dockerRoot, localSbin, sudoersDir]) {
+    fs.mkdirSync(directory, { recursive: true })
+  }
+
+  fs.writeFileSync(publicKeyFile, `ssh-ed25519 ${'A'.repeat(44)} fixture\n`)
+  fs.writeFileSync(path.join(sourceDir, 'docker-compose.yml'), 'services:\n  kinvest:\n    image: fixture\n')
+  for (const scriptName of ['migrate-data-uid.sh', 'prepare-data-dir.sh']) {
+    writeExecutable(
+      path.join(sourceDir, scriptName),
+      `#!/bin/sh
+printf '%s\\n' '${scriptName}' >> "$BOOTSTRAP_FAKE_STATE/lifecycle.log"
+`
+    )
+  }
+  for (const scriptName of ['deploy-kinvest.sh', 'kinvest-ssh-command']) {
+    writeExecutable(path.join(sourceDir, scriptName), '#!/bin/sh\nexit 0\n')
+  }
+
+  writeExecutable(
+    path.join(fakeBin, 'id'),
+    `#!/bin/sh
+if [ "\${1:-}" = '-u' ] && [ "$#" -eq 1 ]; then
+  printf '%s\\n' '0'
+  exit 0
+fi
+if [ "\${1:-}" = '-nG' ]; then
+  printf '%s\\n' 'kinvest-deploy'
+  exit 0
+fi
+if [ "\${1:-}" = 'kinvest-deploy' ]; then
+  if [ "$BOOTSTRAP_EXISTING" = 'true' ] || [ -f "$BOOTSTRAP_FAKE_STATE/user-created" ]; then
+    exit 0
+  fi
+  exit 1
+fi
+exec /usr/bin/id "$@"
+`
+  )
+
+  writeExecutable(
+    path.join(fakeBin, 'getent'),
+    `#!/bin/sh
+database="\${1:-}"
+key="\${2:-}"
+if [ "$database:$key" = 'passwd:10001' ] || [ "$database:$key" = 'group:10001' ]; then
+  exit 2
+fi
+if [ "$database:$key" = 'passwd:10002' ] || [ "$database:$key" = 'group:10002' ]; then
+  [ -f "$BOOTSTRAP_FAKE_STATE/user-created" ] && exit 0
+  exit 2
+fi
+if [ "$database:$key" = 'group:kinvest-deploy' ]; then
+  [ "$BOOTSTRAP_EXISTING" = 'true' ] || [ -f "$BOOTSTRAP_FAKE_STATE/group-created" ]
+  exit
+fi
+if [ "$database:$key" = 'passwd:kinvest-deploy' ]; then
+  if [ "$BOOTSTRAP_EXISTING" = 'true' ]; then
+    printf 'kinvest-deploy:x:1001:1001::%s:/bin/bash\\n' "$BOOTSTRAP_DEPLOY_HOME"
+    exit 0
+  fi
+  if [ -f "$BOOTSTRAP_FAKE_STATE/user-created" ]; then
+    printf 'kinvest-deploy:x:10002:10002::%s:/bin/bash\\n' "$BOOTSTRAP_DEPLOY_HOME"
+    exit 0
+  fi
+fi
+exit 2
+`
+  )
+
+  writeExecutable(
+    path.join(fakeBin, 'groupadd'),
+    `#!/bin/sh
+printf '%s\\n' "$*" >> "$BOOTSTRAP_FAKE_STATE/groupadd.log"
+: > "$BOOTSTRAP_FAKE_STATE/group-created"
+`
+  )
+  writeExecutable(
+    path.join(fakeBin, 'useradd'),
+    `#!/bin/sh
+printf '%s\\n' "$*" >> "$BOOTSTRAP_FAKE_STATE/useradd.log"
+: > "$BOOTSTRAP_FAKE_STATE/user-created"
+`
+  )
+  writeExecutable(
+    path.join(fakeBin, 'install'),
+    `#!/usr/bin/env bash
+set -e
+arguments=("$@")
+count="\${#arguments[@]}"
+destination="\${arguments[$((count - 1))]}"
+mode='0755'
+directory='false'
+for ((index = 0; index < count; index += 1)); do
+  [ "\${arguments[$index]}" = '-d' ] && directory='true'
+  if [ "\${arguments[$index]}" = '-m' ]; then
+    mode="\${arguments[$((index + 1))]}"
+  fi
+done
+if [ "$directory" = 'true' ]; then
+  mkdir -p "$destination"
+  chmod "$mode" "$destination"
+else
+  source="\${arguments[$((count - 2))]}"
+  mkdir -p "$(dirname "$destination")"
+  cp "$source" "$destination"
+  chmod "$mode" "$destination"
+fi
+`
+  )
+  writeExecutable(path.join(fakeBin, 'chown'), '#!/bin/sh\nexit 0\n')
+  writeExecutable(path.join(fakeBin, 'passwd'), '#!/bin/sh\nexit 0\n')
+  writeExecutable(path.join(fakeBin, 'visudo'), '#!/bin/sh\nexit 0\n')
+  writeExecutable(
+    path.join(fakeBin, 'realpath'),
+    '#!/bin/sh\nfor argument in "$@"; do result="$argument"; done\nprintf "%s\\n" "$result"\n'
+  )
+  writeExecutable(path.join(fakeBin, 'docker'), '#!/bin/sh\nexit 0\n')
+  for (const command of ['setpriv', 'flock', 'timeout', 'stat', 'fuser']) {
+    writeExecutable(path.join(fakeBin, command), '#!/bin/sh\nexit 0\n')
+  }
+
+  const bootstrapSource = readRootFile('deploy/server/bootstrap-server.sh')
+    .replace("DOCKER_ROOT='/root/docker'", `DOCKER_ROOT='${dockerRoot}'`)
+    .replace("DEPLOY_HOME='/home/kinvest-deploy'", `DEPLOY_HOME='${deployHome}'`)
+    .replace(
+      "LOCAL_DEPLOY_SCRIPT='/usr/local/sbin/deploy-kinvest'",
+      `LOCAL_DEPLOY_SCRIPT='${path.join(localSbin, 'deploy-kinvest')}'`
+    )
+    .replace(
+      "LOCAL_SSH_COMMAND='/usr/local/sbin/kinvest-ssh-command'",
+      `LOCAL_SSH_COMMAND='${path.join(localSbin, 'kinvest-ssh-command')}'`
+    )
+    .replace(
+      "SUDOERS_FILE='/etc/sudoers.d/kinvest-deploy'",
+      `SUDOERS_FILE='${path.join(sudoersDir, 'kinvest-deploy')}'`
+    )
+  const scriptPath = path.join(fixtureRoot, 'bootstrap-server.sh')
+  writeExecutable(scriptPath, bootstrapSource)
+
+  const result = spawnSync(scriptPath, [sourceDir, publicKeyFile], {
+    encoding: 'utf8',
+    env: {
+      ...process.env,
+      PATH: `${fakeBin}:${process.env.PATH}`,
+      BOOTSTRAP_DEPLOY_HOME: deployHome,
+      BOOTSTRAP_EXISTING: String(existing),
+      BOOTSTRAP_FAKE_STATE: fakeState
+    }
+  })
+
+  return {
+    cleanup() {
+      fs.rmSync(fixtureRoot, { recursive: true, force: true })
+    },
+    deployHome,
+    fakeState,
     result
   }
 }
@@ -398,9 +570,10 @@ function run() {
   assert.doesNotMatch(wrapper, /eval|docker/)
 
   assert.match(bootstrap, /kinvest-ssh-command/)
+  assert.match(bootstrap, /migrate-data-uid\.sh/)
   assert.match(
     bootstrap,
-    /install -o root -g root -m 0755 -- "\$TARGET\/kinvest-ssh-command" \/usr\/local\/sbin\/kinvest-ssh-command/
+    /install -o root -g root -m 0755 -- "\$TARGET\/kinvest-ssh-command" "\$LOCAL_SSH_COMMAND"/
   )
   assert.match(
     bootstrap,
@@ -415,15 +588,64 @@ function run() {
   assert.match(bootstrap, /grep -Eq '[^']*docker/)
   assert.match(bootstrap, /^APP_UID='10001'$/m)
   assert.match(bootstrap, /^APP_GID='10001'$/m)
+  assert.match(bootstrap, /^DEPLOY_UID='10002'$/m)
+  assert.match(bootstrap, /^DEPLOY_GID='10002'$/m)
   assert.match(
     bootstrap,
-    /for command in docker setpriv install useradd passwd visudo realpath flock timeout wc grep getent stat; do/
+    /for command in docker setpriv install useradd groupadd passwd visudo realpath flock timeout wc grep getent mktemp stat fuser; do/
   )
   assert.match(bootstrap, /getent passwd "\$APP_UID"/)
   assert.match(bootstrap, /getent group "\$APP_GID"/)
+  assert.match(bootstrap, /groupadd --gid "\$DEPLOY_GID" "\$DEPLOY_USER"/)
+  assert.match(
+    bootstrap,
+    /useradd --uid "\$DEPLOY_UID" --gid "\$DEPLOY_GID" --create-home --home-dir "\$DEPLOY_HOME" --shell \/bin\/bash "\$DEPLOY_USER"/
+  )
+  assert.match(bootstrap, /existing_deploy_uid/)
+  assert.match(bootstrap, /existing_deploy_gid/)
   assert.doesNotMatch(bootstrap, /\bAPP_(?:UID|GID)='1000'\b/)
   assert.doesNotMatch(bootstrap, /usermod[^\n]*docker|gpasswd[^\n]*docker|docker group/i)
   assert.doesNotMatch(bootstrap, /ssh-(?:ed25519|rsa) [A-Za-z0-9+/]{40,}/)
+  assert.doesNotMatch(deploy, /migrate-data-uid/)
+  assert.match(deploy, /prepare-data-dir\.sh/)
+
+  const migrateCallIndex = bootstrap.indexOf('"$TARGET/migrate-data-uid.sh"')
+  const prepareCallIndex = bootstrap.indexOf('"$TARGET/prepare-data-dir.sh"')
+  assert.ok(migrateCallIndex >= 0 && prepareCallIndex > migrateCallIndex)
+
+  const freshUser = runBootstrapUserFixture({ existing: false })
+  try {
+    assert.equal(freshUser.result.status, 0, freshUser.result.stderr)
+    assert.equal(
+      fs.readFileSync(path.join(freshUser.fakeState, 'groupadd.log'), 'utf8').trim(),
+      '--gid 10002 kinvest-deploy'
+    )
+    assert.equal(
+      fs.readFileSync(path.join(freshUser.fakeState, 'useradd.log'), 'utf8').trim(),
+      '--uid 10002 --gid 10002 --create-home --home-dir ' +
+        `${freshUser.deployHome} ` +
+        '--shell /bin/bash kinvest-deploy'
+    )
+    assert.deepEqual(
+      fs.readFileSync(path.join(freshUser.fakeState, 'lifecycle.log'), 'utf8').trim().split('\n'),
+      ['migrate-data-uid.sh', 'prepare-data-dir.sh']
+    )
+  } finally {
+    freshUser.cleanup()
+  }
+
+  const existingUser = runBootstrapUserFixture({ existing: true })
+  try {
+    assert.equal(existingUser.result.status, 0, existingUser.result.stderr)
+    assert.equal(fs.existsSync(path.join(existingUser.fakeState, 'groupadd.log')), false)
+    assert.equal(fs.existsSync(path.join(existingUser.fakeState, 'useradd.log')), false)
+    assert.deepEqual(
+      fs.readFileSync(path.join(existingUser.fakeState, 'lifecycle.log'), 'utf8').trim().split('\n'),
+      ['migrate-data-uid.sh', 'prepare-data-dir.sh']
+    )
+  } finally {
+    existingUser.cleanup()
+  }
 
   /** @type {Array<[string, RegExp]>} */
   const identityConflicts = [

@@ -136,7 +136,7 @@ function assertRelativeProbeWorksInsideRestrictedParent() {
   }
 }
 
-function runPrepareFixture(prepareSource, { files, running = false }) {
+function runPrepareFixture(prepareSource, { files }) {
   const fixtureRoot = fs.mkdtempSync(path.join(os.tmpdir(), 'kinvest-data-migration-'))
   const fixtureDataDir = path.join(fixtureRoot, 'data')
   const fakeBin = path.join(fixtureRoot, 'bin')
@@ -160,8 +160,8 @@ function runPrepareFixture(prepareSource, { files, running = false }) {
       continue
     }
 
-    fs.writeFileSync(filePath, file.content || file.name, { mode: 0o640 })
-    fs.writeFileSync(path.join(fakeState, `${file.name}.owner`), `${file.owner || '1000:1000'}\n`)
+    fs.writeFileSync(filePath, file.content || file.name, { mode: file.mode || 0o600 })
+    fs.writeFileSync(path.join(fakeState, `${file.name}.owner`), `${file.owner || '10001:10001'}\n`)
     fs.writeFileSync(path.join(fakeState, `${file.name}.links`), `${file.kind === 'hardlink' ? 2 : 1}\n`)
 
     if (file.kind === 'hardlink') {
@@ -231,6 +231,10 @@ done
 base="\${target##*/}"
 case "$format" in
   '%u:%g')
+    if [ "$target" = '.' ]; then
+      printf '%s\\n' '10001:10001'
+      exit 0
+    fi
     if [ -f "$PREPARE_FAKE_STATE/$base.migrated" ]; then
       printf '%s\\n' '10001:10001'
     else
@@ -239,6 +243,20 @@ case "$format" in
     ;;
   '%h')
     cat "$PREPARE_FAKE_STATE/$base.links"
+    ;;
+  '%F')
+    if [ "$target" = '.' ]; then
+      printf '%s\\n' 'directory'
+    else
+      printf '%s\\n' 'regular empty file'
+    fi
+    ;;
+  '%a')
+    if [ "$target" = '.' ]; then
+      printf '%s\\n' '750'
+    else
+      printf '%s\\n' '600'
+    fi
     ;;
   *)
     exit 91
@@ -261,11 +279,10 @@ exit 92
   )
 
   writeExecutable(
-    path.join(fakeBin, 'docker'),
+    path.join(fakeBin, 'mktemp'),
     `#!/bin/sh
-if [ "$PREPARE_RUNNING" = 'true' ]; then
-  printf '%s\\n' 'kinvest'
-fi
+printf '%s\\n' "$*" >> "$PREPARE_FAKE_STATE/mktemp.log"
+exec /usr/bin/mktemp "$@"
 `
   )
 
@@ -282,8 +299,7 @@ fi
     env: {
       ...process.env,
       PATH: `${fakeBin}:${process.env.PATH}`,
-      PREPARE_FAKE_STATE: fakeState,
-      PREPARE_RUNNING: String(running)
+      PREPARE_FAKE_STATE: fakeState
     }
   })
 
@@ -297,6 +313,10 @@ fi
       fs.rmSync(fixtureRoot, { recursive: true, force: true })
     },
     dataDir,
+    mktempInvocations() {
+      const logPath = path.join(fakeState, 'mktemp.log')
+      return fs.existsSync(logPath) ? fs.readFileSync(logPath, 'utf8').trim().split('\n') : []
+    },
     result,
     unrelatedBefore,
     unrelatedPath
@@ -309,6 +329,8 @@ async function run() {
   const dockerignore = readRootFile('.dockerignore')
   const prepareScriptPath = path.join(rootDir, 'deploy/server/prepare-data-dir.sh')
   const prepareScript = readRootFile('deploy/server/prepare-data-dir.sh')
+  const migrationScriptPath = path.join(rootDir, 'deploy/server/migrate-data-uid.sh')
+  const migrationScript = readRootFile('deploy/server/migrate-data-uid.sh')
   const nginx = readRootFile('deploy/server/nginx.conf')
   const explicitNginxCompose = readRootFile('deploy/server/docker-compose.nginx.yml')
   const logrotate = readRootFile('deploy/server/logrotate-nginx')
@@ -381,12 +403,13 @@ async function run() {
   assert.match(prepareScript, /^DATA_DIR='\/root\/docker\/kinvest\/data'$/m)
   assert.match(prepareScript, /^APP_UID='10001'$/m)
   assert.match(prepareScript, /^APP_GID='10001'$/m)
+  assert.doesNotMatch(prepareScript, /^LEGACY_(?:UID|GID)=/m)
   assert.match(
     prepareScript,
     /^ {2}for PATH_COMPONENT in '\/root' '\/root\/docker' '\/root\/docker\/kinvest' "\$DATA_DIR"; do$/m
   )
   assert.match(prepareScript, /\[ -L "\$PATH_COMPONENT" \]/)
-  assert.match(prepareScript, /install -d -m 0750 -- "\$DATA_DIR"/)
+  assert.match(prepareScript, /install -d -o "\$APP_UID" -g "\$APP_GID" -m 0750 -- "\$DATA_DIR"/)
   assert.equal(
     prepareScript.match(/^assert_no_symlink_components$/gm)?.length,
     2,
@@ -394,11 +417,7 @@ async function run() {
   )
   assert.match(prepareScript, /^cd -P -- "\$DATA_DIR"$/m)
   assert.match(prepareScript, /^\s*if \[ "\$\(pwd -P\)" != "\$DATA_DIR" \]; then$/m)
-  assert.match(prepareScript, /chown "\$APP_UID:\$APP_GID" -- \./)
-  assert.match(prepareScript, /chmod 0750 -- \./)
-  assert.match(prepareScript, /^PROBE_BASE="\.kinvest-write-probe-\$\$"$/m)
   assert.match(prepareScript, /setpriv --reuid="\$APP_UID" --regid="\$APP_GID" --clear-groups/)
-  assert.match(prepareScript, /' sh "\$PROBE_BASE"/)
   assert.match(prepareScript, /\.sqlite/)
   assert.match(prepareScript, /\.sqlite-wal/)
   assert.match(prepareScript, /\.sqlite-shm/)
@@ -413,61 +432,86 @@ async function run() {
   )
   assert.match(prepareScript, /stat -c '%u:%g'/)
   assert.match(prepareScript, /stat -c '%h'/)
-  assert.match(prepareScript, /docker ps/)
+  assert.match(prepareScript, /stat -c '%F'/)
+  assert.match(prepareScript, /stat -c '%a'/)
+  assert.match(prepareScript, /mktemp/)
+  assert.match(prepareScript, /setpriv --reuid="\$APP_UID" --regid="\$APP_GID" --clear-groups sh -c/)
+  assert.doesNotMatch(prepareScript, /(?:^|\n)\s*docker\s/m)
+  assert.doesNotMatch(prepareScript, /chown[^\n]*SQLITE_FILE/)
+  assert.doesNotMatch(prepareScript, /chmod[^\n]*SQLITE_FILE/)
+  assert.doesNotMatch(prepareScript, /\.\$\$/)
+  assert.doesNotMatch(prepareScript, /:\s*>\s*"\$PROBE/)
   assert.doesNotMatch(prepareScript, /kinvest\.sqlite\*/)
   assert.doesNotMatch(prepareScript, /\b(?:find|xargs)\b/)
 
-  const installIndex = prepareScript.indexOf('install -d -m 0750 -- "$DATA_DIR"')
+  const installIndex = prepareScript.indexOf('install -d -o "$APP_UID" -g "$APP_GID" -m 0750 -- "$DATA_DIR"')
   const cdIndex = prepareScript.indexOf('cd -P -- "$DATA_DIR"')
-  const chownIndex = prepareScript.indexOf('chown "$APP_UID:$APP_GID" -- .')
   const setprivIndex = prepareScript.indexOf('setpriv --reuid="$APP_UID"')
   const loweredProbeInvocation = prepareScript.slice(setprivIndex)
 
   assert.ok(installIndex >= 0 && cdIndex > installIndex, 'root must enter data directory after safely creating it')
-  assert.ok(chownIndex > cdIndex, 'ownership changes must target the verified physical data directory')
   assert.ok(setprivIndex > cdIndex, 'root must enter data directory before lowering privileges')
   assert.doesNotMatch(loweredProbeInvocation, /\/root|"\$DATA_DIR"/)
 
   assertRelativeProbeWorksInsideRestrictedParent()
 
-  const migration = runPrepareFixture(prepareScript, {
+  assert.equal(fs.statSync(migrationScriptPath).mode & 0o111, 0o111)
+  assert.match(migrationScript, /^DATA_DIR='\/root\/docker\/kinvest\/data'$/m)
+  assert.match(migrationScript, /^STATE_DIR='\/root\/docker\/kinvest\/state'$/m)
+  assert.match(migrationScript, /^LOCK_FILE="\$STATE_DIR\/deploy\.lock"$/m)
+  assert.match(migrationScript, /^APP_UID='10001'$/m)
+  assert.match(migrationScript, /^LEGACY_UID='1000'$/m)
+  assert.match(migrationScript, /flock -n 9/)
+  assert.match(migrationScript, /docker ps -aq --no-trunc/)
+  assert.match(migrationScript, /docker inspect --type container --format/)
+  assert.match(migrationScript, /fuser/)
+  assert.match(migrationScript, /chown root:root -- \./)
+  assert.match(migrationScript, /chmod 0700 -- \./)
+  assert.doesNotMatch(migrationScript, /kinvest\.sqlite\*/)
+  assert.doesNotMatch(migrationScript, /\b(?:find|xargs|chown\s+-R|chmod\s+-R)\b/)
+
+  const dailyPrepare = runPrepareFixture(prepareScript, {
     files: [
-      { name: 'kinvest.sqlite', owner: '1000:1000', content: 'main database content' },
-      { name: 'kinvest.sqlite-wal', owner: '1000:1000', content: 'wal content' },
-      { name: 'kinvest.sqlite-shm', owner: '1000:1000', content: 'shm content' }
+      { name: 'kinvest.sqlite', content: 'main database content' },
+      { name: 'kinvest.sqlite-wal', content: 'wal content' },
+      { name: 'kinvest.sqlite-shm', content: 'shm content' }
     ]
   })
   try {
-    assert.equal(migration.result.status, 0, migration.result.stderr)
-    assert.deepEqual(
-      migration.chownTargets().filter((target) => target !== '.'),
-      ['kinvest.sqlite', 'kinvest.sqlite-wal', 'kinvest.sqlite-shm']
-    )
-    assert.equal(fs.readFileSync(path.join(migration.dataDir, 'kinvest.sqlite'), 'utf8'), 'main database content')
-    assert.equal(fs.readFileSync(path.join(migration.dataDir, 'kinvest.sqlite-wal'), 'utf8'), 'wal content')
-    assert.equal(fs.readFileSync(path.join(migration.dataDir, 'kinvest.sqlite-shm'), 'utf8'), 'shm content')
+    assert.equal(dailyPrepare.result.status, 0, dailyPrepare.result.stderr)
+    assert.deepEqual(dailyPrepare.chownTargets(), [])
+    assert.equal(fs.readFileSync(path.join(dailyPrepare.dataDir, 'kinvest.sqlite'), 'utf8'), 'main database content')
+    assert.equal(fs.readFileSync(path.join(dailyPrepare.dataDir, 'kinvest.sqlite-wal'), 'utf8'), 'wal content')
+    assert.equal(fs.readFileSync(path.join(dailyPrepare.dataDir, 'kinvest.sqlite-shm'), 'utf8'), 'shm content')
     for (const name of ['kinvest.sqlite', 'kinvest.sqlite-wal', 'kinvest.sqlite-shm']) {
-      assert.equal(fs.statSync(path.join(migration.dataDir, name)).mode & 0o777, 0o600)
+      assert.equal(fs.statSync(path.join(dailyPrepare.dataDir, name)).mode & 0o777, 0o600)
     }
-    const unrelatedAfter = fs.statSync(migration.unrelatedPath)
-    assert.equal(unrelatedAfter.uid, migration.unrelatedBefore.uid)
-    assert.equal(unrelatedAfter.gid, migration.unrelatedBefore.gid)
-    assert.equal(unrelatedAfter.mode & 0o777, migration.unrelatedBefore.mode & 0o777)
-    assert.equal(fs.readFileSync(migration.unrelatedPath, 'utf8'), 'must remain untouched')
-    assert.equal(migration.chownTargets().includes('family-notes.txt'), false)
+    const unrelatedAfter = fs.statSync(dailyPrepare.unrelatedPath)
+    assert.equal(unrelatedAfter.uid, dailyPrepare.unrelatedBefore.uid)
+    assert.equal(unrelatedAfter.gid, dailyPrepare.unrelatedBefore.gid)
+    assert.equal(unrelatedAfter.mode & 0o777, dailyPrepare.unrelatedBefore.mode & 0o777)
+    assert.equal(fs.readFileSync(dailyPrepare.unrelatedPath, 'utf8'), 'must remain untouched')
+    assert.equal(dailyPrepare.mktempInvocations().length, 3)
+    for (const invocation of dailyPrepare.mktempInvocations()) {
+      assert.match(invocation, /^\.kinvest-(?:main|wal|shm)-probe\.X{10}$/)
+    }
+    assert.equal(
+      fs.readdirSync(dailyPrepare.dataDir).some((name) => name.startsWith('.kinvest-')),
+      false
+    )
   } finally {
-    migration.cleanup()
+    dailyPrepare.cleanup()
   }
 
-  const unknownOwner = runPrepareFixture(prepareScript, {
-    files: [{ name: 'kinvest.sqlite', owner: '2000:2000' }]
+  const legacyOwner = runPrepareFixture(prepareScript, {
+    files: [{ name: 'kinvest.sqlite', owner: '1000:1000' }]
   })
   try {
-    assert.equal(unknownOwner.result.status, 1)
-    assert.match(unknownOwner.result.stderr, /unexpected owner 2000:2000/)
-    assert.equal(unknownOwner.chownTargets().includes('kinvest.sqlite'), false)
+    assert.equal(legacyOwner.result.status, 1)
+    assert.match(legacyOwner.result.stderr, /expected owner 10001:10001/)
+    assert.equal(legacyOwner.chownTargets().includes('kinvest.sqlite'), false)
   } finally {
-    unknownOwner.cleanup()
+    legacyOwner.cleanup()
   }
 
   const symlink = runPrepareFixture(prepareScript, {
@@ -482,7 +526,7 @@ async function run() {
   }
 
   const hardlink = runPrepareFixture(prepareScript, {
-    files: [{ name: 'kinvest.sqlite', kind: 'hardlink', owner: '1000:1000' }]
+    files: [{ name: 'kinvest.sqlite', kind: 'hardlink' }]
   })
   try {
     assert.equal(hardlink.result.status, 1)
@@ -490,18 +534,6 @@ async function run() {
     assert.equal(hardlink.chownTargets().includes('kinvest.sqlite'), false)
   } finally {
     hardlink.cleanup()
-  }
-
-  const runningLegacy = runPrepareFixture(prepareScript, {
-    files: [{ name: 'kinvest.sqlite', owner: '1000:1000' }],
-    running: true
-  })
-  try {
-    assert.equal(runningLegacy.result.status, 1)
-    assert.match(runningLegacy.result.stderr, /Kinvest container is running.*stop it first/i)
-    assert.equal(runningLegacy.chownTargets().includes('kinvest.sqlite'), false)
-  } finally {
-    runningLegacy.cleanup()
   }
 
   assert.match(dockerignore, /^\.env$/m)

@@ -3,11 +3,17 @@ set -euo pipefail
 
 SOURCE_DIR="${1:-}"
 PUBLIC_KEY_FILE="${2:-}"
-TARGET='/root/docker/kinvest'
+DOCKER_ROOT='/root/docker'
+TARGET="$DOCKER_ROOT/kinvest"
 DEPLOY_USER='kinvest-deploy'
 DEPLOY_HOME='/home/kinvest-deploy'
 APP_UID='10001'
 APP_GID='10001'
+DEPLOY_UID='10002'
+DEPLOY_GID='10002'
+LOCAL_DEPLOY_SCRIPT='/usr/local/sbin/deploy-kinvest'
+LOCAL_SSH_COMMAND='/usr/local/sbin/kinvest-ssh-command'
+SUDOERS_FILE='/etc/sudoers.d/kinvest-deploy'
 
 if [[ -z "$SOURCE_DIR" || -z "$PUBLIC_KEY_FILE" ]]; then
   printf '%s\n' 'usage: bootstrap-server.sh /absolute/source/dir /absolute/public-key-file' >&2
@@ -19,7 +25,7 @@ if [[ "$(id -u)" -ne 0 ]]; then
   exit 1
 fi
 
-for command in docker setpriv install useradd passwd visudo realpath flock timeout wc grep getent stat; do
+for command in docker setpriv install useradd groupadd passwd visudo realpath flock timeout wc grep getent mktemp stat fuser; do
   if ! command -v "$command" >/dev/null 2>&1; then
     printf '%s\n' "required command is unavailable: $command" >&2
     exit 1
@@ -65,7 +71,7 @@ fi
 assert_not_symlink "$SOURCE_DIR"
 assert_not_symlink "$PUBLIC_KEY_FILE"
 
-source_files=(docker-compose.yml prepare-data-dir.sh deploy-kinvest.sh kinvest-ssh-command)
+source_files=(docker-compose.yml migrate-data-uid.sh prepare-data-dir.sh deploy-kinvest.sh kinvest-ssh-command)
 for source_file in "${source_files[@]}"; do
   assert_not_symlink "$SOURCE_DIR/$source_file"
   if [[ ! -f "$SOURCE_DIR/$source_file" ]]; then
@@ -74,12 +80,12 @@ for source_file in "${source_files[@]}"; do
   fi
 done
 
-if [[ ! -d '/root/docker' ]]; then
-  printf '%s\n' 'required server directory /root/docker is absent' >&2
+if [[ ! -d "$DOCKER_ROOT" ]]; then
+  printf '%s\n' "required server directory $DOCKER_ROOT is absent" >&2
   exit 1
 fi
 
-for target_component in '/root' '/root/docker' "$TARGET" "$TARGET/data" "$TARGET/state"; do
+for target_component in '/root' "$DOCKER_ROOT" "$TARGET" "$TARGET/data" "$TARGET/state"; do
   assert_not_symlink "$target_component"
 done
 
@@ -91,17 +97,38 @@ for target_file in "${source_files[@]}"; do
 done
 
 install -o root -g root -m 0644 -- "$SOURCE_DIR/docker-compose.yml" "$TARGET/docker-compose.yml"
+install -o root -g root -m 0755 -- "$SOURCE_DIR/migrate-data-uid.sh" "$TARGET/migrate-data-uid.sh"
 install -o root -g root -m 0755 -- "$SOURCE_DIR/prepare-data-dir.sh" "$TARGET/prepare-data-dir.sh"
 install -o root -g root -m 0755 -- "$SOURCE_DIR/deploy-kinvest.sh" "$TARGET/deploy-kinvest.sh"
 install -o root -g root -m 0755 -- "$SOURCE_DIR/kinvest-ssh-command" "$TARGET/kinvest-ssh-command"
-install -o root -g root -m 0755 -- "$TARGET/deploy-kinvest.sh" /usr/local/sbin/deploy-kinvest
-install -o root -g root -m 0755 -- "$TARGET/kinvest-ssh-command" /usr/local/sbin/kinvest-ssh-command
+install -o root -g root -m 0755 -- "$TARGET/deploy-kinvest.sh" "$LOCAL_DEPLOY_SCRIPT"
+install -o root -g root -m 0755 -- "$TARGET/kinvest-ssh-command" "$LOCAL_SSH_COMMAND"
+
+"$TARGET/migrate-data-uid.sh" >/dev/null
+"$TARGET/prepare-data-dir.sh" >/dev/null
 
 if ! id "$DEPLOY_USER" >/dev/null 2>&1; then
-  useradd --create-home --home-dir "$DEPLOY_HOME" --shell /bin/bash "$DEPLOY_USER"
+  if getent passwd "$DEPLOY_UID" >/dev/null || getent group "$DEPLOY_GID" >/dev/null; then
+    printf '%s\n' "deployment UID:GID $DEPLOY_UID:$DEPLOY_GID is already assigned" >&2
+    exit 1
+  fi
+  if getent passwd "$DEPLOY_USER" >/dev/null || getent group "$DEPLOY_USER" >/dev/null; then
+    printf '%s\n' "deployment account name is partially assigned: $DEPLOY_USER" >&2
+    exit 1
+  fi
+
+  groupadd --gid "$DEPLOY_GID" "$DEPLOY_USER"
+  useradd --uid "$DEPLOY_UID" --gid "$DEPLOY_GID" --create-home --home-dir "$DEPLOY_HOME" --shell /bin/bash "$DEPLOY_USER"
 fi
 
-deploy_home="$(getent passwd "$DEPLOY_USER" | cut -d: -f6)"
+deploy_record="$(getent passwd "$DEPLOY_USER")"
+IFS=: read -r _ _ existing_deploy_uid existing_deploy_gid _ deploy_home _ <<< "$deploy_record"
+
+if [[ "$existing_deploy_uid" == "$APP_UID" || "$existing_deploy_gid" == "$APP_GID" ]]; then
+  printf '%s\n' 'deployment user must not share the Kinvest application UID or GID' >&2
+  exit 1
+fi
+
 if [[ "$deploy_home" != "$DEPLOY_HOME" ]]; then
   printf '%s\n' 'existing deployment user has an unexpected home directory' >&2
   exit 1
@@ -141,18 +168,16 @@ chown "$DEPLOY_USER:$DEPLOY_USER" "$authorized_keys_temporary"
 chmod 0600 "$authorized_keys_temporary"
 mv -f -- "$authorized_keys_temporary" "$DEPLOY_HOME/.ssh/authorized_keys"
 
-"$TARGET/prepare-data-dir.sh" >/dev/null
 docker network inspect web >/dev/null 2>&1 || docker network create web >/dev/null
 
-sudoers_file='/etc/sudoers.d/kinvest-deploy'
-assert_not_symlink "$sudoers_file"
-temporary_sudoers="$(mktemp /etc/sudoers.d/.kinvest-deploy.XXXXXX)"
+assert_not_symlink "$SUDOERS_FILE"
+temporary_sudoers="$(mktemp "${SUDOERS_FILE%/*}/.kinvest-deploy.XXXXXX")"
 printf '%s\n' \
   'kinvest-deploy ALL=(root) NOPASSWD: /usr/local/sbin/deploy-kinvest ""' \
   > "$temporary_sudoers"
 chmod 0440 "$temporary_sudoers"
 visudo -cf "$temporary_sudoers" >/dev/null
-mv -f -- "$temporary_sudoers" "$sudoers_file"
-visudo -cf "$sudoers_file" >/dev/null
+mv -f -- "$temporary_sudoers" "$SUDOERS_FILE"
+visudo -cf "$SUDOERS_FILE" >/dev/null
 
 printf '%s\n' "Kinvest server bootstrap is ready for container UID:GID $APP_UID:$APP_GID; no deployment was started."
