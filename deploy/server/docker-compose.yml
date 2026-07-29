@@ -3,7 +3,7 @@ services:
     image: ${KINVEST_IMAGE:-kinvest:local}
     container_name: kinvest
     restart: unless-stopped
-    user: "1000:1000"
+    user: "10001:10001"
     environment:
       TZ: ${TZ:-Asia/Shanghai}
       PORT: 4173

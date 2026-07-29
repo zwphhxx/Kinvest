@@ -173,10 +173,14 @@ async function run() {
   assert.match(buildStage, /^RUN npm run build$/m)
   assert.deepEqual(
     runtimeCopyCommands,
-    ['COPY --from=build --chown=1000:1000 /app/dist ./'],
+    ['COPY --from=build --chown=10001:10001 /app/dist ./'],
     'runtime stage must copy only the built dist directory'
   )
-  assert.match(runtimeStage, /^USER 1000:1000$/m)
+  assert.match(
+    runtimeStage,
+    /^RUN addgroup -g 10001 -S kinvest && \\\n {4}adduser -S -D -H -u 10001 -G kinvest -s \/sbin\/nologin kinvest$/m
+  )
+  assert.match(runtimeStage, /^USER 10001:10001$/m)
   assert.match(runtimeStage, /^CMD \["node", "server\/server\.js"\]$/m)
   assert.match(
     runtimeStage,
@@ -184,7 +188,7 @@ async function run() {
   )
 
   assert.match(kinvestService, /^ {4}image: \$\{KINVEST_IMAGE:-kinvest:local\}$/m)
-  assert.match(kinvestService, /^ {4}user: "1000:1000"$/m)
+  assert.match(kinvestService, /^ {4}user: "10001:10001"$/m)
   assert.match(kinvestService, /^ {6}KINVEST_DB_PATH: \/data\/kinvest\.sqlite$/m)
   assert.match(kinvestService, /^ {4}expose:\n {6}- "4173"$/m)
   assert.match(
@@ -204,8 +208,8 @@ async function run() {
   assert.equal(fs.statSync(prepareScriptPath).mode & 0o111, 0o111, 'data directory preparation script must be executable')
   assert.match(prepareScript, /^#!\/usr\/bin\/env sh\nset -eu$/m)
   assert.match(prepareScript, /^DATA_DIR='\/root\/docker\/kinvest\/data'$/m)
-  assert.match(prepareScript, /^APP_UID='1000'$/m)
-  assert.match(prepareScript, /^APP_GID='1000'$/m)
+  assert.match(prepareScript, /^APP_UID='10001'$/m)
+  assert.match(prepareScript, /^APP_GID='10001'$/m)
   assert.match(
     prepareScript,
     /^ {2}for PATH_COMPONENT in '\/root' '\/root\/docker' '\/root\/docker\/kinvest' "\$DATA_DIR"; do$/m
@@ -230,6 +234,9 @@ async function run() {
   assert.doesNotMatch(prepareScript, /\b(?:find|rm\s+-rf|chown\s+-R|chmod\s+-R)\b/)
   assert.doesNotMatch(prepareScript, /\b(?:MYSQL|mysql|\.env)\b/)
   assert.doesNotMatch(prepareScript, /\$\{?KINVEST_DATA_DIR\b/)
+  assert.doesNotMatch(runtimeStage, /\b1000(?::1000)?\b/)
+  assert.doesNotMatch(kinvestService, /\b1000(?::1000)?\b/)
+  assert.doesNotMatch(prepareScript, /\b1000(?::1000)?\b/)
 
   const installIndex = prepareScript.indexOf('install -d -m 0750 -- "$DATA_DIR"')
   const cdIndex = prepareScript.indexOf('cd -P -- "$DATA_DIR"')

@@ -6,6 +6,8 @@ PUBLIC_KEY_FILE="${2:-}"
 TARGET='/root/docker/kinvest'
 DEPLOY_USER='kinvest-deploy'
 DEPLOY_HOME='/home/kinvest-deploy'
+APP_UID='10001'
+APP_GID='10001'
 
 if [[ -z "$SOURCE_DIR" || -z "$PUBLIC_KEY_FILE" ]]; then
   printf '%s\n' 'usage: bootstrap-server.sh /absolute/source/dir /absolute/public-key-file' >&2
@@ -17,12 +19,23 @@ if [[ "$(id -u)" -ne 0 ]]; then
   exit 1
 fi
 
-for command in docker setpriv install useradd passwd visudo realpath flock timeout wc grep; do
+for command in docker setpriv install useradd passwd visudo realpath flock timeout wc grep getent; do
   if ! command -v "$command" >/dev/null 2>&1; then
     printf '%s\n' "required command is unavailable: $command" >&2
     exit 1
   fi
 done
+
+if getent passwd "$APP_UID" >/dev/null; then
+  printf '%s\n' "UID $APP_UID is already assigned; refusing to prepare Kinvest." >&2
+  exit 1
+fi
+
+if getent group "$APP_GID" >/dev/null; then
+  printf '%s\n' "GID $APP_GID is already assigned; refusing to prepare Kinvest." >&2
+  exit 1
+fi
+
 docker compose version >/dev/null
 
 assert_not_symlink() {
@@ -142,4 +155,4 @@ visudo -cf "$temporary_sudoers" >/dev/null
 mv -f -- "$temporary_sudoers" "$sudoers_file"
 visudo -cf "$sudoers_file" >/dev/null
 
-printf '%s\n' 'Kinvest server bootstrap is ready; no deployment was started.'
+printf '%s\n' "Kinvest server bootstrap is ready for container UID:GID $APP_UID:$APP_GID; no deployment was started."

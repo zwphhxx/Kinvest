@@ -2,8 +2,8 @@
 set -eu
 
 DATA_DIR='/root/docker/kinvest/data'
-APP_UID='1000'
-APP_GID='1000'
+APP_UID='10001'
+APP_GID='10001'
 
 if [ "$(id -u)" -ne 0 ]; then
   printf '%s\n' 'Kinvest data directory preparation must run as root.' >&2

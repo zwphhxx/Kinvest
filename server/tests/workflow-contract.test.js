@@ -260,6 +260,83 @@ function assertRejectedInput(input, messagePattern) {
   assert.match(result.stderr, messagePattern)
 }
 
+function runBootstrapIdentityConflict(identityKind) {
+  const fixtureRoot = fs.mkdtempSync(path.join(os.tmpdir(), 'kinvest-bootstrap-identity-'))
+  const fakeBin = path.join(fixtureRoot, 'bin')
+  const sourceDir = path.join(fixtureRoot, 'source')
+  const publicKeyFile = path.join(fixtureRoot, 'deploy.pub')
+  const mutationMarker = path.join(fixtureRoot, 'mutation-attempted')
+
+  fs.mkdirSync(fakeBin)
+  fs.mkdirSync(sourceDir)
+  fs.writeFileSync(publicKeyFile, `ssh-ed25519 ${'A'.repeat(44)} fixture\n`)
+
+  writeExecutable(
+    path.join(fakeBin, 'id'),
+    `#!/bin/sh
+if [ "\${1:-}" = "-u" ]; then
+  printf '%s\\n' '0'
+  exit 0
+fi
+exec /usr/bin/id "$@"
+`
+  )
+
+  writeExecutable(
+    path.join(fakeBin, 'getent'),
+    `#!/bin/sh
+if [ "\${1:-}" = "$BOOTSTRAP_CONFLICT_KIND" ] && [ "\${2:-}" = '10001' ]; then
+  printf '%s\\n' 'occupied:x:10001:10001:fixture:/nonexistent:/usr/sbin/nologin'
+  exit 0
+fi
+exit 2
+`
+  )
+
+  writeExecutable(
+    path.join(fakeBin, 'docker'),
+    `#!/bin/sh
+exit 0
+`
+  )
+
+  for (const command of ['setpriv', 'install', 'useradd', 'passwd', 'visudo']) {
+    writeExecutable(
+      path.join(fakeBin, command),
+      `#!/bin/sh
+: > "$BOOTSTRAP_MUTATION_MARKER"
+exit 90
+`
+    )
+  }
+
+  for (const command of ['flock', 'timeout']) {
+    writeExecutable(path.join(fakeBin, command), '#!/bin/sh\nexit 0\n')
+  }
+
+  const result = spawnSync(
+    rootPath('deploy/server/bootstrap-server.sh'),
+    [sourceDir, publicKeyFile],
+    {
+      encoding: 'utf8',
+      env: {
+        ...process.env,
+        PATH: `${fakeBin}:${process.env.PATH}`,
+        BOOTSTRAP_CONFLICT_KIND: identityKind,
+        BOOTSTRAP_MUTATION_MARKER: mutationMarker
+      }
+    }
+  )
+
+  return {
+    cleanup() {
+      fs.rmSync(fixtureRoot, { recursive: true, force: true })
+    },
+    mutationMarker,
+    result
+  }
+}
+
 function run() {
   const workflow = readRootFile('.github/workflows/deploy.yml')
   const deploy = readRootFile('deploy/server/deploy-kinvest.sh')
@@ -336,8 +413,34 @@ function run() {
   )
   assert.match(bootstrap, /id -nG "\$DEPLOY_USER"/)
   assert.match(bootstrap, /grep -Eq '[^']*docker/)
+  assert.match(bootstrap, /^APP_UID='10001'$/m)
+  assert.match(bootstrap, /^APP_GID='10001'$/m)
+  assert.match(bootstrap, /getent passwd "\$APP_UID"/)
+  assert.match(bootstrap, /getent group "\$APP_GID"/)
+  assert.doesNotMatch(bootstrap, /\bAPP_(?:UID|GID)='1000'\b/)
   assert.doesNotMatch(bootstrap, /usermod[^\n]*docker|gpasswd[^\n]*docker|docker group/i)
   assert.doesNotMatch(bootstrap, /ssh-(?:ed25519|rsa) [A-Za-z0-9+/]{40,}/)
+
+  /** @type {Array<[string, RegExp]>} */
+  const identityConflicts = [
+    ['passwd', /UID 10001 is already assigned/i],
+    ['group', /GID 10001 is already assigned/i]
+  ]
+
+  for (const [identityKind, messagePattern] of identityConflicts) {
+    const conflict = runBootstrapIdentityConflict(identityKind)
+    try {
+      assert.equal(conflict.result.status, 1)
+      assert.match(conflict.result.stderr, messagePattern)
+      assert.equal(
+        fs.existsSync(conflict.mutationMarker),
+        false,
+        `${identityKind} conflict must fail before any server mutation`
+      )
+    } finally {
+      conflict.cleanup()
+    }
+  }
 
   assertRejectedInput(
     `ghcr.io/other/kinvest@${candidateDigest}\n${candidateCommit}\n`,

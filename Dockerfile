@@ -16,11 +16,14 @@ ENV NODE_ENV=production \
     PORT=4173 \
     KINVEST_DB_PATH=/data/kinvest.sqlite
 
+RUN addgroup -g 10001 -S kinvest && \
+    adduser -S -D -H -u 10001 -G kinvest -s /sbin/nologin kinvest
+
 WORKDIR /app
 
-COPY --from=build --chown=1000:1000 /app/dist ./
+COPY --from=build --chown=10001:10001 /app/dist ./
 
-USER 1000:1000
+USER 10001:10001
 
 EXPOSE 4173
 
