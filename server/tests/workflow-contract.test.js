@@ -173,6 +173,20 @@ case "$command_name" in
   image)
     [ "\${1:-}" = 'inspect' ]
     ref="\${4:-}"
+    if [[ "$ref" == "$OLD_REF" && -f "$state/fail-previous-snapshot" ]]; then
+      exit 35
+    fi
+    if [[ "$ref" == "$OLD_REF" && -f "$state/fail-old-image-after-snapshot" ]]; then
+      old_inspect_count=0
+      if [[ -f "$state/old-image-inspect-count" ]]; then
+        old_inspect_count="$(cat "$state/old-image-inspect-count")"
+      fi
+      old_inspect_count=$((old_inspect_count + 1))
+      printf '%s\\n' "$old_inspect_count" > "$state/old-image-inspect-count"
+      if ((old_inspect_count > 1)); then
+        exit 35
+      fi
+    fi
     if [[ "$ref" == "$OLD_REF" && -f "$state/fail-old-image-inspect-after-pull" && -f "$state/old-pull-attempted" ]]; then
       exit 35
     fi
@@ -659,10 +673,7 @@ function run() {
   )
   assert.ok(deployTimeoutMatch, 'deploy job must define a bounded timeout')
   const deployTimeoutMinutes = Number.parseInt(deployTimeoutMatch[1], 10)
-  assert.ok(
-    deployTimeoutMinutes >= 20 && deployTimeoutMinutes <= 30,
-    'deploy job timeout must allow a cold pull without becoming unbounded'
-  )
+  assert.equal(deployTimeoutMinutes, 30)
   assert.match(workflow, /^ {4}if: \$\{\{ github\.ref == 'refs\/heads\/main' \}\}$/m)
   assert.match(
     workflow,
@@ -687,12 +698,27 @@ function run() {
   assert.match(deploy, /\^ghcr\\\.io\/zwphhxx\/kinvest@sha256:\[0-9a-f\]\{64\}\$/)
   assert.match(deploy, /^CURRENT_STATE="\$STATE\/current\.state"$/m)
   assert.match(deploy, /^PREVIOUS_STATE="\$STATE\/previous\.state"$/m)
-  assert.match(deploy, /^DOCKER_TIMEOUT='900s'$/m)
+  assert.match(deploy, /^PULL_TIMEOUT='900s'$/m)
+  assert.match(deploy, /^DOCKER_TIMEOUT='120s'$/m)
   assert.match(deploy, /^COMPOSE_TIMEOUT='120s'$/m)
   assert.match(deploy, /^INSPECT_TIMEOUT='15s'$/m)
+  assert.match(deploy, /^HEALTH_TIMEOUT_SECONDS='120'$/m)
   assert.match(deploy, /digest_ref=%s\\ncommit=%s/)
   assert.match(deploy, /timeout --signal=TERM/)
   assert.match(deploy, /--kill-after=/)
+  const runPullBody = deploy.match(/^run_pull\(\) \{([\s\S]*?)^\}$/m)
+  const runDockerBody = deploy.match(/^run_docker\(\) \{([\s\S]*?)^\}$/m)
+  assert.ok(runPullBody, 'deployment must define a dedicated pull wrapper')
+  assert.ok(runDockerBody, 'deployment must retain a bounded general Docker wrapper')
+  assert.match(runPullBody[1], /\$PULL_TIMEOUT/)
+  assert.match(runPullBody[1], /docker pull "\$1"/)
+  assert.match(runDockerBody[1], /\$DOCKER_TIMEOUT/)
+  assert.doesNotMatch(runDockerBody[1], /pull/)
+  assert.match(deploy, /run_docker network inspect web/)
+  assert.match(deploy, /run_docker rm -f kinvest/)
+  assert.doesNotMatch(deploy, /run_docker pull/)
+  assert.match(deploy, /run_pull "\$digest_ref"/)
+  assert.doesNotMatch(deploy, /run_pull "\$previous_digest_ref"/)
   assert.match(deploy, /verify_running_image/)
   assert.match(deploy, /\.Config\.Image/)
   assert.match(deploy, /run_inspect image inspect/)
@@ -700,6 +726,32 @@ function run() {
   assert.match(deploy, /expected_image_id/)
   assert.doesNotMatch(deploy, /set \+e/)
   assert.doesNotMatch(deploy, /:latest\b/)
+
+  const timeoutSeconds = (name) => {
+    const match = deploy.match(new RegExp(`^${name}='([0-9]+)s'$`, 'm'))
+    assert.ok(match, `${name} must be a bounded whole-second timeout`)
+    return Number.parseInt(match[1], 10)
+  }
+  const pullSeconds = timeoutSeconds('PULL_TIMEOUT')
+  const composeSeconds = timeoutSeconds('COMPOSE_TIMEOUT')
+  const inspectSeconds = timeoutSeconds('INSPECT_TIMEOUT')
+  const healthMatch = deploy.match(/^HEALTH_TIMEOUT_SECONDS='([0-9]+)'$/m)
+  assert.ok(healthMatch, 'health polling must have a bounded total budget')
+  const healthSeconds = Number.parseInt(healthMatch[1], 10)
+  const cumulativeDeploySeconds =
+    pullSeconds +
+    composeSeconds +
+    healthSeconds +
+    inspectSeconds +
+    composeSeconds +
+    healthSeconds +
+    inspectSeconds
+  const deployJobSeconds = deployTimeoutMinutes * 60
+  assert.ok(cumulativeDeploySeconds < deployJobSeconds)
+  assert.ok(
+    deployJobSeconds - cumulativeDeploySeconds >= 60,
+    'production job must retain at least 60 seconds outside bounded deployment stages'
+  )
 
   assert.match(wrapper, /^ALLOWED_REPOSITORY='ghcr\.io\/zwphhxx\/kinvest'$/m)
   assert.match(wrapper, /SSH_ORIGINAL_COMMAND/)
@@ -937,6 +989,35 @@ function run() {
     candidatePullFailure.cleanup()
   }
 
+  const previousSnapshotFailure = runDeployFixture(['fail-previous-snapshot'])
+  try {
+    const diagnostics = deployFixtureDiagnostics(previousSnapshotFailure)
+    assert.notEqual(previousSnapshotFailure.result.status, 0, diagnostics)
+    const dockerCalls = fs.readFileSync(
+      path.join(previousSnapshotFailure.fakeState, 'docker-calls.log'),
+      'utf8'
+    )
+    assert.doesNotMatch(dockerCalls, /^pull /m, diagnostics)
+    assert.doesNotMatch(dockerCalls, /^compose /m, diagnostics)
+    assert.doesNotMatch(dockerCalls, /^rm /m, diagnostics)
+    assert.equal(
+      fs.readFileSync(
+        path.join(previousSnapshotFailure.fakeState, 'running.ref'),
+        'utf8'
+      ).trim(),
+      previousRef,
+      diagnostics
+    )
+    assert.equal(
+      fs.existsSync(path.join(previousSnapshotFailure.stateDir, 'previous.state')),
+      false,
+      diagnostics
+    )
+    assert.match(previousSnapshotFailure.result.stderr, /refusing deployment.*snapshot/i)
+  } finally {
+    previousSnapshotFailure.cleanup()
+  }
+
   const candidateComposeFailure = runDeployFixture(['fail-candidate-compose'])
   try {
     assert.notEqual(candidateComposeFailure.result.status, 0)
@@ -969,35 +1050,24 @@ function run() {
       /^rm -f kinvest$/m,
       diagnostics
     )
+    assert.doesNotMatch(
+      fs.readFileSync(path.join(successfulRollback.fakeState, 'docker-calls.log'), 'utf8'),
+      new RegExp(`^pull ${previousRef.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')}$`, 'm'),
+      diagnostics
+    )
     assert.match(successfulRollback.result.stderr, /previous healthy Kinvest digest was restored/i)
   } finally {
     successfulRollback.cleanup()
   }
 
-  const snapshotPreserved = runDeployFixture([
+  const currentNotPrevious = runDeployFixture([
     'candidate-mismatch',
-    'fail-old-pull',
-    'restore-old-on-pull-failure',
-    'fail-old-image-inspect-after-pull'
+    'fail-old-image-after-snapshot'
   ])
-  try {
-    assert.notEqual(snapshotPreserved.result.status, 0)
-    assert.equal(
-      fs.readFileSync(path.join(snapshotPreserved.fakeState, 'running.ref'), 'utf8').trim(),
-      previousRef
-    )
-    assert.equal(fs.existsSync(path.join(snapshotPreserved.fakeState, 'removed')), false)
-    assert.match(snapshotPreserved.result.stderr, /部署失败但previous继续服务/)
-    assert.doesNotMatch(snapshotPreserved.result.stderr, /manual intervention is required/i)
-  } finally {
-    snapshotPreserved.cleanup()
-  }
-
-  const currentNotPrevious = runDeployFixture(['candidate-mismatch', 'fail-old-pull'])
   try {
     assert.notEqual(currentNotPrevious.result.status, 0)
     assert.ok(fs.existsSync(path.join(currentNotPrevious.fakeState, 'removed')))
-    assert.match(currentNotPrevious.result.stderr, /previous digest pull failed/i)
+    assert.match(currentNotPrevious.result.stderr, /previous snapshot.*locally available/i)
     assert.match(currentNotPrevious.result.stderr, /manual intervention is required/i)
     assert.doesNotMatch(currentNotPrevious.result.stderr, /previous继续服务/)
   } finally {
@@ -1037,9 +1107,11 @@ function run() {
     )
     const timeoutLog = fs.readFileSync(path.join(success.fakeState, 'timeout.log'), 'utf8')
     assert.match(timeoutLog, /--signal=TERM --kill-after=10s 900s docker pull/)
-    assert.match(timeoutLog, /docker compose/)
-    assert.match(timeoutLog, /docker image inspect/)
-    assert.match(timeoutLog, /docker inspect/)
+    assert.match(timeoutLog, /--signal=TERM --kill-after=10s 120s docker network inspect/)
+    assert.match(timeoutLog, /--signal=TERM --kill-after=10s 120s env .*docker compose/)
+    assert.match(timeoutLog, /--signal=TERM --kill-after=5s 15s docker image inspect/)
+    assert.match(timeoutLog, /--signal=TERM --kill-after=5s 15s docker inspect/)
+    assert.doesNotMatch(timeoutLog, /900s docker (?!pull)/)
     assert.match(timeoutLog, /--kill-after=/)
   } finally {
     success.cleanup()
