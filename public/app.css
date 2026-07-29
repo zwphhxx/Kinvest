@@ -190,7 +190,12 @@ button,
   margin: 8px 0;
 }
 
+.company-title {
+  margin: 0;
+}
+
 .thermometer {
+  --thermo-position: 60%;
   position: relative;
   height: 12px;
   background: linear-gradient(90deg, #6ab6ea 0%, #9ad8b2 50%, #f0be65 85%, #e27b6c 100%);
@@ -198,11 +203,41 @@ button,
   margin: 10px 0;
 }
 
+.thermometer[data-position="0"] { --thermo-position: 0%; }
+.thermometer[data-position="5"] { --thermo-position: 5%; }
+.thermometer[data-position="10"] { --thermo-position: 10%; }
+.thermometer[data-position="15"] { --thermo-position: 15%; }
+.thermometer[data-position="20"] { --thermo-position: 20%; }
+.thermometer[data-position="25"] { --thermo-position: 25%; }
+.thermometer[data-position="30"] { --thermo-position: 30%; }
+.thermometer[data-position="35"] { --thermo-position: 35%; }
+.thermometer[data-position="40"] { --thermo-position: 40%; }
+.thermometer[data-position="45"] { --thermo-position: 45%; }
+.thermometer[data-position="50"] { --thermo-position: 50%; }
+.thermometer[data-position="55"] { --thermo-position: 55%; }
+.thermometer[data-position="60"] { --thermo-position: 60%; }
+.thermometer[data-position="65"] { --thermo-position: 65%; }
+.thermometer[data-position="70"] { --thermo-position: 70%; }
+.thermometer[data-position="75"] { --thermo-position: 75%; }
+.thermometer[data-position="80"] { --thermo-position: 80%; }
+.thermometer[data-position="85"] { --thermo-position: 85%; }
+.thermometer[data-position="90"] { --thermo-position: 90%; }
+.thermometer[data-position="95"] { --thermo-position: 95%; }
+.thermometer[data-position="100"] { --thermo-position: 100%; }
+
+.thermometer.unavailable {
+  background: #d5dee5;
+}
+
+.thermometer.unavailable::after {
+  display: none;
+}
+
 .thermometer::after {
   content: '';
   position: absolute;
   top: -4px;
-  left: calc(var(--thermo, 60%) - 6px);
+  left: clamp(0px, calc(var(--thermo-position) - 6px), calc(100% - 12px));
   width: 12px;
   height: 20px;
   border-radius: 12px;

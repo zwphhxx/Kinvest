@@ -6,6 +6,7 @@ const state = {
 }
 
 const financeContracts = /** @type {any} */ (window).KinvestFinance
+const valuationContracts = /** @type {any} */ (window).KinvestValuation
 
 const el = {
   globalStatus: document.getElementById('global-status'),
@@ -96,7 +97,7 @@ function renderRefreshHint(refreshState) {
 
 function renderCompanyHead(company) {
   el.companyHead.innerHTML = `
-    <h2 style="margin:0">${company.nameZh}（${company.securityCode}）</h2>
+    <h2 class="company-title">${company.nameZh}（${company.securityCode}）</h2>
     <p class="muted">行业：${company.industry} ｜ 交易所：${company.market} ｜ 币种：${company.quote.currency}</p>
     <p class="tag meta">数据页标签：原始来源数据 / 确定性计算</p>
   `
@@ -113,11 +114,17 @@ function renderMarket(company) {
     <div class="kpi"><div class="kpi-label">估值</div><div class="kpi-value">PE ${valuation.pe} ｜ PB ${valuation.pb}</div></div>
     <div class="kpi"><div class="kpi-label">估值位置</div><div class="kpi-value">${valuation.positionIn3Y}</div></div>
   `
-  const ratio = quote.low3Y && quote.high3Y
-    ? Math.round(((quote.lastPrice - quote.low3Y) / (quote.high3Y - quote.low3Y)) * 100)
-    : 0
-  el.thermo.style.setProperty('--thermo', `${ratio}%`)
-  el.thermo.textContent = `估值温度尺：${ratio}%（区间低位/中部/高位）`
+  const valuationPosition = valuationContracts.prepareValuationPosition(quote)
+  if (!valuationPosition.available) {
+    delete el.thermo.dataset.position
+    el.thermo.classList.add('unavailable')
+    el.thermo.textContent = '估值温度尺：区间不可用'
+    return
+  }
+
+  el.thermo.classList.remove('unavailable')
+  el.thermo.dataset.position = String(valuationPosition.markerPosition)
+  el.thermo.textContent = `估值温度尺：${valuationPosition.ratio}%（区间低位/中部/高位）`
 }
 
 function renderFinance(company) {

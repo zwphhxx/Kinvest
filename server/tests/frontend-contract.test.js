@@ -189,6 +189,46 @@ function assertDefaultAnomaliesRemainDeterministic() {
   assert.match(app, /r\.source\.sourceName/)
 }
 
+function assertValuationPositionContract() {
+  const {
+    markerPositions,
+    prepareValuationPosition
+  } = require('../../public/valuation-position')
+
+  assert.deepEqual(markerPositions, Array.from({ length: 21 }, (_, index) => index * 5))
+  assert.deepEqual(
+    prepareValuationPosition({ lastPrice: 15, low3Y: 10, high3Y: 20 }),
+    { available: true, ratio: 50, markerPosition: 50 }
+  )
+  assert.deepEqual(
+    prepareValuationPosition({ lastPrice: 0, low3Y: 10, high3Y: 20 }),
+    { available: true, ratio: 0, markerPosition: 0 }
+  )
+  assert.deepEqual(
+    prepareValuationPosition({ lastPrice: 30, low3Y: 10, high3Y: 20 }),
+    { available: true, ratio: 100, markerPosition: 100 }
+  )
+
+  const invalidQuotes = [
+    { lastPrice: 10, low3Y: 10, high3Y: 10 },
+    { lastPrice: 10, low3Y: 20, high3Y: 10 },
+    { lastPrice: 10, low3Y: null, high3Y: 20 },
+    { lastPrice: '10', low3Y: 0, high3Y: 20 },
+    { lastPrice: Number.NaN, low3Y: 0, high3Y: 20 }
+  ]
+  for (const quote of invalidQuotes) {
+    assert.deepEqual(
+      prepareValuationPosition(quote),
+      { available: false, ratio: null, markerPosition: null }
+    )
+  }
+
+  for (let lastPrice = 0; lastPrice <= 100; lastPrice += 1) {
+    const result = prepareValuationPosition({ lastPrice, low3Y: 0, high3Y: 100 })
+    assert.equal(markerPositions.includes(result.markerPosition), true)
+  }
+}
+
 function assertFaviconAndMobileTableScrolling() {
   const html = read(htmlPath)
   const css = read(cssPath)
@@ -210,12 +250,32 @@ function assertFaviconAndMobileTableScrolling() {
   assert.doesNotMatch(mobileCss, /body\s*\{[^}]*overflow-x:\s*hidden;/s)
 }
 
+function assertRenderingRespectsStrictCsp() {
+  const app = read(appPath)
+  const css = read(cssPath)
+  const html = read(htmlPath)
+
+  assert.doesNotMatch(`${app}\n${html}`, /<[^>]*\sstyle=/i)
+  assert.doesNotMatch(app, /\.style(?:\.|\[|\s*=)/)
+  assert.doesNotMatch(app, /setAttribute\(\s*['"]style['"]/i)
+  assert.match(app, /el\.thermo\.dataset\.position = String\(valuationPosition\.markerPosition\)/)
+  assert.match(app, /估值温度尺：区间不可用/)
+  assert.match(html, /<script src="\/valuation-position\.js" defer><\/script>[\s\S]*<script src="\/app\.js" defer><\/script>/)
+  assert.match(css, /\.company-title\s*\{[^}]*margin:\s*0;/s)
+  assert.match(css, /\.thermometer\.unavailable::after\s*\{[^}]*display:\s*none;/s)
+  for (let position = 0; position <= 100; position += 5) {
+    assert.match(css, new RegExp(`\\.thermometer\\[data-position="${position}"\\]\\s*\\{`))
+  }
+}
+
 async function run() {
   assertFinanceModeMappingAndFixtureBehavior()
   assertStrictFinanceVerification()
   assertMockAndRealVerificationAreDistinct()
   assertDefaultAnomaliesRemainDeterministic()
+  assertValuationPositionContract()
   assertFaviconAndMobileTableScrolling()
+  assertRenderingRespectsStrictCsp()
 }
 
 module.exports = { run }
