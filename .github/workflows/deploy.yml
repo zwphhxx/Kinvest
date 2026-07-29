@@ -16,6 +16,7 @@ concurrency:
 jobs:
   verify:
     runs-on: ubuntu-latest
+    timeout-minutes: 15
     permissions:
       contents: read
     steps:
@@ -33,39 +34,51 @@ jobs:
 
   publish:
     needs: verify
+    if: ${{ github.ref == 'refs/heads/main' }}
     runs-on: ubuntu-latest
+    timeout-minutes: 20
     permissions:
       contents: read
       packages: write
+    outputs:
+      image_digest: ${{ steps.digest.outputs.image_digest }}
     steps:
       - name: Check out exact commit
         uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683
-      - name: Build and publish immutable image
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@e468171a9de216ec08956ac3ada2f0791b6bd435
+      - name: Log in to GitHub Container Registry
+        uses: docker/login-action@74a5d142397b4f367a81961eba4e8cd7edddf772
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+      - name: Build and publish audit-tagged image
+        id: build
+        uses: docker/build-push-action@263435318d21b8e681c14492fe198d362a7d2c83
+        with:
+          context: .
+          push: true
+          tags: ghcr.io/zwphhxx/kinvest:${{ github.sha }}
+          provenance: true
+      - name: Validate immutable image digest
+        id: digest
         shell: bash
         env:
-          GHCR_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-          IMAGE_REPOSITORY: ghcr.io/${{ github.repository_owner }}/kinvest
-          DEPLOY_SHA: ${{ github.sha }}
+          IMAGE_DIGEST: ${{ steps.build.outputs.digest }}
         run: |
           set -euo pipefail
-          if [[ ! "$DEPLOY_SHA" =~ ^[0-9a-f]{40}$ ]]; then
-            printf '%s\n' 'GitHub supplied an invalid commit SHA.' >&2
+          if [[ ! "$IMAGE_DIGEST" =~ ^sha256:[0-9a-f]{64}$ ]]; then
+            printf '%s\n' 'Build action returned an invalid image digest.' >&2
             exit 1
           fi
-          if [[ ! "$IMAGE_REPOSITORY" =~ ^ghcr\.io/[a-z0-9][a-z0-9._-]*/[a-z0-9][a-z0-9._/-]*$ ]]; then
-            printf '%s\n' 'GitHub supplied an invalid image repository.' >&2
-            exit 1
-          fi
-          IMAGE_REF="${IMAGE_REPOSITORY}:${DEPLOY_SHA}"
-          printf '%s' "$GHCR_TOKEN" | docker login ghcr.io --username "$GITHUB_ACTOR" --password-stdin
-          trap 'docker logout ghcr.io >/dev/null 2>&1 || true' EXIT
-          docker build --pull --tag "$IMAGE_REF" .
-          docker push "$IMAGE_REF"
+          printf 'image_digest=%s\n' "$IMAGE_DIGEST" >> "$GITHUB_OUTPUT"
 
   deploy:
     needs: publish
-    if: ${{ vars.DEPLOY_ENABLED == 'true' }}
+    if: ${{ github.ref == 'refs/heads/main' && vars.DEPLOY_ENABLED == 'true' }}
     runs-on: ubuntu-latest
+    timeout-minutes: 15
     environment: Production
     permissions:
       contents: read
@@ -99,31 +112,36 @@ jobs:
             known_host="[$DEPLOY_HOST]:$DEPLOY_PORT"
           fi
           ssh-keygen -F "$known_host" -f "$HOME/.ssh/known_hosts" >/dev/null
-      - name: Deploy exact immutable release
+      - name: Deploy exact immutable digest
         shell: bash
         env:
           DEPLOY_HOST: ${{ vars.DEPLOY_HOST }}
           DEPLOY_PORT: ${{ vars.DEPLOY_PORT }}
           DEPLOY_USER: ${{ vars.DEPLOY_USER }}
           DEPLOY_SHA: ${{ github.sha }}
-          IMAGE_REPOSITORY: ghcr.io/${{ github.repository_owner }}/kinvest
+          IMAGE_DIGEST: ${{ needs.publish.outputs.image_digest }}
         run: |
           set -euo pipefail
+          IMAGE_REPOSITORY='ghcr.io/zwphhxx/kinvest'
+          IMAGE_DIGEST_REF="${IMAGE_REPOSITORY}@${IMAGE_DIGEST}"
           if [[ ! "$DEPLOY_HOST" =~ ^[A-Za-z0-9.-]+$ ]]; then exit 1; fi
           if [[ ! "$DEPLOY_PORT" =~ ^[0-9]{1,5}$ ]] || ((DEPLOY_PORT < 1 || DEPLOY_PORT > 65535)); then exit 1; fi
           if [[ ! "$DEPLOY_USER" =~ ^[a-z_][a-z0-9_-]*$ ]]; then exit 1; fi
           if [[ ! "$DEPLOY_SHA" =~ ^[0-9a-f]{40}$ ]]; then exit 1; fi
-          if [[ ! "$IMAGE_REPOSITORY" =~ ^ghcr\.io/[a-z0-9][a-z0-9._-]*/[a-z0-9][a-z0-9._/-]*$ ]]; then exit 1; fi
+          if [[ ! "$IMAGE_DIGEST_REF" =~ ^ghcr\.io/zwphhxx/kinvest@sha256:[0-9a-f]{64}$ ]]; then exit 1; fi
           ssh \
             -o BatchMode=yes \
             -o IdentitiesOnly=yes \
             -o StrictHostKeyChecking=yes \
             -o UserKnownHostsFile="$HOME/.ssh/known_hosts" \
+            -o ConnectTimeout=10 \
+            -o ServerAliveInterval=15 \
+            -o ServerAliveCountMax=2 \
             -o LogLevel=ERROR \
             -i "$HOME/.ssh/id_ed25519" \
             -p "$DEPLOY_PORT" \
             "$DEPLOY_USER@$DEPLOY_HOST" \
-            "sudo /usr/local/sbin/deploy-kinvest '$IMAGE_REPOSITORY' '$DEPLOY_SHA'"
+            "deploy $IMAGE_DIGEST_REF $DEPLOY_SHA"
       - name: Remove ephemeral SSH material
         if: ${{ always() }}
         shell: bash

@@ -1,34 +1,51 @@
 #!/usr/bin/env bash
-set -euo pipefail
+set -Eeuo pipefail
 
 ROOT='/root/docker/kinvest'
+ALLOWED_REPOSITORY='ghcr.io/zwphhxx/kinvest'
 COMPOSE="$ROOT/docker-compose.yml"
 STATE="$ROOT/state"
-CURRENT_REF="$STATE/current.ref"
-PREVIOUS_REF="$STATE/previous.ref"
+CURRENT_STATE="$STATE/current.state"
+PREVIOUS_STATE="$STATE/previous.state"
+DOCKER_TIMEOUT='120s'
+COMPOSE_TIMEOUT='120s'
+INSPECT_TIMEOUT='15s'
 HEALTH_ATTEMPTS='60'
 HEALTH_INTERVAL='2'
 
-if [[ "$#" -ne 2 ]]; then
-  printf '%s\n' 'deployment requires an image and commit SHA' >&2
+if [[ "$#" -ne 0 ]]; then
+  printf '%s\n' 'deployment accepts no command-line arguments' >&2
   exit 2
 fi
 
-image="$1"
-sha="$2"
+digest_ref=''
+commit_sha=''
+extra_input=''
 
-if [[ ! "$sha" =~ ^[0-9a-f]{40}$ ]]; then
-  printf '%s\n' 'deployment requires a 40-character lowercase commit SHA' >&2
+if ! IFS= read -r digest_ref || ! IFS= read -r commit_sha; then
+  printf '%s\n' 'deployment requires exactly two input lines' >&2
   exit 2
 fi
 
-if [[ ! "$image" =~ ^ghcr\.io/[a-z0-9][a-z0-9._-]*/[a-z0-9][a-z0-9._/-]*$ ]]; then
-  printf '%s\n' 'deployment requires a lowercase ghcr.io image without a tag or digest' >&2
+if IFS= read -r extra_input; then
+  printf '%s\n' 'deployment requires exactly two input lines' >&2
   exit 2
 fi
 
-candidate_ref="${image}:${sha}"
-previous_ref=''
+if [[ ! "$digest_ref" =~ ^ghcr\.io/zwphhxx/kinvest@sha256:[0-9a-f]{64}$ ]]; then
+  printf '%s\n' 'deployment requires the immutable Kinvest digest reference' >&2
+  exit 2
+fi
+
+if [[ ! "$commit_sha" =~ ^[0-9a-f]{40}$ ]]; then
+  printf '%s\n' 'deployment requires a 40-character lowercase audit commit SHA' >&2
+  exit 2
+fi
+
+if [[ "${digest_ref%@*}" != "$ALLOWED_REPOSITORY" ]]; then
+  printf '%s\n' 'deployment repository is not allowed' >&2
+  exit 2
+fi
 
 if [[ "$(id -u)" -ne 0 ]]; then
   printf '%s\n' 'deployment must run as root' >&2
@@ -55,7 +72,6 @@ fi
 
 assert_not_symlink "$COMPOSE"
 assert_not_symlink "$ROOT/prepare-data-dir.sh"
-
 install -d -m 0700 -- "$STATE"
 assert_not_symlink "$STATE"
 
@@ -65,55 +81,101 @@ if ! flock -n 9; then
   exit 1
 fi
 
-docker network inspect web >/dev/null
-"$ROOT/prepare-data-dir.sh" >/dev/null
-
-is_valid_ref() {
-  [[ "$1" =~ ^ghcr\.io/[a-z0-9][a-z0-9._-]*/[a-z0-9][a-z0-9._/-]*:[0-9a-f]{40}$ ]]
+run_docker() {
+  timeout --signal=TERM "$DOCKER_TIMEOUT" docker "$@"
 }
 
-atomic_write_ref() {
+run_inspect() {
+  timeout --signal=TERM "$INSPECT_TIMEOUT" docker "$@"
+}
+
+run_compose() {
+  local image_ref="$1"
+
+  timeout --signal=TERM "$COMPOSE_TIMEOUT" \
+    env KINVEST_IMAGE="$image_ref" \
+    docker compose \
+      --project-name kinvest \
+      -f "$COMPOSE" \
+      up -d --no-deps kinvest
+}
+
+is_valid_digest_ref() {
+  [[ "$1" =~ ^ghcr\.io/zwphhxx/kinvest@sha256:[0-9a-f]{64}$ ]]
+}
+
+is_valid_commit() {
+  [[ "$1" =~ ^[0-9a-f]{40}$ ]]
+}
+
+atomic_write_state() {
   local destination="$1"
-  local value="$2"
+  local image_ref="$2"
+  local audit_commit="$3"
   local temporary
 
-  temporary="$(mktemp "$STATE/.ref.XXXXXX")"
-  printf '%s\n' "$value" > "$temporary"
+  temporary="$(mktemp "$STATE/.state.XXXXXX")"
+  printf 'digest_ref=%s\ncommit=%s\n' "$image_ref" "$audit_commit" > "$temporary"
   chmod 0600 "$temporary"
   mv -f -- "$temporary" "$destination"
 }
 
-if [[ -e "$CURRENT_REF" ]]; then
-  assert_not_symlink "$CURRENT_REF"
-  IFS= read -r previous_ref < "$CURRENT_REF"
-  if ! is_valid_ref "$previous_ref"; then
-    printf '%s\n' 'refusing invalid current Kinvest image state' >&2
+previous_digest_ref=''
+previous_commit=''
+
+read_previous_state() {
+  local first_line=''
+  local second_line=''
+  local unexpected_line=''
+
+  assert_not_symlink "$CURRENT_STATE"
+
+  if ! IFS= read -r first_line || ! IFS= read -r second_line; then
+    return 1
+  fi < "$CURRENT_STATE"
+
+  if IFS= read -r unexpected_line < <(tail -n +3 "$CURRENT_STATE"); then
+    return 1
+  fi
+
+  previous_digest_ref="${first_line#digest_ref=}"
+  previous_commit="${second_line#commit=}"
+
+  [[ "$first_line" == "digest_ref=$previous_digest_ref" ]] &&
+    [[ "$second_line" == "commit=$previous_commit" ]] &&
+    is_valid_digest_ref "$previous_digest_ref" &&
+    is_valid_commit "$previous_commit"
+}
+
+run_docker network inspect web >/dev/null
+"$ROOT/prepare-data-dir.sh" >/dev/null
+
+if [[ -e "$CURRENT_STATE" ]]; then
+  if ! read_previous_state; then
+    printf '%s\n' 'refusing invalid current Kinvest deployment state' >&2
     exit 1
   fi
-  atomic_write_ref "$PREVIOUS_REF" "$previous_ref"
+  atomic_write_state "$PREVIOUS_STATE" "$previous_digest_ref" "$previous_commit"
 else
-  rm -f -- "$PREVIOUS_REF"
+  assert_not_symlink "$CURRENT_STATE"
+  rm -f -- "$PREVIOUS_STATE"
 fi
-
-minimal_diagnostics() {
-  docker inspect \
-    --format 'container={{.Name}} status={{.State.Status}} health={{if .State.Health}}{{.State.Health.Status}}{{else}}none{{end}} image={{.Config.Image}}' \
-    kinvest >&2 2>/dev/null || printf '%s\n' 'Kinvest container is absent' >&2
-}
 
 wait_for_health() {
   local attempt
-  local status
+  local health_status
 
   for ((attempt = 1; attempt <= HEALTH_ATTEMPTS; attempt += 1)); do
-    status="$(docker inspect --format '{{if .State.Health}}{{.State.Health.Status}}{{else}}{{.State.Status}}{{end}}' kinvest 2>/dev/null || true)"
+    if ! health_status="$(run_inspect inspect --format '{{.State.Health.Status}}' kinvest)"; then
+      return 1
+    fi
 
-    if [[ "$status" == 'healthy' ]]; then
+    if [[ "$health_status" == 'healthy' ]]; then
       return 0
     fi
 
-    if [[ "$status" == 'unhealthy' || "$status" == 'exited' || "$status" == 'dead' ]]; then
-      break
+    if [[ "$health_status" == 'unhealthy' ]]; then
+      return 1
     fi
 
     sleep "$HEALTH_INTERVAL"
@@ -122,59 +184,91 @@ wait_for_health() {
   return 1
 }
 
+verify_running_image() {
+  local expected_ref="$1"
+  local expected_image_id
+  local actual_image_ref
+  local actual_image_id
+
+  if ! expected_image_id="$(run_inspect image inspect --format '{{.Id}}' "$expected_ref")"; then
+    return 1
+  fi
+  if ! actual_image_ref="$(run_inspect inspect --format '{{.Config.Image}}' kinvest)"; then
+    return 1
+  fi
+  if ! actual_image_id="$(run_inspect inspect --format '{{.Image}}' kinvest)"; then
+    return 1
+  fi
+
+  [[ "$actual_image_ref" == "$expected_ref" && "$actual_image_id" == "$expected_image_id" ]]
+}
+
+remove_kinvest_container() {
+  run_docker rm -f kinvest >/dev/null
+}
+
+rollback_failure() {
+  local reason="$1"
+  local original_status="$2"
+
+  printf '%s\n' "$reason" >&2
+  if ! remove_kinvest_container; then
+    printf '%s\n' 'Kinvest container removal also failed.' >&2
+  fi
+  printf '%s\n' 'Kinvest is not verified healthy; manual intervention is required.' >&2
+  exit "$original_status"
+}
+
 rollback() {
   local original_status="${1:-1}"
 
   trap - ERR
-  set +e
-  printf '%s\n' 'Kinvest deployment failed; starting safe rollback.' >&2
-  minimal_diagnostics
+  printf '%s\n' 'Kinvest deployment failed; starting verified rollback.' >&2
 
-  if [[ -n "$previous_ref" ]]; then
-    docker pull "$previous_ref" >/dev/null
-    KINVEST_IMAGE="$previous_ref" docker compose \
-      --project-name kinvest \
-      -f "$COMPOSE" \
-      up -d --no-deps kinvest >/dev/null
-
-    if wait_for_health; then
-      printf '%s\n' 'Previous healthy Kinvest image was restored.' >&2
-    else
-      printf '%s\n' 'Rollback image did not become healthy; manual intervention is required.' >&2
-      minimal_diagnostics
+  if [[ -z "$previous_digest_ref" ]]; then
+    if ! remove_kinvest_container; then
+      printf '%s\n' 'Kinvest candidate container removal failed.' >&2
     fi
-  else
-    docker rm -f kinvest >/dev/null 2>&1 || true
-    printf '%s\n' 'No previous release existed; Kinvest remains stopped.' >&2
+    printf '%s\n' 'No previous digest exists; manual intervention is required.' >&2
+    exit "$original_status"
   fi
 
+  if ! run_docker pull "$previous_digest_ref" >/dev/null; then
+    rollback_failure 'Previous digest pull failed.' "$original_status"
+  fi
+
+  if ! run_compose "$previous_digest_ref" >/dev/null; then
+    rollback_failure 'Previous release compose failed.' "$original_status"
+  fi
+
+  if ! verify_running_image "$previous_digest_ref"; then
+    rollback_failure 'Previous release image identity verification failed.' "$original_status"
+  fi
+
+  if ! wait_for_health; then
+    rollback_failure 'Previous release health verification failed.' "$original_status"
+  fi
+
+  printf '%s\n' 'Previous healthy Kinvest digest was restored.' >&2
   exit "$original_status"
 }
 
-trap 'rollback $?' ERR
+trap 'rollback "$?"' ERR
 
-docker pull "$candidate_ref" >/dev/null
-expected_image_id="$(docker image inspect --format '{{.Id}}' "$candidate_ref")"
-
-KINVEST_IMAGE="$candidate_ref" docker compose \
-  --project-name kinvest \
-  -f "$COMPOSE" \
-  up -d --no-deps kinvest >/dev/null
+run_docker pull "$digest_ref" >/dev/null
+run_compose "$digest_ref" >/dev/null
 
 if ! wait_for_health; then
-  printf '%s\n' 'Kinvest container did not become healthy within the deployment window.' >&2
+  printf '%s\n' 'Kinvest candidate did not become healthy.' >&2
   false
 fi
 
-actual_image_id="$(docker inspect --format '{{.Image}}' kinvest)"
-actual_image_ref="$(docker inspect --format '{{.Config.Image}}' kinvest)"
-
-if [[ "$actual_image_id" != "$expected_image_id" || "$actual_image_ref" != "$candidate_ref" ]]; then
-  printf '%s\n' 'Kinvest running image does not match the requested immutable release.' >&2
+if ! verify_running_image "$digest_ref"; then
+  printf '%s\n' 'Kinvest running image does not match the requested immutable digest.' >&2
   false
 fi
 
-atomic_write_ref "$CURRENT_REF" "$candidate_ref"
+atomic_write_state "$CURRENT_STATE" "$digest_ref" "$commit_sha"
 trap - ERR
 
-printf '%s\n' "Kinvest deployed immutable release $sha."
+printf '%s\n' "Kinvest deployed immutable digest for audit commit $commit_sha."

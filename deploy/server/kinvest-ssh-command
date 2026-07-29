@@ -1,0 +1,35 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+ALLOWED_REPOSITORY='ghcr.io/zwphhxx/kinvest'
+original_command="${SSH_ORIGINAL_COMMAND:-}"
+verb=''
+digest_ref=''
+commit_sha=''
+extra=''
+
+if [[ "$#" -ne 0 ]]; then
+  printf '%s\n' 'forced deployment command accepts no arguments' >&2
+  exit 2
+fi
+
+IFS=' ' read -r verb digest_ref commit_sha extra <<< "$original_command"
+expected_command="deploy $digest_ref $commit_sha"
+
+if [[ "$verb" != 'deploy' || -n "$extra" || "$original_command" != "$expected_command" ]]; then
+  printf '%s\n' 'SSH command is not permitted' >&2
+  exit 2
+fi
+
+if [[ ! "$digest_ref" =~ ^ghcr\.io/zwphhxx/kinvest@sha256:[0-9a-f]{64}$ ]]; then
+  printf '%s\n' 'SSH command has an invalid Kinvest digest' >&2
+  exit 2
+fi
+
+if [[ "${digest_ref%@*}" != "$ALLOWED_REPOSITORY" || ! "$commit_sha" =~ ^[0-9a-f]{40}$ ]]; then
+  printf '%s\n' 'SSH command has invalid deployment metadata' >&2
+  exit 2
+fi
+
+printf '%s\n%s\n' "$digest_ref" "$commit_sha" |
+  sudo -n /usr/local/sbin/deploy-kinvest
