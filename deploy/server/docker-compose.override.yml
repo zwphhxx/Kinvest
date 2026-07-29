@@ -1,0 +1,9 @@
+services:
+  nginx:
+    networks:
+      - default
+      - web
+
+networks:
+  web:
+    external: true
