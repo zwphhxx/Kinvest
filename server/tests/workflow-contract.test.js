@@ -363,6 +363,10 @@ printf '%s\\n' '${scriptName}' >> "$BOOTSTRAP_FAKE_STATE/lifecycle.log"
 `
     )
   }
+  fs.writeFileSync(
+    path.join(sourceDir, 'migrate-data-uid-lib.sh'),
+    '# migration core library fixture\n'
+  )
   for (const scriptName of ['deploy-kinvest.sh', 'kinvest-ssh-command']) {
     writeExecutable(path.join(sourceDir, scriptName), '#!/bin/sh\nexit 0\n')
   }
@@ -571,6 +575,11 @@ function run() {
 
   assert.match(bootstrap, /kinvest-ssh-command/)
   assert.match(bootstrap, /migrate-data-uid\.sh/)
+  assert.match(bootstrap, /migrate-data-uid-lib\.sh/)
+  assert.match(
+    bootstrap,
+    /install -o root -g root -m 0644 -- "\$SOURCE_DIR\/migrate-data-uid-lib\.sh" "\$TARGET\/migrate-data-uid-lib\.sh"/
+  )
   assert.match(
     bootstrap,
     /install -o root -g root -m 0755 -- "\$TARGET\/kinvest-ssh-command" "\$LOCAL_SSH_COMMAND"/

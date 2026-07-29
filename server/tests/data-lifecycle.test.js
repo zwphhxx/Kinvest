@@ -1,307 +1,428 @@
 const assert = require('node:assert/strict')
 const { spawnSync } = require('node:child_process')
+const crypto = require('node:crypto')
 const fs = require('node:fs')
 const os = require('node:os')
 const path = require('node:path')
 
 const rootDir = path.resolve(__dirname, '../..')
+const migrationLibraryPath = path.join(rootDir, 'deploy/server/migrate-data-uid-lib.sh')
 
 function writeExecutable(filePath, source) {
   fs.writeFileSync(filePath, source, { mode: 0o755 })
 }
 
-function readRootFile(relativePath) {
-  return fs.readFileSync(path.join(rootDir, relativePath), 'utf8')
+function fileHash(filePath) {
+  return crypto.createHash('sha256').update(fs.readFileSync(filePath)).digest('hex')
 }
 
-function runMigrationFixture({ containers = [], files, busyFile = '' }) {
-  const fixtureRoot = fs.mkdtempSync(path.join(os.tmpdir(), 'kinvest-offline-migration-'))
-  const fixtureDataDir = path.join(fixtureRoot, 'data')
-  const stateDir = path.join(fixtureRoot, 'state')
+function runMigrationCore({
+  containers = [],
+  files,
+  flockConflict = false,
+  fuserResult = 'clear'
+}) {
+  const rawFixtureRoot = fs.mkdtempSync(path.join(os.tmpdir(), 'kinvest-migration-core-'))
+  const fixtureRoot = fs.realpathSync(rawFixtureRoot)
+  const kinvestRoot = path.join(fixtureRoot, 'kinvest')
+  const dataDir = path.join(kinvestRoot, 'data')
+  const stateDir = path.join(kinvestRoot, 'state')
   const fakeBin = path.join(fixtureRoot, 'bin')
-  const fakeState = path.join(fixtureRoot, 'fake-state')
-
-  fs.mkdirSync(fixtureDataDir)
-  fs.mkdirSync(stateDir)
-  fs.mkdirSync(fakeBin)
-  fs.mkdirSync(fakeState)
-
-  const dataDir = fs.realpathSync(fixtureDataDir)
+  const modelDir = path.join(fixtureRoot, 'model')
+  const operationLog = path.join(modelDir, 'operations.log')
   const unrelatedPath = path.join(dataDir, 'family-notes.txt')
-  fs.writeFileSync(unrelatedPath, 'untouched', { mode: 0o640 })
+
+  for (const directory of [dataDir, stateDir, fakeBin, modelDir]) {
+    fs.mkdirSync(directory, { recursive: true })
+  }
+
+  fs.writeFileSync(path.join(modelDir, 'directory.owner'), '1000:1000\n')
+  fs.writeFileSync(path.join(modelDir, 'directory.mode'), '750\n')
+  fs.writeFileSync(path.join(modelDir, 'fuser.result'), `${fuserResult}\n`)
+  fs.writeFileSync(path.join(modelDir, 'container.ids'), containers.map(({ id }) => id).join('\n'))
+  if (flockConflict) {
+    fs.writeFileSync(path.join(modelDir, 'flock.conflict'), '')
+  }
+
+  fs.writeFileSync(unrelatedPath, 'unrelated family data', { mode: 0o640 })
+  const unrelatedBefore = fs.statSync(unrelatedPath)
+  const unrelatedHashBefore = fileHash(unrelatedPath)
 
   for (const file of files) {
     const filePath = path.join(dataDir, file.name)
-    if (file.kind === 'symlink') {
-      const target = path.join(fixtureRoot, `${file.name}.target`)
-      fs.writeFileSync(target, file.content || 'target')
-      fs.symlinkSync(target, filePath)
-      continue
-    }
-
-    fs.writeFileSync(filePath, file.content || file.name, { mode: 0o640 })
-    fs.writeFileSync(path.join(fakeState, `${file.name}.owner`), `${file.owner || '1000:1000'}\n`)
-    fs.writeFileSync(path.join(fakeState, `${file.name}.links`), `${file.kind === 'hardlink' ? 2 : 1}\n`)
-    if (file.kind === 'hardlink') {
-      fs.linkSync(filePath, path.join(dataDir, `${file.name}.other-link`))
-    }
+    fs.writeFileSync(filePath, file.content || file.name, { mode: file.mode || 0o640 })
+    fs.writeFileSync(path.join(modelDir, `${file.name}.owner`), `${file.owner || '1000:1000'}\n`)
+    fs.writeFileSync(path.join(modelDir, `${file.name}.mode`), `${(file.mode || 0o640).toString(8)}\n`)
+    fs.writeFileSync(path.join(modelDir, `${file.name}.links`), '1\n')
+    fs.writeFileSync(path.join(modelDir, `${file.name}.type`), 'regular file\n')
   }
 
-  fs.writeFileSync(path.join(fakeState, 'container-ids'), containers.map(({ id }) => id).join('\n'))
   for (const container of containers) {
-    fs.writeFileSync(path.join(fakeState, `${container.id}.name`), `${container.name}\n`)
-    fs.writeFileSync(path.join(fakeState, `${container.id}.status`), `${container.status}\n`)
-    fs.writeFileSync(path.join(fakeState, `${container.id}.mount`), `${container.mountSource || dataDir}\n`)
+    fs.writeFileSync(path.join(modelDir, `${container.id}.name`), `${container.name}\n`)
+    fs.writeFileSync(path.join(modelDir, `${container.id}.status`), `${container.status}\n`)
+    fs.writeFileSync(
+      path.join(modelDir, `${container.id}.mounts`),
+      `${(container.mounts || [dataDir]).join('\n')}\n`
+    )
   }
-  fs.writeFileSync(path.join(fakeState, 'busy-file'), busyFile)
 
   writeExecutable(
     path.join(fakeBin, 'id'),
-    '#!/bin/sh\n[ "${1:-}" = "-u" ] && { printf "%s\\n" 0; exit 0; }\nexec /usr/bin/id "$@"\n'
+    `#!/bin/sh
+[ "$#" -eq 1 ] && [ "$1" = '-u' ] || exit 90
+printf '%s\\n' '0'
+`
   )
+
   writeExecutable(
     path.join(fakeBin, 'flock'),
-    '#!/bin/sh\n[ "$#" -eq 2 ] && [ "$1" = "-n" ] && [ "$2" = "9" ]\n'
+    `#!/bin/sh
+[ "$#" -eq 2 ] && [ "$1" = '-n' ] && [ "$2" = '9' ] || exit 91
+printf '%s\\n' 'flock -n 9' >> "$KINVEST_TEST_MODEL/operations.log"
+[ ! -f "$KINVEST_TEST_MODEL/flock.conflict" ]
+`
   )
+
   writeExecutable(
     path.join(fakeBin, 'docker'),
     `#!/bin/sh
 set -eu
-printf '%s\\n' "$*" >> "$MIGRATION_FAKE_STATE/docker.log"
+printf 'docker' >> "$KINVEST_TEST_MODEL/operations.log"
+for argument in "$@"; do printf ' %s' "$argument" >> "$KINVEST_TEST_MODEL/operations.log"; done
+printf '\\n' >> "$KINVEST_TEST_MODEL/operations.log"
+
 if [ "$#" -eq 3 ] && [ "$1" = 'ps' ] && [ "$2" = '-aq' ] && [ "$3" = '--no-trunc' ]; then
-  cat "$MIGRATION_FAKE_STATE/container-ids"
+  cat "$KINVEST_TEST_MODEL/container.ids"
   exit 0
 fi
-if [ "$#" -eq 6 ] && [ "$1" = 'inspect' ] && [ "$2" = '--type' ] && [ "$3" = 'container' ] && [ "$4" = '--format' ]; then
+
+if [ "$#" -eq 6 ] && [ "$1" = 'inspect' ] && [ "$2" = '--type' ] &&
+  [ "$3" = 'container' ] && [ "$4" = '--format' ]; then
   format="$5"
-  id="$6"
+  container_id="$6"
   case "$format" in
-    '{{range .Mounts}}{{println .Source}}{{end}}') cat "$MIGRATION_FAKE_STATE/$id.mount" ;;
-    '{{.State.Status}}') cat "$MIGRATION_FAKE_STATE/$id.status" ;;
-    '{{.Name}}') cat "$MIGRATION_FAKE_STATE/$id.name" ;;
-    *) exit 94 ;;
+    '{{range .Mounts}}{{println .Source}}{{end}}')
+      cat "$KINVEST_TEST_MODEL/$container_id.mounts"
+      ;;
+    '{{.State.Status}}')
+      cat "$KINVEST_TEST_MODEL/$container_id.status"
+      ;;
+    '{{.Name}}')
+      cat "$KINVEST_TEST_MODEL/$container_id.name"
+      ;;
+    *)
+      exit 92
+      ;;
   esac
   exit 0
 fi
-exit 95
+
+exit 93
 `
   )
+
   writeExecutable(
     path.join(fakeBin, 'fuser'),
     `#!/bin/sh
-[ "$#" -eq 2 ] && [ "$1" = '-s' ] || exit 96
-[ "\${2##*/}" = "$(cat "$MIGRATION_FAKE_STATE/busy-file")" ] && exit 0
-exit 1
-`
-  )
-  writeExecutable(
-    path.join(fakeBin, 'chown'),
-    `#!/bin/sh
-owner="$1"
-target=''
-for argument in "$@"; do target="$argument"; done
-printf '%s %s\\n' "$owner" "$target" >> "$MIGRATION_FAKE_STATE/chown.log"
-base="\${target##*/}"
-if [ "$target" = '.' ]; then
-  if [ "$owner" = 'root:root' ]; then
-    printf '%s\\n' '0:0' > "$MIGRATION_FAKE_STATE/directory.owner"
-  else
-    printf '%s\\n' "$owner" > "$MIGRATION_FAKE_STATE/directory.owner"
-  fi
-elif [ "$owner" = '10001:10001' ]; then
-  : > "$MIGRATION_FAKE_STATE/$base.migrated"
-fi
-`
-  )
-  writeExecutable(
-    path.join(fakeBin, 'chmod'),
-    `#!/bin/sh
-mode="$1"
-shift
-[ "\${1:-}" = '--' ] && shift
-exec /bin/chmod "$mode" "$@"
-`
-  )
-  writeExecutable(
-    path.join(fakeBin, 'stat'),
-    `#!/bin/sh
-format=''
-target=''
-while [ "$#" -gt 0 ]; do
-  if [ "$1" = '-c' ]; then
-    shift
-    format="$1"
-  elif [ "$1" != '--' ]; then
-    target="$1"
-  fi
-  shift
-done
-base="\${target##*/}"
-case "$format" in
-  '%F') [ "$target" = '.' ] && printf '%s\\n' directory || printf '%s\\n' 'regular empty file' ;;
-  '%h') cat "$MIGRATION_FAKE_STATE/$base.links" ;;
-  '%a')
-    if [ "$target" = '.' ]; then
-      mode="$(/usr/bin/stat -f '%Lp' .)"
-      printf '%s\\n' "$mode"
-    else
-      mode="$(/usr/bin/stat -f '%Lp' "$target")"
-      printf '%s\\n' "$mode"
-    fi
-    ;;
-  '%u:%g')
-    if [ "$target" = '.' ]; then
-      cat "$MIGRATION_FAKE_STATE/directory.owner"
-    elif [ -f "$MIGRATION_FAKE_STATE/$base.migrated" ]; then
-      printf '%s\\n' '10001:10001'
-    else
-      cat "$MIGRATION_FAKE_STATE/$base.owner"
-    fi
-    ;;
-  *) exit 97 ;;
+[ "$#" -eq 2 ] && [ "$1" = '-s' ] || exit 94
+case "$2" in
+  kinvest.sqlite|kinvest.sqlite-wal|kinvest.sqlite-shm|kinvest.sqlite-journal) ;;
+  *) exit 95 ;;
+esac
+printf '%s\\n' "fuser -s $2" >> "$KINVEST_TEST_MODEL/operations.log"
+case "$(cat "$KINVEST_TEST_MODEL/fuser.result")" in
+  clear) exit 1 ;;
+  busy) exit 0 ;;
+  error) exit 2 ;;
+  *) exit 96 ;;
 esac
 `
   )
+
   writeExecutable(
-    path.join(fakeBin, 'setpriv'),
+    path.join(fakeBin, 'chown'),
     `#!/bin/sh
-[ "$(cat "$MIGRATION_FAKE_STATE/directory.owner")" = '10001:10001' ] || exit 98
-while [ "$#" -gt 0 ]; do
-  case "$1" in
-    --reuid=*|--regid=*|--clear-groups) shift ;;
-    *) exec "$@" ;;
-  esac
-done
-exit 99
+[ "$#" -eq 3 ] && [ "$2" = '--' ] || exit 97
+owner="$1"
+target="$3"
+case "$target" in
+  .)
+    case "$owner" in root:root) owner='0:0' ;; 10001:10001) ;; *) exit 98 ;; esac
+    printf '%s\\n' "$owner" > "$KINVEST_TEST_MODEL/directory.owner"
+    ;;
+  kinvest.sqlite|kinvest.sqlite-wal|kinvest.sqlite-shm|kinvest.sqlite-journal)
+    [ "$owner" = '10001:10001' ] || exit 99
+    [ -f "$KINVEST_TEST_MODEL/$target.owner" ] || exit 100
+    printf '%s\\n' "$owner" > "$KINVEST_TEST_MODEL/$target.owner"
+    ;;
+  *)
+    exit 101
+    ;;
+esac
+printf '%s\\n' "chown $1 -- $target" >> "$KINVEST_TEST_MODEL/operations.log"
 `
   )
 
-  fs.writeFileSync(path.join(fakeState, 'directory.owner'), '1000:1000\n')
+  writeExecutable(
+    path.join(fakeBin, 'chmod'),
+    `#!/bin/sh
+[ "$#" -eq 3 ] && [ "$2" = '--' ] || exit 102
+mode="$1"
+target="$3"
+case "$target:$mode" in
+  .:0700) stored_mode='700' ;;
+  .:0750) stored_mode='750' ;;
+  kinvest.sqlite:0600|kinvest.sqlite-wal:0600|kinvest.sqlite-shm:0600|kinvest.sqlite-journal:0600)
+    [ -f "$KINVEST_TEST_MODEL/$target.mode" ] || exit 103
+    stored_mode='600'
+    ;;
+  *)
+    exit 104
+    ;;
+esac
+if [ "$target" = '.' ]; then
+  printf '%s\\n' "$stored_mode" > "$KINVEST_TEST_MODEL/directory.mode"
+else
+  printf '%s\\n' "$stored_mode" > "$KINVEST_TEST_MODEL/$target.mode"
+fi
+/bin/chmod "$mode" "$target"
+printf '%s\\n' "chmod $mode -- $target" >> "$KINVEST_TEST_MODEL/operations.log"
+`
+  )
 
-  const migrationSource = readRootFile('deploy/server/migrate-data-uid.sh')
-    .replace("DATA_DIR='/root/docker/kinvest/data'", `DATA_DIR='${dataDir}'`)
-    .replace("STATE_DIR='/root/docker/kinvest/state'", `STATE_DIR='${stateDir}'`)
-  const scriptPath = path.join(fixtureRoot, 'migrate-data-uid.sh')
-  writeExecutable(scriptPath, migrationSource)
+  writeExecutable(
+    path.join(fakeBin, 'stat'),
+    `#!/bin/sh
+[ "$#" -eq 4 ] && [ "$1" = '-c' ] && [ "$3" = '--' ] || exit 105
+format="$2"
+target="$4"
+if [ "$target" = '.' ]; then
+  case "$format" in
+    '%F') printf '%s\\n' 'directory' ;;
+    '%u:%g') cat "$KINVEST_TEST_MODEL/directory.owner" ;;
+    '%a') cat "$KINVEST_TEST_MODEL/directory.mode" ;;
+    *) exit 106 ;;
+  esac
+  exit 0
+fi
+case "$target" in
+  kinvest.sqlite|kinvest.sqlite-wal|kinvest.sqlite-shm|kinvest.sqlite-journal) ;;
+  *) exit 107 ;;
+esac
+[ -f "$KINVEST_TEST_MODEL/$target.owner" ] || exit 108
+case "$format" in
+  '%F') cat "$KINVEST_TEST_MODEL/$target.type" ;;
+  '%h') cat "$KINVEST_TEST_MODEL/$target.links" ;;
+  '%u:%g') cat "$KINVEST_TEST_MODEL/$target.owner" ;;
+  '%a') cat "$KINVEST_TEST_MODEL/$target.mode" ;;
+  *) exit 109 ;;
+esac
+`
+  )
 
-  const unrelatedBefore = fs.statSync(unrelatedPath)
-  const result = spawnSync(scriptPath, [], {
-    encoding: 'utf8',
-    env: {
-      ...process.env,
-      PATH: `${fakeBin}:${process.env.PATH}`,
-      MIGRATION_FAKE_STATE: fakeState
+  writeExecutable(
+    path.join(fakeBin, 'setpriv'),
+    `#!/bin/sh
+[ "$#" -ge 7 ] || exit 110
+[ "$1" = '--reuid=10001' ] && [ "$2" = '--regid=10001' ] &&
+  [ "$3" = '--clear-groups' ] && [ "$4" = '/bin/sh' ] && [ "$5" = '-c' ] || exit 111
+[ "$(cat "$KINVEST_TEST_MODEL/directory.owner")" = '10001:10001' ] || exit 112
+for model_file in "$KINVEST_TEST_MODEL"/kinvest.sqlite*.owner; do
+  [ "$(cat "$model_file")" = '10001:10001' ] || exit 113
+done
+printf '%s\\n' 'setpriv 10001:10001' >> "$KINVEST_TEST_MODEL/operations.log"
+shift 3
+exec "$@"
+`
+  )
+
+  const harnessPath = path.join(fixtureRoot, 'run-migration-core.sh')
+  writeExecutable(
+    harnessPath,
+    `#!/bin/sh
+set -eu
+. "$1"
+shift
+kinvest_migrate_data_uid "$@"
+`
+  )
+
+  const result = spawnSync(
+    harnessPath,
+    [
+      migrationLibraryPath,
+      kinvestRoot,
+      dataDir,
+      stateDir,
+      path.join(fakeBin, 'id'),
+      path.join(fakeBin, 'docker'),
+      path.join(fakeBin, 'flock'),
+      path.join(fakeBin, 'stat'),
+      path.join(fakeBin, 'fuser'),
+      path.join(fakeBin, 'setpriv'),
+      path.join(fakeBin, 'chown'),
+      path.join(fakeBin, 'chmod'),
+      '/bin/sh'
+    ],
+    {
+      encoding: 'utf8',
+      env: {
+        ...process.env,
+        KINVEST_TEST_MODEL: modelDir
+      }
     }
-  })
+  )
 
   return {
-    chownLog() {
-      const logPath = path.join(fakeState, 'chown.log')
-      return fs.existsSync(logPath) ? fs.readFileSync(logPath, 'utf8').trim().split('\n') : []
-    },
     cleanup() {
       fs.chmodSync(dataDir, 0o700)
       fs.rmSync(fixtureRoot, { recursive: true, force: true })
     },
     dataDir,
+    directoryModel() {
+      return {
+        mode: fs.readFileSync(path.join(modelDir, 'directory.mode'), 'utf8').trim(),
+        owner: fs.readFileSync(path.join(modelDir, 'directory.owner'), 'utf8').trim()
+      }
+    },
+    fileModel(name) {
+      return {
+        mode: fs.readFileSync(path.join(modelDir, `${name}.mode`), 'utf8').trim(),
+        owner: fs.readFileSync(path.join(modelDir, `${name}.owner`), 'utf8').trim()
+      }
+    },
+    operationLines() {
+      return fs.existsSync(operationLog)
+        ? fs.readFileSync(operationLog, 'utf8').trim().split('\n').filter(Boolean)
+        : []
+    },
     result,
-    unrelatedBefore,
-    unrelatedPath
+    snapshot(name) {
+      const filePath = path.join(dataDir, name)
+      const fileStat = fs.statSync(filePath)
+      return {
+        hash: fileHash(filePath),
+        mode: fileStat.mode & 0o777
+      }
+    },
+    unrelatedAfter() {
+      const fileStat = fs.statSync(unrelatedPath)
+      return {
+        gid: fileStat.gid,
+        hash: fileHash(unrelatedPath),
+        mode: fileStat.mode & 0o777,
+        uid: fileStat.uid
+      }
+    },
+    unrelatedBefore: {
+      gid: unrelatedBefore.gid,
+      hash: unrelatedHashBefore,
+      mode: unrelatedBefore.mode & 0o777,
+      uid: unrelatedBefore.uid
+    }
   }
 }
 
+function assertNoFileMutation(fixture, before) {
+  assert.deepEqual(fixture.snapshot('kinvest.sqlite'), before)
+  assert.equal(fixture.operationLines().some((line) => /^(?:chown|chmod)/.test(line)), false)
+}
+
 function run() {
-  const migrationSource = readRootFile('deploy/server/migrate-data-uid.sh')
-  const reclaimIndex = migrationSource.indexOf('chown root:root -- .')
-  const preflightIndex = migrationSource.indexOf("stat -c '%F'")
-  const fileMigrationIndex = migrationSource.indexOf('chown "$APP_UID:$APP_GID" -- "$SQLITE_FILE"')
+  assert.equal(fs.existsSync(migrationLibraryPath), true, 'the executable migration core library must exist')
 
-  assert.ok(reclaimIndex >= 0)
-  assert.ok(preflightIndex > reclaimIndex, 'SQLite lstat checks must happen after root reclaims the directory')
-  assert.ok(fileMigrationIndex > preflightIndex, 'all metadata preflight must precede file migration')
-  assert.match(migrationSource, /manual intervention/i)
-  assert.doesNotMatch(migrationSource, /\b(?:find|xargs|chown\s+-R|chmod\s+-R)\b/)
+  for (const status of ['running', 'paused', 'restarting']) {
+    const mountedSameSource = runMigrationCore({
+      containers: [{ id: `same-${status}`, name: `arbitrary-${status}-name`, status }],
+      files: [{ name: 'kinvest.sqlite', content: `before-${status}` }]
+    })
+    const sameSourceBefore = mountedSameSource.snapshot('kinvest.sqlite')
+    try {
+      assert.equal(mountedSameSource.result.status, 1)
+      assert.match(mountedSameSource.result.stderr, new RegExp(`arbitrary-${status}-name.*${status}`))
+      assertNoFileMutation(mountedSameSource, sameSourceBefore)
+      assert.match(
+        mountedSameSource.operationLines().join('\n'),
+        /docker inspect --type container --format \{\{range \.Mounts\}\}/
+      )
+    } finally {
+      mountedSameSource.cleanup()
+    }
+  }
 
-  const success = runMigrationFixture({
+  for (const fuserResult of ['busy', 'error']) {
+    const occupied = runMigrationCore({
+      files: [{ name: 'kinvest.sqlite', content: `before-${fuserResult}` }],
+      fuserResult
+    })
+    const before = occupied.snapshot('kinvest.sqlite')
+    try {
+      assert.equal(occupied.result.status, 1)
+      assert.match(
+        occupied.result.stderr,
+        fuserResult === 'busy' ? /open file handle/i : /Unable to verify open file handles/
+      )
+      assertNoFileMutation(occupied, before)
+    } finally {
+      occupied.cleanup()
+    }
+  }
+
+  const success = runMigrationCore({
     files: [
-      { name: 'kinvest.sqlite', content: 'main content' },
-      { name: 'kinvest.sqlite-wal', content: 'wal content' },
-      { name: 'kinvest.sqlite-shm', content: 'shm content' }
+      { name: 'kinvest.sqlite', content: 'main database bytes' },
+      { name: 'kinvest.sqlite-wal', content: 'wal bytes' },
+      { name: 'kinvest.sqlite-shm', content: 'shm bytes' }
     ]
   })
   try {
     assert.equal(success.result.status, 0, success.result.stderr)
-    assert.equal(fs.readFileSync(path.join(success.dataDir, 'kinvest.sqlite'), 'utf8'), 'main content')
-    assert.equal(fs.readFileSync(path.join(success.dataDir, 'kinvest.sqlite-wal'), 'utf8'), 'wal content')
-    assert.equal(fs.readFileSync(path.join(success.dataDir, 'kinvest.sqlite-shm'), 'utf8'), 'shm content')
     for (const name of ['kinvest.sqlite', 'kinvest.sqlite-wal', 'kinvest.sqlite-shm']) {
-      assert.equal(fs.statSync(path.join(success.dataDir, name)).mode & 0o777, 0o600)
-      assert.ok(success.chownLog().includes(`10001:10001 ${name}`))
+      assert.deepEqual(success.fileModel(name), { mode: '600', owner: '10001:10001' })
+      assert.equal(success.snapshot(name).mode, 0o600)
     }
-    const unrelatedAfter = fs.statSync(success.unrelatedPath)
-    assert.equal(unrelatedAfter.uid, success.unrelatedBefore.uid)
-    assert.equal(unrelatedAfter.gid, success.unrelatedBefore.gid)
-    assert.equal(unrelatedAfter.mode & 0o777, success.unrelatedBefore.mode & 0o777)
-    assert.equal(success.chownLog().some((line) => line.endsWith('family-notes.txt')), false)
-    assert.equal(success.chownLog().at(-1), '10001:10001 .')
+    assert.deepEqual(success.directoryModel(), { mode: '750', owner: '10001:10001' })
+    assert.deepEqual(success.unrelatedAfter(), success.unrelatedBefore)
+
+    const operations = success.operationLines()
+    const reclaimIndex = operations.indexOf('chown root:root -- .')
+    const firstFileChownIndex = operations.indexOf('chown 10001:10001 -- kinvest.sqlite')
+    const finalDirectoryIndex = operations.indexOf('chown 10001:10001 -- .')
+    assert.ok(reclaimIndex >= 0 && firstFileChownIndex > reclaimIndex)
+    assert.ok(finalDirectoryIndex > firstFileChownIndex)
   } finally {
     success.cleanup()
   }
 
-  for (const status of ['running', 'paused', 'restarting']) {
-    const mounted = runMigrationFixture({
-      containers: [{ id: `container-${status}`, name: 'unrelated-preview-name', status }],
-      files: [{ name: 'kinvest.sqlite' }]
-    })
-    try {
-      assert.equal(mounted.result.status, 1)
-      assert.match(mounted.result.stderr, new RegExp(`unrelated-preview-name.*${status}`))
-      assert.deepEqual(mounted.chownLog(), [])
-    } finally {
-      mounted.cleanup()
-    }
-  }
-
-  const fullPreflight = runMigrationFixture({
+  const lateFailure = runMigrationCore({
     files: [
       { name: 'kinvest.sqlite', owner: '1000:1000' },
       { name: 'kinvest.sqlite-wal', owner: '2000:2000' }
     ]
   })
   try {
-    assert.equal(fullPreflight.result.status, 1)
-    assert.match(fullPreflight.result.stderr, /unexpected owner 2000:2000/)
-    assert.equal(fullPreflight.chownLog().some((line) => line.endsWith('kinvest.sqlite')), false)
-    assert.equal(fullPreflight.chownLog().at(-1), 'root:root .')
+    assert.equal(lateFailure.result.status, 1)
+    assert.deepEqual(lateFailure.directoryModel(), { mode: '700', owner: '0:0' })
+    assert.equal(
+      lateFailure.operationLines().some((line) => line === 'chown 10001:10001 -- kinvest.sqlite'),
+      false
+    )
+    assert.match(lateFailure.result.stderr, /manual intervention/i)
   } finally {
-    fullPreflight.cleanup()
+    lateFailure.cleanup()
   }
 
-  for (const file of [
-    { name: 'kinvest.sqlite', kind: 'symlink' },
-    { name: 'kinvest.sqlite', kind: 'hardlink' }
-  ]) {
-    const unsafeLink = runMigrationFixture({ files: [file] })
-    try {
-      assert.equal(unsafeLink.result.status, 1)
-      assert.match(unsafeLink.result.stderr, /(?:symlink|hard link)/i)
-      assert.equal(unsafeLink.chownLog().some((line) => line.endsWith('kinvest.sqlite')), false)
-      assert.equal(unsafeLink.chownLog().at(-1), 'root:root .')
-    } finally {
-      unsafeLink.cleanup()
-    }
-  }
-
-  const busy = runMigrationFixture({
-    files: [{ name: 'kinvest.sqlite' }],
-    busyFile: 'kinvest.sqlite'
+  const lockConflict = runMigrationCore({
+    files: [{ name: 'kinvest.sqlite', content: 'locked bytes' }],
+    flockConflict: true
   })
+  const lockedBefore = lockConflict.snapshot('kinvest.sqlite')
   try {
-    assert.equal(busy.result.status, 1)
-    assert.match(busy.result.stderr, /open file handle/i)
-    assert.deepEqual(busy.chownLog(), [])
+    assert.equal(lockConflict.result.status, 1)
+    assertNoFileMutation(lockConflict, lockedBefore)
+    assert.deepEqual(lockConflict.operationLines(), ['flock -n 9'])
   } finally {
-    busy.cleanup()
+    lockConflict.cleanup()
   }
 }
 

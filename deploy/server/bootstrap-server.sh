@@ -71,7 +71,7 @@ fi
 assert_not_symlink "$SOURCE_DIR"
 assert_not_symlink "$PUBLIC_KEY_FILE"
 
-source_files=(docker-compose.yml migrate-data-uid.sh prepare-data-dir.sh deploy-kinvest.sh kinvest-ssh-command)
+source_files=(docker-compose.yml migrate-data-uid-lib.sh migrate-data-uid.sh prepare-data-dir.sh deploy-kinvest.sh kinvest-ssh-command)
 for source_file in "${source_files[@]}"; do
   assert_not_symlink "$SOURCE_DIR/$source_file"
   if [[ ! -f "$SOURCE_DIR/$source_file" ]]; then
@@ -97,6 +97,7 @@ for target_file in "${source_files[@]}"; do
 done
 
 install -o root -g root -m 0644 -- "$SOURCE_DIR/docker-compose.yml" "$TARGET/docker-compose.yml"
+install -o root -g root -m 0644 -- "$SOURCE_DIR/migrate-data-uid-lib.sh" "$TARGET/migrate-data-uid-lib.sh"
 install -o root -g root -m 0755 -- "$SOURCE_DIR/migrate-data-uid.sh" "$TARGET/migrate-data-uid.sh"
 install -o root -g root -m 0755 -- "$SOURCE_DIR/prepare-data-dir.sh" "$TARGET/prepare-data-dir.sh"
 install -o root -g root -m 0755 -- "$SOURCE_DIR/deploy-kinvest.sh" "$TARGET/deploy-kinvest.sh"
