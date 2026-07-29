@@ -1,0 +1,131 @@
+name: Deploy Kinvest
+
+on:
+  push:
+    branches:
+      - main
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: kinvest-production
+  cancel-in-progress: false
+
+jobs:
+  verify:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    steps:
+      - name: Check out exact commit
+        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683
+      - name: Use Node.js
+        uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020
+        with:
+          node-version: "22.13.0"
+          cache: npm
+      - name: Install locked dependencies
+        run: npm ci
+      - name: Run quality gates
+        run: npm run check
+
+  publish:
+    needs: verify
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      packages: write
+    steps:
+      - name: Check out exact commit
+        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683
+      - name: Build and publish immutable image
+        shell: bash
+        env:
+          GHCR_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          IMAGE_REPOSITORY: ghcr.io/${{ github.repository_owner }}/kinvest
+          DEPLOY_SHA: ${{ github.sha }}
+        run: |
+          set -euo pipefail
+          if [[ ! "$DEPLOY_SHA" =~ ^[0-9a-f]{40}$ ]]; then
+            printf '%s\n' 'GitHub supplied an invalid commit SHA.' >&2
+            exit 1
+          fi
+          if [[ ! "$IMAGE_REPOSITORY" =~ ^ghcr\.io/[a-z0-9][a-z0-9._-]*/[a-z0-9][a-z0-9._/-]*$ ]]; then
+            printf '%s\n' 'GitHub supplied an invalid image repository.' >&2
+            exit 1
+          fi
+          IMAGE_REF="${IMAGE_REPOSITORY}:${DEPLOY_SHA}"
+          printf '%s' "$GHCR_TOKEN" | docker login ghcr.io --username "$GITHUB_ACTOR" --password-stdin
+          trap 'docker logout ghcr.io >/dev/null 2>&1 || true' EXIT
+          docker build --pull --tag "$IMAGE_REF" .
+          docker push "$IMAGE_REF"
+
+  deploy:
+    needs: publish
+    if: ${{ vars.DEPLOY_ENABLED == 'true' }}
+    runs-on: ubuntu-latest
+    environment: Production
+    permissions:
+      contents: read
+    steps:
+      - name: Configure strict SSH trust
+        shell: bash
+        env:
+          DEPLOY_HOST: ${{ vars.DEPLOY_HOST }}
+          DEPLOY_PORT: ${{ vars.DEPLOY_PORT }}
+          DEPLOY_KEY: ${{ secrets.DEPLOY_SSH_KEY }}
+          DEPLOY_KNOWN_HOSTS: ${{ secrets.DEPLOY_KNOWN_HOSTS }}
+        run: |
+          set -euo pipefail
+          if [[ ! "$DEPLOY_HOST" =~ ^[A-Za-z0-9.-]+$ ]]; then
+            printf '%s\n' 'Invalid deployment host.' >&2
+            exit 1
+          fi
+          if [[ ! "$DEPLOY_PORT" =~ ^[0-9]{1,5}$ ]] || ((DEPLOY_PORT < 1 || DEPLOY_PORT > 65535)); then
+            printf '%s\n' 'Invalid deployment port.' >&2
+            exit 1
+          fi
+          test -n "$DEPLOY_KEY"
+          test -n "$DEPLOY_KNOWN_HOSTS"
+          umask 077
+          install -d -m 700 "$HOME/.ssh"
+          printf '%s\n' "$DEPLOY_KEY" > "$HOME/.ssh/id_ed25519"
+          printf '%s\n' "$DEPLOY_KNOWN_HOSTS" > "$HOME/.ssh/known_hosts"
+          chmod 600 "$HOME/.ssh/id_ed25519" "$HOME/.ssh/known_hosts"
+          known_host="$DEPLOY_HOST"
+          if [[ "$DEPLOY_PORT" != '22' ]]; then
+            known_host="[$DEPLOY_HOST]:$DEPLOY_PORT"
+          fi
+          ssh-keygen -F "$known_host" -f "$HOME/.ssh/known_hosts" >/dev/null
+      - name: Deploy exact immutable release
+        shell: bash
+        env:
+          DEPLOY_HOST: ${{ vars.DEPLOY_HOST }}
+          DEPLOY_PORT: ${{ vars.DEPLOY_PORT }}
+          DEPLOY_USER: ${{ vars.DEPLOY_USER }}
+          DEPLOY_SHA: ${{ github.sha }}
+          IMAGE_REPOSITORY: ghcr.io/${{ github.repository_owner }}/kinvest
+        run: |
+          set -euo pipefail
+          if [[ ! "$DEPLOY_HOST" =~ ^[A-Za-z0-9.-]+$ ]]; then exit 1; fi
+          if [[ ! "$DEPLOY_PORT" =~ ^[0-9]{1,5}$ ]] || ((DEPLOY_PORT < 1 || DEPLOY_PORT > 65535)); then exit 1; fi
+          if [[ ! "$DEPLOY_USER" =~ ^[a-z_][a-z0-9_-]*$ ]]; then exit 1; fi
+          if [[ ! "$DEPLOY_SHA" =~ ^[0-9a-f]{40}$ ]]; then exit 1; fi
+          if [[ ! "$IMAGE_REPOSITORY" =~ ^ghcr\.io/[a-z0-9][a-z0-9._-]*/[a-z0-9][a-z0-9._/-]*$ ]]; then exit 1; fi
+          ssh \
+            -o BatchMode=yes \
+            -o IdentitiesOnly=yes \
+            -o StrictHostKeyChecking=yes \
+            -o UserKnownHostsFile="$HOME/.ssh/known_hosts" \
+            -o LogLevel=ERROR \
+            -i "$HOME/.ssh/id_ed25519" \
+            -p "$DEPLOY_PORT" \
+            "$DEPLOY_USER@$DEPLOY_HOST" \
+            "sudo /usr/local/sbin/deploy-kinvest '$IMAGE_REPOSITORY' '$DEPLOY_SHA'"
+      - name: Remove ephemeral SSH material
+        if: ${{ always() }}
+        shell: bash
+        run: |
+          rm -f "$HOME/.ssh/id_ed25519" "$HOME/.ssh/known_hosts"
