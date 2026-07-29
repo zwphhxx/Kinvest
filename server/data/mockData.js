@@ -11,6 +11,8 @@ function mkPeriod(type, period, fields) {
     period,
     source: {
       sourceName: fields.sourceName,
+      sourceType: fields.sourceType,
+      scopeVerified: fields.scopeVerified,
       sourceTime: new Date(fields.sourceTime),
       fetchTime: new Date(fields.fetchTime)
     },
@@ -70,6 +72,8 @@ const companies = [
       annual: [
         mkPeriod('annual', '2024', {
           sourceName: 'iFinD company 指标',
+          sourceType: 'ifind_indicator',
+          scopeVerified: true,
           sourceTime: '2026-07-27T20:13:00.000Z',
           fetchTime: '2026-07-28T03:10:00.000Z',
           currency: 'HKD',
@@ -93,6 +97,8 @@ const companies = [
         }),
         mkPeriod('annual', '2025', {
           sourceName: 'iFinD company 指标',
+          sourceType: 'ifind_indicator',
+          scopeVerified: true,
           sourceTime: '2026-07-27T20:13:00.000Z',
           fetchTime: '2026-07-28T03:10:00.000Z',
           currency: 'HKD',
@@ -118,6 +124,8 @@ const companies = [
       quarterly: [
         mkPeriod('quarter', '2026-Q1', {
           sourceName: 'iFinD company 指标',
+          sourceType: 'ifind_indicator',
+          scopeVerified: true,
           sourceTime: '2026-07-27T20:13:00.000Z',
           fetchTime: '2026-07-28T03:10:00.000Z',
           currency: 'HKD',
@@ -344,6 +352,8 @@ const companies = [
       annual: [
         mkPeriod('annual', '2025', {
           sourceName: 'iFinD company 指标',
+          sourceType: 'ifind_indicator',
+          scopeVerified: true,
           sourceTime: '2026-07-27T20:13:00.000Z',
           fetchTime: '2026-07-28T03:10:00.000Z',
           currency: 'USD',

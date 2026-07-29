@@ -28,6 +28,7 @@ async function runBuildArtifactsExist() {
     'package.json',
     'public/app.css',
     'public/app.js',
+    'public/finance-contract.js',
     'public/index.html',
     'public/research.html',
     'server/adapters/ifindAdapter.js',

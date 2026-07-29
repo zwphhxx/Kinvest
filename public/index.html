@@ -63,7 +63,7 @@
             <button class="chip-btn" data-tab="quarter">季度</button>
           </div>
           <p id="finance-scroll-hint" class="table-scroll-hint">左右滑动查看完整表格</p>
-          <div id="finance-table-wrap" class="table-scroll finance-table-scroll" role="region" tabindex="0" aria-describedby="finance-scroll-hint"></div>
+          <div id="finance-table-wrap" class="table-scroll finance-table-scroll" aria-label="财务数据表格，可横向滚动" role="region" tabindex="0" aria-describedby="finance-scroll-hint"></div>
         </section>
 
         <section class="section">
@@ -74,7 +74,7 @@
         <section class="section">
           <h3>业务构成细分（按验证口径展示）</h3>
           <p id="breakdown-scroll-hint" class="table-scroll-hint">左右滑动查看完整表格</p>
-          <div id="breakdown-table" class="table-scroll breakdown-table-scroll" role="region" tabindex="0" aria-describedby="breakdown-scroll-hint"></div>
+          <div id="breakdown-table" class="table-scroll breakdown-table-scroll" aria-label="业务构成细分表格，可横向滚动" role="region" tabindex="0" aria-describedby="breakdown-scroll-hint"></div>
         </section>
 
         <section class="section">
@@ -100,6 +100,7 @@
     </main>
   </div>
 
+  <script src="/finance-contract.js" defer></script>
   <script src="/app.js" defer></script>
 </body>
 </html>

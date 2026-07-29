@@ -5,6 +5,8 @@ const state = {
   financeMode: 'annual'
 }
 
+const financeContracts = /** @type {any} */ (window).KinvestFinance
+
 const el = {
   globalStatus: document.getElementById('global-status'),
   watchlist: document.getElementById('watchlist'),
@@ -119,16 +121,17 @@ function renderMarket(company) {
 }
 
 function renderFinance(company) {
-  const rows = company.financials[state.financeMode] || []
-  if (!rows.length) {
+  const prepared = financeContracts.prepareFinanceRows(company.financials, state.financeMode)
+  const rows = prepared.rows
+  if (prepared.totalCount === 0) {
     el.financeTableWrap.innerHTML = '<p class="muted">当前口径未返回数据。</p>'
     return
   }
+  if (!rows.length) {
+    el.financeTableWrap.innerHTML = '<p class="muted">该报告期来源口径未验证，未展示数据。</p>'
+    return
+  }
 
-  const row = rows[0]
-  const sourceName = typeof row.source?.sourceName === 'string' && row.source.sourceName.trim()
-    ? row.source.sourceName.trim()
-    : '待验证来源（Mock）'
   const columns = [
     ['revenue', '营业收入'],
     ['grossMargin', '毛利率'],
@@ -145,19 +148,28 @@ function renderFinance(company) {
     ['debtToAsset', '资产负债率']
   ].filter(([k]) => rows.some((r) => r.values?.[k] !== undefined))
 
-  const header = `<tr><th>期间</th>${columns.map((item) => `<th>${item[1]}</th>`).join('')}</tr>`
+  const header = `<tr>
+    <th>期间</th><th>报告日</th><th>币种</th><th>单位</th><th>口径来源</th><th>获取时间</th>
+    ${columns.map((item) => `<th>${item[1]}</th>`).join('')}
+  </tr>`
   const body = rows.map((r) => {
     const cols = columns.map(([key]) => {
       const value = r.values[key]
       const formatted = typeof value === 'number' ? (Number.isInteger(value) ? value.toLocaleString('zh-CN') : value.toLocaleString('zh-CN')) : '—'
       return `<td>${formatted}</td>`
     }).join('')
-    return `<tr><td>${r.period}</td>${cols}</tr>`
+    return `<tr>
+      <td>${r.period}</td><td>${r.reportDate}</td><td>${r.currency}</td><td>${r.unit}</td>
+      <td>${r.source.sourceName}</td><td>${formatDateTime(r.source.fetchTime)}</td>${cols}
+    </tr>`
   }).join('')
+  const rejectedSummary = prepared.rejectedCount > 0
+    ? `<p class="muted">该报告期来源口径未验证，未展示数据（${prepared.rejectedCount} 条）。</p>`
+    : ''
 
   el.financeTableWrap.innerHTML = `
-    <p class="muted">币种：${row.currency} ｜ 单位：${row.unit} ｜ 报告期：${row.reportDate}</p>
-    <p class="tag meta">口径来源：${sourceName} ｜ 获取：${formatDateTime(row.source?.fetchTime)}</p>
+    <p class="muted">已展示 ${rows.length} 条来源口径已验证的财务记录。</p>
+    ${rejectedSummary}
     <table>
       <thead>${header}</thead>
       <tbody>${body}</tbody>

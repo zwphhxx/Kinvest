@@ -14,7 +14,8 @@ const runtimeFiles = [
   'public/index.html',
   'public/research.html',
   'public/app.css',
-  'public/app.js'
+  'public/app.js',
+  'public/finance-contract.js'
 ].sort()
 
 fs.rmSync(distDirectory, { recursive: true, force: true })
