@@ -18,9 +18,9 @@ ENV NODE_ENV=production \
 
 WORKDIR /app
 
-COPY --from=build --chown=node:node /app/dist ./
+COPY --from=build --chown=1000:1000 /app/dist ./
 
-USER node
+USER 1000:1000
 
 EXPOSE 4173
 

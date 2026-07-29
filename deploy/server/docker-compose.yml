@@ -3,12 +3,17 @@ services:
     image: ${KINVEST_IMAGE:-kinvest:local}
     container_name: kinvest
     restart: unless-stopped
+    user: "1000:1000"
     environment:
       TZ: ${TZ:-Asia/Shanghai}
       PORT: 4173
       KINVEST_DB_PATH: /data/kinvest.sqlite
     volumes:
-      - /root/docker/kinvest/data:/data
+      - type: bind
+        source: /root/docker/kinvest/data
+        target: /data
+        bind:
+          create_host_path: false
     expose:
       - "4173"
     networks:
