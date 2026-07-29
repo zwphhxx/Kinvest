@@ -53,6 +53,15 @@ assert_not_symlink() {
   fi
 }
 
+assert_existing_path_canonical() {
+  local candidate="$1"
+
+  if [[ -e "$candidate" && "$(realpath -e -- "$candidate")" != "$candidate" ]]; then
+    printf '%s\n' "refusing non-canonical existing path: $candidate" >&2
+    exit 1
+  fi
+}
+
 if [[ "$SOURCE_DIR" != /* || "$PUBLIC_KEY_FILE" != /* ]]; then
   printf '%s\n' 'source paths must be absolute' >&2
   exit 2
@@ -78,6 +87,10 @@ for source_file in "${source_files[@]}"; do
     printf '%s\n' "required bootstrap source is missing: $source_file" >&2
     exit 1
   fi
+  if [[ "$(realpath -e -- "$SOURCE_DIR/$source_file")" != "$SOURCE_DIR/$source_file" ]]; then
+    printf '%s\n' "bootstrap source must use its canonical path: $source_file" >&2
+    exit 1
+  fi
 done
 
 if [[ ! -d "$DOCKER_ROOT" ]]; then
@@ -85,9 +98,52 @@ if [[ ! -d "$DOCKER_ROOT" ]]; then
   exit 1
 fi
 
-for target_component in '/root' "$DOCKER_ROOT" "$TARGET" "$TARGET/data" "$TARGET/state"; do
+target_components=(
+  '/root'
+  "$DOCKER_ROOT"
+  "$TARGET"
+  "$TARGET/data"
+  "$TARGET/state"
+  "${LOCAL_DEPLOY_SCRIPT%/*}"
+  "${DEPLOY_HOME%/*}"
+  "$DEPLOY_HOME"
+  "$DEPLOY_HOME/.ssh"
+  "${SUDOERS_FILE%/*}"
+)
+for target_component in "${target_components[@]}"; do
   assert_not_symlink "$target_component"
+  assert_existing_path_canonical "$target_component"
 done
+
+target_files=()
+for source_file in "${source_files[@]}"; do
+  target_files+=("$TARGET/$source_file")
+done
+target_files+=(
+  "$LOCAL_DEPLOY_SCRIPT"
+  "$LOCAL_SSH_COMMAND"
+  "$DEPLOY_HOME/.ssh/authorized_keys"
+  "$SUDOERS_FILE"
+)
+for target_file in "${target_files[@]}"; do
+  assert_not_symlink "$target_file"
+  assert_existing_path_canonical "$target_file"
+done
+
+if [[ "$(wc -l < "$PUBLIC_KEY_FILE")" -ne 1 ]]; then
+  printf '%s\n' 'deployment public key file must contain exactly one line' >&2
+  exit 2
+fi
+
+public_key_type=''
+public_key_blob=''
+public_key_comment=''
+IFS=' ' read -r public_key_type public_key_blob public_key_comment < "$PUBLIC_KEY_FILE"
+
+if [[ "$public_key_type" != 'ssh-ed25519' || ! "$public_key_blob" =~ ^[A-Za-z0-9+/]+={0,2}$ ]]; then
+  printf '%s\n' 'deployment public key must be one plain Ed25519 key without options' >&2
+  exit 2
+fi
 
 DEPLOY_ACCOUNT_STATE=''
 deploy_record=''
@@ -131,10 +187,6 @@ fi
 install -d -o root -g root -m 0750 -- "$TARGET"
 install -d -o root -g root -m 0700 -- "$TARGET/state"
 
-for target_file in "${source_files[@]}"; do
-  assert_not_symlink "$TARGET/$target_file"
-done
-
 install -o root -g root -m 0644 -- "$SOURCE_DIR/docker-compose.yml" "$TARGET/docker-compose.yml"
 install -o root -g root -m 0644 -- "$SOURCE_DIR/migrate-data-uid-lib.sh" "$TARGET/migrate-data-uid-lib.sh"
 install -o root -g root -m 0755 -- "$SOURCE_DIR/migrate-data-uid.sh" "$TARGET/migrate-data-uid.sh"
@@ -150,47 +202,23 @@ install -o root -g root -m 0755 -- "$TARGET/kinvest-ssh-command" "$LOCAL_SSH_COM
 if [[ "$DEPLOY_ACCOUNT_STATE" == 'fresh' ]]; then
   groupadd --gid "$DEPLOY_GID" "$DEPLOY_USER"
   useradd --uid "$DEPLOY_UID" --gid "$DEPLOY_GID" --create-home --home-dir "$DEPLOY_HOME" --shell /bin/bash "$DEPLOY_USER"
-fi
 
-deploy_record="$(getent passwd "$DEPLOY_USER")"
-IFS=: read -r _ _ existing_deploy_uid existing_deploy_gid _ deploy_home _ <<< "$deploy_record"
+  deploy_record="$(getent passwd "$DEPLOY_USER")"
+  IFS=: read -r _ _ existing_deploy_uid existing_deploy_gid _ deploy_home _ <<< "$deploy_record"
 
-if [[ "$existing_deploy_uid" == "$APP_UID" || "$existing_deploy_gid" == "$APP_GID" ]]; then
-  printf '%s\n' 'deployment user must not share the Kinvest application UID or GID' >&2
-  exit 1
-fi
-
-if [[ "$deploy_home" != "$DEPLOY_HOME" ]]; then
-  printf '%s\n' 'existing deployment user has an unexpected home directory' >&2
-  exit 1
-fi
-
-if id -nG "$DEPLOY_USER" | grep -Eq '(^|[[:space:]])docker($|[[:space:]])'; then
-  printf '%s\n' 'deployment user has forbidden direct Docker daemon access' >&2
-  exit 1
+  if [[ "$existing_deploy_uid" != "$DEPLOY_UID" || "$existing_deploy_gid" != "$DEPLOY_GID" || "$deploy_home" != "$DEPLOY_HOME" ]]; then
+    printf '%s\n' 'fresh deployment user does not match the preflighted identity' >&2
+    exit 1
+  fi
+  if id -nG "$DEPLOY_USER" | grep -Eq '(^|[[:space:]])docker($|[[:space:]])'; then
+    printf '%s\n' 'fresh deployment user has forbidden direct Docker daemon access' >&2
+    exit 1
+  fi
 fi
 
 passwd --lock kinvest-deploy >/dev/null
-assert_not_symlink "$DEPLOY_HOME"
-assert_not_symlink "$DEPLOY_HOME/.ssh"
-assert_not_symlink "$DEPLOY_HOME/.ssh/authorized_keys"
 install -d -o "$DEPLOY_USER" -g "$DEPLOY_USER" -m 0700 -- "$DEPLOY_HOME/.ssh"
 chmod 700 "$DEPLOY_HOME/.ssh"
-
-if [[ "$(wc -l < "$PUBLIC_KEY_FILE")" -ne 1 ]]; then
-  printf '%s\n' 'deployment public key file must contain exactly one line' >&2
-  exit 2
-fi
-
-public_key_type=''
-public_key_blob=''
-public_key_comment=''
-IFS=' ' read -r public_key_type public_key_blob public_key_comment < "$PUBLIC_KEY_FILE"
-
-if [[ "$public_key_type" != 'ssh-ed25519' || ! "$public_key_blob" =~ ^[A-Za-z0-9+/]+={0,3}$ ]]; then
-  printf '%s\n' 'deployment public key must be one plain Ed25519 key without options' >&2
-  exit 2
-fi
 
 authorized_keys_temporary="$(mktemp "$DEPLOY_HOME/.ssh/.authorized_keys.XXXXXX")"
 printf 'restrict,command="/usr/local/sbin/kinvest-ssh-command" %s %s\n' \
@@ -201,7 +229,6 @@ mv -f -- "$authorized_keys_temporary" "$DEPLOY_HOME/.ssh/authorized_keys"
 
 docker network inspect web >/dev/null 2>&1 || docker network create web >/dev/null
 
-assert_not_symlink "$SUDOERS_FILE"
 temporary_sudoers="$(mktemp "${SUDOERS_FILE%/*}/.kinvest-deploy.XXXXXX")"
 printf '%s\n' \
   'kinvest-deploy ALL=(root) NOPASSWD: /usr/local/sbin/deploy-kinvest ""' \

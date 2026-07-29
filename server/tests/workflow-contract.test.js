@@ -343,7 +343,9 @@ function runBootstrapUserFixture({
   existingGroups = 'kinvest-deploy',
   existingHome = '',
   existingUid = '1001',
-  freshUidTaken = false
+  freshUidTaken = false,
+  preflightSymlink = '',
+  publicKeyContent = ''
 }) {
   const rawFixtureRoot = fs.mkdtempSync(path.join(os.tmpdir(), 'kinvest-bootstrap-user-'))
   const fixtureRoot = fs.realpathSync(rawFixtureRoot)
@@ -361,7 +363,10 @@ function runBootstrapUserFixture({
     fs.mkdirSync(directory, { recursive: true })
   }
 
-  fs.writeFileSync(publicKeyFile, `ssh-ed25519 ${'A'.repeat(44)} fixture\n`)
+  fs.writeFileSync(
+    publicKeyFile,
+    publicKeyContent || `ssh-ed25519 ${'A'.repeat(44)} fixture\n`
+  )
   fs.writeFileSync(path.join(sourceDir, 'docker-compose.yml'), 'services:\n  kinvest:\n    image: fixture\n')
   for (const scriptName of ['migrate-data-uid.sh', 'prepare-data-dir.sh']) {
     writeExecutable(
@@ -378,6 +383,30 @@ printf '%s\\n' 'lifecycle ${scriptName}' >> "$BOOTSTRAP_FAKE_STATE/operations.lo
   )
   for (const scriptName of ['deploy-kinvest.sh', 'kinvest-ssh-command']) {
     writeExecutable(path.join(sourceDir, scriptName), '#!/bin/sh\nexit 0\n')
+  }
+
+  if (preflightSymlink) {
+    const symlinkTarget = path.join(fixtureRoot, 'symlink-target')
+    fs.mkdirSync(symlinkTarget)
+
+    if (preflightSymlink === 'deploy-home') {
+      fs.mkdirSync(path.dirname(deployHome), { recursive: true })
+      fs.symlinkSync(symlinkTarget, deployHome)
+    } else if (preflightSymlink === 'deploy-ssh') {
+      fs.mkdirSync(deployHome, { recursive: true })
+      fs.symlinkSync(symlinkTarget, path.join(deployHome, '.ssh'))
+    } else if (preflightSymlink === 'authorized-keys') {
+      fs.mkdirSync(path.join(deployHome, '.ssh'), { recursive: true })
+      fs.symlinkSync(
+        path.join(symlinkTarget, 'authorized_keys'),
+        path.join(deployHome, '.ssh/authorized_keys')
+      )
+    } else if (preflightSymlink === 'sudoers') {
+      fs.symlinkSync(
+        path.join(symlinkTarget, 'kinvest-deploy'),
+        path.join(sudoersDir, 'kinvest-deploy')
+      )
+    }
   }
 
   writeExecutable(
@@ -491,14 +520,46 @@ else
 fi
 `
   )
-  writeExecutable(path.join(fakeBin, 'chown'), '#!/bin/sh\nexit 0\n')
-  writeExecutable(path.join(fakeBin, 'passwd'), '#!/bin/sh\nexit 0\n')
+  writeExecutable(
+    path.join(fakeBin, 'chown'),
+    '#!/bin/sh\nprintf "%s\\n" "chown $*" >> "$BOOTSTRAP_FAKE_STATE/operations.log"\n'
+  )
+  writeExecutable(
+    path.join(fakeBin, 'chmod'),
+    '#!/bin/sh\nprintf "%s\\n" "chmod $*" >> "$BOOTSTRAP_FAKE_STATE/operations.log"\nexec /bin/chmod "$@"\n'
+  )
+  writeExecutable(
+    path.join(fakeBin, 'passwd'),
+    '#!/bin/sh\nprintf "%s\\n" "passwd $*" >> "$BOOTSTRAP_FAKE_STATE/operations.log"\n'
+  )
   writeExecutable(path.join(fakeBin, 'visudo'), '#!/bin/sh\nexit 0\n')
   writeExecutable(
     path.join(fakeBin, 'realpath'),
     '#!/bin/sh\nfor argument in "$@"; do result="$argument"; done\nprintf "%s\\n" "$result"\n'
   )
-  writeExecutable(path.join(fakeBin, 'docker'), '#!/bin/sh\nexit 0\n')
+  writeExecutable(
+    path.join(fakeBin, 'docker'),
+    `#!/bin/sh
+if [ "\${1:-}" = 'compose' ] && [ "\${2:-}" = 'version' ]; then
+  exit 0
+fi
+if [ "\${1:-}" = 'network' ] && [ "\${2:-}" = 'inspect' ]; then
+  exit 1
+fi
+if [ "\${1:-}" = 'network' ] && [ "\${2:-}" = 'create' ]; then
+  printf '%s\\n' "network-create \${3:-}" >> "$BOOTSTRAP_FAKE_STATE/operations.log"
+  exit 0
+fi
+exit 90
+`
+  )
+  writeExecutable(
+    path.join(fakeBin, 'mktemp'),
+    `#!/bin/sh
+printf '%s\\n' "mktemp $*" >> "$BOOTSTRAP_FAKE_STATE/operations.log"
+exec /usr/bin/mktemp "$@"
+`
+  )
   for (const command of ['setpriv', 'flock', 'timeout', 'stat', 'fuser']) {
     writeExecutable(path.join(fakeBin, command), '#!/bin/sh\nexit 0\n')
   }
@@ -716,6 +777,57 @@ function run() {
       )
     } finally {
       rejectedPreflight.cleanup()
+    }
+  }
+
+  for (const invalidPublicKey of [
+    `ssh-ed25519 ${'A'.repeat(44)} first\nssh-ed25519 ${'B'.repeat(44)} second\n`,
+    `ssh-rsa ${'A'.repeat(44)} fixture\n`,
+    'ssh-ed25519 invalid!blob fixture\n'
+  ]) {
+    const rejectedKey = runBootstrapUserFixture({
+      existing: false,
+      publicKeyContent: invalidPublicKey
+    })
+    try {
+      assert.notEqual(rejectedKey.result.status, 0)
+      assert.equal(
+        fs.existsSync(path.join(rejectedKey.fakeState, 'operations.log')),
+        false,
+        'invalid deployment public key must fail before every server write'
+      )
+      assert.doesNotMatch(
+        `${rejectedKey.result.stdout}${rejectedKey.result.stderr}`,
+        /invalid!blob|A{20}|B{20}/
+      )
+    } finally {
+      rejectedKey.cleanup()
+    }
+  }
+
+  for (const preflightSymlink of [
+    'deploy-home',
+    'deploy-ssh',
+    'authorized-keys',
+    'sudoers'
+  ]) {
+    const rejectedSymlink = runBootstrapUserFixture({
+      existing: true,
+      preflightSymlink
+    })
+    try {
+      assert.notEqual(rejectedSymlink.result.status, 0)
+      assert.equal(
+        fs.existsSync(path.join(rejectedSymlink.fakeState, 'operations.log')),
+        false,
+        `${preflightSymlink} symlink must fail before install, migration, mktemp, or account changes`
+      )
+      assert.equal(
+        fs.existsSync(path.join(rejectedSymlink.fakeState, 'lifecycle.log')),
+        false
+      )
+    } finally {
+      rejectedSymlink.cleanup()
     }
   }
 
