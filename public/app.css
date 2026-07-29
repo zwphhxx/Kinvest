@@ -57,6 +57,7 @@ body {
   border-radius: 16px;
   padding: 16px;
   margin-bottom: 14px;
+  min-width: 0;
 }
 
 .hidden {
@@ -153,6 +154,7 @@ button,
 
 .section {
   margin-bottom: 12px;
+  min-width: 0;
 }
 
 .section h3 {
@@ -216,6 +218,31 @@ button,
 table {
   width: 100%;
   border-collapse: collapse;
+}
+
+.table-scroll {
+  width: 100%;
+  max-width: 100%;
+  overflow-x: auto;
+  overscroll-behavior-inline: contain;
+  -webkit-overflow-scrolling: touch;
+}
+
+.table-scroll:focus-visible {
+  outline: 2px solid var(--accent);
+  outline-offset: 3px;
+}
+
+.finance-table-scroll table {
+  min-width: 980px;
+}
+
+.breakdown-table-scroll table {
+  min-width: 680px;
+}
+
+.table-scroll-hint {
+  display: none;
 }
 
 th, td {
@@ -304,5 +331,12 @@ thead th {
   .topbar {
     flex-direction: column;
     align-items: flex-start;
+  }
+
+  .table-scroll-hint {
+    display: block;
+    margin: -2px 0 6px;
+    color: #526373;
+    font-size: 0.8rem;
   }
 }

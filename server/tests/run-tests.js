@@ -3,6 +3,7 @@ const tests = [
   require('./refresh-rules.test'),
   require('./health.test'),
   require('./build.test'),
+  require('./frontend-contract.test'),
   require('./deploy-contract.test'),
   require('./workflow-contract.test')
 ]

@@ -4,6 +4,7 @@
   <meta charset="UTF-8" />
   <meta name="viewport" content="width=device-width, initial-scale=1.0" />
   <title>Kinvest 家庭投资看板</title>
+  <link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 64 64'%3E%3Crect width='64' height='64' rx='14' fill='%230b7a6e'/%3E%3Cpath d='M17 14v36h8V36l15 14h11L31 31l18-17H38L25 28V14z' fill='white'/%3E%3C/svg%3E" />
   <link rel="stylesheet" href="/app.css" />
 </head>
 <body>
@@ -61,7 +62,8 @@
             <button class="chip-btn active" data-tab="annual">年度</button>
             <button class="chip-btn" data-tab="quarter">季度</button>
           </div>
-          <div id="finance-table-wrap"></div>
+          <p id="finance-scroll-hint" class="table-scroll-hint">左右滑动查看完整表格</p>
+          <div id="finance-table-wrap" class="table-scroll finance-table-scroll" role="region" tabindex="0" aria-describedby="finance-scroll-hint"></div>
         </section>
 
         <section class="section">
@@ -71,7 +73,8 @@
 
         <section class="section">
           <h3>业务构成细分（按验证口径展示）</h3>
-          <div id="breakdown-table"></div>
+          <p id="breakdown-scroll-hint" class="table-scroll-hint">左右滑动查看完整表格</p>
+          <div id="breakdown-table" class="table-scroll breakdown-table-scroll" role="region" tabindex="0" aria-describedby="breakdown-scroll-hint"></div>
         </section>
 
         <section class="section">

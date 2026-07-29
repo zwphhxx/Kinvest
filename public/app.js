@@ -126,6 +126,9 @@ function renderFinance(company) {
   }
 
   const row = rows[0]
+  const sourceName = typeof row.source?.sourceName === 'string' && row.source.sourceName.trim()
+    ? row.source.sourceName.trim()
+    : '待验证来源（Mock）'
   const columns = [
     ['revenue', '营业收入'],
     ['grossMargin', '毛利率'],
@@ -154,7 +157,7 @@ function renderFinance(company) {
 
   el.financeTableWrap.innerHTML = `
     <p class="muted">币种：${row.currency} ｜ 单位：${row.unit} ｜ 报告期：${row.reportDate}</p>
-    <p class="tag meta">口径来源：${row.sourceName} ｜ 获取：${formatDateTime(row.source.fetchTime)}</p>
+    <p class="tag meta">口径来源：${sourceName} ｜ 获取：${formatDateTime(row.source?.fetchTime)}</p>
     <table>
       <thead>${header}</thead>
       <tbody>${body}</tbody>
@@ -172,7 +175,6 @@ function renderAnomalies(items) {
           <span class="tag ${it.triggered ? 'critical' : 'ok'}">${status}</span>
           <span class="tag">规则：${it.rule}</span>
           <span class="tag">版本：${it.version}</span>
-          <span class="tag">${it.note.includes('投资') ? '含投资提示' : '只给规则解释'}</span>
         </p>
         <p class="muted">公式：${it.formula}</p>
         <p class="muted">输入：${JSON.stringify(it.input)} ｜ 阈值：${JSON.stringify(it.threshold)}</p>
