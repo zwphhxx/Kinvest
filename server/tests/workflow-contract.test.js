@@ -256,7 +256,11 @@ function runDeployFixture(markers = [], { withPrevious = true } = {}) {
   }
 
   for (const marker of markers) {
-    fs.writeFileSync(path.join(fakeState, marker), '')
+    if (marker === 'previous-unhealthy') {
+      fs.writeFileSync(path.join(fakeState, 'running.health'), 'unhealthy\n')
+    } else {
+      fs.writeFileSync(path.join(fakeState, marker), '')
+    }
   }
 
   createFakeDocker(fakeBin)
@@ -673,7 +677,7 @@ function run() {
   )
   assert.ok(deployTimeoutMatch, 'deploy job must define a bounded timeout')
   const deployTimeoutMinutes = Number.parseInt(deployTimeoutMatch[1], 10)
-  assert.equal(deployTimeoutMinutes, 30)
+  assert.equal(deployTimeoutMinutes, 40)
   assert.match(workflow, /^ {4}if: \$\{\{ github\.ref == 'refs\/heads\/main' \}\}$/m)
   assert.match(
     workflow,
@@ -732,25 +736,81 @@ function run() {
     assert.ok(match, `${name} must be a bounded whole-second timeout`)
     return Number.parseInt(match[1], 10)
   }
+  const plainSeconds = (name) => {
+    const match = deploy.match(new RegExp(`^${name}='([0-9]+)'$`, 'm'))
+    assert.ok(match, `${name} must be a bounded whole-second value`)
+    return Number.parseInt(match[1], 10)
+  }
+  const functionBody = (name) => {
+    const match = deploy.match(new RegExp(`^${name}\\(\\) \\{([\\s\\S]*?)^\\}$`, 'm'))
+    assert.ok(match, `${name} must remain an auditable shell function`)
+    return match[1]
+  }
+  const inspectCalls = (name) =>
+    (functionBody(name).match(/\brun_inspect\b/g) || []).length
+
   const pullSeconds = timeoutSeconds('PULL_TIMEOUT')
+  const dockerSeconds = timeoutSeconds('DOCKER_TIMEOUT')
   const composeSeconds = timeoutSeconds('COMPOSE_TIMEOUT')
   const inspectSeconds = timeoutSeconds('INSPECT_TIMEOUT')
-  const healthMatch = deploy.match(/^HEALTH_TIMEOUT_SECONDS='([0-9]+)'$/m)
-  assert.ok(healthMatch, 'health polling must have a bounded total budget')
-  const healthSeconds = Number.parseInt(healthMatch[1], 10)
+  const dockerKillSeconds = timeoutSeconds('DOCKER_KILL_AFTER')
+  const inspectKillSeconds = timeoutSeconds('INSPECT_KILL_AFTER')
+  const healthSeconds = plainSeconds('HEALTH_TIMEOUT_SECONDS')
+  const inspectCallSeconds = inspectSeconds + inspectKillSeconds
+  const healthWorstSeconds = healthSeconds + inspectCallSeconds
+
+  const snapshotInspectCalls = inspectCalls('capture_previous_snapshot')
+  const candidateIdentityInspectCalls = inspectCalls('verify_running_image')
+  const localSnapshotInspectCalls = inspectCalls(
+    'previous_snapshot_is_locally_available'
+  )
+  const previousIdentityInspectCalls = inspectCalls(
+    'verify_previous_image_from_snapshot'
+  )
+  const currentHealthInspectCalls = inspectCalls('current_is_healthy')
+  const previousServingInspectCalls =
+    localSnapshotInspectCalls +
+    previousIdentityInspectCalls +
+    currentHealthInspectCalls
+
+  assert.equal(snapshotInspectCalls, 4)
+  assert.equal(candidateIdentityInspectCalls, 3)
+  assert.equal(localSnapshotInspectCalls, 1)
+  assert.equal(previousIdentityInspectCalls, 2)
+  assert.equal(currentHealthInspectCalls, 1)
+  assert.equal(previousServingInspectCalls, 4)
+
+  const networkPrecheckSeconds = dockerSeconds + dockerKillSeconds
+  const previousSnapshotSeconds = snapshotInspectCalls * inspectCallSeconds
+  const candidatePullSeconds = pullSeconds + dockerKillSeconds
+  const candidateComposeSeconds = composeSeconds + dockerKillSeconds
+  const candidateIdentitySeconds = candidateIdentityInspectCalls * inspectCallSeconds
+  const rollbackPrecheckSeconds = previousServingInspectCalls * inspectCallSeconds
+  const rollbackLocalImageSeconds = localSnapshotInspectCalls * inspectCallSeconds
+  const rollbackComposeSeconds = composeSeconds + dockerKillSeconds
+  const rollbackIdentitySeconds = previousIdentityInspectCalls * inspectCallSeconds
+  const rollbackFailureRecheckSeconds = previousServingInspectCalls * inspectCallSeconds
+  const rollbackCleanupSeconds = dockerSeconds + dockerKillSeconds
+  const fixedOverheadSeconds = 120
   const cumulativeDeploySeconds =
-    pullSeconds +
-    composeSeconds +
-    healthSeconds +
-    inspectSeconds +
-    composeSeconds +
-    healthSeconds +
-    inspectSeconds
+    networkPrecheckSeconds +
+    previousSnapshotSeconds +
+    candidatePullSeconds +
+    candidateComposeSeconds +
+    healthWorstSeconds +
+    candidateIdentitySeconds +
+    rollbackPrecheckSeconds +
+    rollbackLocalImageSeconds +
+    rollbackComposeSeconds +
+    rollbackIdentitySeconds +
+    healthWorstSeconds +
+    rollbackFailureRecheckSeconds +
+    rollbackCleanupSeconds +
+    fixedOverheadSeconds
   const deployJobSeconds = deployTimeoutMinutes * 60
-  assert.ok(cumulativeDeploySeconds < deployJobSeconds)
   assert.ok(
-    deployJobSeconds - cumulativeDeploySeconds >= 60,
-    'production job must retain at least 60 seconds outside bounded deployment stages'
+    cumulativeDeploySeconds <= deployJobSeconds - 180,
+    `worst-case ${cumulativeDeploySeconds}s deployment must leave at least 180s in the job`
   )
 
   assert.match(wrapper, /^ALLOWED_REPOSITORY='ghcr\.io\/zwphhxx\/kinvest'$/m)
@@ -1016,6 +1076,33 @@ function run() {
     assert.match(previousSnapshotFailure.result.stderr, /refusing deployment.*snapshot/i)
   } finally {
     previousSnapshotFailure.cleanup()
+  }
+
+  const previousUnhealthy = runDeployFixture(['previous-unhealthy'])
+  try {
+    const diagnostics = deployFixtureDiagnostics(previousUnhealthy)
+    assert.notEqual(previousUnhealthy.result.status, 0, diagnostics)
+    const dockerCalls = fs.readFileSync(
+      path.join(previousUnhealthy.fakeState, 'docker-calls.log'),
+      'utf8'
+    )
+    assert.doesNotMatch(dockerCalls, new RegExp(candidateDigest), diagnostics)
+    assert.doesNotMatch(dockerCalls, /^pull /m, diagnostics)
+    assert.doesNotMatch(dockerCalls, /^compose /m, diagnostics)
+    assert.doesNotMatch(dockerCalls, /^rm /m, diagnostics)
+    assert.equal(
+      fs.readFileSync(path.join(previousUnhealthy.fakeState, 'running.ref'), 'utf8').trim(),
+      previousRef,
+      diagnostics
+    )
+    assert.equal(
+      fs.readFileSync(path.join(previousUnhealthy.fakeState, 'running.health'), 'utf8').trim(),
+      'unhealthy',
+      diagnostics
+    )
+    assert.match(previousUnhealthy.result.stderr, /refusing deployment.*snapshot/i)
+  } finally {
+    previousUnhealthy.cleanup()
   }
 
   const candidateComposeFailure = runDeployFixture(['fail-candidate-compose'])
