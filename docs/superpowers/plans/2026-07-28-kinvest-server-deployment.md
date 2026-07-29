@@ -34,7 +34,7 @@
 - Create: `Dockerfile` - build and run the app as the unprivileged `node` user.
 - Create: `deploy/server/docker-compose.yml` - run Kinvest on the external `web` network.
 - Create: `deploy/server/nginx.conf` - preserve TLS/ACME and proxy the site to Kinvest.
-- Create: `deploy/server/docker-compose.override.yml` - attach the existing Nginx to `web`.
+- Create: `deploy/server/docker-compose.nginx.yml` - explicitly attach the existing Nginx to `web`.
 - Create: `deploy/server/logrotate-nginx` - bound existing Nginx log growth.
 - Create: `server/tests/deploy-contract.test.js` - verify deployment files preserve security constraints.
 
@@ -550,7 +550,7 @@ git push origin main
 **Files:**
 
 - Create: `deploy/server/nginx.conf`
-- Create: `deploy/server/docker-compose.override.yml`
+- Create: `deploy/server/docker-compose.nginx.yml`
 - Create: `deploy/server/logrotate-nginx`
 - Modify: `server/tests/deploy-contract.test.js`
 
@@ -560,12 +560,13 @@ Add these assertions to `server/tests/deploy-contract.test.js`:
 
 ```javascript
 const nginx = read('deploy/server/nginx.conf')
-const override = read('deploy/server/docker-compose.override.yml')
+const override = read('deploy/server/docker-compose.nginx.yml')
 const logrotate = read('deploy/server/logrotate-nginx')
 
 assert.match(nginx, /ssl_certificate \/etc\/letsencrypt\/live\/dearmina\.cn\/fullchain\.pem/)
 assert.match(nginx, /location \/.well-known\/acme-challenge\//)
-assert.match(nginx, /proxy_pass http:\/\/kinvest:4173/)
+assert.match(nginx, /resolver 127\.0\.0\.11 valid=10s ipv6=off/)
+assert.match(nginx, /proxy_pass \$kinvest_upstream/)
 assert.match(nginx, /client_max_body_size 1m/)
 assert.match(nginx, /X-Content-Type-Options/)
 assert.match(nginx, /limit_req_zone/)
@@ -581,7 +582,9 @@ Expected: FAIL because the Nginx and override files do not exist.
 
 - [ ] **Step 2: Add the existing-stack network override**
 
-Create `deploy/server/docker-compose.override.yml`:
+Create `deploy/server/docker-compose.nginx.yml`. This filename is intentionally
+not auto-loaded: every server command must explicitly merge it with the
+server's existing Compose file using two `-f` arguments.
 
 ```yaml
 services:
@@ -609,20 +612,27 @@ http {
   default_type application/octet-stream;
   server_tokens off;
 
-  map $sent_http_content_type $kinvest_cache_control {
+  map $uri $kinvest_cache_control {
     default "no-store";
-    ~*text/css "public, max-age=3600";
-    ~*javascript "public, max-age=3600";
-    ~*image/ "public, max-age=3600";
+    ~^/assets/ "public, max-age=31536000, immutable";
+    ~*\.(?:css|js|svg|png|jpg|jpeg|webp|ico)$ "public, max-age=3600";
+  }
+
+  map $http_upgrade $connection_upgrade {
+    default upgrade;
+    '' close;
   }
 
   limit_req_zone $binary_remote_addr zone=kinvest_api:10m rate=10r/s;
   limit_req_zone $binary_remote_addr zone=kinvest_refresh:10m rate=2r/m;
   limit_req_status 429;
+  resolver 127.0.0.11 valid=10s ipv6=off;
 
-  upstream kinvest_app {
-    server kinvest:4173;
-    keepalive 16;
+  server {
+    listen 80 default_server;
+    listen [::]:80 default_server;
+    server_name _;
+    return 444;
   }
 
   server {
@@ -636,8 +646,20 @@ http {
     }
 
     location / {
-      return 301 https://$host$request_uri;
+      return 301 https://dearmina.cn$request_uri;
     }
+  }
+
+  server {
+    listen 443 ssl default_server;
+    listen [::]:443 ssl default_server;
+    server_name _;
+
+    ssl_certificate /etc/letsencrypt/live/dearmina.cn/fullchain.pem;
+    ssl_certificate_key /etc/letsencrypt/live/dearmina.cn/privkey.pem;
+    ssl_protocols TLSv1.2 TLSv1.3;
+
+    return 444;
   }
 
   server {
@@ -662,13 +684,16 @@ http {
     add_header Strict-Transport-Security "max-age=86400" always;
     add_header Cache-Control $kinvest_cache_control always;
 
+    set $kinvest_upstream http://kinvest:4173;
+
     location ~ ^/api/company/[^/]+/refresh$ {
       limit_req zone=kinvest_refresh burst=2 nodelay;
-      proxy_pass http://kinvest_app;
+      proxy_pass $kinvest_upstream;
       proxy_http_version 1.1;
-      proxy_set_header Host $host;
+      proxy_set_header Host dearmina.cn;
+      proxy_set_header X-Forwarded-Host dearmina.cn;
       proxy_set_header X-Real-IP $remote_addr;
-      proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
+      proxy_set_header X-Forwarded-For $remote_addr;
       proxy_set_header X-Forwarded-Proto $scheme;
       proxy_connect_timeout 5s;
       proxy_read_timeout 30s;
@@ -676,29 +701,39 @@ http {
 
     location /api/ {
       limit_req zone=kinvest_api burst=20 nodelay;
-      proxy_pass http://kinvest_app;
+      proxy_pass $kinvest_upstream;
       proxy_http_version 1.1;
-      proxy_set_header Host $host;
+      proxy_set_header Host dearmina.cn;
+      proxy_set_header X-Forwarded-Host dearmina.cn;
       proxy_set_header X-Real-IP $remote_addr;
-      proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
+      proxy_set_header X-Forwarded-For $remote_addr;
       proxy_set_header X-Forwarded-Proto $scheme;
       proxy_connect_timeout 5s;
       proxy_read_timeout 30s;
     }
 
-    location ~* \.(css|js|svg|png|jpg|jpeg|webp|ico)$ {
-      proxy_pass http://kinvest_app;
-      proxy_set_header Host $host;
-      expires 1h;
+    location /assets/ {
+      proxy_pass $kinvest_upstream;
+      proxy_http_version 1.1;
+      proxy_set_header Host dearmina.cn;
+      proxy_set_header X-Forwarded-Host dearmina.cn;
+      proxy_set_header X-Real-IP $remote_addr;
+      proxy_set_header X-Forwarded-For $remote_addr;
+      proxy_set_header X-Forwarded-Proto $scheme;
+      proxy_connect_timeout 5s;
+      proxy_read_timeout 30s;
     }
 
     location / {
-      proxy_pass http://kinvest_app;
+      proxy_pass $kinvest_upstream;
       proxy_http_version 1.1;
-      proxy_set_header Host $host;
+      proxy_set_header Host dearmina.cn;
+      proxy_set_header X-Forwarded-Host dearmina.cn;
       proxy_set_header X-Real-IP $remote_addr;
-      proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
+      proxy_set_header X-Forwarded-For $remote_addr;
       proxy_set_header X-Forwarded-Proto $scheme;
+      proxy_set_header Upgrade $http_upgrade;
+      proxy_set_header Connection $connection_upgrade;
       proxy_connect_timeout 5s;
       proxy_read_timeout 30s;
     }
@@ -729,19 +764,22 @@ Run:
 ```bash
 docker run --rm \
   -v "$PWD/deploy/server/nginx.conf:/etc/nginx/nginx.conf:ro" \
-  nginx:1.27.5 nginx -t
+  -v "$CERT_DIR:/etc/letsencrypt/live/dearmina.cn:ro" \
+  nginx:1.27.5-alpine nginx -t
 ```
 
-Expected: `syntax is ok` and `test is successful`. The upstream name may require
-validation on a Docker network with a running `kinvest` container; if standalone
-validation cannot resolve it, run the check with both containers attached to a
-temporary network and require the same successful output.
+Expected: `syntax is ok` and `test is successful` even when the Kinvest container
+is absent, because Docker DNS resolution occurs per request. Also merge
+`deploy/server/docker-compose.nginx.yml` explicitly with a minimal fixture for
+the existing Nginx service using `docker compose -f <fixture> -f
+deploy/server/docker-compose.nginx.yml config`; verify the merged service retains
+its fixture image, ports, and volumes and adds both `default` and `web` networks.
 
 - [ ] **Step 6: Run the full quality gate, commit, and push**
 
 ```bash
 npm run check
-git add deploy/server/nginx.conf deploy/server/docker-compose.override.yml deploy/server/logrotate-nginx server/tests/deploy-contract.test.js
+git add deploy/server/nginx.conf deploy/server/docker-compose.nginx.yml deploy/server/logrotate-nginx server/tests/deploy-contract.test.js
 git commit -m "ops: define Kinvest nginx cutover"
 git push origin main
 ```
@@ -1092,7 +1130,7 @@ git push origin main
 
 - `/usr/local/sbin/deploy-kinvest`
 - `/etc/kinvest/docker-compose.yml`
-- `/root/docker/docker-compose.override.yml`
+- `/etc/kinvest/docker-compose.nginx.yml`
 - `/home/kinvest-deploy/.ssh/authorized_keys`
 - `/etc/sudoers.d/kinvest-deploy`
 
@@ -1117,7 +1155,7 @@ scp -P 4334 \
   deploy/server/bootstrap-server.sh \
   deploy/server/deploy-kinvest.sh \
   deploy/server/docker-compose.yml \
-  deploy/server/docker-compose.override.yml \
+  deploy/server/docker-compose.nginx.yml \
   deploy/server/nginx.conf \
   deploy/server/logrotate-nginx \
   /private/tmp/kinvest-deploy-key/id_ed25519.pub \
@@ -1148,8 +1186,8 @@ install -o root -g root -m 644 \
   /root/kinvest-bootstrap/docker-compose.yml \
   /etc/kinvest/docker-compose.yml
 install -o root -g root -m 644 \
-  /root/kinvest-bootstrap/docker-compose.override.yml \
-  /root/docker/docker-compose.override.yml
+  /root/kinvest-bootstrap/docker-compose.nginx.yml \
+  /etc/kinvest/docker-compose.nginx.yml
 install -o root -g root -m 600 \
   /root/kinvest-bootstrap/nginx.conf \
   /etc/kinvest/nginx.conf
@@ -1180,7 +1218,7 @@ Expected: all commands succeed and no secret value is printed.
 **Server files modified:**
 
 - `/root/docker/nginx/conf/nginx.conf`
-- `/root/docker/docker-compose.override.yml`
+- `/etc/kinvest/docker-compose.nginx.yml`
 - `/etc/kinvest/current.env`
 
 - [ ] **Step 1: Deploy the exact GitHub commit before switching Nginx**
@@ -1205,8 +1243,10 @@ return the new health endpoint. Later deployments use the default `required` mod
 Run:
 
 ```bash
-cd /root/docker
-docker compose up -d nginx
+docker compose \
+  -f /root/docker/docker-compose.yml \
+  -f /etc/kinvest/docker-compose.nginx.yml \
+  up -d nginx
 docker network inspect web
 ```
 
@@ -1221,7 +1261,7 @@ docker exec nginx nginx -t
 docker run --rm --network web \
   -v /etc/kinvest/nginx.conf:/etc/nginx/nginx.conf:ro \
   -v /root/docker/certbot/ssl:/etc/letsencrypt:ro \
-  nginx:1.27.5 nginx -t
+  nginx:1.27.5-alpine nginx -t
 ```
 
 Expected: both syntax checks succeed.

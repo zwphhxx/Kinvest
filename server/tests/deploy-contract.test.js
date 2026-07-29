@@ -72,14 +72,18 @@ function nginxBlock(source, headerPattern) {
 }
 
 function assertProxyContract(block, { websocket = false } = {}) {
-  assert.match(block, /^\s*proxy_pass http:\/\/kinvest_app;$/m)
+  assert.match(block, /^\s*proxy_pass \$kinvest_upstream;$/m)
+  assert.doesNotMatch(block, /^\s*proxy_pass \$kinvest_upstream\//m)
   assert.match(block, /^\s*proxy_http_version 1\.1;$/m)
-  assert.match(block, /^\s*proxy_set_header Host \$host;$/m)
+  assert.match(block, /^\s*proxy_set_header Host dearmina\.cn;$/m)
+  assert.match(block, /^\s*proxy_set_header X-Forwarded-Host dearmina\.cn;$/m)
   assert.match(block, /^\s*proxy_set_header X-Real-IP \$remote_addr;$/m)
-  assert.match(block, /^\s*proxy_set_header X-Forwarded-For \$proxy_add_x_forwarded_for;$/m)
+  assert.match(block, /^\s*proxy_set_header X-Forwarded-For \$remote_addr;$/m)
   assert.match(block, /^\s*proxy_set_header X-Forwarded-Proto \$scheme;$/m)
   assert.match(block, /^\s*proxy_connect_timeout 5s;$/m)
   assert.match(block, /^\s*proxy_read_timeout 30s;$/m)
+  assert.doesNotMatch(block, /\$proxy_add_x_forwarded_for/)
+  assert.doesNotMatch(block, /proxy_set_header Host \$host/)
 
   if (websocket) {
     assert.match(block, /^\s*proxy_set_header Upgrade \$http_upgrade;$/m)
@@ -135,7 +139,7 @@ async function run() {
   const prepareScriptPath = path.join(rootDir, 'deploy/server/prepare-data-dir.sh')
   const prepareScript = readRootFile('deploy/server/prepare-data-dir.sh')
   const nginx = readRootFile('deploy/server/nginx.conf')
-  const override = readRootFile('deploy/server/docker-compose.override.yml')
+  const explicitNginxCompose = readRootFile('deploy/server/docker-compose.nginx.yml')
   const logrotate = readRootFile('deploy/server/logrotate-nginx')
   const buildStage = stageBody(dockerfile, 'build')
   const runtimeStage = stageBody(dockerfile, 'runtime')
@@ -144,11 +148,21 @@ async function run() {
   const networks = topLevelBlock(compose, 'networks')
   const http = nginxBlock(nginx, 'http')
   const httpServers = nginxBlocks(http, 'server')
-  const httpRedirectServer = httpServers.find((block) => /^\s*listen 80;$/m.test(block))
-  const httpsServer = httpServers.find((block) => /^\s*listen 443 ssl;$/m.test(block))
+  const httpDefaultServer = httpServers.find((block) => /^\s*listen 80 default_server;$/m.test(block))
+  const httpRedirectServer = httpServers.find(
+    (block) => /^\s*listen 80;$/m.test(block) && !/default_server/.test(block)
+  )
+  const httpsDefaultServer = httpServers.find(
+    (block) => /^\s*listen 443 ssl default_server;$/m.test(block)
+  )
+  const httpsServer = httpServers.find(
+    (block) => /^\s*listen 443 ssl;$/m.test(block) && !/default_server/.test(block)
+  )
 
-  assert.equal(httpServers.length, 2, 'Nginx must define one HTTP and one HTTPS virtual host')
+  assert.equal(httpServers.length, 4, 'Nginx must define default and canonical HTTP/HTTPS virtual hosts')
+  assert.ok(httpDefaultServer, 'Nginx must reject unknown HTTP hosts')
   assert.ok(httpRedirectServer, 'Nginx must define the HTTP redirect virtual host')
+  assert.ok(httpsDefaultServer, 'Nginx must reject unknown HTTPS hosts after TLS negotiation')
   assert.ok(httpsServer, 'Nginx must define the HTTPS application virtual host')
 
   assert.deepEqual(
@@ -236,7 +250,6 @@ async function run() {
 
   const cacheMap = nginxBlock(http, 'map\\s+\\$uri\\s+\\$kinvest_cache_control')
   const connectionMap = nginxBlock(http, 'map\\s+\\$http_upgrade\\s+\\$connection_upgrade')
-  const upstream = nginxBlock(http, 'upstream\\s+kinvest_app')
   const acmeLocation = nginxBlock(httpRedirectServer, 'location\\s+/\\.well-known/acme-challenge/')
   const redirectLocation = nginxBlock(httpRedirectServer, 'location\\s+/')
   const refreshLocation = nginxBlock(
@@ -248,8 +261,10 @@ async function run() {
   const applicationLocation = nginxBlock(httpsServer, 'location\\s+/')
   const httpsLocations = nginxBlocks(httpsServer, 'location[^\\n{]*')
 
-  assert.match(upstream, /^\s*server kinvest:4173;$/m)
-  assert.match(upstream, /^\s*keepalive 16;$/m)
+  assert.match(http, /^\s*resolver 127\.0\.0\.11 valid=10s ipv6=off;$/m)
+  assert.doesNotMatch(http, /upstream\s+kinvest_app\s*\{/)
+  assert.match(httpsServer, /^\s*set \$kinvest_upstream http:\/\/kinvest:4173;$/m)
+  assert.doesNotMatch(httpsServer, /set \$kinvest_upstream http:\/\/kinvest:4173\//)
   assert.match(cacheMap, /^\s*default "no-store";$/m)
   assert.match(cacheMap, /^\s*~\^\/assets\/ "public, max-age=31536000, immutable";$/m)
   assert.match(cacheMap, /^\s*~\*\\\.\(\?:css\|js\|svg\|png\|jpg\|jpeg\|webp\|ico\)\$ "public, max-age=3600";$/m)
@@ -259,11 +274,20 @@ async function run() {
   assert.match(http, /^\s*limit_req_zone \$binary_remote_addr zone=kinvest_refresh:10m rate=2r\/m;$/m)
   assert.match(http, /^\s*limit_req_status 429;$/m)
 
+  assert.match(httpDefaultServer, /^\s*listen \[::\]:80 default_server;$/m)
+  assert.match(httpDefaultServer, /^\s*server_name _;$/m)
+  assert.match(httpDefaultServer, /^\s*return 444;$/m)
   assert.match(httpRedirectServer, /^\s*server_name dearmina\.cn www\.dearmina\.cn;$/m)
   assert.match(acmeLocation, /^\s*root \/var\/www\/certbot;$/m)
   assert.match(acmeLocation, /^\s*try_files \$uri =404;$/m)
-  assert.match(redirectLocation, /^\s*return 301 https:\/\/\$host\$request_uri;$/m)
+  assert.match(redirectLocation, /^\s*return 301 https:\/\/dearmina\.cn\$request_uri;$/m)
+  assert.doesNotMatch(httpRedirectServer, /https:\/\/\$host/)
 
+  assert.match(httpsDefaultServer, /^\s*listen \[::\]:443 ssl default_server;$/m)
+  assert.match(httpsDefaultServer, /^\s*server_name _;$/m)
+  assert.match(httpsDefaultServer, /^\s*ssl_certificate \/etc\/letsencrypt\/live\/dearmina\.cn\/fullchain\.pem;$/m)
+  assert.match(httpsDefaultServer, /^\s*ssl_certificate_key \/etc\/letsencrypt\/live\/dearmina\.cn\/privkey\.pem;$/m)
+  assert.match(httpsDefaultServer, /^\s*return 444;$/m)
   assert.match(httpsServer, /^\s*listen \[::\]:443 ssl;$/m)
   assert.match(httpsServer, /^\s*server_name dearmina\.cn www\.dearmina\.cn;$/m)
   assert.match(httpsServer, /^\s*ssl_certificate \/etc\/letsencrypt\/live\/dearmina\.cn\/fullchain\.pem;$/m)
@@ -300,7 +324,7 @@ async function run() {
   assertProxyContract(applicationLocation, { websocket: true })
 
   assert.equal(
-    override.trim(),
+    explicitNginxCompose.trim(),
     [
       'services:',
       '  nginx:',
@@ -312,9 +336,14 @@ async function run() {
       '  web:',
       '    external: true'
     ].join('\n'),
-    'Compose override must only attach the existing Nginx service to the private web network'
+    'Explicit Nginx Compose file must only attach the existing service to the private web network'
   )
-  assert.doesNotMatch(override, /^\s*(?:ports|volumes|image|container_name):/m)
+  assert.equal(
+    fs.existsSync(path.join(rootDir, 'deploy/server/docker-compose.override.yml')),
+    false,
+    'repository-local Compose must not auto-load an incomplete Nginx override'
+  )
+  assert.doesNotMatch(explicitNginxCompose, /^\s*(?:ports|volumes|image|container_name):/m)
 
   assert.equal(
     logrotate.trim(),
