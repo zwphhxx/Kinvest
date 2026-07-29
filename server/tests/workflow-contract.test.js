@@ -22,7 +22,33 @@ function readRootFile(relativePath) {
 }
 
 function writeExecutable(filePath, source) {
+  assert.match(
+    source,
+    /^#![^\r\n]+\n/,
+    `${filePath} must start with an LF-terminated portable shebang`
+  )
   fs.writeFileSync(filePath, source, { mode: 0o755 })
+}
+
+function readOptionalFile(filePath) {
+  return fs.existsSync(filePath) ? fs.readFileSync(filePath, 'utf8') : null
+}
+
+function deployFixtureDiagnostics(fixture) {
+  return JSON.stringify(
+    {
+      status: fixture.result.status,
+      signal: fixture.result.signal,
+      error: fixture.result.error?.message ?? null,
+      stdout: fixture.result.stdout,
+      stderr: fixture.result.stderr,
+      fakeStateFiles: fs.readdirSync(fixture.fakeState).sort(),
+      timeoutCalls: readOptionalFile(path.join(fixture.fakeState, 'timeout.log')),
+      dockerCalls: readOptionalFile(path.join(fixture.fakeState, 'docker-calls.log'))
+    },
+    null,
+    2
+  )
 }
 
 function assertBasicWorkflowYaml(source) {
@@ -122,6 +148,7 @@ image_id() {
 
 command_name="\${1:-}"
 shift || true
+printf '%s\\n' "$command_name $*" >> "$state/docker-calls.log"
 
 case "$command_name" in
   network)
@@ -201,7 +228,7 @@ function runDeployFixture(markers = [], { withPrevious = true } = {}) {
   fs.mkdirSync(path.join(serverRoot, 'data'), { recursive: true })
   fs.mkdirSync(stateDir, { recursive: true })
   fs.writeFileSync(path.join(serverRoot, 'docker-compose.yml'), 'services:\\n  kinvest:\\n    image: test\\n')
-  writeExecutable(path.join(serverRoot, 'prepare-data-dir.sh'), '#!/bin/sh\\nexit 0\\n')
+  writeExecutable(path.join(serverRoot, 'prepare-data-dir.sh'), '#!/bin/sh\nexit 0\n')
 
   if (withPrevious) {
     fs.writeFileSync(
@@ -868,8 +895,17 @@ function run() {
 
   const mismatch = runDeployFixture(['candidate-mismatch'], { withPrevious: false })
   try {
-    assert.notEqual(mismatch.result.status, 0)
-    assert.ok(fs.existsSync(path.join(mismatch.fakeState, 'removed')))
+    const diagnostics = deployFixtureDiagnostics(mismatch)
+    assert.notEqual(mismatch.result.status, 0, diagnostics)
+    assert.ok(
+      fs.existsSync(path.join(mismatch.fakeState, 'removed')),
+      `unverified candidate must be removed when no previous release can be verified\n${diagnostics}`
+    )
+    assert.match(
+      fs.readFileSync(path.join(mismatch.fakeState, 'docker-calls.log'), 'utf8'),
+      /^rm -f kinvest$/m,
+      diagnostics
+    )
     assert.match(mismatch.result.stderr, /running image does not match/)
     assert.match(mismatch.result.stderr, /manual intervention is required/i)
   } finally {
@@ -904,12 +940,23 @@ function run() {
 
   const successfulRollback = runDeployFixture(['candidate-mismatch'])
   try {
-    assert.notEqual(successfulRollback.result.status, 0)
+    const diagnostics = deployFixtureDiagnostics(successfulRollback)
+    assert.notEqual(successfulRollback.result.status, 0, diagnostics)
     assert.equal(
       fs.readFileSync(path.join(successfulRollback.fakeState, 'running.ref'), 'utf8').trim(),
-      previousRef
+      previousRef,
+      diagnostics
     )
-    assert.equal(fs.existsSync(path.join(successfulRollback.fakeState, 'removed')), false)
+    assert.equal(
+      fs.existsSync(path.join(successfulRollback.fakeState, 'removed')),
+      false,
+      `verified healthy previous release must remain available\n${diagnostics}`
+    )
+    assert.doesNotMatch(
+      fs.readFileSync(path.join(successfulRollback.fakeState, 'docker-calls.log'), 'utf8'),
+      /^rm -f kinvest$/m,
+      diagnostics
+    )
     assert.match(successfulRollback.result.stderr, /previous healthy Kinvest digest was restored/i)
   } finally {
     successfulRollback.cleanup()
