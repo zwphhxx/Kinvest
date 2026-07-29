@@ -10,6 +10,8 @@ PREVIOUS_STATE="$STATE/previous.state"
 DOCKER_TIMEOUT='120s'
 COMPOSE_TIMEOUT='120s'
 INSPECT_TIMEOUT='15s'
+DOCKER_KILL_AFTER='10s'
+INSPECT_KILL_AFTER='5s'
 HEALTH_ATTEMPTS='60'
 HEALTH_INTERVAL='2'
 
@@ -82,17 +84,17 @@ if ! flock -n 9; then
 fi
 
 run_docker() {
-  timeout --signal=TERM "$DOCKER_TIMEOUT" docker "$@"
+  timeout --signal=TERM --kill-after="$DOCKER_KILL_AFTER" "$DOCKER_TIMEOUT" docker "$@"
 }
 
 run_inspect() {
-  timeout --signal=TERM "$INSPECT_TIMEOUT" docker "$@"
+  timeout --signal=TERM --kill-after="$INSPECT_KILL_AFTER" "$INSPECT_TIMEOUT" docker "$@"
 }
 
 run_compose() {
   local image_ref="$1"
 
-  timeout --signal=TERM "$COMPOSE_TIMEOUT" \
+  timeout --signal=TERM --kill-after="$DOCKER_KILL_AFTER" "$COMPOSE_TIMEOUT" \
     env KINVEST_IMAGE="$image_ref" \
     docker compose \
       --project-name kinvest \
@@ -122,6 +124,8 @@ atomic_write_state() {
 
 previous_digest_ref=''
 previous_commit=''
+previous_snapshot_image_id=''
+previous_snapshot_verified='false'
 
 read_previous_state() {
   local first_line=''
@@ -184,6 +188,16 @@ wait_for_health() {
   return 1
 }
 
+current_is_healthy() {
+  local health_status
+
+  if ! health_status="$(run_inspect inspect --format '{{.State.Health.Status}}' kinvest)"; then
+    return 1
+  fi
+
+  [[ "$health_status" == 'healthy' ]]
+}
+
 verify_running_image() {
   local expected_ref="$1"
   local expected_image_id
@@ -203,13 +217,74 @@ verify_running_image() {
   [[ "$actual_image_ref" == "$expected_ref" && "$actual_image_id" == "$expected_image_id" ]]
 }
 
+capture_previous_snapshot() {
+  local actual_image_id
+
+  if ! verify_running_image "$previous_digest_ref" || ! current_is_healthy; then
+    previous_snapshot_verified='false'
+    previous_snapshot_image_id=''
+    return 1
+  fi
+
+  if ! actual_image_id="$(run_inspect inspect --format '{{.Image}}' kinvest)"; then
+    previous_snapshot_verified='false'
+    previous_snapshot_image_id=''
+    return 1
+  fi
+
+  previous_snapshot_image_id="$actual_image_id"
+  previous_snapshot_verified='true'
+}
+
+verify_previous_from_snapshot() {
+  local actual_image_ref
+  local actual_image_id
+
+  if [[ "$previous_snapshot_verified" != 'true' || -z "$previous_snapshot_image_id" ]]; then
+    return 1
+  fi
+  if ! actual_image_ref="$(run_inspect inspect --format '{{.Config.Image}}' kinvest)"; then
+    return 1
+  fi
+  if ! actual_image_id="$(run_inspect inspect --format '{{.Image}}' kinvest)"; then
+    return 1
+  fi
+
+  [[ "$actual_image_ref" == "$previous_digest_ref" ]] &&
+    [[ "$actual_image_id" == "$previous_snapshot_image_id" ]] &&
+    current_is_healthy
+}
+
+previous_is_serving() {
+  if [[ -z "$previous_digest_ref" ]]; then
+    return 1
+  fi
+
+  if verify_running_image "$previous_digest_ref" && current_is_healthy; then
+    return 0
+  fi
+
+  verify_previous_from_snapshot
+}
+
 remove_kinvest_container() {
   run_docker rm -f kinvest >/dev/null
+}
+
+preserve_previous_and_exit() {
+  local original_status="$1"
+
+  printf '%s\n' '部署失败但previous继续服务。' >&2
+  exit "$original_status"
 }
 
 rollback_failure() {
   local reason="$1"
   local original_status="$2"
+
+  if previous_is_serving; then
+    preserve_previous_and_exit "$original_status"
+  fi
 
   printf '%s\n' "$reason" >&2
   if ! remove_kinvest_container; then
@@ -233,6 +308,10 @@ rollback() {
     exit "$original_status"
   fi
 
+  if previous_is_serving; then
+    preserve_previous_and_exit "$original_status"
+  fi
+
   if ! run_docker pull "$previous_digest_ref" >/dev/null; then
     rollback_failure 'Previous digest pull failed.' "$original_status"
   fi
@@ -252,6 +331,12 @@ rollback() {
   printf '%s\n' 'Previous healthy Kinvest digest was restored.' >&2
   exit "$original_status"
 }
+
+if [[ -n "$previous_digest_ref" ]]; then
+  if ! capture_previous_snapshot; then
+    printf '%s\n' 'Previous service was not healthy enough for a deployment snapshot.' >&2
+  fi
+fi
 
 trap 'rollback "$?"' ERR
 

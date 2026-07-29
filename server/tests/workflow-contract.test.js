@@ -78,6 +78,9 @@ exec /usr/bin/id "$@"
   writeExecutable(
     path.join(binDir, 'flock'),
     `#!/bin/sh
+if [ -f "$FAKE_DOCKER_STATE/flock-busy" ]; then
+  exit 75
+fi
 exit 0
 `
   )
@@ -94,11 +97,10 @@ exit 0
     `#!/bin/sh
 set -eu
 printf '%s\\n' "$*" >> "$FAKE_DOCKER_STATE/timeout.log"
-if [ "\${1:-}" = "--signal=TERM" ]; then
-  shift 2
-else
+while [ "\${1:-}" = "--signal=TERM" ] || [ "\${1#--kill-after=}" != "\${1:-}" ]; do
   shift
-fi
+done
+shift
 exec "$@"
 `
   )
@@ -127,7 +129,16 @@ case "$command_name" in
     ;;
   pull)
     ref="\${1:-}"
+    if [[ -f "$state/fail-candidate-pull" && "$ref" == "$CANDIDATE_REF" ]]; then
+      exit 30
+    fi
     if [[ -f "$state/fail-old-pull" && "$ref" == "$OLD_REF" ]]; then
+      if [[ -f "$state/restore-old-on-pull-failure" ]]; then
+        printf '%s\\n' "$OLD_REF" > "$state/running.ref"
+        image_id "$OLD_REF" > "$state/running.id"
+        printf '%s\\n' 'healthy' > "$state/running.health"
+        : > "$state/old-pull-attempted"
+      fi
       exit 31
     fi
     printf '%s\\n' "$ref" >> "$state/pulls.log"
@@ -135,6 +146,9 @@ case "$command_name" in
   image)
     [ "\${1:-}" = 'inspect' ]
     ref="\${4:-}"
+    if [[ "$ref" == "$OLD_REF" && -f "$state/fail-old-image-inspect-after-pull" && -f "$state/old-pull-attempted" ]]; then
+      exit 35
+    fi
     image_id "$ref"
     ;;
   inspect)
@@ -148,12 +162,15 @@ case "$command_name" in
     ;;
   compose)
     ref="\${KINVEST_IMAGE:-}"
+    if [[ -f "$state/fail-candidate-compose" && "$ref" == "$CANDIDATE_REF" ]]; then
+      exit 36
+    fi
     if [[ -f "$state/fail-old-compose" && "$ref" == "$OLD_REF" ]]; then
       exit 33
     fi
     if [[ -f "$state/candidate-mismatch" && "$ref" == "$CANDIDATE_REF" ]]; then
-      printf '%s\\n' "$OLD_REF" > "$state/running.ref"
-      image_id "$OLD_REF" > "$state/running.id"
+      printf '%s\\n' 'ghcr.io/zwphhxx/kinvest@sha256:${'9'.repeat(64)}' > "$state/running.ref"
+      printf 'sha256:%s\\n' '${'9'.repeat(64)}' > "$state/running.id"
     else
       printf '%s\\n' "$ref" > "$state/running.ref"
       image_id "$ref" > "$state/running.id"
@@ -192,6 +209,9 @@ function runDeployFixture(markers = [], { withPrevious = true } = {}) {
       `digest_ref=${previousRef}\ncommit=${previousCommit}\n`,
       { mode: 0o600 }
     )
+    fs.writeFileSync(path.join(fakeState, 'running.ref'), `${previousRef}\n`)
+    fs.writeFileSync(path.join(fakeState, 'running.id'), `sha256:${'1'.repeat(64)}\n`)
+    fs.writeFileSync(path.join(fakeState, 'running.health'), 'healthy\n')
   }
 
   for (const marker of markers) {
@@ -285,6 +305,7 @@ function run() {
   assert.match(deploy, /^PREVIOUS_STATE="\$STATE\/previous\.state"$/m)
   assert.match(deploy, /digest_ref=%s\\ncommit=%s/)
   assert.match(deploy, /timeout --signal=TERM/)
+  assert.match(deploy, /--kill-after=/)
   assert.match(deploy, /verify_running_image/)
   assert.match(deploy, /\.Config\.Image/)
   assert.match(deploy, /run_inspect image inspect/)
@@ -342,26 +363,93 @@ function run() {
     mismatch.cleanup()
   }
 
-  const pullFailure = runDeployFixture(['candidate-mismatch', 'fail-old-pull'])
+  const candidatePullFailure = runDeployFixture(['fail-candidate-pull'])
   try {
-    assert.notEqual(pullFailure.result.status, 0)
-    assert.ok(fs.existsSync(path.join(pullFailure.fakeState, 'removed')))
-    assert.match(pullFailure.result.stderr, /previous digest pull failed/i)
-    assert.match(pullFailure.result.stderr, /manual intervention is required/i)
-    assert.doesNotMatch(pullFailure.result.stderr, /was restored/)
+    assert.notEqual(candidatePullFailure.result.status, 0)
+    assert.equal(
+      fs.readFileSync(path.join(candidatePullFailure.fakeState, 'running.ref'), 'utf8').trim(),
+      previousRef
+    )
+    assert.equal(fs.existsSync(path.join(candidatePullFailure.fakeState, 'removed')), false)
+    assert.match(candidatePullFailure.result.stderr, /部署失败但previous继续服务/)
   } finally {
-    pullFailure.cleanup()
+    candidatePullFailure.cleanup()
   }
 
-  const composeFailure = runDeployFixture(['candidate-mismatch', 'fail-old-compose'])
+  const candidateComposeFailure = runDeployFixture(['fail-candidate-compose'])
   try {
-    assert.notEqual(composeFailure.result.status, 0)
-    assert.ok(fs.existsSync(path.join(composeFailure.fakeState, 'removed')))
-    assert.match(composeFailure.result.stderr, /previous release compose failed/i)
-    assert.match(composeFailure.result.stderr, /manual intervention is required/i)
-    assert.doesNotMatch(composeFailure.result.stderr, /was restored/)
+    assert.notEqual(candidateComposeFailure.result.status, 0)
+    assert.equal(
+      fs.readFileSync(path.join(candidateComposeFailure.fakeState, 'running.ref'), 'utf8').trim(),
+      previousRef
+    )
+    assert.equal(fs.existsSync(path.join(candidateComposeFailure.fakeState, 'removed')), false)
+    assert.match(candidateComposeFailure.result.stderr, /部署失败但previous继续服务/)
   } finally {
-    composeFailure.cleanup()
+    candidateComposeFailure.cleanup()
+  }
+
+  const successfulRollback = runDeployFixture(['candidate-mismatch'])
+  try {
+    assert.notEqual(successfulRollback.result.status, 0)
+    assert.equal(
+      fs.readFileSync(path.join(successfulRollback.fakeState, 'running.ref'), 'utf8').trim(),
+      previousRef
+    )
+    assert.equal(fs.existsSync(path.join(successfulRollback.fakeState, 'removed')), false)
+    assert.match(successfulRollback.result.stderr, /previous healthy Kinvest digest was restored/i)
+  } finally {
+    successfulRollback.cleanup()
+  }
+
+  const snapshotPreserved = runDeployFixture([
+    'candidate-mismatch',
+    'fail-old-pull',
+    'restore-old-on-pull-failure',
+    'fail-old-image-inspect-after-pull'
+  ])
+  try {
+    assert.notEqual(snapshotPreserved.result.status, 0)
+    assert.equal(
+      fs.readFileSync(path.join(snapshotPreserved.fakeState, 'running.ref'), 'utf8').trim(),
+      previousRef
+    )
+    assert.equal(fs.existsSync(path.join(snapshotPreserved.fakeState, 'removed')), false)
+    assert.match(snapshotPreserved.result.stderr, /部署失败但previous继续服务/)
+    assert.doesNotMatch(snapshotPreserved.result.stderr, /manual intervention is required/i)
+  } finally {
+    snapshotPreserved.cleanup()
+  }
+
+  const currentNotPrevious = runDeployFixture(['candidate-mismatch', 'fail-old-pull'])
+  try {
+    assert.notEqual(currentNotPrevious.result.status, 0)
+    assert.ok(fs.existsSync(path.join(currentNotPrevious.fakeState, 'removed')))
+    assert.match(currentNotPrevious.result.stderr, /previous digest pull failed/i)
+    assert.match(currentNotPrevious.result.stderr, /manual intervention is required/i)
+    assert.doesNotMatch(currentNotPrevious.result.stderr, /previous继续服务/)
+  } finally {
+    currentNotPrevious.cleanup()
+  }
+
+  const composeRollbackFailure = runDeployFixture(['candidate-mismatch', 'fail-old-compose'])
+  try {
+    assert.notEqual(composeRollbackFailure.result.status, 0)
+    assert.ok(fs.existsSync(path.join(composeRollbackFailure.fakeState, 'removed')))
+    assert.match(composeRollbackFailure.result.stderr, /previous release compose failed/i)
+    assert.match(composeRollbackFailure.result.stderr, /manual intervention is required/i)
+  } finally {
+    composeRollbackFailure.cleanup()
+  }
+
+  const flockRejected = runDeployFixture(['flock-busy'])
+  try {
+    assert.notEqual(flockRejected.result.status, 0)
+    assert.match(flockRejected.result.stderr, /already running/i)
+    assert.equal(fs.existsSync(path.join(flockRejected.fakeState, 'removed')), false)
+    assert.equal(fs.existsSync(path.join(flockRejected.fakeState, 'pulls.log')), false)
+  } finally {
+    flockRejected.cleanup()
   }
 
   const success = runDeployFixture()
@@ -380,6 +468,7 @@ function run() {
     assert.match(timeoutLog, /docker compose/)
     assert.match(timeoutLog, /docker image inspect/)
     assert.match(timeoutLog, /docker inspect/)
+    assert.match(timeoutLog, /--kill-after=/)
   } finally {
     success.cleanup()
   }
