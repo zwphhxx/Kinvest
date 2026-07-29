@@ -9,6 +9,7 @@ const { createIfindClient } = require('./adapters/ifindAdapter')
 const PORT = Number(process.env.PORT || 4173)
 const ROOT = path.join(__dirname, '..')
 const PUBLIC_DIR = path.join(ROOT, 'public')
+const RUNTIME_FILE_CREATION_MASK = 0o077
 
 const MIME = {
   '.html': 'text/html; charset=utf-8',
@@ -257,6 +258,23 @@ const server = http.createServer(async (req, res) => {
   serveStatic(req, res, pathname)
 })
 
-server.listen(PORT, () => {
-  console.log(`Kinvest mock server started at http://localhost:${PORT}`)
-})
+function applyRuntimeFileCreationMask() {
+  return process.umask(RUNTIME_FILE_CREATION_MASK)
+}
+
+function startServer() {
+  applyRuntimeFileCreationMask()
+  server.listen(PORT, () => {
+    console.log(`Kinvest mock server started at http://localhost:${PORT}`)
+  })
+  return server
+}
+
+if (require.main === module) {
+  startServer()
+}
+
+module.exports = {
+  applyRuntimeFileCreationMask,
+  startServer
+}
