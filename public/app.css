@@ -333,6 +333,10 @@ thead th {
     align-items: flex-start;
   }
 
+  #company-content {
+    overflow-x: clip;
+  }
+
   .table-scroll-hint {
     display: block;
     margin: -2px 0 6px;

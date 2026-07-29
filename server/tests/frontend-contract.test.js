@@ -11,6 +11,22 @@ function read(filePath) {
   return fs.readFileSync(filePath, 'utf8')
 }
 
+function extractCssBlock(css, selector) {
+  const selectorIndex = css.indexOf(selector)
+  assert.notEqual(selectorIndex, -1, `Missing CSS selector: ${selector}`)
+  const openingBrace = css.indexOf('{', selectorIndex)
+  assert.notEqual(openingBrace, -1, `Missing CSS block: ${selector}`)
+  let depth = 1
+
+  for (let index = openingBrace + 1; index < css.length; index += 1) {
+    if (css[index] === '{') depth += 1
+    if (css[index] === '}') depth -= 1
+    if (depth === 0) return css.slice(openingBrace + 1, index)
+  }
+
+  assert.fail(`Unclosed CSS block: ${selector}`)
+}
+
 function loadFinanceContracts() {
   return require('../../public/finance-contract')
 }
@@ -187,6 +203,11 @@ function assertFaviconAndMobileTableScrolling() {
   assert.match(css, /\.table-scroll\s*\{[^}]*overflow-x:\s*auto;/s)
   assert.match(css, /\.finance-table-scroll table\s*\{[^}]*min-width:/s)
   assert.match(css, /\.breakdown-table-scroll table\s*\{[^}]*min-width:/s)
+
+  const mobileCss = extractCssBlock(css, '@media (max-width: 860px)')
+  const mobileCompanyContent = extractCssBlock(mobileCss, '#company-content')
+  assert.match(mobileCompanyContent, /overflow-x:\s*clip;/)
+  assert.doesNotMatch(mobileCss, /body\s*\{[^}]*overflow-x:\s*hidden;/s)
 }
 
 async function run() {
