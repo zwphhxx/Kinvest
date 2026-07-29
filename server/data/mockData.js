@@ -7,11 +7,13 @@ const watchlist = [
 
 function mkPeriod(type, period, fields) {
   return {
+    dataMode: fields.dataMode,
     periodType: type,
     period,
     source: {
       sourceName: fields.sourceName,
       sourceType: fields.sourceType,
+      mockContractVerified: fields.mockContractVerified,
       scopeVerified: fields.scopeVerified,
       sourceTime: new Date(fields.sourceTime),
       fetchTime: new Date(fields.fetchTime)
@@ -71,9 +73,10 @@ const companies = [
     financials: {
       annual: [
         mkPeriod('annual', '2024', {
-          sourceName: 'iFinD company 指标',
-          sourceType: 'ifind_indicator',
-          scopeVerified: true,
+          dataMode: 'mock',
+          sourceName: 'Mock fixture（模拟 iFinD 指标结构，非真实返回）',
+          sourceType: 'mock_fixture',
+          mockContractVerified: true,
           sourceTime: '2026-07-27T20:13:00.000Z',
           fetchTime: '2026-07-28T03:10:00.000Z',
           currency: 'HKD',
@@ -96,9 +99,10 @@ const companies = [
           }
         }),
         mkPeriod('annual', '2025', {
-          sourceName: 'iFinD company 指标',
-          sourceType: 'ifind_indicator',
-          scopeVerified: true,
+          dataMode: 'mock',
+          sourceName: 'Mock fixture（模拟 iFinD 指标结构，非真实返回）',
+          sourceType: 'mock_fixture',
+          mockContractVerified: true,
           sourceTime: '2026-07-27T20:13:00.000Z',
           fetchTime: '2026-07-28T03:10:00.000Z',
           currency: 'HKD',
@@ -123,9 +127,10 @@ const companies = [
       ],
       quarterly: [
         mkPeriod('quarter', '2026-Q1', {
-          sourceName: 'iFinD company 指标',
-          sourceType: 'ifind_indicator',
-          scopeVerified: true,
+          dataMode: 'mock',
+          sourceName: 'Mock fixture（模拟 iFinD 指标结构，非真实返回）',
+          sourceType: 'mock_fixture',
+          mockContractVerified: true,
           sourceTime: '2026-07-27T20:13:00.000Z',
           fetchTime: '2026-07-28T03:10:00.000Z',
           currency: 'HKD',
@@ -351,9 +356,10 @@ const companies = [
     financials: {
       annual: [
         mkPeriod('annual', '2025', {
-          sourceName: 'iFinD company 指标',
-          sourceType: 'ifind_indicator',
-          scopeVerified: true,
+          dataMode: 'mock',
+          sourceName: 'Mock fixture（模拟 iFinD 指标结构，非真实返回）',
+          sourceType: 'mock_fixture',
+          mockContractVerified: true,
           sourceTime: '2026-07-27T20:13:00.000Z',
           fetchTime: '2026-07-28T03:10:00.000Z',
           currency: 'USD',

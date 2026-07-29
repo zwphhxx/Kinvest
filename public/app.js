@@ -149,7 +149,7 @@ function renderFinance(company) {
   ].filter(([k]) => rows.some((r) => r.values?.[k] !== undefined))
 
   const header = `<tr>
-    <th>期间</th><th>报告日</th><th>币种</th><th>单位</th><th>口径来源</th><th>获取时间</th>
+    <th>期间</th><th>数据身份</th><th>报告日</th><th>币种</th><th>单位</th><th>口径来源</th><th>获取时间</th>
     ${columns.map((item) => `<th>${item[1]}</th>`).join('')}
   </tr>`
   const body = rows.map((r) => {
@@ -159,16 +159,19 @@ function renderFinance(company) {
       return `<td>${formatted}</td>`
     }).join('')
     return `<tr>
-      <td>${r.period}</td><td>${r.reportDate}</td><td>${r.currency}</td><td>${r.unit}</td>
+      <td>${r.period}</td><td>${r.dataMode === 'mock' ? 'Mock（非真实）' : '真实来源（已验）'}</td>
+      <td>${r.reportDate}</td><td>${r.currency}</td><td>${r.unit}</td>
       <td>${r.source.sourceName}</td><td>${formatDateTime(r.source.fetchTime)}</td>${cols}
     </tr>`
   }).join('')
+  const mockCount = rows.filter((r) => r.dataMode === 'mock').length
+  const mockSummary = mockCount > 0 ? `，其中 ${mockCount} 条为 Mock 模拟数据` : ''
   const rejectedSummary = prepared.rejectedCount > 0
     ? `<p class="muted">该报告期来源口径未验证，未展示数据（${prepared.rejectedCount} 条）。</p>`
     : ''
 
   el.financeTableWrap.innerHTML = `
-    <p class="muted">已展示 ${rows.length} 条来源口径已验证的财务记录。</p>
+    <p class="muted">已展示 ${rows.length} 条通过展示契约的财务记录${mockSummary}。</p>
     ${rejectedSummary}
     <table>
       <thead>${header}</thead>

@@ -5,6 +5,12 @@ const FINANCE_MODE_KEYS = Object.freeze({
   quarter: 'quarterly'
 })
 
+const VERIFIED_REAL_SOURCE_TYPES = Object.freeze([
+  'ifind_indicator',
+  'ifind_topic_report',
+  'official_announcement'
+])
+
 function isNonEmptyString(value) {
   return typeof value === 'string' && value.trim().length > 0
 }
@@ -31,9 +37,19 @@ function isVerifiedFinanceRow(row) {
   const source = row.source
   if (!source || typeof source !== 'object' || Array.isArray(source)) return false
 
-  return isNonEmptyString(source.sourceName) &&
-    isNonEmptyString(source.sourceType) &&
+  const isExplicitMock = row.dataMode === 'mock' &&
+    source.sourceType === 'mock_fixture' &&
+    source.mockContractVerified === true &&
+    source.scopeVerified !== true &&
+    /mock/i.test(source.sourceName) &&
+    source.sourceName.includes('非真实')
+  const isVerifiedReal = row.dataMode === 'real' &&
     source.scopeVerified === true &&
+    source.mockContractVerified !== true &&
+    VERIFIED_REAL_SOURCE_TYPES.includes(source.sourceType)
+
+  return (isExplicitMock || isVerifiedReal) &&
+    isNonEmptyString(source.sourceName) &&
     isValidTimestamp(source.sourceTime) &&
     isValidTimestamp(source.fetchTime) &&
     isNonEmptyString(row.period) &&
@@ -55,6 +71,7 @@ function prepareFinanceRows(financials, mode) {
 
 const financeContractApi = {
   FINANCE_MODE_KEYS,
+  VERIFIED_REAL_SOURCE_TYPES,
   getFinanceRowsForMode,
   isVerifiedFinanceRow,
   prepareFinanceRows
