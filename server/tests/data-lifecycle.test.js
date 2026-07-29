@@ -7,6 +7,7 @@ const path = require('node:path')
 
 const rootDir = path.resolve(__dirname, '../..')
 const migrationLibraryPath = path.join(rootDir, 'deploy/server/migrate-data-uid-lib.sh')
+const migrationWrapperPath = path.join(rootDir, 'deploy/server/migrate-data-uid.sh')
 
 function writeExecutable(filePath, source) {
   fs.writeFileSync(filePath, source, { mode: 0o755 })
@@ -14,6 +15,90 @@ function writeExecutable(filePath, source) {
 
 function fileHash(filePath) {
   return crypto.createHash('sha256').update(fs.readFileSync(filePath)).digest('hex')
+}
+
+function runInstalledProductionWrapper() {
+  const rawFixtureRoot = fs.mkdtempSync(path.join(os.tmpdir(), 'kinvest-migration-wrapper-'))
+  const fixtureRoot = fs.realpathSync(rawFixtureRoot)
+  const kinvestRoot = path.join(fixtureRoot, 'kinvest')
+  const stateDir = path.join(kinvestRoot, 'state')
+  const fakeBin = path.join(fixtureRoot, 'bin')
+  const attackerRoot = path.join(fixtureRoot, 'attacker')
+
+  fs.mkdirSync(stateDir, { recursive: true })
+  fs.mkdirSync(fakeBin)
+  fs.copyFileSync(migrationLibraryPath, path.join(kinvestRoot, 'migrate-data-uid-lib.sh'))
+
+  const adapterSource = `#!/bin/sh
+case "\${0##*/}" in
+  id)
+    [ "$#" -eq 1 ] && [ "$1" = '-u' ] || exit 90
+    printf '%s\\n' '0'
+    ;;
+  flock)
+    [ "$#" -eq 2 ] && [ "$1" = '-n' ] && [ "$2" = '9' ] || exit 91
+    ;;
+esac
+`
+  const adapterPaths = {}
+  for (const name of [
+    'id',
+    'docker',
+    'flock',
+    'stat',
+    'fuser',
+    'mktemp',
+    'rm',
+    'setpriv',
+    'chown',
+    'chmod'
+  ]) {
+    const adapterPath = path.join(fakeBin, name)
+    writeExecutable(adapterPath, adapterSource)
+    adapterPaths[name] = adapterPath
+  }
+
+  const replacements = new Map([
+    ['/root/docker/kinvest', kinvestRoot],
+    ['/usr/bin/id', adapterPaths.id],
+    ['/usr/bin/docker', adapterPaths.docker],
+    ['/usr/bin/flock', adapterPaths.flock],
+    ['/usr/bin/stat', adapterPaths.stat],
+    ['/usr/sbin/fuser', adapterPaths.fuser],
+    ['/usr/bin/mktemp', adapterPaths.mktemp],
+    ['/usr/bin/rm', adapterPaths.rm],
+    ['/usr/bin/setpriv', adapterPaths.setpriv],
+    ['/usr/bin/chown', adapterPaths.chown],
+    ['/usr/bin/chmod', adapterPaths.chmod]
+  ])
+  let installedWrapper = fs.readFileSync(migrationWrapperPath, 'utf8')
+  for (const [productionValue, fixtureValue] of replacements) {
+    installedWrapper = installedWrapper.split(productionValue).join(fixtureValue)
+  }
+
+  const installedWrapperPath = path.join(fixtureRoot, 'migrate-data-uid.sh')
+  writeExecutable(installedWrapperPath, installedWrapper)
+  const result = spawnSync(installedWrapperPath, [], {
+    encoding: 'utf8',
+    env: {
+      ...process.env,
+      DATA_DIR: path.join(attackerRoot, 'data'),
+      KINVEST_FIXED_DATA_DIR: path.join(attackerRoot, 'fixed-data'),
+      KINVEST_FIXED_MIGRATION_ROOT: attackerRoot,
+      KINVEST_FIXED_STATE_DIR: path.join(attackerRoot, 'fixed-state'),
+      MIGRATION_ROOT: attackerRoot,
+      STATE_DIR: path.join(attackerRoot, 'state')
+    }
+  })
+
+  return {
+    attackerRoot,
+    cleanup() {
+      fs.rmSync(fixtureRoot, { recursive: true, force: true })
+    },
+    lockPath: path.join(stateDir, 'deploy.lock'),
+    result
+  }
 }
 
 function runMigrationCore({
@@ -391,6 +476,17 @@ function assertNoFileMutation(fixture, before) {
 
 function run() {
   assert.equal(fs.existsSync(migrationLibraryPath), true, 'the executable migration core library must exist')
+  assert.equal(fs.existsSync(migrationWrapperPath), true, 'the production migration wrapper must exist')
+
+  const productionWrapper = runInstalledProductionWrapper()
+  try {
+    assert.equal(productionWrapper.result.status, 0, productionWrapper.result.stderr)
+    assert.doesNotMatch(productionWrapper.result.stderr, /readonly variable|read only/i)
+    assert.equal(fs.existsSync(productionWrapper.lockPath), true)
+    assert.equal(fs.existsSync(productionWrapper.attackerRoot), false)
+  } finally {
+    productionWrapper.cleanup()
+  }
 
   for (const status of ['running', 'paused', 'restarting']) {
     const mountedSameSource = runMigrationCore({

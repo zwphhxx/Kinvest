@@ -6,18 +6,21 @@ if [ "$#" -ne 0 ]; then
   exit 2
 fi
 
-MIGRATION_ROOT='/root/docker/kinvest'
-DATA_DIR='/root/docker/kinvest/data'
-STATE_DIR='/root/docker/kinvest/state'
+KINVEST_FIXED_MIGRATION_ROOT='/root/docker/kinvest'
+KINVEST_FIXED_DATA_DIR='/root/docker/kinvest/data'
+KINVEST_FIXED_STATE_DIR='/root/docker/kinvest/state'
 
-readonly MIGRATION_ROOT DATA_DIR STATE_DIR
+readonly \
+  KINVEST_FIXED_MIGRATION_ROOT \
+  KINVEST_FIXED_DATA_DIR \
+  KINVEST_FIXED_STATE_DIR
 
 . '/root/docker/kinvest/migrate-data-uid-lib.sh'
 
 kinvest_migrate_data_uid \
-  "$MIGRATION_ROOT" \
-  "$DATA_DIR" \
-  "$STATE_DIR" \
+  "$KINVEST_FIXED_MIGRATION_ROOT" \
+  "$KINVEST_FIXED_DATA_DIR" \
+  "$KINVEST_FIXED_STATE_DIR" \
   '/usr/bin/id' \
   '/usr/bin/docker' \
   '/usr/bin/flock' \

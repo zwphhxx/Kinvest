@@ -457,9 +457,14 @@ async function run() {
   assertRelativeProbeWorksInsideRestrictedParent()
 
   assert.equal(fs.statSync(migrationScriptPath).mode & 0o111, 0o111)
-  assert.match(migrationScript, /^MIGRATION_ROOT='\/root\/docker\/kinvest'$/m)
-  assert.match(migrationScript, /^DATA_DIR='\/root\/docker\/kinvest\/data'$/m)
-  assert.match(migrationScript, /^STATE_DIR='\/root\/docker\/kinvest\/state'$/m)
+  assert.match(migrationScript, /^KINVEST_FIXED_MIGRATION_ROOT='\/root\/docker\/kinvest'$/m)
+  assert.match(migrationScript, /^KINVEST_FIXED_DATA_DIR='\/root\/docker\/kinvest\/data'$/m)
+  assert.match(migrationScript, /^KINVEST_FIXED_STATE_DIR='\/root\/docker\/kinvest\/state'$/m)
+  assert.match(
+    migrationScript,
+    /readonly \\\n\s+KINVEST_FIXED_MIGRATION_ROOT \\\n\s+KINVEST_FIXED_DATA_DIR \\\n\s+KINVEST_FIXED_STATE_DIR/
+  )
+  assert.doesNotMatch(migrationScript, /^readonly MIGRATION_ROOT DATA_DIR STATE_DIR$/m)
   assert.match(migrationScript, /^\.\s+'\/root\/docker\/kinvest\/migrate-data-uid-lib\.sh'$/m)
   assert.match(migrationScript, /if \[ "\$#" -ne 0 \]/)
   assert.doesNotMatch(migrationScript, /\$\{[^}]+:-/)
