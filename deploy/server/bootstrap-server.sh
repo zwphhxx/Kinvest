@@ -89,6 +89,45 @@ for target_component in '/root' "$DOCKER_ROOT" "$TARGET" "$TARGET/data" "$TARGET
   assert_not_symlink "$target_component"
 done
 
+DEPLOY_ACCOUNT_STATE=''
+deploy_record=''
+existing_deploy_uid=''
+existing_deploy_gid=''
+deploy_home=''
+
+if id "$DEPLOY_USER" >/dev/null 2>&1; then
+  DEPLOY_ACCOUNT_STATE='existing'
+  deploy_record="$(getent passwd "$DEPLOY_USER")"
+  IFS=: read -r _ _ existing_deploy_uid existing_deploy_gid _ deploy_home _ <<< "$deploy_record"
+
+  if [[ -z "$existing_deploy_uid" || -z "$existing_deploy_gid" ]]; then
+    printf '%s\n' 'existing deployment user has an invalid account record' >&2
+    exit 1
+  fi
+  if [[ "$existing_deploy_uid" == "$APP_UID" || "$existing_deploy_gid" == "$APP_GID" ]]; then
+    printf '%s\n' 'deployment user must not share the Kinvest application UID or GID' >&2
+    exit 1
+  fi
+  if [[ "$deploy_home" != "$DEPLOY_HOME" ]]; then
+    printf '%s\n' 'existing deployment user has an unexpected home directory' >&2
+    exit 1
+  fi
+  if id -nG "$DEPLOY_USER" | grep -Eq '(^|[[:space:]])docker($|[[:space:]])'; then
+    printf '%s\n' 'deployment user has forbidden direct Docker daemon access' >&2
+    exit 1
+  fi
+else
+  DEPLOY_ACCOUNT_STATE='fresh'
+  if getent passwd "$DEPLOY_UID" >/dev/null || getent group "$DEPLOY_GID" >/dev/null; then
+    printf '%s\n' "deployment UID:GID $DEPLOY_UID:$DEPLOY_GID is already assigned" >&2
+    exit 1
+  fi
+  if getent passwd "$DEPLOY_USER" >/dev/null || getent group "$DEPLOY_USER" >/dev/null; then
+    printf '%s\n' "deployment account name is partially assigned: $DEPLOY_USER" >&2
+    exit 1
+  fi
+fi
+
 install -d -o root -g root -m 0750 -- "$TARGET"
 install -d -o root -g root -m 0700 -- "$TARGET/state"
 
@@ -108,16 +147,7 @@ install -o root -g root -m 0755 -- "$TARGET/kinvest-ssh-command" "$LOCAL_SSH_COM
 "$TARGET/migrate-data-uid.sh" >/dev/null
 "$TARGET/prepare-data-dir.sh" >/dev/null
 
-if ! id "$DEPLOY_USER" >/dev/null 2>&1; then
-  if getent passwd "$DEPLOY_UID" >/dev/null || getent group "$DEPLOY_GID" >/dev/null; then
-    printf '%s\n' "deployment UID:GID $DEPLOY_UID:$DEPLOY_GID is already assigned" >&2
-    exit 1
-  fi
-  if getent passwd "$DEPLOY_USER" >/dev/null || getent group "$DEPLOY_USER" >/dev/null; then
-    printf '%s\n' "deployment account name is partially assigned: $DEPLOY_USER" >&2
-    exit 1
-  fi
-
+if [[ "$DEPLOY_ACCOUNT_STATE" == 'fresh' ]]; then
   groupadd --gid "$DEPLOY_GID" "$DEPLOY_USER"
   useradd --uid "$DEPLOY_UID" --gid "$DEPLOY_GID" --create-home --home-dir "$DEPLOY_HOME" --shell /bin/bash "$DEPLOY_USER"
 fi

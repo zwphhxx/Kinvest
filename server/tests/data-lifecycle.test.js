@@ -20,7 +20,9 @@ function runMigrationCore({
   containers = [],
   files,
   flockConflict = false,
-  fuserResult = 'clear'
+  fuserResult = 'clear',
+  restoreFailure = '',
+  signalAfterFinal = ''
 }) {
   const rawFixtureRoot = fs.mkdtempSync(path.join(os.tmpdir(), 'kinvest-migration-core-'))
   const fixtureRoot = fs.realpathSync(rawFixtureRoot)
@@ -39,6 +41,8 @@ function runMigrationCore({
   fs.writeFileSync(path.join(modelDir, 'directory.owner'), '1000:1000\n')
   fs.writeFileSync(path.join(modelDir, 'directory.mode'), '750\n')
   fs.writeFileSync(path.join(modelDir, 'fuser.result'), `${fuserResult}\n`)
+  fs.writeFileSync(path.join(modelDir, 'restore.failure'), `${restoreFailure}\n`)
+  fs.writeFileSync(path.join(modelDir, 'signal.after-final'), `${signalAfterFinal}\n`)
   fs.writeFileSync(path.join(modelDir, 'container.ids'), containers.map(({ id }) => id).join('\n'))
   if (flockConflict) {
     fs.writeFileSync(path.join(modelDir, 'flock.conflict'), '')
@@ -124,18 +128,47 @@ exit 93
   writeExecutable(
     path.join(fakeBin, 'fuser'),
     `#!/bin/sh
-[ "$#" -eq 2 ] && [ "$1" = '-s' ] || exit 94
-case "$2" in
+[ "$#" -eq 1 ] || exit 94
+case "$1" in
   kinvest.sqlite|kinvest.sqlite-wal|kinvest.sqlite-shm|kinvest.sqlite-journal) ;;
   *) exit 95 ;;
 esac
-printf '%s\\n' "fuser -s $2" >> "$KINVEST_TEST_MODEL/operations.log"
+printf '%s\\n' "fuser $1" >> "$KINVEST_TEST_MODEL/operations.log"
 case "$(cat "$KINVEST_TEST_MODEL/fuser.result")" in
   clear) exit 1 ;;
-  busy) exit 0 ;;
+  busy) printf '%s\\n' '4321'; exit 0 ;;
+  exit1-stderr) printf '%s\\n' 'diagnostic' >&2; exit 1 ;;
+  exit1-stdout) printf '%s\\n' 'contradiction'; exit 1 ;;
+  exit0-empty) exit 0 ;;
   error) exit 2 ;;
   *) exit 96 ;;
 esac
+`
+  )
+
+  writeExecutable(
+    path.join(fakeBin, 'mktemp'),
+    `#!/bin/sh
+[ "$#" -eq 1 ] || exit 114
+case "$1" in
+  "$KINVEST_TEST_STATE"/.kinvest-fuser-*.XXXXXXXXXX) ;;
+  *) exit 115 ;;
+esac
+printf '%s\\n' "mktemp $1" >> "$KINVEST_TEST_MODEL/operations.log"
+exec /usr/bin/mktemp "$1"
+`
+  )
+
+  writeExecutable(
+    path.join(fakeBin, 'rm'),
+    `#!/bin/sh
+[ "$#" -eq 3 ] && [ "$1" = '-f' ] && [ "$2" = '--' ] || exit 116
+case "$3" in
+  "$KINVEST_TEST_STATE"/.kinvest-fuser-*) ;;
+  *) exit 117 ;;
+esac
+printf '%s\\n' "rm -f -- $3" >> "$KINVEST_TEST_MODEL/operations.log"
+exec /bin/rm -f "$3"
 `
   )
 
@@ -148,7 +181,14 @@ target="$3"
 case "$target" in
   .)
     case "$owner" in root:root) owner='0:0' ;; 10001:10001) ;; *) exit 98 ;; esac
+    if [ "$owner" = '0:0' ] && [ -f "$KINVEST_TEST_MODEL/final-handoff" ]; then
+      : > "$KINVEST_TEST_MODEL/restore-started"
+      [ "$(cat "$KINVEST_TEST_MODEL/restore.failure")" != 'chown' ] || exit 118
+    fi
     printf '%s\\n' "$owner" > "$KINVEST_TEST_MODEL/directory.owner"
+    if [ "$owner" = '10001:10001' ]; then
+      : > "$KINVEST_TEST_MODEL/final-handoff"
+    fi
     ;;
   kinvest.sqlite|kinvest.sqlite-wal|kinvest.sqlite-shm|kinvest.sqlite-journal)
     [ "$owner" = '10001:10001' ] || exit 99
@@ -160,6 +200,10 @@ case "$target" in
     ;;
 esac
 printf '%s\\n' "chown $1 -- $target" >> "$KINVEST_TEST_MODEL/operations.log"
+if [ "$target" = '.' ] && [ "$owner" = '10001:10001' ]; then
+  signal="$(cat "$KINVEST_TEST_MODEL/signal.after-final")"
+  [ -z "$signal" ] || kill "-$signal" "$PPID"
+fi
 `
   )
 
@@ -170,7 +214,12 @@ printf '%s\\n' "chown $1 -- $target" >> "$KINVEST_TEST_MODEL/operations.log"
 mode="$1"
 target="$3"
 case "$target:$mode" in
-  .:0700) stored_mode='700' ;;
+  .:0700)
+    if [ -f "$KINVEST_TEST_MODEL/restore-started" ]; then
+      [ "$(cat "$KINVEST_TEST_MODEL/restore.failure")" != 'chmod' ] || exit 119
+    fi
+    stored_mode='700'
+    ;;
   .:0750) stored_mode='750' ;;
   kinvest.sqlite:0600|kinvest.sqlite-wal:0600|kinvest.sqlite-shm:0600|kinvest.sqlite-journal:0600)
     [ -f "$KINVEST_TEST_MODEL/$target.mode" ] || exit 103
@@ -199,8 +248,17 @@ target="$4"
 if [ "$target" = '.' ]; then
   case "$format" in
     '%F') printf '%s\\n' 'directory' ;;
-    '%u:%g') cat "$KINVEST_TEST_MODEL/directory.owner" ;;
-    '%a') cat "$KINVEST_TEST_MODEL/directory.mode" ;;
+    '%u:%g'|'%a')
+      if [ -f "$KINVEST_TEST_MODEL/restore-started" ] &&
+        [ "$(cat "$KINVEST_TEST_MODEL/restore.failure")" = 'stat' ]; then
+        exit 120
+      fi
+      if [ "$format" = '%u:%g' ]; then
+        cat "$KINVEST_TEST_MODEL/directory.owner"
+      else
+        cat "$KINVEST_TEST_MODEL/directory.mode"
+      fi
+      ;;
     *) exit 106 ;;
   esac
   exit 0
@@ -259,6 +317,8 @@ kinvest_migrate_data_uid "$@"
       path.join(fakeBin, 'flock'),
       path.join(fakeBin, 'stat'),
       path.join(fakeBin, 'fuser'),
+      path.join(fakeBin, 'mktemp'),
+      path.join(fakeBin, 'rm'),
       path.join(fakeBin, 'setpriv'),
       path.join(fakeBin, 'chown'),
       path.join(fakeBin, 'chmod'),
@@ -268,7 +328,8 @@ kinvest_migrate_data_uid "$@"
       encoding: 'utf8',
       env: {
         ...process.env,
-        KINVEST_TEST_MODEL: modelDir
+        KINVEST_TEST_MODEL: modelDir,
+        KINVEST_TEST_STATE: stateDir
       }
     }
   )
@@ -350,7 +411,13 @@ function run() {
     }
   }
 
-  for (const fuserResult of ['busy', 'error']) {
+  for (const fuserResult of [
+    'busy',
+    'exit1-stderr',
+    'exit1-stdout',
+    'exit0-empty',
+    'error'
+  ]) {
     const occupied = runMigrationCore({
       files: [{ name: 'kinvest.sqlite', content: `before-${fuserResult}` }],
       fuserResult
@@ -363,6 +430,14 @@ function run() {
         fuserResult === 'busy' ? /open file handle/i : /Unable to verify open file handles/
       )
       assertNoFileMutation(occupied, before)
+      assert.equal(
+        occupied.operationLines().filter((line) => line.startsWith('mktemp ')).length,
+        2
+      )
+      assert.equal(
+        occupied.operationLines().filter((line) => line.startsWith('rm -f -- ')).length,
+        2
+      )
     } finally {
       occupied.cleanup()
     }
@@ -423,6 +498,42 @@ function run() {
     assert.deepEqual(lockConflict.operationLines(), ['flock -n 9'])
   } finally {
     lockConflict.cleanup()
+  }
+
+  /** @type {Array<[string, number]>} */
+  const signalCases = [
+    ['HUP', 129],
+    ['INT', 130],
+    ['TERM', 143]
+  ]
+
+  for (const [signal, expectedStatus] of signalCases) {
+    const interrupted = runMigrationCore({
+      files: [{ name: 'kinvest.sqlite' }],
+      signalAfterFinal: signal
+    })
+    try {
+      assert.equal(interrupted.result.status, expectedStatus)
+      assert.deepEqual(interrupted.directoryModel(), { mode: '700', owner: '0:0' })
+      assert.match(interrupted.result.stderr, /data remains root-only/i)
+    } finally {
+      interrupted.cleanup()
+    }
+  }
+
+  for (const restoreFailure of ['chown', 'chmod', 'stat']) {
+    const failedRestore = runMigrationCore({
+      files: [{ name: 'kinvest.sqlite' }],
+      restoreFailure,
+      signalAfterFinal: 'TERM'
+    })
+    try {
+      assert.equal(failedRestore.result.status, 125)
+      assert.match(failedRestore.result.stderr, /cannot verify root-only|无法验证root-only/i)
+      assert.doesNotMatch(failedRestore.result.stderr, /data remains root-only/i)
+    } finally {
+      failedRestore.cleanup()
+    }
   }
 }
 

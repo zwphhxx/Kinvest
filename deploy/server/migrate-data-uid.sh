@@ -23,6 +23,8 @@ kinvest_migrate_data_uid \
   '/usr/bin/flock' \
   '/usr/bin/stat' \
   '/usr/sbin/fuser' \
+  '/usr/bin/mktemp' \
+  '/usr/bin/rm' \
   '/usr/bin/setpriv' \
   '/usr/bin/chown' \
   '/usr/bin/chmod' \

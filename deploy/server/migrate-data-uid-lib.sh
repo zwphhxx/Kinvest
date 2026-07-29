@@ -1,8 +1,8 @@
 kinvest_migrate_data_uid() {
   set -eu
 
-  if [ "$#" -ne 12 ]; then
-    printf '%s\n' 'Kinvest migration core requires root, data, state, and nine command adapters.' >&2
+  if [ "$#" -ne 14 ]; then
+    printf '%s\n' 'Kinvest migration core requires root, data, state, and eleven command adapters.' >&2
     return 2
   fi
 
@@ -14,11 +14,13 @@ kinvest_migrate_data_uid() {
   FLOCK_COMMAND=$6
   STAT_COMMAND=$7
   FUSER_COMMAND=$8
-  SETPRIV_COMMAND=$9
+  MKTEMP_COMMAND=$9
   shift 9
-  CHOWN_COMMAND=$1
-  CHMOD_COMMAND=$2
-  SHELL_COMMAND=$3
+  RM_COMMAND=$1
+  SETPRIV_COMMAND=$2
+  CHOWN_COMMAND=$3
+  CHMOD_COMMAND=$4
+  SHELL_COMMAND=$5
 
   LOCK_FILE="$STATE_DIR/deploy.lock"
   APP_UID='10001'
@@ -28,6 +30,7 @@ kinvest_migrate_data_uid() {
   SQLITE_FILES='kinvest.sqlite kinvest.sqlite-wal kinvest.sqlite-shm kinvest.sqlite-journal'
   DATA_RECLAIMED='false'
   MIGRATION_COMPLETE='false'
+  FUSER_TEMP_FILES=''
 
   if [ "$DATA_DIR" != "$MIGRATION_ROOT/data" ] || [ "$STATE_DIR" != "$MIGRATION_ROOT/state" ]; then
     printf '%s\n' 'Kinvest migration paths must be rooted under the supplied migration root.' >&2
@@ -45,6 +48,8 @@ kinvest_migrate_data_uid() {
     "$FLOCK_COMMAND" \
     "$STAT_COMMAND" \
     "$FUSER_COMMAND" \
+    "$MKTEMP_COMMAND" \
+    "$RM_COMMAND" \
     "$SETPRIV_COMMAND" \
     "$CHOWN_COMMAND" \
     "$CHMOD_COMMAND" \
@@ -119,6 +124,70 @@ kinvest_migrate_data_uid() {
     return 1
   fi
 
+  cleanup_fuser_temp_files() {
+    TEMP_CLEANUP_OK='true'
+    for TEMP_FILE in $FUSER_TEMP_FILES; do
+      if ! "$RM_COMMAND" -f -- "$TEMP_FILE"; then
+        TEMP_CLEANUP_OK='false'
+      fi
+    done
+    FUSER_TEMP_FILES=''
+    [ "$TEMP_CLEANUP_OK" = 'true' ]
+  }
+
+  finish_migration() {
+    STATUS=$1
+    trap - EXIT HUP INT TERM
+
+    if ! cleanup_fuser_temp_files; then
+      printf '%s\n' 'Unable to clean up Kinvest fuser verification files; manual intervention is required.' >&2
+      STATUS=125
+    fi
+
+    if [ "$DATA_RECLAIMED" = 'true' ] && [ "$MIGRATION_COMPLETE" != 'true' ]; then
+      RESTORE_OK='true'
+
+      if ! "$CHOWN_COMMAND" root:root -- .; then
+        RESTORE_OK='false'
+      fi
+      if ! "$CHMOD_COMMAND" 0700 -- .; then
+        RESTORE_OK='false'
+      fi
+
+      RESTORED_OWNER=''
+      RESTORED_MODE=''
+      if ! RESTORED_OWNER=$("$STAT_COMMAND" -c '%u:%g' -- .); then
+        RESTORE_OK='false'
+      fi
+      if ! RESTORED_MODE=$("$STAT_COMMAND" -c '%a' -- .); then
+        RESTORE_OK='false'
+      fi
+
+      if [ "$RESTORED_OWNER" != '0:0' ] || [ "$RESTORED_MODE" != '700' ]; then
+        RESTORE_OK='false'
+      fi
+
+      if [ "$RESTORE_OK" = 'true' ]; then
+        printf '%s\n' \
+          'Kinvest migration did not complete; data remains root-only and manual intervention is required.' >&2
+        if [ "$STATUS" -eq 0 ]; then
+          STATUS=124
+        fi
+      else
+        printf '%s\n' \
+          'Cannot verify root-only after migration failure; manual intervention is required.' >&2
+        STATUS=125
+      fi
+    fi
+
+    exit "$STATUS"
+  }
+
+  trap 'finish_migration "$?"' EXIT
+  trap 'exit 129' HUP
+  trap 'exit 130' INT
+  trap 'exit 143' TERM
+
   CONTAINER_IDS=$("$DOCKER_COMMAND" ps -aq --no-trunc)
   for CONTAINER_ID in $CONTAINER_IDS; do
     MOUNT_SOURCES=$(
@@ -161,34 +230,45 @@ EOF
       continue
     fi
 
-    if "$FUSER_COMMAND" -s "$SQLITE_FILE"; then
+    umask 077
+    FUSER_STDOUT=$("$MKTEMP_COMMAND" "$STATE_DIR/.kinvest-fuser-stdout.XXXXXXXXXX")
+    FUSER_TEMP_FILES="$FUSER_TEMP_FILES $FUSER_STDOUT"
+    FUSER_STDERR=$("$MKTEMP_COMMAND" "$STATE_DIR/.kinvest-fuser-stderr.XXXXXXXXXX")
+    FUSER_TEMP_FILES="$FUSER_TEMP_FILES $FUSER_STDERR"
+
+    FUSER_STATUS=0
+    if "$FUSER_COMMAND" "$SQLITE_FILE" >"$FUSER_STDOUT" 2>"$FUSER_STDERR"; then
+      FUSER_STATUS=0
+    else
+      FUSER_STATUS=$?
+    fi
+
+    FUSER_STDOUT_HAS_DATA='false'
+    FUSER_STDERR_HAS_DATA='false'
+    [ ! -s "$FUSER_STDOUT" ] || FUSER_STDOUT_HAS_DATA='true'
+    [ ! -s "$FUSER_STDERR" ] || FUSER_STDERR_HAS_DATA='true'
+
+    if [ "$FUSER_STATUS" -eq 1 ] &&
+      [ "$FUSER_STDOUT_HAS_DATA" = 'false' ] &&
+      [ "$FUSER_STDERR_HAS_DATA" = 'false' ]; then
+      :
+    elif [ "$FUSER_STATUS" -eq 0 ] &&
+      [ "$FUSER_STDOUT_HAS_DATA" = 'true' ] &&
+      [ "$FUSER_STDERR_HAS_DATA" = 'false' ]; then
+      cleanup_fuser_temp_files
       printf '%s\n' "SQLite file has an open file handle: $SQLITE_FILE" >&2
       return 1
     else
-      FUSER_STATUS=$?
-      if [ "$FUSER_STATUS" -ne 1 ]; then
-        printf '%s\n' "Unable to verify open file handles for: $SQLITE_FILE" >&2
-        return 1
-      fi
+      cleanup_fuser_temp_files
+      printf '%s\n' "Unable to verify open file handles for: $SQLITE_FILE" >&2
+      return 1
+    fi
+
+    if ! cleanup_fuser_temp_files; then
+      printf '%s\n' 'Unable to clean up fuser verification files.' >&2
+      return 1
     fi
   done
-
-  finish_migration() {
-    STATUS=$?
-    trap - EXIT HUP INT TERM
-
-    if [ "$STATUS" -ne 0 ] && [ "$DATA_RECLAIMED" = 'true' ] &&
-      [ "$MIGRATION_COMPLETE" != 'true' ]; then
-      "$CHOWN_COMMAND" root:root -- . >/dev/null 2>&1 || true
-      "$CHMOD_COMMAND" 0700 -- . >/dev/null 2>&1 || true
-      printf '%s\n' \
-        'Kinvest UID migration failed after data isolation; data remains root-only and manual intervention is required.' >&2
-    fi
-
-    exit "$STATUS"
-  }
-
-  trap finish_migration EXIT HUP INT TERM
 
   "$CHOWN_COMMAND" root:root -- .
   "$CHMOD_COMMAND" 0700 -- .
@@ -278,6 +358,20 @@ EOF
     printf '%s\n' 'Kinvest data directory final ownership verification failed.' >&2
     return 1
   fi
+
+  for SQLITE_FILE in $PRESENT_SQLITE_FILES; do
+    if [ "$("$STAT_COMMAND" -c '%F' -- "$SQLITE_FILE")" != 'regular file' ] &&
+      [ "$("$STAT_COMMAND" -c '%F' -- "$SQLITE_FILE")" != 'regular empty file' ]; then
+      printf '%s\n' "Final SQLite file type verification failed: $SQLITE_FILE" >&2
+      return 1
+    fi
+    if [ "$("$STAT_COMMAND" -c '%h' -- "$SQLITE_FILE")" -ne 1 ] ||
+      [ "$("$STAT_COMMAND" -c '%u:%g' -- "$SQLITE_FILE")" != "$APP_UID:$APP_GID" ] ||
+      [ "$("$STAT_COMMAND" -c '%a' -- "$SQLITE_FILE")" != '600' ]; then
+      printf '%s\n' "Final SQLite file state verification failed: $SQLITE_FILE" >&2
+      return 1
+    fi
+  done
 
   MIGRATION_COMPLETE='true'
   printf '%s\n' "Kinvest offline data UID migration completed for UID:GID $APP_UID:$APP_GID."

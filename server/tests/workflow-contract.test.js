@@ -337,7 +337,14 @@ exit 90
   }
 }
 
-function runBootstrapUserFixture({ existing }) {
+function runBootstrapUserFixture({
+  existing,
+  existingGid = '1001',
+  existingGroups = 'kinvest-deploy',
+  existingHome = '',
+  existingUid = '1001',
+  freshUidTaken = false
+}) {
   const rawFixtureRoot = fs.mkdtempSync(path.join(os.tmpdir(), 'kinvest-bootstrap-user-'))
   const fixtureRoot = fs.realpathSync(rawFixtureRoot)
   const fakeBin = path.join(fixtureRoot, 'bin')
@@ -348,6 +355,7 @@ function runBootstrapUserFixture({ existing }) {
   const localSbin = path.join(fixtureRoot, 'usr/local/sbin')
   const sudoersDir = path.join(fixtureRoot, 'etc/sudoers.d')
   const publicKeyFile = path.join(fixtureRoot, 'deploy.pub')
+  const modeledExistingHome = existingHome || deployHome
 
   for (const directory of [fakeBin, fakeState, sourceDir, dockerRoot, localSbin, sudoersDir]) {
     fs.mkdirSync(directory, { recursive: true })
@@ -360,6 +368,7 @@ function runBootstrapUserFixture({ existing }) {
       path.join(sourceDir, scriptName),
       `#!/bin/sh
 printf '%s\\n' '${scriptName}' >> "$BOOTSTRAP_FAKE_STATE/lifecycle.log"
+printf '%s\\n' 'lifecycle ${scriptName}' >> "$BOOTSTRAP_FAKE_STATE/operations.log"
 `
     )
   }
@@ -379,7 +388,7 @@ if [ "\${1:-}" = '-u' ] && [ "$#" -eq 1 ]; then
   exit 0
 fi
 if [ "\${1:-}" = '-nG' ]; then
-  printf '%s\\n' 'kinvest-deploy'
+  printf '%s\\n' "$BOOTSTRAP_EXISTING_GROUPS"
   exit 0
 fi
 if [ "\${1:-}" = 'kinvest-deploy' ]; then
@@ -397,10 +406,26 @@ exec /usr/bin/id "$@"
     `#!/bin/sh
 database="\${1:-}"
 key="\${2:-}"
-if [ "$database:$key" = 'passwd:10001' ] || [ "$database:$key" = 'group:10001' ]; then
+if [ "$database:$key" = 'passwd:10001' ]; then
+  if [ "$BOOTSTRAP_EXISTING" = 'true' ] && [ "$BOOTSTRAP_EXISTING_UID" = '10001' ]; then
+    printf 'kinvest-deploy:x:%s:%s::%s:/bin/bash\\n' \
+      "$BOOTSTRAP_EXISTING_UID" "$BOOTSTRAP_EXISTING_GID" "$BOOTSTRAP_EXISTING_HOME"
+    exit 0
+  fi
+  exit 2
+fi
+if [ "$database:$key" = 'group:10001' ]; then
+  if [ "$BOOTSTRAP_EXISTING" = 'true' ] && [ "$BOOTSTRAP_EXISTING_GID" = '10001' ]; then
+    printf '%s\\n' 'kinvest-deploy:x:10001:'
+    exit 0
+  fi
   exit 2
 fi
 if [ "$database:$key" = 'passwd:10002' ] || [ "$database:$key" = 'group:10002' ]; then
+  [ "$BOOTSTRAP_FRESH_UID_TAKEN" = 'true' ] && {
+    printf '%s\\n' 'occupied:x:10002:'
+    exit 0
+  }
   [ -f "$BOOTSTRAP_FAKE_STATE/user-created" ] && exit 0
   exit 2
 fi
@@ -410,7 +435,8 @@ if [ "$database:$key" = 'group:kinvest-deploy' ]; then
 fi
 if [ "$database:$key" = 'passwd:kinvest-deploy' ]; then
   if [ "$BOOTSTRAP_EXISTING" = 'true' ]; then
-    printf 'kinvest-deploy:x:1001:1001::%s:/bin/bash\\n' "$BOOTSTRAP_DEPLOY_HOME"
+    printf 'kinvest-deploy:x:%s:%s::%s:/bin/bash\\n' \
+      "$BOOTSTRAP_EXISTING_UID" "$BOOTSTRAP_EXISTING_GID" "$BOOTSTRAP_EXISTING_HOME"
     exit 0
   fi
   if [ -f "$BOOTSTRAP_FAKE_STATE/user-created" ]; then
@@ -426,6 +452,7 @@ exit 2
     path.join(fakeBin, 'groupadd'),
     `#!/bin/sh
 printf '%s\\n' "$*" >> "$BOOTSTRAP_FAKE_STATE/groupadd.log"
+printf '%s\\n' "groupadd $*" >> "$BOOTSTRAP_FAKE_STATE/operations.log"
 : > "$BOOTSTRAP_FAKE_STATE/group-created"
 `
   )
@@ -433,6 +460,7 @@ printf '%s\\n' "$*" >> "$BOOTSTRAP_FAKE_STATE/groupadd.log"
     path.join(fakeBin, 'useradd'),
     `#!/bin/sh
 printf '%s\\n' "$*" >> "$BOOTSTRAP_FAKE_STATE/useradd.log"
+printf '%s\\n' "useradd $*" >> "$BOOTSTRAP_FAKE_STATE/operations.log"
 : > "$BOOTSTRAP_FAKE_STATE/user-created"
 `
   )
@@ -440,6 +468,7 @@ printf '%s\\n' "$*" >> "$BOOTSTRAP_FAKE_STATE/useradd.log"
     path.join(fakeBin, 'install'),
     `#!/usr/bin/env bash
 set -e
+printf '%s\\n' "install $*" >> "$BOOTSTRAP_FAKE_STATE/operations.log"
 arguments=("$@")
 count="\${#arguments[@]}"
 destination="\${arguments[$((count - 1))]}"
@@ -497,9 +526,14 @@ fi
     env: {
       ...process.env,
       PATH: `${fakeBin}:${process.env.PATH}`,
-      BOOTSTRAP_DEPLOY_HOME: deployHome,
-      BOOTSTRAP_EXISTING: String(existing),
-      BOOTSTRAP_FAKE_STATE: fakeState
+        BOOTSTRAP_DEPLOY_HOME: deployHome,
+        BOOTSTRAP_EXISTING: String(existing),
+        BOOTSTRAP_EXISTING_GID: existingGid,
+        BOOTSTRAP_EXISTING_GROUPS: existingGroups,
+        BOOTSTRAP_EXISTING_HOME: modeledExistingHome,
+        BOOTSTRAP_EXISTING_UID: existingUid,
+        BOOTSTRAP_FAKE_STATE: fakeState,
+        BOOTSTRAP_FRESH_UID_TAKEN: String(freshUidTaken)
     }
   })
 
@@ -639,6 +673,15 @@ function run() {
       fs.readFileSync(path.join(freshUser.fakeState, 'lifecycle.log'), 'utf8').trim().split('\n'),
       ['migrate-data-uid.sh', 'prepare-data-dir.sh']
     )
+    const freshOperations = fs
+      .readFileSync(path.join(freshUser.fakeState, 'operations.log'), 'utf8')
+      .trim()
+      .split('\n')
+    assert.ok(freshOperations.findIndex((line) => line.startsWith('install ')) >= 0)
+    assert.ok(
+      freshOperations.indexOf('lifecycle migrate-data-uid.sh') <
+        freshOperations.findIndex((line) => line.startsWith('groupadd '))
+    )
   } finally {
     freshUser.cleanup()
   }
@@ -654,6 +697,26 @@ function run() {
     )
   } finally {
     existingUser.cleanup()
+  }
+
+  for (const unsafeFixture of [
+    { existing: true, existingHome: '/unexpected/home' },
+    { existing: true, existingUid: '10001' },
+    { existing: true, existingGid: '10001' },
+    { existing: true, existingGroups: 'kinvest-deploy docker' },
+    { existing: false, freshUidTaken: true }
+  ]) {
+    const rejectedPreflight = runBootstrapUserFixture(unsafeFixture)
+    try {
+      assert.notEqual(rejectedPreflight.result.status, 0)
+      assert.equal(
+        fs.existsSync(path.join(rejectedPreflight.fakeState, 'operations.log')),
+        false,
+        'unsafe deployment account preflight must fail before install, migration, or user creation'
+      )
+    } finally {
+      rejectedPreflight.cleanup()
+    }
   }
 
   /** @type {Array<[string, RegExp]>} */
