@@ -1,5 +1,7 @@
 const assert = require('node:assert/strict')
+const { spawnSync } = require('node:child_process')
 const fs = require('node:fs')
+const os = require('node:os')
 const path = require('node:path')
 
 const rootDir = path.resolve(__dirname, '../..')
@@ -33,6 +35,47 @@ function serviceBlock(compose, serviceName) {
 
   assert.ok(match, `Compose service "${serviceName}" must exist`)
   return match[0]
+}
+
+function assertRelativeProbeWorksInsideRestrictedParent() {
+  if (typeof process.getuid !== 'function' || process.getuid() === 0) {
+    return
+  }
+
+  const fixtureRoot = fs.mkdtempSync(path.join(os.tmpdir(), 'kinvest-restricted-parent-'))
+  const restrictedParent = path.join(fixtureRoot, 'root-mode-directory')
+  const dataDir = path.join(restrictedParent, 'data')
+
+  fs.mkdirSync(dataDir, { recursive: true, mode: 0o700 })
+
+  try {
+    const result = spawnSync(
+      '/bin/sh',
+      [
+        '-c',
+        [
+          'set -eu',
+          'cd -- "$1/data"',
+          'chmod 000 "$1"',
+          ': > .relative-probe.sqlite',
+          'if (: > "$1/data/.absolute-probe.sqlite") 2>/dev/null; then exit 42; fi',
+          'test -f .relative-probe.sqlite'
+        ].join('\n'),
+        'sh',
+        restrictedParent
+      ],
+      { encoding: 'utf8' }
+    )
+
+    assert.equal(
+      result.status,
+      0,
+      `relative probe must work after entering data dir while absolute traversal fails: ${result.stderr}`
+    )
+  } finally {
+    fs.chmodSync(restrictedParent, 0o700)
+    fs.rmSync(fixtureRoot, { recursive: true, force: true })
+  }
 }
 
 async function run() {
@@ -88,17 +131,43 @@ async function run() {
   assert.match(prepareScript, /^DATA_DIR='\/root\/docker\/kinvest\/data'$/m)
   assert.match(prepareScript, /^APP_UID='1000'$/m)
   assert.match(prepareScript, /^APP_GID='1000'$/m)
-  assert.match(prepareScript, /\[ -L "\$DATA_DIR" \]/)
+  assert.match(
+    prepareScript,
+    /^ {2}for PATH_COMPONENT in '\/root' '\/root\/docker' '\/root\/docker\/kinvest' "\$DATA_DIR"; do$/m
+  )
+  assert.match(prepareScript, /\[ -L "\$PATH_COMPONENT" \]/)
   assert.match(prepareScript, /install -d -m 0750 -- "\$DATA_DIR"/)
-  assert.match(prepareScript, /chown "\$APP_UID:\$APP_GID" -- "\$DATA_DIR"/)
-  assert.match(prepareScript, /chmod 0750 -- "\$DATA_DIR"/)
+  assert.equal(
+    prepareScript.match(/^assert_no_symlink_components$/gm)?.length,
+    2,
+    'path chain must be checked before and after directory creation'
+  )
+  assert.match(prepareScript, /^cd -P -- "\$DATA_DIR"$/m)
+  assert.match(prepareScript, /^\s*if \[ "\$\(pwd -P\)" != "\$DATA_DIR" \]; then$/m)
+  assert.match(prepareScript, /chown "\$APP_UID:\$APP_GID" -- \./)
+  assert.match(prepareScript, /chmod 0750 -- \./)
+  assert.match(prepareScript, /^PROBE_BASE="\.kinvest-write-probe-\$\$"$/m)
   assert.match(prepareScript, /setpriv --reuid="\$APP_UID" --regid="\$APP_GID" --clear-groups/)
+  assert.match(prepareScript, /' sh "\$PROBE_BASE"/)
   assert.match(prepareScript, /\.sqlite/)
   assert.match(prepareScript, /\.sqlite-wal/)
   assert.match(prepareScript, /\.sqlite-shm/)
   assert.doesNotMatch(prepareScript, /\b(?:find|rm\s+-rf|chown\s+-R|chmod\s+-R)\b/)
   assert.doesNotMatch(prepareScript, /\b(?:MYSQL|mysql|\.env)\b/)
   assert.doesNotMatch(prepareScript, /\$\{?KINVEST_DATA_DIR\b/)
+
+  const installIndex = prepareScript.indexOf('install -d -m 0750 -- "$DATA_DIR"')
+  const cdIndex = prepareScript.indexOf('cd -P -- "$DATA_DIR"')
+  const chownIndex = prepareScript.indexOf('chown "$APP_UID:$APP_GID" -- .')
+  const setprivIndex = prepareScript.indexOf('setpriv --reuid="$APP_UID"')
+  const loweredProbeInvocation = prepareScript.slice(setprivIndex)
+
+  assert.ok(installIndex >= 0 && cdIndex > installIndex, 'root must enter data directory after safely creating it')
+  assert.ok(chownIndex > cdIndex, 'ownership changes must target the verified physical data directory')
+  assert.ok(setprivIndex > cdIndex, 'root must enter data directory before lowering privileges')
+  assert.doesNotMatch(loweredProbeInvocation, /\/root|"\$DATA_DIR"/)
+
+  assertRelativeProbeWorksInsideRestrictedParent()
 
   assert.match(dockerignore, /^\.env$/m)
   assert.match(dockerignore, /^\*\.sqlite$/m)

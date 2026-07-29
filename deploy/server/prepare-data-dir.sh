@@ -10,21 +10,34 @@ if [ "$(id -u)" -ne 0 ]; then
   exit 1
 fi
 
-if [ -L "$DATA_DIR" ]; then
-  printf '%s\n' "Refusing to use symlinked data directory: $DATA_DIR" >&2
-  exit 1
-fi
-
 if ! command -v setpriv >/dev/null 2>&1; then
   printf '%s\n' 'setpriv is required to verify the Kinvest application UID can write data.' >&2
   exit 1
 fi
 
-install -d -m 0750 -- "$DATA_DIR"
-chown "$APP_UID:$APP_GID" -- "$DATA_DIR"
-chmod 0750 -- "$DATA_DIR"
+assert_no_symlink_components() {
+  for PATH_COMPONENT in '/root' '/root/docker' '/root/docker/kinvest' "$DATA_DIR"; do
+    if [ -L "$PATH_COMPONENT" ]; then
+      printf '%s\n' "Refusing to use symlinked path component: $PATH_COMPONENT" >&2
+      exit 1
+    fi
+  done
+}
 
-PROBE_BASE="$DATA_DIR/.kinvest-write-probe-$$"
+assert_no_symlink_components
+install -d -m 0750 -- "$DATA_DIR"
+assert_no_symlink_components
+
+cd -P -- "$DATA_DIR"
+if [ "$(pwd -P)" != "$DATA_DIR" ]; then
+  printf '%s\n' "Refusing unexpected physical data directory: $(pwd -P)" >&2
+  exit 1
+fi
+
+chown "$APP_UID:$APP_GID" -- .
+chmod 0750 -- .
+
+PROBE_BASE=".kinvest-write-probe-$$"
 
 cleanup() {
   rm -f -- "$PROBE_BASE.sqlite" "$PROBE_BASE.sqlite-wal" "$PROBE_BASE.sqlite-shm"
