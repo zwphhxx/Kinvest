@@ -78,7 +78,7 @@ jobs:
     needs: publish
     if: ${{ github.ref == 'refs/heads/main' && vars.DEPLOY_ENABLED == 'true' }}
     runs-on: ubuntu-latest
-    timeout-minutes: 15
+    timeout-minutes: 25
     environment: Production
     permissions:
       contents: read

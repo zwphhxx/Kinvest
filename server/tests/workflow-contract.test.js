@@ -654,6 +654,15 @@ function run() {
   assert.match(workflow, /^ {2}group: kinvest-production$/m)
   assert.match(workflow, /^ {2}cancel-in-progress: false$/m)
   assert.equal((workflow.match(/timeout-minutes:/g) || []).length, 3)
+  const deployTimeoutMatch = workflow.match(
+    /^ {2}deploy:\n[\s\S]*?^ {4}timeout-minutes: ([0-9]+)$/m
+  )
+  assert.ok(deployTimeoutMatch, 'deploy job must define a bounded timeout')
+  const deployTimeoutMinutes = Number.parseInt(deployTimeoutMatch[1], 10)
+  assert.ok(
+    deployTimeoutMinutes >= 20 && deployTimeoutMinutes <= 30,
+    'deploy job timeout must allow a cold pull without becoming unbounded'
+  )
   assert.match(workflow, /^ {4}if: \$\{\{ github\.ref == 'refs\/heads\/main' \}\}$/m)
   assert.match(
     workflow,
@@ -678,6 +687,9 @@ function run() {
   assert.match(deploy, /\^ghcr\\\.io\/zwphhxx\/kinvest@sha256:\[0-9a-f\]\{64\}\$/)
   assert.match(deploy, /^CURRENT_STATE="\$STATE\/current\.state"$/m)
   assert.match(deploy, /^PREVIOUS_STATE="\$STATE\/previous\.state"$/m)
+  assert.match(deploy, /^DOCKER_TIMEOUT='900s'$/m)
+  assert.match(deploy, /^COMPOSE_TIMEOUT='120s'$/m)
+  assert.match(deploy, /^INSPECT_TIMEOUT='15s'$/m)
   assert.match(deploy, /digest_ref=%s\\ncommit=%s/)
   assert.match(deploy, /timeout --signal=TERM/)
   assert.match(deploy, /--kill-after=/)
@@ -1024,7 +1036,7 @@ function run() {
       `digest_ref=${previousRef}\ncommit=${previousCommit}\n`
     )
     const timeoutLog = fs.readFileSync(path.join(success.fakeState, 'timeout.log'), 'utf8')
-    assert.match(timeoutLog, /docker pull/)
+    assert.match(timeoutLog, /--signal=TERM --kill-after=10s 900s docker pull/)
     assert.match(timeoutLog, /docker compose/)
     assert.match(timeoutLog, /docker image inspect/)
     assert.match(timeoutLog, /docker inspect/)
