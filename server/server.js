@@ -5,6 +5,7 @@ const { getWatchlist, listCompanies, getCompany, applyManualRefresh } = require(
 const { evaluateRefreshState, allowManualRefresh, recordManualRefreshAttempt } = require('./services/refresh-rules')
 const { getHealthState } = require('./services/health')
 const { createIfindClient } = require('./adapters/ifindAdapter')
+const { resolveSecurityIdentity } = require('./domain/security-identity')
 
 const PORT = Number(process.env.PORT || 4173)
 const ROOT = path.join(__dirname, '..')
@@ -44,12 +45,38 @@ function parseSegments(pathname) {
   return String(pathname || '/').split('/').filter(Boolean)
 }
 
-function toApiError(message, code = 400) {
+function toApiError(message, code = 400, details = {}) {
   return {
     success: false,
     error: message,
-    code
+    code,
+    ...details
   }
+}
+
+function toSecurityNotConfiguredError(requestedCode, targetLabel = '证券') {
+  const code = String(requestedCode || '')
+  const identity = resolveSecurityIdentity(code)
+  const details = {
+    errorCode: 'SECURITY_NOT_CONFIGURED',
+    requestedCode: code
+  }
+
+  if (identity) {
+    details.displayCode = identity.displayCode
+    details.issuerLegalName = identity.issuerLegalName
+    details.nameZh = identity.nameZh
+    details.configured = identity.configured
+  }
+
+  if (identity && identity.companyId === 'company-baidu') {
+    details.historyCorrection = '历史纠错：旧 Mock 曾将 09888.HK 错链至阿里巴巴；该代码实际属于百度，当前未收录。'
+  }
+
+  const message = identity
+    ? `${targetLabel}未收录：${identity.nameZh}（${identity.displayCode}）`
+    : `${targetLabel}未收录：${code}`
+  return toApiError(message, 404, details)
 }
 
 async function withMeta(company) {
@@ -108,7 +135,7 @@ async function apiSearch(req, res, query) {
 async function apiCompany(req, res, code) {
   const company = getCompany(code)
   if (!company) {
-    formatJson(res, toApiError(`未找到公司：${code}`, 404), 404)
+    formatJson(res, toSecurityNotConfiguredError(code, '公司'), 404)
     return
   }
   const data = await withMeta(company)
@@ -118,7 +145,7 @@ async function apiCompany(req, res, code) {
 async function apiRefresh(req, res, code) {
   const company = getCompany(code)
   if (!company) {
-    formatJson(res, toApiError(`未找到公司：${code}`, 404), 404)
+    formatJson(res, toSecurityNotConfiguredError(code, '刷新目标'), 404)
     return
   }
   const state = evaluateRefreshState(company)
@@ -145,7 +172,7 @@ async function apiRefresh(req, res, code) {
 async function apiResearch(req, res, code) {
   const company = getCompany(code)
   if (!company) {
-    formatJson(res, toApiError(`未找到研究目标：${code}`, 404), 404)
+    formatJson(res, toSecurityNotConfiguredError(code, '研究目标'), 404)
     return
   }
   const researchState = company.research
@@ -156,7 +183,7 @@ async function apiResearch(req, res, code) {
   formatJson(res, {
     success: true,
     data: {
-      code,
+      code: company.securityCode,
       nameZh: company.nameZh,
       version: researchState.version,
       generatedAt: researchState.generatedAt,
@@ -275,6 +302,11 @@ if (require.main === module) {
 }
 
 module.exports = {
+  apiCompany,
+  apiRefresh,
+  apiResearch,
   applyRuntimeFileCreationMask,
-  startServer
+  startServer,
+  toApiError,
+  toSecurityNotConfiguredError
 }

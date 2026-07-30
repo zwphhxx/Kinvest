@@ -38,6 +38,7 @@ async function runBuildArtifactsExist() {
     'server/adapters/ifindAdapter.js',
     'server/data/mockData.js',
     'server/db/refresh-db.js',
+    'server/domain/security-identity.js',
     'server/server.js',
     'server/services/health.js',
     'server/services/refresh-rules.js',

@@ -418,13 +418,18 @@ Nginx、应用、数据库和任务执行层保持可独立替换，扩展时不
 
 收入、成本、毛利和毛利率的总量指标优先使用 `company` 或 `series`；产品、业务分部、地区和渠道等细分数据优先验证 `data-pool` 中的主营构成或分部报表。指标不可用时不从其他口径推算或猜测。
 
-证券名称搜索使用本地缓存的证券主数据，不在每次键入时调用 iFinD。系统分别保存：
+证券名称搜索使用本地缓存的证券身份主数据，不在每次键入时调用 iFinD。每个上市身份使用稳定、只读的分离模型，至少保存 `companyId`、`listingId`、`issuerLegalName`、`nameZh`、`exchange`、`exchangeCode`、`displayCode`、`formatAliases`、`vendorCodes` 和 `configured`。其中：
 
-- 用户看到的交易所代码，例如港股 `09988`。
-- iFinD 内部查询代码，例如 `9988.HK`。
-- 公司中文名、英文名和安全别名。
+- `displayCode` 是站内 canonical 展示与运行代码；阿里巴巴使用 `9988.HK`。
+- `formatAliases` 只表示同一交易所代码的格式变体；阿里巴巴的格式别名仅为 `09988.HK`。
+- 百度是独立发行人与上市身份，canonical 展示代码为 `9888.HK`，格式别名仅为 `09888.HK`，当前 `configured=false`。
+- `vendorCodes` 与展示代码分离。iFinD、ISIN 等供应商代码未经验证时必须保存为 `code: null, status: unverified`，不得从展示代码猜测或标记为已验证。
 
-初始证券主数据通过经过验证的数据池或管理员导入获得；找不到可靠映射时要求用户输入准确证券代码，不猜测市场。
+解析层允许 `displayCode`、`exchangeCode` 和 `formatAliases` 定位同一上市身份。搜索层还允许中文名和发行人法定名称匹配。已知但 `configured=false` 的身份保留在搜索结果中并明确显示“未收录”，但不得加载公司数据。
+
+普通未知代码和已知但未收录身份统一返回 `SECURITY_NOT_CONFIGURED`。已知身份的错误可附带请求代码、canonical `displayCode` 与真实发行人名称；未知合法或非法代码不得伪造发行人。只有输入记录中的发行人名称可映射到一个公司、而证券代码明确属于另一个公司时，数据校验层才返回 `SECURITY_IDENTITY_CONFLICT`。历史 Mock 错链提示属于纠错说明，不能输出为身份冲突错误。
+
+初始证券身份主数据通过经过验证的数据池或管理员导入获得；找不到可靠映射时要求用户输入准确证券代码，不猜测市场。
 
 ## 9. 行情刷新与额度保护
 
@@ -706,5 +711,4 @@ PostgreSQL 不保存：
 - 后续可平滑迁移至 PostgreSQL（通过 schema + repository layer）。
 - 调度仍为单实例，后续高并发时再拆 worker/队列/Redis。
 - 预留家庭登录、RBAC、审计、水平扩容接口，不把它们提前固化为假设前提。
-
 
