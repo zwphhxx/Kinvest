@@ -103,14 +103,19 @@ function resolveIssuerIdentity(issuerName) {
   const normalizedIssuerName = normalizeIssuerName(issuerName)
   if (!normalizedIssuerName) return null
 
-  return SECURITY_IDENTITIES.find((identity) => {
-    return ISSUER_ALIASES[identity.companyId].some((alias) => {
+  const matches = new Map()
+  for (const identity of SECURITY_IDENTITIES) {
+    const matchesAlias = ISSUER_ALIASES[identity.companyId].some((alias) => {
       const normalizedAlias = normalizeIssuerName(alias)
       return normalizedIssuerName === normalizedAlias
         || normalizedIssuerName.includes(normalizedAlias)
-        || normalizedAlias.includes(normalizedIssuerName)
     })
-  }) || null
+    if (matchesAlias) {
+      matches.set(identity.companyId, identity)
+    }
+  }
+
+  return matches.size === 1 ? matches.values().next().value : null
 }
 
 function detectSecurityIdentityConflict(record) {

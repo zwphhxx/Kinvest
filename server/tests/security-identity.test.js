@@ -104,6 +104,20 @@ async function run() {
   assert.equal(historicalConflict.codeIdentity.companyId, 'company-baidu')
   assert.equal(historicalConflict.issuerIdentity.companyId, 'company-alibaba-group')
   assert.equal(detectSecurityIdentityConflict({
+    securityCode: '9888.HK',
+    issuerLegalName: '集团'
+  }), null)
+  const canonicalConflict = detectSecurityIdentityConflict({
+    securityCode: '9888.HK',
+    issuerLegalName: 'Alibaba Group Holding Limited'
+  })
+  assert.equal(canonicalConflict.errorCode, 'SECURITY_IDENTITY_CONFLICT')
+  assert.equal(canonicalConflict.issuerIdentity.companyId, 'company-alibaba-group')
+  assert.equal(detectSecurityIdentityConflict({
+    securityCode: '9888.HK',
+    issuerLegalName: 'Alibaba Group Holding Limited / Baidu, Inc.'
+  }), null)
+  assert.equal(detectSecurityIdentityConflict({
     securityCode: '09888.HK',
     issuerLegalName: 'Baidu, Inc.'
   }), null)
