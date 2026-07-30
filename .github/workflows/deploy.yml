@@ -60,28 +60,33 @@ jobs:
           set -euo pipefail
 
           forbidden_path=''
+          forbidden_kind=''
           while IFS= read -r -d '' path; do
-            case "$path" in
+            normalized_path="$(printf '%s_' "$path" | LC_ALL=C tr '[:upper:]' '[:lower:]')"
+            normalized_path="${normalized_path%_}"
+            case "$normalized_path" in
               .env|*/.env|.env.*|*/.env.*)
-                case "$path" in
+                case "$normalized_path" in
                   *.example|*.sample|*.template) ;;
                   *)
-                    forbidden_path='environment file'
+                    forbidden_kind='environment file'
+                    forbidden_path="$path"
                     break
                     ;;
                 esac
                 ;;
             esac
-            case "${path##*/}" in
+            case "${normalized_path##*/}" in
               id_rsa|id_dsa|id_ecdsa|id_ed25519|*.key|*.p12|*.pfx|*.jks|*.keystore|*.der)
-                forbidden_path='private key file'
+                forbidden_kind='private key file'
+                forbidden_path="$path"
                 break
                 ;;
             esac
           done < <(git ls-files -z)
 
           if [[ -n "$forbidden_path" ]]; then
-            printf '%s\n' 'A forbidden credential file is tracked.' >&2
+            printf 'A forbidden %s is tracked: %q\n' "$forbidden_kind" "$forbidden_path" >&2
             exit 1
           fi
 

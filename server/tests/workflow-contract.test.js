@@ -166,6 +166,49 @@ function namedStep(job, name) {
   return lines.slice(start, end).join('\n')
 }
 
+function multilineStepRun(step) {
+  const lines = step.split('\n')
+  const start = lines.findIndex((line) => line === '        run: |')
+  assert.notEqual(start, -1, 'step must define a multiline run script')
+  return lines
+    .slice(start + 1)
+    .map((line) => {
+      assert.ok(
+        line === '' || line.startsWith('          '),
+        'multiline run script must retain YAML indentation'
+      )
+      return line === '' ? '' : line.slice(10)
+    })
+    .join('\n')
+}
+
+function runRepositoryScanFixture(repositoryScan, trackedPath) {
+  const fixtureRoot = fs.mkdtempSync(path.join(os.tmpdir(), 'kinvest-repository-scan-'))
+  try {
+    const trackedFile = path.join(fixtureRoot, trackedPath)
+    fs.mkdirSync(path.dirname(trackedFile), { recursive: true })
+    fs.writeFileSync(trackedFile, Buffer.from([0, 1, 2, 3]))
+
+    const init = spawnSync('git', ['init', '--quiet'], {
+      cwd: fixtureRoot,
+      encoding: 'utf8'
+    })
+    assert.equal(init.status, 0, init.stderr)
+    const add = spawnSync('git', ['add', '--', trackedPath], {
+      cwd: fixtureRoot,
+      encoding: 'utf8'
+    })
+    assert.equal(add.status, 0, add.stderr)
+
+    return spawnSync('bash', ['-c', multilineStepRun(repositoryScan)], {
+      cwd: fixtureRoot,
+      encoding: 'utf8'
+    })
+  } finally {
+    fs.rmSync(fixtureRoot, { recursive: true, force: true })
+  }
+}
+
 function inlineList(value) {
   assert.match(value, /^\[[A-Za-z0-9_, -]+\]$/, 'value must be an inline YAML list')
   return value
@@ -835,7 +878,34 @@ function run() {
   const repositoryScan = namedStep(prJobs.security, 'Scan tracked files for secrets')
   assert.equal(directScalar(repositoryScan, 'shell', 8), 'bash')
   assert.equal(directScalar(repositoryScan, 'run', 8), '|')
+  for (const uppercaseCredentialPath of [
+    'credentials/secret.P12',
+    'credentials/private.PFX',
+    'credentials/private.JKS',
+    'credentials/private.KEYSTORE',
+    'credentials/key.DER'
+  ]) {
+    const scanResult = runRepositoryScanFixture(
+      repositoryScan,
+      uppercaseCredentialPath
+    )
+    assert.notEqual(
+      scanResult.status,
+      0,
+      `${uppercaseCredentialPath} must be rejected regardless of extension case`
+    )
+    assert.ok(
+      scanResult.stderr.includes(uppercaseCredentialPath),
+      'scanner diagnostics must retain the original tracked path'
+    )
+  }
   assert.match(repositoryScan, /git ls-files -z/)
+  assert.match(repositoryScan, /while IFS= read -r -d '' path/)
+  assert.match(
+    repositoryScan,
+    /LC_ALL=C tr '\[:upper:\]' '\[:lower:\]'/
+  )
+  assert.match(repositoryScan, /forbidden_path="\$path"/)
   assert.match(repositoryScan, /\*\.example\|\*\.sample\|\*\.template/)
   assert.match(
     repositoryScan,
