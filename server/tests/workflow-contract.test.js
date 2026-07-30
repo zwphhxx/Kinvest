@@ -174,6 +174,16 @@ function inlineList(value) {
     .map((item) => item.trim())
 }
 
+function assertRequiredPrJobsCannotSkipPullRequests(prJobs) {
+  for (const [jobId, job] of Object.entries(prJobs)) {
+    assert.equal(
+      directMappingKeys(job, 4).includes('if'),
+      false,
+      `${jobId} must not define a job-level if that can skip pull_request checks`
+    )
+  }
+}
+
 function createFakeDocker(binDir) {
   writeExecutable(
     path.join(binDir, 'id'),
@@ -782,6 +792,20 @@ function run() {
       workflowBlock(jobs, jobId, 2)
     ])
   )
+  assertRequiredPrJobsCannotSkipPullRequests(prJobs)
+  const pullRequestSkippingVerify = prJobs.verify.replace(
+    '    runs-on: ubuntu-latest',
+    "    if: github.event_name != 'pull_request'\n    runs-on: ubuntu-latest"
+  )
+  assert.throws(
+    () =>
+      assertRequiredPrJobsCannotSkipPullRequests({
+        ...prJobs,
+        verify: pullRequestSkippingVerify
+      }),
+    /verify must not define a job-level if that can skip pull_request checks/
+  )
+
   for (const [jobId, job] of Object.entries(prJobs)) {
     assert.equal(directScalar(job, 'name', 4), jobId)
     const jobPermissions = workflowBlock(job, 'permissions', 4)
@@ -813,7 +837,10 @@ function run() {
   assert.equal(directScalar(repositoryScan, 'run', 8), '|')
   assert.match(repositoryScan, /git ls-files -z/)
   assert.match(repositoryScan, /\*\.example\|\*\.sample\|\*\.template/)
-  assert.match(repositoryScan, /id_rsa\|id_dsa\|id_ecdsa\|id_ed25519/)
+  assert.match(
+    repositoryScan,
+    /id_rsa\|id_dsa\|id_ecdsa\|id_ed25519\|\*\.key\|\*\.p12\|\*\.pfx\|\*\.jks\|\*\.keystore\|\*\.der/
+  )
   assert.match(repositoryScan, /private_key_prefix='BEGIN \[A-Z \]\*PRIVATE'/)
   assert.match(repositoryScan, /private_key_suffix=' KEY'/)
   assert.match(repositoryScan, /github_prefix='gh\[pousr\]_'/)

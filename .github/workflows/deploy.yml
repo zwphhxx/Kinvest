@@ -73,7 +73,7 @@ jobs:
                 ;;
             esac
             case "${path##*/}" in
-              id_rsa|id_dsa|id_ecdsa|id_ed25519|*.key|*.p12|*.pfx)
+              id_rsa|id_dsa|id_ecdsa|id_ed25519|*.key|*.p12|*.pfx|*.jks|*.keystore|*.der)
                 forbidden_path='private key file'
                 break
                 ;;
