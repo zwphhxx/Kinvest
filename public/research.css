@@ -1,0 +1,26 @@
+.research-wrap {
+  max-width: 980px;
+  margin: 0 auto;
+  padding: 20px;
+}
+
+.research-wrap h1 {
+  margin: 4px 0 8px;
+}
+
+.meta-line {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 8px;
+}
+
+.status-box {
+  background: #f8fafb;
+  border: 1px dashed #ccdde8;
+  border-radius: 12px;
+  padding: 10px;
+}
+
+.status-box p {
+  margin: 6px 0;
+}

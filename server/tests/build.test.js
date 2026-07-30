@@ -30,7 +30,11 @@ async function runBuildArtifactsExist() {
     'public/app.js',
     'public/finance-contract.js',
     'public/index.html',
+    'public/research-contract.js',
+    'public/research.css',
     'public/research.html',
+    'public/research.js',
+    'public/valuation-position.js',
     'server/adapters/ifindAdapter.js',
     'server/data/mockData.js',
     'server/db/refresh-db.js',
@@ -55,6 +59,24 @@ async function runBuildArtifactsExist() {
       listRelativeFiles(path.join(repositoryRoot, 'dist')),
       expectedArtifacts
     )
+
+    for (const artifact of expectedArtifacts.filter((file) => file.endsWith('.html'))) {
+      const html = fs.readFileSync(path.join(repositoryRoot, 'dist', artifact), 'utf8')
+      const localReferences = Array.from(
+        html.matchAll(/\b(?:href|src)=(["'])(\/[^"']+)\1/g),
+        (match) => match[2]
+      )
+      for (const reference of localReferences) {
+        const pathname = reference.split(/[?#]/, 1)[0]
+        if (!path.extname(pathname)) continue
+        const assetPath = path.join(repositoryRoot, 'dist', 'public', pathname)
+        assert.strictEqual(
+          fs.existsSync(assetPath) && fs.statSync(assetPath).isFile(),
+          true,
+          `${artifact} references missing build artifact: ${pathname}`
+        )
+      }
+    }
   } finally {
     fs.rmSync(fixturePath, { force: true })
   }

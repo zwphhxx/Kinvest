@@ -6,6 +6,8 @@ const projectRoot = path.resolve(__dirname, '../..')
 const appPath = path.join(projectRoot, 'public/app.js')
 const cssPath = path.join(projectRoot, 'public/app.css')
 const htmlPath = path.join(projectRoot, 'public/index.html')
+const researchHtmlPath = path.join(projectRoot, 'public/research.html')
+const researchJsPath = path.join(projectRoot, 'public/research.js')
 
 function read(filePath) {
   return fs.readFileSync(filePath, 'utf8')
@@ -268,6 +270,107 @@ function assertRenderingRespectsStrictCsp() {
   }
 }
 
+function assertResearchPageRespectsStrictCsp() {
+  const html = read(researchHtmlPath)
+  const script = read(researchJsPath)
+
+  assert.doesNotMatch(html, /<style(?:\s|>)/i)
+  assert.doesNotMatch(html, /<[^>]*\sstyle=/i)
+  assert.doesNotMatch(html, /<script(?![^>]*\bsrc=)[^>]*>/i)
+  assert.doesNotMatch(html, /\son[a-z]+\s*=/i)
+  assert.match(html, /id="research-body" class="card hidden"/)
+  assert.match(html, /<link rel="icon" href="data:image\/svg\+xml,/)
+  assert.match(html, /<link rel="stylesheet" href="\/research\.css" \/>/)
+  assert.match(html, /<script src="\/research-contract\.js" defer><\/script>[\s\S]*<script src="\/research\.js" defer><\/script>/)
+  assert.doesNotMatch(script, /\.(?:innerHTML|outerHTML)/)
+  assert.doesNotMatch(script, /insertAdjacentHTML|document\.write/)
+  assert.doesNotMatch(script, /\.on[a-z]+\s*=/i)
+  assert.doesNotMatch(script, /javascript:/i)
+  assert.doesNotMatch(script, /\.style(?:\.|\[|\s*=)/)
+  assert.doesNotMatch(script, /setAttribute\(\s*['"]style['"]/i)
+  assert.match(script, /textContent/)
+  assert.match(script, /replaceChildren/)
+}
+
+async function assertResearchResponseContract() {
+  const {
+    normalizeResearchResponse,
+    normalizeSecurityCode,
+    parseJsonResponse
+  } = require('../../public/research-contract')
+  const validPayload = {
+    success: true,
+    data: {
+      nameZh: '测试公司',
+      version: 1,
+      snapshotTime: '2026-07-29T00:00:00.000Z',
+      generatedAt: '2026-07-29T00:01:00.000Z',
+      citedAnnouncementsCount: 1,
+      citedNewsCount: 2,
+      tags: ['<img src=x onerror=alert(1)>'],
+      sections: {
+        thesis: '<script>alert(1)</script>',
+        bulls: ['<b>多头</b>'],
+        bears: ['javascript:alert(1)'],
+        catalysts: ['催化剂'],
+        invalidation: ['证伪条件']
+      }
+    }
+  }
+
+  assert.equal(normalizeSecurityCode('aapl.us'), 'AAPL.US')
+  assert.equal(normalizeSecurityCode('09888.HK'), '09888.HK')
+  for (const invalid of ['', '../api/health', 'AAPL.US?x=1', 'AAPL/US', null]) {
+    assert.equal(normalizeSecurityCode(invalid), null)
+  }
+
+  const normalized = normalizeResearchResponse(validPayload)
+  assert.equal(normalized.ok, true)
+  assert.equal(normalized.data.sections.thesis, '<script>alert(1)</script>')
+
+  const malformedPayloads = [
+    null,
+    {},
+    { success: true, data: null },
+    { success: true, data: { ...validPayload.data, tags: 'not-an-array' } },
+    {
+      success: true,
+      data: {
+        ...validPayload.data,
+        sections: { ...validPayload.data.sections, bulls: null }
+      }
+    },
+    { success: true, data: { ...validPayload.data, generatedAt: 'invalid-date' } }
+  ]
+  for (const payload of malformedPayloads) {
+    assert.equal(normalizeResearchResponse(payload).ok, false)
+  }
+  assert.deepEqual(
+    normalizeResearchResponse({ success: false, data: { message: '安全 Mock 不可用' } }),
+    { ok: false, message: '安全 Mock 不可用' }
+  )
+
+  assert.deepEqual(
+    await parseJsonResponse({ ok: true, json: async () => validPayload }),
+    validPayload
+  )
+  await assert.rejects(
+    parseJsonResponse({ ok: true, json: async () => { throw new Error('HTML response') } }),
+    /研究接口返回格式不可用/
+  )
+  for (const body of [null, [], { error: { message: '对象错误' } }, { message: '字段漂移' }]) {
+    await assert.rejects(
+      parseJsonResponse({ ok: false, json: async () => body }),
+      /研究接口请求失败/
+    )
+  }
+  await assert.rejects(
+    parseJsonResponse({ ok: false, json: async () => ({ error: '已验证错误' }) }),
+    /已验证错误/
+  )
+  await assert.rejects(parseJsonResponse(null), /研究接口响应不可用/)
+}
+
 async function run() {
   assertFinanceModeMappingAndFixtureBehavior()
   assertStrictFinanceVerification()
@@ -276,6 +379,8 @@ async function run() {
   assertValuationPositionContract()
   assertFaviconAndMobileTableScrolling()
   assertRenderingRespectsStrictCsp()
+  assertResearchPageRespectsStrictCsp()
+  await assertResearchResponseContract()
 }
 
 module.exports = { run }
