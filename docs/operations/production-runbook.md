@@ -84,7 +84,7 @@ SQLite 持久化目录
 ```sh
 docker inspect --format '{{.Config.Image}}' kinvest
 docker inspect --format '{{.State.Health.Status}}' kinvest
-cat /root/docker/kinvest/current.state
+cat /root/docker/kinvest/state/current.state
 ```
 
 `current.state` 只应包含部署 commit、不可变镜像摘要等非敏感元数据。若它出现任何凭据，应立即停止发布、限制文件访问并按安全事件处理。
@@ -375,8 +375,8 @@ trap - ERR INT TERM
 
 部署程序维护：
 
-- `/root/docker/kinvest/current.state`
-- `/root/docker/kinvest/previous.state`
+- `/root/docker/kinvest/state/current.state`
+- `/root/docker/kinvest/state/previous.state`
 
 回滚只使用 `previous.state` 已记录且服务器本地存在的 immutable digest。不要使用 `latest`，不要在故障期间临时改 Dockerfile，也不要把未经验证的镜像载入生产。
 
