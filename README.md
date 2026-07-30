@@ -1,38 +1,33 @@
 # Kinvest 家庭投资看板
 
-## 目标
+Kinvest 是一个面向家庭成员的投资信息看板，强调来源可追溯、确定性规则可解释，并将 AI 观点限制在独立的深度研究页面。
 
-Kinvest 是一个面向家庭成员的「来源可追溯、默认不含 AI 观点」的投资信息看板，当前阶段先交付前端骨架与模拟数据流程，后续逐步接入 iFinD、OpenAI 兼容模型和 SQLite/生产栈。
+## 在线预览
 
-## 当前阶段状态
+- 线上地址：[https://dearmina.cn](https://dearmina.cn)
+- 当前状态：可运行的 Mock 前后端与 SQLite 数据层
+- 数据说明：当前行情、财务、公告、资讯和深度研究均为演示数据，不代表真实市场数据或投资建议
+- 阶段 5：真实 iFinD、模型服务和腾讯云密钥管理服务仍待外部配置
 
-- 阶段 0（仓库准备 + 设计迁移）：完成
-- 阶段 1（可运行前端骨架 + 模拟数据 + 页面预览）：进行中
-- 阶段 2（服务端层、SQLite/刷新边界、iFinD 适配器边界）：进行中
+## 本地启动
 
-## 快速启动（当前阶段）
-
-```bash
+```sh
 cd /Users/zhuwenpeng/Developer/Kinvest
 npm run dev
 ```
 
-浏览器访问：
+本地首页为 `http://localhost:4173/`，深度研究示例为
+`http://localhost:4173/research.html?code=09888.HK`。
 
-- 首页：`http://localhost:4173/`
-- 深度研究页示例：`http://localhost:4173/research.html?code=09888.HK`
+## 部署与运维
 
-## 说明
+`main` 分支由 GitHub Actions 完成检查和镜像构建，再以不可变镜像摘要部署到 Production 环境。应用运行在 Docker 私有网络中，不发布主机应用端口；现有 Nginx 继续负责 HTTPS 和公网入口。
 
-- 本阶段不接入真实 iFinD / 模型接口，全部为演示数据。
-- 所有凭据字段（refresh_token、API key、env 文件）都禁止进入仓库、数据库、日志与镜像。
-- 代码和文档仍按后续阶段逐步替换为真实接口与持久化实现。
+完整操作说明见 [生产运维手册](docs/operations/production-runbook.md)。
 
-## 分阶段交付与安全约束
+## 安全声明
 
-1. 阶段 0：仓库初始化、文档归档、计划与验收标准
-2. 阶段 1：前端骨架与模拟数据（本阶段）
-3. 阶段 2：服务端 + SQLite + 刷新/配额/缓存边界 + iFinD 适配器
-4. 阶段 3：公告 PDF 与研究快照治理
-5. 阶段 4：Nginx/Docker Compose + 部署与安全更新说明
-6. 阶段 5：接入真实 iFinD、模型与腾讯轻量云部署
+- 不得将 token、API key、`refresh_token`、`.env` 或敏感日志提交到 Git。
+- 凭据不得进入网页、数据库、Docker 镜像或普通应用日志。
+- iFinD `refresh_token` 只允许管理员人工更新到腾讯云密钥管理服务，网站只提醒到期，绝不自动轮换。
+- 当前所有页面数据均为 Mock；未验证的真实指标、财务细分和资讯来源不得伪装成生产数据。
