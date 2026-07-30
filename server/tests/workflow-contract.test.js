@@ -89,6 +89,144 @@ function assertBasicWorkflowYaml(source) {
   assert.deepEqual(rootKeys, ['name', 'on', 'permissions', 'concurrency', 'jobs'])
 }
 
+function findWorkflowBlock(source, key, indent) {
+  const lines = source.split('\n')
+  const marker = `${' '.repeat(indent)}${key}:`
+  const start = lines.findIndex((line) => line === marker)
+  if (start === -1) {
+    return null
+  }
+
+  let end = lines.length
+  for (let index = start + 1; index < lines.length; index += 1) {
+    const line = lines[index]
+    if (line.trim() === '' || line.trimStart().startsWith('#')) {
+      continue
+    }
+    const lineIndent = line.length - line.trimStart().length
+    if (lineIndent <= indent) {
+      end = index
+      break
+    }
+  }
+
+  return lines.slice(start, end).join('\n')
+}
+
+function workflowBlock(source, key, indent) {
+  const block = findWorkflowBlock(source, key, indent)
+  assert.ok(block, `${key} must be a workflow mapping at indentation ${indent}`)
+  return block
+}
+
+function directMappingKeys(block, indent) {
+  const keyPattern = new RegExp(`^ {${indent}}([A-Za-z_][A-Za-z0-9_-]*):`, 'm')
+  return block
+    .split('\n')
+    .map((line) => line.match(keyPattern)?.[1] ?? null)
+    .filter((key) => key !== null)
+}
+
+function directScalar(block, key, indent) {
+  const match = block.match(new RegExp(`^ {${indent}}${key}:\\s*(.+)$`, 'm'))
+  assert.ok(match, `${key} must be a scalar at indentation ${indent}`)
+  return match[1]
+}
+
+function directListItems(block, indent) {
+  const itemPattern = new RegExp(`^ {${indent}}-\\s+(.+)$`, 'm')
+  return block
+    .split('\n')
+    .map((line) => line.match(itemPattern)?.[1] ?? null)
+    .filter((item) => item !== null)
+}
+
+function triggerBranches(events, trigger) {
+  const triggerBlock = findWorkflowBlock(events, trigger, 2)
+  if (!triggerBlock) {
+    return []
+  }
+  const branchesBlock = findWorkflowBlock(triggerBlock, 'branches', 4)
+  return branchesBlock ? directListItems(branchesBlock, 6) : []
+}
+
+function namedStep(job, name) {
+  const lines = job.split('\n')
+  const marker = `      - name: ${name}`
+  const start = lines.findIndex((line) => line === marker)
+  assert.notEqual(start, -1, `job must contain the "${name}" step`)
+
+  let end = lines.length
+  for (let index = start + 1; index < lines.length; index += 1) {
+    if (lines[index].startsWith('      - ')) {
+      end = index
+      break
+    }
+  }
+  return lines.slice(start, end).join('\n')
+}
+
+function multilineStepRun(step) {
+  const lines = step.split('\n')
+  const start = lines.findIndex((line) => line === '        run: |')
+  assert.notEqual(start, -1, 'step must define a multiline run script')
+  return lines
+    .slice(start + 1)
+    .map((line) => {
+      assert.ok(
+        line === '' || line.startsWith('          '),
+        'multiline run script must retain YAML indentation'
+      )
+      return line === '' ? '' : line.slice(10)
+    })
+    .join('\n')
+}
+
+function runRepositoryScanFixture(repositoryScan, trackedPath) {
+  const fixtureRoot = fs.mkdtempSync(path.join(os.tmpdir(), 'kinvest-repository-scan-'))
+  try {
+    const trackedFile = path.join(fixtureRoot, trackedPath)
+    fs.mkdirSync(path.dirname(trackedFile), { recursive: true })
+    fs.writeFileSync(trackedFile, Buffer.from([0, 1, 2, 3]))
+
+    const init = spawnSync('git', ['init', '--quiet'], {
+      cwd: fixtureRoot,
+      encoding: 'utf8'
+    })
+    assert.equal(init.status, 0, init.stderr)
+    const add = spawnSync('git', ['add', '--', trackedPath], {
+      cwd: fixtureRoot,
+      encoding: 'utf8'
+    })
+    assert.equal(add.status, 0, add.stderr)
+
+    return spawnSync('bash', ['-c', multilineStepRun(repositoryScan)], {
+      cwd: fixtureRoot,
+      encoding: 'utf8'
+    })
+  } finally {
+    fs.rmSync(fixtureRoot, { recursive: true, force: true })
+  }
+}
+
+function inlineList(value) {
+  assert.match(value, /^\[[A-Za-z0-9_, -]+\]$/, 'value must be an inline YAML list')
+  return value
+    .slice(1, -1)
+    .split(',')
+    .map((item) => item.trim())
+}
+
+function assertRequiredPrJobsCannotSkipPullRequests(prJobs) {
+  for (const [jobId, job] of Object.entries(prJobs)) {
+    assert.equal(
+      directMappingKeys(job, 4).includes('if'),
+      false,
+      `${jobId} must not define a job-level if that can skip pull_request checks`
+    )
+  }
+}
+
 function createFakeDocker(binDir) {
   writeExecutable(
     path.join(binDir, 'id'),
@@ -661,6 +799,172 @@ function run() {
 
   assertBasicWorkflowYaml(workflow)
 
+  const events = workflowBlock(workflow, 'on', 0)
+  const jobs = workflowBlock(workflow, 'jobs', 0)
+  const jobIds = directMappingKeys(jobs, 2)
+  const missingPrContracts = []
+  if (!triggerBranches(events, 'pull_request').includes('main')) {
+    missingPrContracts.push('pull_request(main)')
+  }
+  for (const requiredJob of ['security', 'container-build']) {
+    if (!jobIds.includes(requiredJob)) {
+      missingPrContracts.push(`job:${requiredJob}`)
+    }
+  }
+  assert.deepEqual(
+    missingPrContracts,
+    [],
+    `secure PR workflow contracts are missing: ${missingPrContracts.join(', ')}`
+  )
+
+  assert.deepEqual(
+    directMappingKeys(events, 2).sort(),
+    ['pull_request', 'push', 'workflow_dispatch']
+  )
+  assert.deepEqual(triggerBranches(events, 'push'), ['main'])
+  assert.deepEqual(triggerBranches(events, 'pull_request'), ['main'])
+  assert.doesNotMatch(workflow, /^\s*pull_request_target:/m)
+
+  assert.deepEqual(
+    [...jobIds].sort(),
+    ['container-build', 'deploy', 'publish', 'security', 'verify']
+  )
+  const prJobs = Object.fromEntries(
+    ['verify', 'security', 'container-build'].map((jobId) => [
+      jobId,
+      workflowBlock(jobs, jobId, 2)
+    ])
+  )
+  assertRequiredPrJobsCannotSkipPullRequests(prJobs)
+  const pullRequestSkippingVerify = prJobs.verify.replace(
+    '    runs-on: ubuntu-latest',
+    "    if: github.event_name != 'pull_request'\n    runs-on: ubuntu-latest"
+  )
+  assert.throws(
+    () =>
+      assertRequiredPrJobsCannotSkipPullRequests({
+        ...prJobs,
+        verify: pullRequestSkippingVerify
+      }),
+    /verify must not define a job-level if that can skip pull_request checks/
+  )
+
+  for (const [jobId, job] of Object.entries(prJobs)) {
+    assert.equal(directScalar(job, 'name', 4), jobId)
+    const jobPermissions = workflowBlock(job, 'permissions', 4)
+    assert.deepEqual(directMappingKeys(jobPermissions, 6), ['contents'])
+    assert.equal(directScalar(jobPermissions, 'contents', 6), 'read')
+    assert.equal(directMappingKeys(job, 4).includes('environment'), false)
+    assert.doesNotMatch(job, /\$\{\{\s*secrets\./)
+  }
+
+  assert.equal(
+    directScalar(namedStep(prJobs.verify, 'Install locked dependencies'), 'run', 8),
+    'npm ci'
+  )
+  assert.equal(
+    directScalar(namedStep(prJobs.verify, 'Run quality gates'), 'run', 8),
+    'npm run check'
+  )
+
+  assert.equal(
+    directScalar(namedStep(prJobs.security, 'Install locked dependencies'), 'run', 8),
+    'npm ci'
+  )
+  assert.equal(
+    directScalar(namedStep(prJobs.security, 'Audit high severity dependencies'), 'run', 8),
+    'npm audit --audit-level=high'
+  )
+  const repositoryScan = namedStep(prJobs.security, 'Scan tracked files for secrets')
+  assert.equal(directScalar(repositoryScan, 'shell', 8), 'bash')
+  assert.equal(directScalar(repositoryScan, 'run', 8), '|')
+  for (const uppercaseCredentialPath of [
+    'credentials/secret.P12',
+    'credentials/private.PFX',
+    'credentials/private.JKS',
+    'credentials/private.KEYSTORE',
+    'credentials/key.DER'
+  ]) {
+    const scanResult = runRepositoryScanFixture(
+      repositoryScan,
+      uppercaseCredentialPath
+    )
+    assert.notEqual(
+      scanResult.status,
+      0,
+      `${uppercaseCredentialPath} must be rejected regardless of extension case`
+    )
+    assert.ok(
+      scanResult.stderr.includes(uppercaseCredentialPath),
+      'scanner diagnostics must retain the original tracked path'
+    )
+  }
+  assert.match(repositoryScan, /git ls-files -z/)
+  assert.match(repositoryScan, /while IFS= read -r -d '' path/)
+  assert.match(
+    repositoryScan,
+    /LC_ALL=C tr '\[:upper:\]' '\[:lower:\]'/
+  )
+  assert.match(repositoryScan, /forbidden_path="\$path"/)
+  assert.match(repositoryScan, /\*\.example\|\*\.sample\|\*\.template/)
+  assert.match(
+    repositoryScan,
+    /id_rsa\|id_dsa\|id_ecdsa\|id_ed25519\|\*\.key\|\*\.p12\|\*\.pfx\|\*\.jks\|\*\.keystore\|\*\.der/
+  )
+  assert.match(repositoryScan, /private_key_prefix='BEGIN \[A-Z \]\*PRIVATE'/)
+  assert.match(repositoryScan, /private_key_suffix=' KEY'/)
+  assert.match(repositoryScan, /github_prefix='gh\[pousr\]_'/)
+  assert.match(repositoryScan, /github_fine_prefix='github_''pat_'/)
+  assert.match(repositoryScan, /aws_prefix='AK''IA'/)
+  assert.match(repositoryScan, /google_prefix='AI''za'/)
+  assert.match(repositoryScan, /stripe_prefix='sk_''live_'/)
+  assert.match(repositoryScan, /slack_prefix='xox''\[baprs\]-'/)
+  assert.equal((repositoryScan.match(/git grep -IlE/g) || []).length, 2)
+  assert.equal((repositoryScan.match(/>\/dev\/null/g) || []).length, 2)
+  assert.doesNotMatch(repositoryScan, /git grep -IEn/)
+
+  assert.match(
+    prJobs['container-build'],
+    /uses: docker\/setup-buildx-action@[0-9a-f]{40}/
+  )
+  assert.match(
+    prJobs['container-build'],
+    /uses: docker\/build-push-action@[0-9a-f]{40}/
+  )
+  assert.match(prJobs['container-build'], /^ {10}platforms: linux\/amd64$/m)
+  assert.match(prJobs['container-build'], /^ {10}push: false$/m)
+  assert.doesNotMatch(prJobs['container-build'], /docker\/login-action|push: true/)
+
+  const publishJob = workflowBlock(jobs, 'publish', 2)
+  assert.deepEqual(inlineList(directScalar(publishJob, 'needs', 4)), [
+    'verify',
+    'security',
+    'container-build'
+  ])
+  assert.equal(
+    directScalar(publishJob, 'if', 4),
+    "${{ github.event_name != 'pull_request' && github.ref == 'refs/heads/main' }}"
+  )
+
+  const deployJob = workflowBlock(jobs, 'deploy', 2)
+  assert.equal(directScalar(deployJob, 'needs', 4), 'publish')
+  assert.equal(directScalar(deployJob, 'environment', 4), 'Production')
+  assert.equal(
+    directScalar(deployJob, 'if', 4),
+    "${{ github.event_name != 'pull_request' && github.ref == 'refs/heads/main' && vars.DEPLOY_ENABLED == 'true' }}"
+  )
+  assert.match(deployJob, /\$\{\{\s*secrets\.DEPLOY_SSH_KEY\s*\}\}/)
+  assert.match(deployJob, /\$\{\{\s*secrets\.DEPLOY_KNOWN_HOSTS\s*\}\}/)
+  assert.doesNotMatch(workflow.replace(deployJob, ''), /\$\{\{\s*secrets\.DEPLOY_/)
+
+  const usesLines = workflow.match(/^\s+uses:\s+\S+\s*$/gm) || []
+  assert.ok(usesLines.length > 0)
+  for (const usesLine of usesLines) {
+    const action = usesLine.trim().match(/^uses:\s+([^@\s]+)@([^\s]+)$/)
+    assert.ok(action, `Action reference must include a commit SHA: ${usesLine.trim()}`)
+    assert.match(action[2], /^[0-9a-f]{40}$/, `${action[1]} must use a full commit SHA`)
+  }
+
   for (const relativePath of [
     'deploy/server/deploy-kinvest.sh',
     'deploy/server/bootstrap-server.sh',
@@ -671,18 +975,13 @@ function run() {
 
   assert.match(workflow, /^ {2}group: kinvest-production$/m)
   assert.match(workflow, /^ {2}cancel-in-progress: false$/m)
-  assert.equal((workflow.match(/timeout-minutes:/g) || []).length, 3)
+  assert.equal((workflow.match(/timeout-minutes:/g) || []).length, 5)
   const deployTimeoutMatch = workflow.match(
     /^ {2}deploy:\n[\s\S]*?^ {4}timeout-minutes: ([0-9]+)$/m
   )
   assert.ok(deployTimeoutMatch, 'deploy job must define a bounded timeout')
   const deployTimeoutMinutes = Number.parseInt(deployTimeoutMatch[1], 10)
   assert.equal(deployTimeoutMinutes, 40)
-  assert.match(workflow, /^ {4}if: \$\{\{ github\.ref == 'refs\/heads\/main' \}\}$/m)
-  assert.match(
-    workflow,
-    /^ {4}if: \$\{\{ github\.ref == 'refs\/heads\/main' && vars\.DEPLOY_ENABLED == 'true' \}\}$/m
-  )
   assert.match(workflow, /docker\/build-push-action@[0-9a-f]{40}/)
   assert.match(workflow, /docker\/login-action@[0-9a-f]{40}/)
   assert.match(workflow, /docker\/setup-buildx-action@[0-9a-f]{40}/)

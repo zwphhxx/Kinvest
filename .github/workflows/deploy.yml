@@ -4,6 +4,9 @@ on:
   push:
     branches:
       - main
+  pull_request:
+    branches:
+      - main
   workflow_dispatch:
 
 permissions:
@@ -15,6 +18,7 @@ concurrency:
 
 jobs:
   verify:
+    name: verify
     runs-on: ubuntu-latest
     timeout-minutes: 15
     permissions:
@@ -32,9 +36,101 @@ jobs:
       - name: Run quality gates
         run: npm run check
 
+  security:
+    name: security
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    permissions:
+      contents: read
+    steps:
+      - name: Check out exact commit
+        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683
+      - name: Use Node.js
+        uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020
+        with:
+          node-version: "22.13.0"
+          cache: npm
+      - name: Install locked dependencies
+        run: npm ci
+      - name: Audit high severity dependencies
+        run: npm audit --audit-level=high
+      - name: Scan tracked files for secrets
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          forbidden_path=''
+          forbidden_kind=''
+          while IFS= read -r -d '' path; do
+            normalized_path="$(printf '%s_' "$path" | LC_ALL=C tr '[:upper:]' '[:lower:]')"
+            normalized_path="${normalized_path%_}"
+            case "$normalized_path" in
+              .env|*/.env|.env.*|*/.env.*)
+                case "$normalized_path" in
+                  *.example|*.sample|*.template) ;;
+                  *)
+                    forbidden_kind='environment file'
+                    forbidden_path="$path"
+                    break
+                    ;;
+                esac
+                ;;
+            esac
+            case "${normalized_path##*/}" in
+              id_rsa|id_dsa|id_ecdsa|id_ed25519|*.key|*.p12|*.pfx|*.jks|*.keystore|*.der)
+                forbidden_kind='private key file'
+                forbidden_path="$path"
+                break
+                ;;
+            esac
+          done < <(git ls-files -z)
+
+          if [[ -n "$forbidden_path" ]]; then
+            printf 'A forbidden %s is tracked: %q\n' "$forbidden_kind" "$forbidden_path" >&2
+            exit 1
+          fi
+
+          private_key_prefix='BEGIN [A-Z ]*PRIVATE'
+          private_key_suffix=' KEY'
+          private_key_pattern="${private_key_prefix}${private_key_suffix}"
+          if git grep -IlE "$private_key_pattern" -- . >/dev/null; then
+            printf '%s\n' 'Private key material was found in a tracked file.' >&2
+            exit 1
+          fi
+
+          github_prefix='gh[pousr]_'
+          github_fine_prefix='github_''pat_'
+          aws_prefix='AK''IA'
+          google_prefix='AI''za'
+          stripe_prefix='sk_''live_'
+          slack_prefix='xox''[baprs]-'
+          secret_pattern="(${github_prefix}[A-Za-z0-9]{36,}|${github_fine_prefix}[A-Za-z0-9_]{20,}|${aws_prefix}[A-Z0-9]{16}|${google_prefix}[A-Za-z0-9_-]{35}|${stripe_prefix}[A-Za-z0-9]{20,}|${slack_prefix}[A-Za-z0-9-]{20,})"
+          if git grep -IlE "$secret_pattern" -- . >/dev/null; then
+            printf '%s\n' 'A value matching a common secret format was found.' >&2
+            exit 1
+          fi
+
+  container-build:
+    name: container-build
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    permissions:
+      contents: read
+    steps:
+      - name: Check out exact commit
+        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@e468171a9de216ec08956ac3ada2f0791b6bd435
+      - name: Build pull request image
+        uses: docker/build-push-action@263435318d21b8e681c14492fe198d362a7d2c83
+        with:
+          context: .
+          platforms: linux/amd64
+          push: false
+
   publish:
-    needs: verify
-    if: ${{ github.ref == 'refs/heads/main' }}
+    needs: [verify, security, container-build]
+    if: ${{ github.event_name != 'pull_request' && github.ref == 'refs/heads/main' }}
     runs-on: ubuntu-latest
     timeout-minutes: 20
     permissions:
@@ -76,7 +172,7 @@ jobs:
 
   deploy:
     needs: publish
-    if: ${{ github.ref == 'refs/heads/main' && vars.DEPLOY_ENABLED == 'true' }}
+    if: ${{ github.event_name != 'pull_request' && github.ref == 'refs/heads/main' && vars.DEPLOY_ENABLED == 'true' }}
     runs-on: ubuntu-latest
     timeout-minutes: 40
     environment: Production
