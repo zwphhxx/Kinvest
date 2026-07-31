@@ -104,6 +104,18 @@ class DeviceAuthRepository {
     `)
   }
 
+  runInImmediateTransaction(operation) {
+    this.database.exec('BEGIN IMMEDIATE')
+    try {
+      const result = operation()
+      this.database.exec('COMMIT')
+      return result
+    } catch (error) {
+      this.database.exec('ROLLBACK')
+      throw error
+    }
+  }
+
   insertRequest(request) {
     this.database.prepare(`
       INSERT INTO device_auth_requests (
@@ -153,27 +165,19 @@ class DeviceAuthRepository {
   }
 
   consumeRequestAndInsertCredential(requestId, consumedAt, credential) {
-    this.database.exec('BEGIN IMMEDIATE')
-    try {
-      const consumed = this.database.prepare(`
-        UPDATE device_auth_requests
-        SET consumed_at = ?
-        WHERE request_id = ?
-          AND approved_at IS NOT NULL
-          AND consumed_at IS NULL
-          AND locked_at IS NULL
-      `).run(consumedAt, requestId)
-      if (Number(consumed.changes) !== 1) {
-        this.database.exec('ROLLBACK')
-        return false
-      }
-      this.insertCredential(credential)
-      this.database.exec('COMMIT')
-      return true
-    } catch (error) {
-      this.database.exec('ROLLBACK')
-      throw error
+    const consumed = this.database.prepare(`
+      UPDATE device_auth_requests
+      SET consumed_at = ?
+      WHERE request_id = ?
+        AND approved_at IS NOT NULL
+        AND consumed_at IS NULL
+        AND locked_at IS NULL
+    `).run(consumedAt, requestId)
+    if (Number(consumed.changes) !== 1) {
+      return false
     }
+    this.insertCredential(credential)
+    return true
   }
 
   insertCredential(credential) {
@@ -237,53 +241,37 @@ class DeviceAuthRepository {
   }
 
   rotateCredential(oldCredentialId, replacement, graceExpiresAt) {
-    this.database.exec('BEGIN IMMEDIATE')
-    try {
-      const changed = this.database.prepare(`
-        UPDATE device_credentials
-        SET replacement_credential_id = ?, replacement_grace_expires_at = ?
-        WHERE credential_id = ?
-          AND revoked_at IS NULL
-          AND replacement_credential_id IS NULL
-      `).run(replacement.credentialId, graceExpiresAt, oldCredentialId)
-      if (Number(changed.changes) !== 1) {
-        this.database.exec('ROLLBACK')
-        return false
-      }
-      this.insertCredential(replacement)
-      this.database.exec('COMMIT')
-      return true
-    } catch (error) {
-      this.database.exec('ROLLBACK')
-      throw error
+    const changed = this.database.prepare(`
+      UPDATE device_credentials
+      SET replacement_credential_id = ?, replacement_grace_expires_at = ?
+      WHERE credential_id = ?
+        AND revoked_at IS NULL
+        AND replacement_credential_id IS NULL
+    `).run(replacement.credentialId, graceExpiresAt, oldCredentialId)
+    if (Number(changed.changes) !== 1) {
+      return false
     }
+    this.insertCredential(replacement)
+    return true
   }
 
   revokeCredential(credentialId, revokedAt) {
-    this.database.exec('BEGIN IMMEDIATE')
-    try {
-      const credential = this.database.prepare(`
-        SELECT device_id
-        FROM device_credentials
-        WHERE credential_id = ?
-      `).get(credentialId)
-      if (!credential) {
-        this.database.exec('ROLLBACK')
-        return { deviceId: null, credentialsRevoked: 0 }
-      }
-      const result = this.database.prepare(`
-        UPDATE device_credentials
-        SET revoked_at = ?
-        WHERE device_id = ? AND revoked_at IS NULL
-      `).run(revokedAt, credential.device_id)
-      this.database.exec('COMMIT')
-      return {
-        deviceId: credential.device_id,
-        credentialsRevoked: Number(result.changes)
-      }
-    } catch (error) {
-      this.database.exec('ROLLBACK')
-      throw error
+    const credential = this.database.prepare(`
+      SELECT device_id
+      FROM device_credentials
+      WHERE credential_id = ?
+    `).get(credentialId)
+    if (!credential) {
+      return { deviceId: null, credentialsRevoked: 0 }
+    }
+    const result = this.database.prepare(`
+      UPDATE device_credentials
+      SET revoked_at = ?
+      WHERE device_id = ? AND revoked_at IS NULL
+    `).run(revokedAt, credential.device_id)
+    return {
+      deviceId: credential.device_id,
+      credentialsRevoked: Number(result.changes)
     }
   }
 
@@ -297,31 +285,24 @@ class DeviceAuthRepository {
   }
 
   revokeByHmacVersion(hmacVersionId, revokedAt) {
-    this.database.exec('BEGIN IMMEDIATE')
-    try {
-      const matched = this.database.prepare(`
-        SELECT COUNT(DISTINCT device_id) AS devices_matched
-        FROM device_credentials
-        WHERE hmac_version_id = ?
-      `).get(hmacVersionId)
-      const result = this.database.prepare(`
-        UPDATE device_credentials
-        SET revoked_at = ?
-        WHERE revoked_at IS NULL
-          AND device_id IN (
-            SELECT device_id
-            FROM device_credentials
-            WHERE hmac_version_id = ?
-          )
-      `).run(revokedAt, hmacVersionId)
-      this.database.exec('COMMIT')
-      return {
-        devicesMatched: Number(matched.devices_matched),
-        credentialsRevoked: Number(result.changes)
-      }
-    } catch (error) {
-      this.database.exec('ROLLBACK')
-      throw error
+    const matched = this.database.prepare(`
+      SELECT COUNT(DISTINCT device_id) AS devices_matched
+      FROM device_credentials
+      WHERE hmac_version_id = ?
+    `).get(hmacVersionId)
+    const result = this.database.prepare(`
+      UPDATE device_credentials
+      SET revoked_at = ?
+      WHERE revoked_at IS NULL
+        AND device_id IN (
+          SELECT device_id
+          FROM device_credentials
+          WHERE hmac_version_id = ?
+        )
+    `).run(revokedAt, hmacVersionId)
+    return {
+      devicesMatched: Number(matched.devices_matched),
+      credentialsRevoked: Number(result.changes)
     }
   }
 

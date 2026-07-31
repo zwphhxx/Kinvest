@@ -1,5 +1,8 @@
 const crypto = require('crypto')
-const { validateSecretReference } = require('./secret-provider')
+const {
+  SecretProviderError,
+  validateSecretReference
+} = require('./secret-provider')
 
 const DAY_MS = 24 * 60 * 60 * 1000
 const REQUEST_TTL_MS = 10 * 60 * 1000
@@ -21,6 +24,7 @@ const ERROR_MESSAGES = {
   REQUEST_NOT_FOUND: 'The request is unavailable',
   TOKEN_EXPIRED: 'The device credential has expired',
   TOKEN_INVALID: 'The device credential is invalid',
+  TOKEN_KEY_UNAVAILABLE: 'A required device credential key is unavailable',
   TOKEN_REPLACED: 'The device credential has been replaced'
 }
 
@@ -36,8 +40,32 @@ function hashValue(value) {
   return crypto.createHash('sha256').update(value).digest('base64url')
 }
 
+function hashRequestCode(requestId, requestCode) {
+  return crypto.scryptSync(
+    String(requestCode),
+    `kinvest-device-request-code-v1:${requestId}`,
+    32,
+    {
+      N: 16384,
+      r: 8,
+      p: 1,
+      maxmem: 64 * 1024 * 1024
+    }
+  ).toString('base64url')
+}
+
 function hmacToken(secret, token) {
   return crypto.createHmac('sha256', secret).update(token).digest('base64url')
+}
+
+function deriveReplacementToken(secret, token, credentialId) {
+  return crypto.createHmac('sha256', secret)
+    .update('kinvest-device-token-rotation-v1')
+    .update('\0')
+    .update(credentialId)
+    .update('\0')
+    .update(token)
+    .digest('base64url')
 }
 
 function digestsEqual(left, right) {
@@ -91,14 +119,16 @@ class DeviceApprovalService {
     const requestCode = String(codeNumber).padStart(6, '0')
     const expiresAt = now + REQUEST_TTL_MS
 
-    this.repository.insertRequest({
-      requestId,
-      requestCodeDigest: hashValue(`${requestId}:${requestCode}`),
-      browserCredentialDigest: hashValue(browserCredential),
-      createdAt: now,
-      expiresAt
+    this.repository.runInImmediateTransaction(() => {
+      this.repository.insertRequest({
+        requestId,
+        requestCodeDigest: hashRequestCode(requestId, requestCode),
+        browserCredentialDigest: hashValue(browserCredential),
+        createdAt: now,
+        expiresAt
+      })
+      this.repository.addAuditEvent('device_request_created', now, requestId, { requestId })
     })
-    this.repository.addAuditEvent('device_request_created', now, requestId, { requestId })
 
     return {
       requestId,
@@ -118,26 +148,36 @@ class DeviceApprovalService {
     if (request.consumedAt !== null) {
       throw new DeviceApprovalError('REQUEST_ALREADY_USED')
     }
-    if (request.approvedAt !== null) {
-      return { approved: true, requestId }
-    }
     if (request.lockedAt !== null || request.failedAttempts >= REQUEST_MAX_ATTEMPTS) {
       throw new DeviceApprovalError('REQUEST_LOCKED')
     }
     if (now >= request.expiresAt) {
       throw new DeviceApprovalError('REQUEST_EXPIRED')
     }
+    if (request.approvedAt !== null) {
+      return { approved: true, requestId }
+    }
 
-    const suppliedDigest = hashValue(`${requestId}:${requestCode}`)
+    const suppliedDigest = hashRequestCode(requestId, requestCode)
     if (!digestsEqual(suppliedDigest, request.requestCodeDigest)) {
-      const updated = this.repository.recordFailedAttempt(
-        requestId,
-        now,
-        REQUEST_MAX_ATTEMPTS
-      )
-      this.repository.addAuditEvent('device_request_code_rejected', now, requestId, {
-        requestId,
-        count: updated.failedAttempts
+      const updated = this.repository.runInImmediateTransaction(() => {
+        const failedRequest = this.repository.recordFailedAttempt(
+          requestId,
+          now,
+          REQUEST_MAX_ATTEMPTS
+        )
+        if (failedRequest.approvedAt === null) {
+          this.repository.addAuditEvent(
+            'device_request_code_rejected',
+            now,
+            requestId,
+            {
+              requestId,
+              count: failedRequest.failedAttempts
+            }
+          )
+        }
+        return failedRequest
       })
       if (updated.approvedAt !== null) {
         return { approved: true, requestId }
@@ -147,10 +187,12 @@ class DeviceApprovalService {
       )
     }
 
-    if (!this.repository.approveRequest(requestId, now)) {
-      throw new DeviceApprovalError('REQUEST_NOT_FOUND')
-    }
-    this.repository.addAuditEvent('device_request_approved', now, requestId, { requestId })
+    this.repository.runInImmediateTransaction(() => {
+      if (!this.repository.approveRequest(requestId, now)) {
+        throw new DeviceApprovalError('REQUEST_NOT_FOUND')
+      }
+      this.repository.addAuditEvent('device_request_approved', now, requestId, { requestId })
+    })
     return { approved: true, requestId }
   }
 
@@ -180,22 +222,25 @@ class DeviceApprovalService {
       deviceId: this.randomBytes(16).toString('base64url'),
       now
     })
-    if (!this.repository.consumeRequestAndInsertCredential(
-      requestId,
-      now,
-      issued.record
-    )) {
-      throw new DeviceApprovalError('REQUEST_ALREADY_USED')
-    }
-    this.repository.addAuditEvent(
-      'device_credential_issued',
-      now,
-      issued.record.credentialId,
-      {
-        credentialId: issued.record.credentialId,
-        hmacVersionId: issued.record.hmacVersionId
+    this.repository.runInImmediateTransaction(() => {
+      if (!this.repository.consumeRequestAndInsertCredential(
+        requestId,
+        now,
+        issued.record
+      )) {
+        throw new DeviceApprovalError('REQUEST_ALREADY_USED')
       }
-    )
+      this.repository.addAuditEvent(
+        'device_credential_issued',
+        now,
+        issued.record.credentialId,
+        {
+          credentialId: issued.record.credentialId,
+          deviceId: issued.record.deviceId,
+          hmacVersionId: issued.record.hmacVersionId
+        }
+      )
+    })
 
     return {
       credentialId: issued.record.credentialId,
@@ -220,31 +265,55 @@ class DeviceApprovalService {
     }
 
     if (credential.replacementCredentialId) {
-      if (now >= credential.replacementGraceExpiresAt) {
-        throw new DeviceApprovalError('TOKEN_REPLACED')
+      const replacement = this.repository.getCredential(
+        credential.replacementCredentialId
+      )
+      if (!replacement) throw new DeviceApprovalError('TOKEN_INVALID')
+      const replacementSecret = this.readHmacSecretOrUnavailable(
+        replacement.hmacVersionId
+      )
+      const replacementToken = deriveReplacementToken(
+        replacementSecret,
+        token,
+        credential.credentialId
+      )
+      if (!digestsEqual(
+        hmacToken(replacementSecret, replacementToken),
+        replacement.tokenDigest
+      )) {
+        throw new DeviceApprovalError('TOKEN_INVALID')
       }
       return {
         authenticated: true,
-        credentialId: credential.replacementCredentialId,
+        credentialId: credential.credentialId,
         deviceId: credential.deviceId,
         hmacVersionId: credential.hmacVersionId,
-        rotated: false,
-        concurrentGrace: true
+        replacementCredentialId: replacement.credentialId,
+        replacementHmacVersionId: replacement.hmacVersionId,
+        token: replacementToken,
+        rotated: true,
+        concurrentGrace: true,
+        cookie: cookieContract()
       }
     }
 
     if (now - credential.rotatedAt >= TOKEN_ROTATION_MS) {
-      return this.rotateCredential(credential, now)
+      return this.rotateCredential(credential, token, now)
     }
 
     const idleExpiresAt = Math.min(now + TOKEN_IDLE_MS, credential.absoluteExpiresAt)
-    this.repository.updateCredentialUse(credential.credentialId, now, idleExpiresAt)
-    this.repository.addAuditEvent(
-      'device_credential_authenticated',
-      now,
-      credential.credentialId,
-      { credentialId: credential.credentialId }
-    )
+    this.repository.runInImmediateTransaction(() => {
+      this.repository.updateCredentialUse(credential.credentialId, now, idleExpiresAt)
+      this.repository.addAuditEvent(
+        'device_credential_authenticated',
+        now,
+        credential.credentialId,
+        {
+          credentialId: credential.credentialId,
+          deviceId: credential.deviceId
+        }
+      )
+    })
     return {
       authenticated: true,
       credentialId: credential.credentialId,
@@ -259,27 +328,31 @@ class DeviceApprovalService {
 
   revokeCredential(credentialId) {
     const now = this.now()
-    const result = this.repository.revokeCredential(credentialId, now)
-    const response = {
-      devicesRevoked: result.deviceId === null ? 0 : 1,
-      credentialsRevoked: result.credentialsRevoked
-    }
-    if (response.devicesRevoked > 0) {
-      this.repository.addAuditEvent('device_revoked', now, result.deviceId, {
-        deviceId: result.deviceId,
-        credentialId,
-        devicesRevoked: response.devicesRevoked,
-        credentialsRevoked: response.credentialsRevoked
-      })
-    }
-    return response
+    return this.repository.runInImmediateTransaction(() => {
+      const result = this.repository.revokeCredential(credentialId, now)
+      const response = {
+        devicesRevoked: result.credentialsRevoked > 0 ? 1 : 0,
+        credentialsRevoked: result.credentialsRevoked
+      }
+      if (response.devicesRevoked > 0) {
+        this.repository.addAuditEvent('device_revoked', now, result.deviceId, {
+          deviceId: result.deviceId,
+          credentialId,
+          devicesRevoked: response.devicesRevoked,
+          credentialsRevoked: response.credentialsRevoked
+        })
+      }
+      return response
+    })
   }
 
   revokeAllCredentials() {
     const now = this.now()
-    const count = this.repository.revokeAllCredentials(now)
-    this.repository.addAuditEvent('device_credentials_revoked_all', now, null, { count })
-    return count
+    return this.repository.runInImmediateTransaction(() => {
+      const count = this.repository.revokeAllCredentials(now)
+      this.repository.addAuditEvent('device_credentials_revoked_all', now, null, { count })
+      return count
+    })
   }
 
   revokeByHmacVersion(hmacVersionId) {
@@ -288,13 +361,15 @@ class DeviceApprovalService {
       versionId: hmacVersionId
     })
     const now = this.now()
-    const result = this.repository.revokeByHmacVersion(hmacVersionId, now)
-    this.repository.addAuditEvent('device_credentials_revoked_hmac_version', now, null, {
-      hmacVersionId,
-      devicesMatched: result.devicesMatched,
-      credentialsRevoked: result.credentialsRevoked
+    return this.repository.runInImmediateTransaction(() => {
+      const result = this.repository.revokeByHmacVersion(hmacVersionId, now)
+      this.repository.addAuditEvent('device_credentials_revoked_hmac_version', now, null, {
+        hmacVersionId,
+        devicesMatched: result.devicesMatched,
+        credentialsRevoked: result.credentialsRevoked
+      })
+      return result
     })
-    return result
   }
 
   getReferencedHmacVersionIds() {
@@ -327,9 +402,15 @@ class DeviceApprovalService {
     })
   }
 
-  createCredential({ approvedAt, absoluteExpiresAt, hmacVersionId, deviceId, now }) {
-    const token = this.randomBytes(32).toString('base64url')
-    const secret = this.readHmacSecret(hmacVersionId)
+  createCredential({
+    approvedAt,
+    absoluteExpiresAt,
+    hmacVersionId,
+    deviceId,
+    now,
+    token = this.randomBytes(32).toString('base64url'),
+    secret = this.readHmacSecret(hmacVersionId)
+  }) {
     const credentialId = this.randomBytes(16).toString('base64url')
     return {
       token,
@@ -349,54 +430,101 @@ class DeviceApprovalService {
 
   findCredentialForToken(token, now) {
     const secrets = new Map()
+    const unavailableVersions = new Set()
+    let hasUnavailableVersion = false
     for (const credential of this.repository.listCredentialCandidates(now)) {
+      if (unavailableVersions.has(credential.hmacVersionId)) continue
       if (!secrets.has(credential.hmacVersionId)) {
-        secrets.set(
-          credential.hmacVersionId,
-          this.readHmacSecret(credential.hmacVersionId)
-        )
+        try {
+          secrets.set(
+            credential.hmacVersionId,
+            this.readHmacSecret(credential.hmacVersionId)
+          )
+        } catch (error) {
+          if (
+            error instanceof SecretProviderError &&
+            error.code === 'SECRET_NOT_FOUND'
+          ) {
+            unavailableVersions.add(credential.hmacVersionId)
+            hasUnavailableVersion = true
+            continue
+          }
+          throw error
+        }
       }
       const digest = hmacToken(secrets.get(credential.hmacVersionId), token)
       if (digestsEqual(digest, credential.tokenDigest)) {
         return credential
       }
     }
+    if (hasUnavailableVersion) {
+      throw new DeviceApprovalError('TOKEN_KEY_UNAVAILABLE')
+    }
     return null
   }
 
-  rotateCredential(credential, now) {
+  readHmacSecretOrUnavailable(hmacVersionId) {
+    try {
+      return this.readHmacSecret(hmacVersionId)
+    } catch (error) {
+      if (
+        error instanceof SecretProviderError &&
+        error.code === 'SECRET_NOT_FOUND'
+      ) {
+        throw new DeviceApprovalError('TOKEN_KEY_UNAVAILABLE')
+      }
+      throw error
+    }
+  }
+
+  rotateCredential(credential, rawToken, now) {
+    const replacementHmacVersionId = this.activeHmacVersionId
+    const replacementSecret = this.readHmacSecretOrUnavailable(
+      replacementHmacVersionId
+    )
+    const replacementToken = deriveReplacementToken(
+      replacementSecret,
+      rawToken,
+      credential.credentialId
+    )
     const issued = this.createCredential({
       approvedAt: credential.approvedAt,
       absoluteExpiresAt: credential.absoluteExpiresAt,
-      hmacVersionId: this.activeHmacVersionId,
+      hmacVersionId: replacementHmacVersionId,
       deviceId: credential.deviceId,
-      now
+      now,
+      token: replacementToken,
+      secret: replacementSecret
     })
     const graceExpiresAt = now + TOKEN_GRACE_MS
-    if (!this.repository.rotateCredential(
-      credential.credentialId,
-      issued.record,
-      graceExpiresAt
-    )) {
-      throw new DeviceApprovalError('TOKEN_REPLACED')
-    }
-    this.repository.addAuditEvent(
-      'device_credential_rotated',
-      now,
-      credential.credentialId,
-      {
-        credentialId: credential.credentialId,
-        replacementCredentialId: issued.record.credentialId,
-        deviceId: credential.deviceId,
-        hmacVersionId: issued.record.hmacVersionId
+    this.repository.runInImmediateTransaction(() => {
+      if (!this.repository.rotateCredential(
+        credential.credentialId,
+        issued.record,
+        graceExpiresAt
+      )) {
+        throw new DeviceApprovalError('TOKEN_REPLACED')
       }
-    )
+      this.repository.addAuditEvent(
+        'device_credential_rotated',
+        now,
+        credential.credentialId,
+        {
+          credentialId: credential.credentialId,
+          replacementCredentialId: issued.record.credentialId,
+          deviceId: credential.deviceId,
+          hmacVersionId: issued.record.hmacVersionId
+        }
+      )
+    })
     return {
       authenticated: true,
-      credentialId: issued.record.credentialId,
+      credentialId: credential.credentialId,
       deviceId: issued.record.deviceId,
-      token: issued.token,
-      hmacVersionId: issued.record.hmacVersionId,
+      hmacVersionId: credential.hmacVersionId,
+      replacementCredentialId: issued.record.credentialId,
+      replacementHmacVersionId: issued.record.hmacVersionId,
+      token: replacementToken,
       idleExpiresAt: issued.record.idleExpiresAt,
       absoluteExpiresAt: issued.record.absoluteExpiresAt,
       rotated: true,

@@ -60,6 +60,31 @@ function expectCode(callback, expectedCode) {
   })
 }
 
+function installAuditFailure(database, eventType) {
+  assert.match(eventType, /^[a-z_]+$/)
+  database.exec(`
+    CREATE TEMP TRIGGER fail_selected_audit
+    BEFORE INSERT ON device_auth_audit
+    WHEN NEW.event_type = '${eventType}'
+    BEGIN
+      SELECT RAISE(ABORT, 'AUDIT_WRITE_FAILED');
+    END;
+  `)
+}
+
+function expectAuditFailure(callback) {
+  assert.throws(callback, (error) => {
+    assert.ok(error instanceof Error)
+    assert.strictEqual(error.message.includes('AUDIT_WRITE_FAILED'), true)
+    return true
+  })
+}
+
+function countRows(database, tableName) {
+  assert.match(tableName, /^[a-z_]+$/)
+  return Number(database.prepare(`SELECT COUNT(*) AS count FROM ${tableName}`).get().count)
+}
+
 function issueDevice(harness) {
   const request = harness.service.createRequest()
   harness.service.approveRequest({
@@ -125,6 +150,12 @@ function testRequestApprovalAndRedemption() {
     'SELECT request_code_digest, browser_credential_digest FROM device_auth_requests WHERE request_id = ?'
   ).get(request.requestId)
   assert.notStrictEqual(storedRequest.request_code_digest, request.requestCode)
+  assert.notStrictEqual(
+    storedRequest.request_code_digest,
+    crypto.createHash('sha256')
+      .update(`${request.requestId}:${request.requestCode}`)
+      .digest('base64url')
+  )
   assert.notStrictEqual(storedRequest.browser_credential_digest, request.browserCredential)
   assert.strictEqual(JSON.stringify(storedRequest).includes(request.requestCode), false)
   assert.strictEqual(JSON.stringify(storedRequest).includes(request.browserCredential), false)
@@ -217,6 +248,20 @@ function testApprovedRequestIsIdempotentBeforeCodeValidation() {
     requestId: request.requestId,
     browserCredential: request.browserCredential
   }).token.length > 0, true)
+
+  const expired = createHarness()
+  const expiredRequest = expired.service.createRequest()
+  expired.service.approveRequest({
+    requestId: expiredRequest.requestId,
+    requestCode: expiredRequest.requestCode,
+    adminAuthenticated: true
+  })
+  expired.clock.value += (10 * 60 * 1000) + 1
+  expectCode(() => expired.service.approveRequest({
+    requestId: expiredRequest.requestId,
+    requestCode: 'wrong-after-expiry',
+    adminAuthenticated: true
+  }), 'REQUEST_EXPIRED')
 }
 
 function testTokenStorageAndExplicitHmacVersion() {
@@ -246,6 +291,7 @@ function testRotationAndConcurrentGrace() {
   const harness = createHarness()
   const { credential } = issueDevice(harness)
 
+  harness.service.setActiveHmacVersionId(VERSION_TWO)
   harness.clock.value += 30 * DAY_MS
   const rotation = harness.service.authenticate(credential.token)
   assert.strictEqual(rotation.authenticated, true)
@@ -253,14 +299,33 @@ function testRotationAndConcurrentGrace() {
   assert.strictEqual(Buffer.from(rotation.token, 'base64url').length, 32)
   assert.notStrictEqual(rotation.token, credential.token)
   assert.strictEqual(rotation.cookie.secure, true)
+  assert.strictEqual(rotation.credentialId, credential.credentialId)
+  assert.strictEqual(rotation.hmacVersionId, VERSION_ONE)
+  assert.strictEqual(typeof rotation.replacementCredentialId, 'string')
+  assert.strictEqual(rotation.replacementHmacVersionId, VERSION_TWO)
 
+  const afterFirstRotation = harness.repository.getCredential(credential.credentialId)
+  const originalGraceExpiry = afterFirstRotation.replacementGraceExpiresAt
   const oldDuringGrace = harness.service.authenticate(credential.token)
   assert.strictEqual(oldDuringGrace.authenticated, true)
   assert.strictEqual(oldDuringGrace.concurrentGrace, true)
-  assert.strictEqual(oldDuringGrace.rotated, false)
+  assert.strictEqual(oldDuringGrace.rotated, true)
+  assert.strictEqual(oldDuringGrace.token, rotation.token)
+  assert.strictEqual(oldDuringGrace.credentialId, credential.credentialId)
+  assert.strictEqual(oldDuringGrace.hmacVersionId, VERSION_ONE)
+  assert.strictEqual(
+    oldDuringGrace.replacementCredentialId,
+    rotation.replacementCredentialId
+  )
+  assert.strictEqual(oldDuringGrace.replacementHmacVersionId, VERSION_TWO)
+  assert.strictEqual(oldDuringGrace.cookie.sameSite, 'Strict')
   const oldRecord = harness.repository.getCredential(credential.credentialId)
-  const replacementRecord = harness.repository.getCredential(rotation.credentialId)
+  const replacementRecord = harness.repository.getCredential(
+    rotation.replacementCredentialId
+  )
   assert.strictEqual(oldRecord.deviceId, replacementRecord.deviceId)
+  assert.strictEqual(oldRecord.replacementGraceExpiresAt, originalGraceExpiry)
+  assert.strictEqual(harness.service.authenticate(rotation.token).authenticated, true)
 
   harness.clock.value += (5 * 60 * 1000) + 1
   expectCode(() => harness.service.authenticate(credential.token), 'TOKEN_INVALID')
@@ -273,7 +338,9 @@ function testIdleAndAbsoluteExpiryBoundaries() {
   idleHarness.clock.value += 89 * DAY_MS
   const idleRotation = idleHarness.service.authenticate(idleCredential.token)
   assert.strictEqual(idleRotation.rotated, true)
-  const idleRecord = idleHarness.repository.getCredential(idleRotation.credentialId)
+  const idleRecord = idleHarness.repository.getCredential(
+    idleRotation.replacementCredentialId
+  )
   assert.strictEqual(
     idleRecord.idleExpiresAt,
     Math.min(idleHarness.clock.value + (90 * DAY_MS), idleRecord.absoluteExpiresAt)
@@ -299,8 +366,11 @@ function testIdleAndAbsoluteExpiryBoundaries() {
   if (beforeAbsoluteExpiry.rotated) {
     activeToken = beforeAbsoluteExpiry.token
   }
+  const activeCredentialId = beforeAbsoluteExpiry.rotated
+    ? beforeAbsoluteExpiry.replacementCredentialId
+    : beforeAbsoluteExpiry.credentialId
   const activeRecord = absoluteHarness.repository.getCredential(
-    beforeAbsoluteExpiry.credentialId
+    activeCredentialId
   )
   assert.strictEqual(activeRecord.absoluteExpiresAt, absoluteRecord.absoluteExpiresAt)
   assert.strictEqual(activeRecord.idleExpiresAt, absoluteRecord.absoluteExpiresAt)
@@ -328,6 +398,15 @@ function testRevocationAndVersionDeletionProtection() {
     devicesRevoked: 1,
     credentialsRevoked: 1
   })
+  assert.deepStrictEqual(harness.service.revokeCredential(first.credentialId), {
+    devicesRevoked: 0,
+    credentialsRevoked: 0
+  })
+  assert.strictEqual(
+    harness.repository.listAuditEvents()
+      .filter((event) => event.eventType === 'device_revoked').length,
+    1
+  )
   expectCode(() => harness.service.authenticate(first.token), 'TOKEN_INVALID')
   assert.deepStrictEqual(harness.service.getReferencedHmacVersionIds(), [VERSION_TWO])
   assert.strictEqual(harness.service.assertHmacVersionDeletable(VERSION_ONE), true)
@@ -376,7 +455,7 @@ function testExpiredVersionIsNotReadAndLeakRevokesReplacement() {
   assert.deepStrictEqual(
     harness.repository.listCredentialCandidates(harness.clock.value)
       .map((credential) => credential.credentialId),
-    [replacement.credentialId]
+    [replacement.replacementCredentialId]
   )
   assert.strictEqual(harness.secretProvider.deleteEntry({
     secretName: SECRET_NAME,
@@ -391,6 +470,116 @@ function testExpiredVersionIsNotReadAndLeakRevokesReplacement() {
   })
   expectCode(() => harness.service.authenticate(original.token), 'TOKEN_INVALID')
   expectCode(() => harness.service.authenticate(replacement.token), 'TOKEN_INVALID')
+}
+
+function testMissingActiveVersionDoesNotBlockOtherDevices() {
+  const harness = createHarness()
+  const versionOneCredential = issueDevice(harness).credential
+  harness.service.setActiveHmacVersionId(VERSION_TWO)
+  const versionTwoCredential = issueDevice(harness).credential
+  assert.strictEqual(harness.secretProvider.deleteEntry({
+    secretName: SECRET_NAME,
+    versionId: VERSION_ONE
+  }), true)
+
+  assert.strictEqual(
+    harness.service.authenticate(versionTwoCredential.token).authenticated,
+    true
+  )
+  try {
+    harness.service.authenticate(versionOneCredential.token)
+    assert.fail('missing active key must fail')
+  } catch (error) {
+    assert.ok(error && typeof error === 'object' && 'code' in error)
+    assert.strictEqual(error.code, 'TOKEN_KEY_UNAVAILABLE')
+    assert.strictEqual(error.message.includes(SECRET_NAME), false)
+    assert.strictEqual(error.message.includes(VERSION_ONE), false)
+    assert.strictEqual(error.message.includes('synthetic-hmac-key-one'), false)
+  }
+}
+
+function testStateAndAuditAreAtomic() {
+  const creation = createHarness()
+  installAuditFailure(creation.database, 'device_request_created')
+  expectAuditFailure(() => creation.service.createRequest())
+  assert.strictEqual(countRows(creation.database, 'device_auth_requests'), 0)
+
+  const failedAttempt = createHarness()
+  const failedRequest = failedAttempt.service.createRequest()
+  installAuditFailure(failedAttempt.database, 'device_request_code_rejected')
+  expectAuditFailure(() => failedAttempt.service.approveRequest({
+    requestId: failedRequest.requestId,
+    requestCode: 'wrong-code',
+    adminAuthenticated: true
+  }))
+  assert.strictEqual(failedAttempt.repository.getRequest(failedRequest.requestId).failedAttempts, 0)
+
+  const approval = createHarness()
+  const approvalRequest = approval.service.createRequest()
+  installAuditFailure(approval.database, 'device_request_approved')
+  expectAuditFailure(() => approval.service.approveRequest({
+    requestId: approvalRequest.requestId,
+    requestCode: approvalRequest.requestCode,
+    adminAuthenticated: true
+  }))
+  assert.strictEqual(approval.repository.getRequest(approvalRequest.requestId).approvedAt, null)
+
+  const redemption = createHarness()
+  const redemptionRequest = redemption.service.createRequest()
+  redemption.service.approveRequest({
+    requestId: redemptionRequest.requestId,
+    requestCode: redemptionRequest.requestCode,
+    adminAuthenticated: true
+  })
+  installAuditFailure(redemption.database, 'device_credential_issued')
+  expectAuditFailure(() => redemption.service.redeemRequest({
+    requestId: redemptionRequest.requestId,
+    browserCredential: redemptionRequest.browserCredential
+  }))
+  assert.strictEqual(redemption.repository.getRequest(redemptionRequest.requestId).consumedAt, null)
+  assert.strictEqual(countRows(redemption.database, 'device_credentials'), 0)
+
+  const sliding = createHarness()
+  const slidingCredential = issueDevice(sliding).credential
+  const beforeSliding = sliding.repository.getCredential(slidingCredential.credentialId)
+  sliding.clock.value += DAY_MS
+  installAuditFailure(sliding.database, 'device_credential_authenticated')
+  expectAuditFailure(() => sliding.service.authenticate(slidingCredential.token))
+  const afterSliding = sliding.repository.getCredential(slidingCredential.credentialId)
+  assert.strictEqual(afterSliding.lastUsedAt, beforeSliding.lastUsedAt)
+  assert.strictEqual(afterSliding.idleExpiresAt, beforeSliding.idleExpiresAt)
+
+  const rotation = createHarness()
+  const rotationCredential = issueDevice(rotation).credential
+  rotation.clock.value += 30 * DAY_MS
+  installAuditFailure(rotation.database, 'device_credential_rotated')
+  expectAuditFailure(() => rotation.service.authenticate(rotationCredential.token))
+  assert.strictEqual(
+    rotation.repository.getCredential(rotationCredential.credentialId)
+      .replacementCredentialId,
+    null
+  )
+  assert.strictEqual(countRows(rotation.database, 'device_credentials'), 1)
+
+  const singleRevocation = createHarness()
+  const singleCredential = issueDevice(singleRevocation).credential
+  installAuditFailure(singleRevocation.database, 'device_revoked')
+  expectAuditFailure(() => singleRevocation.service.revokeCredential(
+    singleCredential.credentialId
+  ))
+  assert.strictEqual(singleRevocation.service.authenticate(singleCredential.token).authenticated, true)
+
+  const allRevocation = createHarness()
+  const allCredential = issueDevice(allRevocation).credential
+  installAuditFailure(allRevocation.database, 'device_credentials_revoked_all')
+  expectAuditFailure(() => allRevocation.service.revokeAllCredentials())
+  assert.strictEqual(allRevocation.service.authenticate(allCredential.token).authenticated, true)
+
+  const versionRevocation = createHarness()
+  const versionCredential = issueDevice(versionRevocation).credential
+  installAuditFailure(versionRevocation.database, 'device_credentials_revoked_hmac_version')
+  expectAuditFailure(() => versionRevocation.service.revokeByHmacVersion(VERSION_ONE))
+  assert.strictEqual(versionRevocation.service.authenticate(versionCredential.token).authenticated, true)
 }
 
 function testAuditDoesNotContainSecrets() {
@@ -431,6 +620,8 @@ async function run() {
   testRevocationAndVersionDeletionProtection()
   testLogicalDeviceRevocationAcrossRotation()
   testExpiredVersionIsNotReadAndLeakRevokesReplacement()
+  testMissingActiveVersionDoesNotBlockOtherDevices()
+  testStateAndAuditAreAtomic()
   testAuditDoesNotContainSecrets()
 }
 
