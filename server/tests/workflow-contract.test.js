@@ -294,6 +294,7 @@ case "$command_name" in
     ;;
   pull)
     ref="\${1:-}"
+    printf '%s\\n' "$ref" >> "$state/pull-attempts.log"
     if [[ -f "$state/fail-candidate-pull" && "$ref" == "$CANDIDATE_REF" ]]; then
       exit 30
     fi
@@ -305,6 +306,25 @@ case "$command_name" in
         : > "$state/old-pull-attempted"
       fi
       exit 31
+    fi
+    if [[ "$ref" == "$CANDIDATE_REF" && -f "$state/candidate-pull-timeout-once" ]]; then
+      rm -f "$state/candidate-pull-timeout-once"
+      exit 124
+    fi
+    if [[ "$ref" == "$CANDIDATE_REF" && -f "$state/candidate-pull-permanent-error" ]]; then
+      printf '%s\\n' 'Error response from daemon: manifest unknown' >&2
+      exit 1
+    fi
+    if [[ "$ref" == "$CANDIDATE_REF" ]]; then
+      remaining='0'
+      if [[ -f "$state/candidate-pull-transient-remaining" ]]; then
+        remaining="$(cat "$state/candidate-pull-transient-remaining")"
+      fi
+      if ((remaining > 0)); then
+        printf '%s\\n' "$((remaining - 1))" > "$state/candidate-pull-transient-remaining"
+        printf '%s\\n' 'Error response from daemon: Get "https://ghcr.io/v2/": dial tcp 203.0.113.10:443: i/o timeout' >&2
+        exit 1
+      fi
     fi
     printf '%s\\n' "$ref" >> "$state/pulls.log"
     ;;
@@ -396,6 +416,11 @@ function runDeployFixture(markers = [], { withPrevious = true } = {}) {
   for (const marker of markers) {
     if (marker === 'previous-unhealthy') {
       fs.writeFileSync(path.join(fakeState, 'running.health'), 'unhealthy\n')
+    } else if (marker.startsWith('candidate-pull-transient-remaining:')) {
+      fs.writeFileSync(
+        path.join(fakeState, 'candidate-pull-transient-remaining'),
+        marker.slice('candidate-pull-transient-remaining:'.length)
+      )
     } else {
       fs.writeFileSync(path.join(fakeState, marker), '')
     }
@@ -431,6 +456,13 @@ function runDeployFixture(markers = [], { withPrevious = true } = {}) {
     result,
     stateDir
   }
+}
+
+function readPullAttempts(fixture) {
+  const logPath = path.join(fixture.fakeState, 'pull-attempts.log')
+  return fs.existsSync(logPath)
+    ? fs.readFileSync(logPath, 'utf8').trim().split('\n')
+    : []
 }
 
 function assertRejectedInput(input, messagePattern) {
@@ -1001,7 +1033,9 @@ function run() {
   assert.match(deploy, /\^ghcr\\\.io\/zwphhxx\/kinvest@sha256:\[0-9a-f\]\{64\}\$/)
   assert.match(deploy, /^CURRENT_STATE="\$STATE\/current\.state"$/m)
   assert.match(deploy, /^PREVIOUS_STATE="\$STATE\/previous\.state"$/m)
-  assert.match(deploy, /^PULL_TIMEOUT='900s'$/m)
+  assert.match(deploy, /^PULL_ATTEMPTS='3'$/m)
+  assert.match(deploy, /^PULL_TIMEOUT='300s'$/m)
+  assert.match(deploy, /^PULL_RETRY_BASE_WAIT_SECONDS='2'$/m)
   assert.match(deploy, /^DOCKER_TIMEOUT='120s'$/m)
   assert.match(deploy, /^COMPOSE_TIMEOUT='120s'$/m)
   assert.match(deploy, /^INSPECT_TIMEOUT='15s'$/m)
@@ -1011,16 +1045,38 @@ function run() {
   assert.match(deploy, /--kill-after=/)
   const runPullBody = deploy.match(/^run_pull\(\) \{([\s\S]*?)^\}$/m)
   const runDockerBody = deploy.match(/^run_docker\(\) \{([\s\S]*?)^\}$/m)
+  const pullWithRetriesBody = deploy.match(/^pull_with_retries\(\) \{([\s\S]*?)^\}$/m)
+  const pullTransientBody = deploy.match(/^pull_failure_is_transient\(\) \{([\s\S]*?)^\}$/m)
   assert.ok(runPullBody, 'deployment must define a dedicated pull wrapper')
   assert.ok(runDockerBody, 'deployment must retain a bounded general Docker wrapper')
+  assert.ok(pullWithRetriesBody, 'deployment must define a bounded pull retry wrapper')
+  assert.ok(pullTransientBody, 'deployment must classify transient pull failures explicitly')
   assert.match(runPullBody[1], /\$PULL_TIMEOUT/)
   assert.match(runPullBody[1], /docker pull "\$1"/)
   assert.match(runDockerBody[1], /\$DOCKER_TIMEOUT/)
   assert.doesNotMatch(runDockerBody[1], /pull/)
+  assert.match(pullWithRetriesBody[1], /run_pull "\$ref"/)
+  assert.match(pullWithRetriesBody[1], /while \(\(attempt <= PULL_ATTEMPTS\)\)/)
+  assert.match(pullWithRetriesBody[1], /pull_failure_is_transient "\$status" "\$stderr_file"/)
+  assert.match(pullWithRetriesBody[1], /sleep "\$wait_seconds"/)
+  assert.match(pullWithRetriesBody[1], /wait_seconds=\$\(\(wait_seconds \* 2\)\)/)
+  assert.match(
+    pullWithRetriesBody[1],
+    /pull attempt %s of %s failed with exit code %s/,
+    'retry log lines must contain only attempt number and exit code'
+  )
+  assert.doesNotMatch(
+    pullWithRetriesBody[1],
+    /\bcat\b|\btee\b/,
+    'captured pull stderr must never be written to the deployment log'
+  )
+  assert.match(pullTransientBody[1], /status == 124/)
+  assert.match(pullTransientBody[1], /grep -Eqi/)
   assert.match(deploy, /run_docker network inspect web/)
   assert.match(deploy, /run_docker rm -f kinvest/)
   assert.doesNotMatch(deploy, /run_docker pull/)
-  assert.match(deploy, /run_pull "\$digest_ref"/)
+  assert.match(deploy, /pull_with_retries "\$digest_ref"/)
+  assert.doesNotMatch(deploy, /run_pull "\$digest_ref"/)
   assert.doesNotMatch(deploy, /run_pull "\$previous_digest_ref"/)
   assert.match(deploy, /verify_running_image/)
   assert.match(deploy, /\.Config\.Image/)
@@ -1049,6 +1105,8 @@ function run() {
     (functionBody(name).match(/\brun_inspect\b/g) || []).length
 
   const pullSeconds = timeoutSeconds('PULL_TIMEOUT')
+  const pullAttempts = plainSeconds('PULL_ATTEMPTS')
+  const pullRetryBaseWaitSeconds = plainSeconds('PULL_RETRY_BASE_WAIT_SECONDS')
   const dockerSeconds = timeoutSeconds('DOCKER_TIMEOUT')
   const composeSeconds = timeoutSeconds('COMPOSE_TIMEOUT')
   const inspectSeconds = timeoutSeconds('INSPECT_TIMEOUT')
@@ -1081,7 +1139,10 @@ function run() {
 
   const networkPrecheckSeconds = dockerSeconds + dockerKillSeconds
   const previousSnapshotSeconds = snapshotInspectCalls * inspectCallSeconds
-  const candidatePullSeconds = pullSeconds + dockerKillSeconds
+  const pullRetryWaitsSeconds =
+    pullRetryBaseWaitSeconds * (2 ** (pullAttempts - 1) - 1)
+  const candidatePullSeconds =
+    pullAttempts * (pullSeconds + dockerKillSeconds) + pullRetryWaitsSeconds
   const candidateComposeSeconds = composeSeconds + dockerKillSeconds
   const candidateIdentitySeconds = candidateIdentityInspectCalls * inspectCallSeconds
   const rollbackPrecheckSeconds = previousServingInspectCalls * inspectCallSeconds
@@ -1491,16 +1552,131 @@ function run() {
       fs.readFileSync(path.join(success.stateDir, 'previous.state'), 'utf8'),
       `digest_ref=${previousRef}\ncommit=${previousCommit}\n`
     )
+    assert.deepEqual(
+      readPullAttempts(success),
+      [candidateRef],
+      'first-attempt pull success must not trigger a retry'
+    )
     const timeoutLog = fs.readFileSync(path.join(success.fakeState, 'timeout.log'), 'utf8')
-    assert.match(timeoutLog, /--signal=TERM --kill-after=10s 900s docker pull/)
+    assert.match(timeoutLog, /--signal=TERM --kill-after=10s 300s docker pull/)
     assert.match(timeoutLog, /--signal=TERM --kill-after=10s 120s docker network inspect/)
     assert.match(timeoutLog, /--signal=TERM --kill-after=10s 120s env .*docker compose/)
     assert.match(timeoutLog, /--signal=TERM --kill-after=5s 15s docker image inspect/)
     assert.match(timeoutLog, /--signal=TERM --kill-after=5s 15s docker inspect/)
-    assert.doesNotMatch(timeoutLog, /900s docker (?!pull)/)
+    assert.doesNotMatch(timeoutLog, /300s docker (?!pull)/)
     assert.match(timeoutLog, /--kill-after=/)
   } finally {
     success.cleanup()
+  }
+
+  const transientRetrySuccess = runDeployFixture(['candidate-pull-transient-remaining:1'])
+  try {
+    const diagnostics = deployFixtureDiagnostics(transientRetrySuccess)
+    assert.equal(transientRetrySuccess.result.status, 0, diagnostics)
+    assert.deepEqual(
+      readPullAttempts(transientRetrySuccess),
+      [candidateRef, candidateRef],
+      'one transient pull failure must be retried exactly once before success'
+    )
+    assert.equal(
+      fs.readFileSync(path.join(transientRetrySuccess.stateDir, 'current.state'), 'utf8'),
+      `digest_ref=${candidateRef}\ncommit=${candidateCommit}\n`
+    )
+    assert.match(
+      transientRetrySuccess.result.stderr,
+      /pull attempt 1 of 3 failed with exit code 1\./
+    )
+    assert.match(
+      transientRetrySuccess.result.stderr,
+      /pull attempt 2 of 3 succeeded\./
+    )
+    assert.doesNotMatch(
+      transientRetrySuccess.result.stderr,
+      /dial tcp|i\/o timeout/,
+      'raw pull stderr must not leak into the deployment log'
+    )
+  } finally {
+    transientRetrySuccess.cleanup()
+  }
+
+  const timeoutRetrySuccess = runDeployFixture(['candidate-pull-timeout-once'])
+  try {
+    const diagnostics = deployFixtureDiagnostics(timeoutRetrySuccess)
+    assert.equal(timeoutRetrySuccess.result.status, 0, diagnostics)
+    assert.deepEqual(readPullAttempts(timeoutRetrySuccess), [candidateRef, candidateRef])
+    assert.match(
+      timeoutRetrySuccess.result.stderr,
+      /pull attempt 1 of 3 failed with exit code 124\./
+    )
+    assert.match(timeoutRetrySuccess.result.stderr, /pull attempt 2 of 3 succeeded\./)
+  } finally {
+    timeoutRetrySuccess.cleanup()
+  }
+
+  const allPullAttemptsFail = runDeployFixture(['candidate-pull-transient-remaining:3'])
+  try {
+    const diagnostics = deployFixtureDiagnostics(allPullAttemptsFail)
+    assert.notEqual(allPullAttemptsFail.result.status, 0, diagnostics)
+    assert.deepEqual(
+      readPullAttempts(allPullAttemptsFail),
+      [candidateRef, candidateRef, candidateRef],
+      'pull retries must stop after the bounded attempt budget'
+    )
+    const pullTimeoutCalls = fs
+      .readFileSync(path.join(allPullAttemptsFail.fakeState, 'timeout.log'), 'utf8')
+      .split('\n')
+      .filter((line) => /300s docker pull/.test(line))
+    assert.equal(pullTimeoutCalls.length, 3, 'each pull attempt must keep the 300s bound')
+    assert.equal(
+      fs.readFileSync(path.join(allPullAttemptsFail.fakeState, 'running.ref'), 'utf8').trim(),
+      previousRef
+    )
+    assert.equal(
+      fs.readFileSync(path.join(allPullAttemptsFail.stateDir, 'current.state'), 'utf8'),
+      `digest_ref=${previousRef}\ncommit=${previousCommit}\n`,
+      'failed deployment must not replace current.state'
+    )
+    assert.equal(fs.existsSync(path.join(allPullAttemptsFail.fakeState, 'removed')), false)
+    assert.match(allPullAttemptsFail.result.stderr, /pull failed after 3 attempts\./)
+    assert.match(allPullAttemptsFail.result.stderr, /部署失败但previous继续服务/)
+    assert.doesNotMatch(allPullAttemptsFail.result.stderr, /dial tcp|i\/o timeout/)
+  } finally {
+    allPullAttemptsFail.cleanup()
+  }
+
+  const permanentPullFailure = runDeployFixture(['candidate-pull-permanent-error'])
+  try {
+    const diagnostics = deployFixtureDiagnostics(permanentPullFailure)
+    assert.notEqual(permanentPullFailure.result.status, 0, diagnostics)
+    assert.deepEqual(
+      readPullAttempts(permanentPullFailure),
+      [candidateRef],
+      'permanent pull failures must not be retried'
+    )
+    assert.equal(
+      fs.readFileSync(path.join(permanentPullFailure.fakeState, 'running.ref'), 'utf8').trim(),
+      previousRef
+    )
+    assert.match(permanentPullFailure.result.stderr, /non-retryable error \(exit code 1\)/)
+    assert.match(permanentPullFailure.result.stderr, /部署失败但previous继续服务/)
+    assert.doesNotMatch(
+      permanentPullFailure.result.stderr,
+      /manifest unknown/,
+      'raw registry errors must not leak into the deployment log'
+    )
+  } finally {
+    permanentPullFailure.cleanup()
+  }
+
+  const unclassifiedPullFailure = runDeployFixture(['fail-candidate-pull'])
+  try {
+    assert.deepEqual(
+      readPullAttempts(unclassifiedPullFailure),
+      [candidateRef],
+      'unclassified pull failures must not be retried'
+    )
+  } finally {
+    unclassifiedPullFailure.cleanup()
   }
 
   for (const source of [workflow, deploy, bootstrap, wrapper]) {
