@@ -1,7 +1,9 @@
+const { resolveSecurityIdentity } = require('../domain/security-identity')
+
 const now = new Date('2026-07-28T15:42:00.000Z')
 
 const watchlist = [
-  '09888.HK',
+  '9988.HK',
   'AAPL.US'
 ]
 
@@ -27,8 +29,11 @@ function mkPeriod(type, period, fields) {
 
 const companies = [
   {
-    securityCode: '09888.HK',
-    isin: 'CHN09888HK',
+    companyId: 'company-alibaba-group',
+    listingId: 'listing-hkex-9988',
+    issuerLegalName: 'Alibaba Group Holding Limited',
+    securityCode: '9988.HK',
+    isin: null,
     market: 'HK',
     symbol: 'BABA',
     nameZh: '阿里巴巴',
@@ -233,20 +238,20 @@ const companies = [
       {
         date: new Date('2026-06-30T00:00:00.000Z'),
         publishTime: new Date('2026-06-30T06:24:00.000Z'),
-        code: '09888.HK',
+        code: '9988.HK',
         title: '年度业绩公告（暂不含摘要）',
         type: '年度业绩',
-        pdf: 'https://example.local/announcements/09888-2026-annual.pdf',
+        pdf: 'https://example.local/announcements/9988-2026-annual.pdf',
         integrity: { requested: true, fetched: true, completeness: 'partial' },
         source: 'iFinD公告'
       },
       {
         date: new Date('2026-06-15T00:00:00.000Z'),
         publishTime: new Date('2026-06-15T07:10:00.000Z'),
-        code: '09888.HK',
+        code: '9988.HK',
         title: '监管及股份流通公告',
         type: '监管',
-        pdf: 'https://example.local/announcements/09888-compliance.pdf',
+        pdf: 'https://example.local/announcements/9988-compliance.pdf',
         integrity: { requested: true, fetched: true, completeness: 'full' },
         source: '交易所'
       }
@@ -301,7 +306,7 @@ const companies = [
       snapshotTime: new Date('2026-07-28T10:20:00.000Z'),
       citedAnnouncementsCount: 2,
       citedNewsCount: 1,
-      viewUrl: '/research.html?code=09888.HK'
+      viewUrl: '/research.html?code=9988.HK'
     },
     researchCandidates: {
       includedAnnouncements: 2,
@@ -437,7 +442,14 @@ function clone(value) {
 }
 
 function getCompany(code) {
-  return companies.find(item => item.securityCode === code) || null
+  const identity = resolveSecurityIdentity(code)
+  if (identity) {
+    if (!identity.configured) return null
+    return companies.find(item => item.listingId === identity.listingId) || null
+  }
+
+  const normalizedCode = String(code || '').trim().toUpperCase()
+  return companies.find(item => item.securityCode === normalizedCode) || null
 }
 
 function getWatchlist() {
@@ -445,13 +457,25 @@ function getWatchlist() {
 }
 
 function listCompanies() {
-  return companies.map(item => ({
-    securityCode: item.securityCode,
-    nameZh: item.nameZh,
-    symbol: item.symbol,
-    market: item.market,
-    industry: item.industry
-  }))
+  return companies.map((item) => {
+    const identity = resolveSecurityIdentity(item.securityCode)
+    return {
+      companyId: identity ? identity.companyId : null,
+      listingId: identity ? identity.listingId : null,
+      issuerLegalName: identity ? identity.issuerLegalName : null,
+      securityCode: identity ? identity.displayCode : item.securityCode,
+      displayCode: identity ? identity.displayCode : item.securityCode,
+      exchangeCode: identity ? identity.exchangeCode : item.symbol,
+      exchange: identity ? identity.exchange : item.market,
+      formatAliases: identity ? identity.formatAliases : [],
+      vendorCodes: identity ? identity.vendorCodes : {},
+      configured: identity ? identity.configured : true,
+      nameZh: item.nameZh,
+      symbol: item.symbol,
+      market: item.market,
+      industry: item.industry
+    }
+  })
 }
 
 function applyManualRefresh(company) {

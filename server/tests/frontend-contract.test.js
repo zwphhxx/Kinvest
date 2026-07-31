@@ -81,7 +81,7 @@ function assertFinanceModeMappingAndFixtureBehavior() {
   const { getFinanceRowsForMode, isVerifiedFinanceRow, prepareFinanceRows } = loadFinanceContracts()
   const { getCompany } = require('../data/mockData')
 
-  const alibaba = getCompany('09888.HK')
+  const alibaba = getCompany('9988.HK')
   const apple = getCompany('AAPL.US')
   const quarterly = getFinanceRowsForMode(alibaba.financials, 'quarter')
   assert.equal(quarterly.length, 1)
@@ -319,7 +319,7 @@ async function assertResearchResponseContract() {
   }
 
   assert.equal(normalizeSecurityCode('aapl.us'), 'AAPL.US')
-  assert.equal(normalizeSecurityCode('09888.HK'), '09888.HK')
+  assert.equal(normalizeSecurityCode('9988.HK'), '9988.HK')
   for (const invalid of ['', '../api/health', 'AAPL.US?x=1', 'AAPL/US', null]) {
     assert.equal(normalizeSecurityCode(invalid), null)
   }
@@ -371,6 +371,22 @@ async function assertResearchResponseContract() {
   await assert.rejects(parseJsonResponse(null), /研究接口响应不可用/)
 }
 
+function assertSecurityIdentityUiContract() {
+  const app = read(appPath)
+  const html = read(htmlPath)
+  const researchScript = read(researchJsPath)
+
+  assert.match(app, /item\.configured === false/)
+  assert.match(app, /未收录/)
+  assert.match(app, /if \(item\.configured !== false\) \{[\s\S]*row\.addEventListener\('click'/)
+  assert.match(html, /research\.html\?code=9988\.HK/)
+  assert.match(html, /9988\.HK/)
+  assert.match(html, /09988\.HK/)
+  assert.doesNotMatch(html, /09888\.HK/)
+  assert.match(researchScript, /'9988\.HK'/)
+  assert.doesNotMatch(researchScript, /09888\.HK/)
+}
+
 async function run() {
   assertFinanceModeMappingAndFixtureBehavior()
   assertStrictFinanceVerification()
@@ -380,6 +396,7 @@ async function run() {
   assertFaviconAndMobileTableScrolling()
   assertRenderingRespectsStrictCsp()
   assertResearchPageRespectsStrictCsp()
+  assertSecurityIdentityUiContract()
   await assertResearchResponseContract()
 }
 

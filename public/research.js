@@ -1,5 +1,5 @@
 const params = new URLSearchParams(window.location.search)
-const requestedCode = params.get('code') || '09888.HK'
+const requestedCode = params.get('code') || '9988.HK'
 
 function byId(id) {
   return document.getElementById(id)

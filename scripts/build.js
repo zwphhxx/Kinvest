@@ -8,6 +8,7 @@ const runtimeFiles = [
   'server/adapters/ifindAdapter.js',
   'server/data/mockData.js',
   'server/db/refresh-db.js',
+  'server/domain/security-identity.js',
   'server/services/health.js',
   'server/services/refresh-rules.js',
   'server/utils/refresh-policy.js',

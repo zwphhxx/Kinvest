@@ -310,8 +310,16 @@ function renderSearchResults(items) {
   items.forEach((item) => {
     const row = document.createElement('article')
     row.className = 'watchlist-card'
-    row.innerHTML = `<p><strong>${item.nameZh}（${item.securityCode}）</strong></p><p class="muted">${item.market} · ${item.symbol || ''}</p>`
-    row.addEventListener('click', () => loadCompany(item.securityCode))
+    const aliases = Array.isArray(item.formatAliases) && item.formatAliases.length
+      ? ` · 格式别名 ${item.formatAliases.join('、')}`
+      : ''
+    const availability = item.configured === false ? ' · 未收录' : ''
+    row.innerHTML = `<p><strong>${item.nameZh}（${item.securityCode}）</strong></p><p class="muted">${item.market} · ${item.symbol || ''}${aliases}${availability}</p>`
+    if (item.configured !== false) {
+      row.addEventListener('click', () => loadCompany(item.securityCode))
+    } else {
+      row.setAttribute('aria-disabled', 'true')
+    }
     el.searchResults.appendChild(row)
   })
 }

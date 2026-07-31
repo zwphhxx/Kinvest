@@ -17,7 +17,8 @@ npm run dev
 ```
 
 本地首页为 `http://localhost:4173/`，深度研究示例为
-`http://localhost:4173/research.html?code=09888.HK`。
+`http://localhost:4173/research.html?code=9988.HK`。阿里巴巴的 canonical
+展示代码为 `9988.HK`，`09988.HK` 仅作为格式别名解析。
 
 ## 部署与运维
 
