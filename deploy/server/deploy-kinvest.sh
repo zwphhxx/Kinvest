@@ -7,7 +7,9 @@ COMPOSE="$ROOT/docker-compose.yml"
 STATE="$ROOT/state"
 CURRENT_STATE="$STATE/current.state"
 PREVIOUS_STATE="$STATE/previous.state"
-PULL_TIMEOUT='900s'
+PULL_ATTEMPTS='3'
+PULL_TIMEOUT='300s'
+PULL_RETRY_BASE_WAIT_SECONDS='2'
 DOCKER_TIMEOUT='120s'
 COMPOSE_TIMEOUT='120s'
 INSPECT_TIMEOUT='15s'
@@ -90,6 +92,59 @@ run_docker() {
 
 run_pull() {
   timeout --signal=TERM --kill-after="$DOCKER_KILL_AFTER" "$PULL_TIMEOUT" docker pull "$1"
+}
+
+pull_failure_is_transient() {
+  local status="$1"
+  local stderr_file="$2"
+
+  if ((status == 124 || status == 137 || status == 143)); then
+    return 0
+  fi
+
+  grep -Eqi \
+    'timeout|timed out|connection reset|connection refused|EOF|temporary|try again|unreachable|no route to host|TLS handshake|Bad Gateway|Service Unavailable|Gateway Timeout|502|503|504' \
+    "$stderr_file"
+}
+
+pull_with_retries() {
+  local ref="$1"
+  local attempt=1
+  local wait_seconds="$PULL_RETRY_BASE_WAIT_SECONDS"
+  local status=0
+  local stderr_file
+
+  stderr_file="$(mktemp "$STATE/.pull-stderr.XXXXXX")"
+
+  while ((attempt <= PULL_ATTEMPTS)); do
+    status=0
+    run_pull "$ref" >/dev/null 2>"$stderr_file" || status=$?
+
+    if ((status == 0)); then
+      rm -f -- "$stderr_file"
+      printf 'Kinvest image pull attempt %s of %s succeeded.\n' "$attempt" "$PULL_ATTEMPTS" >&2
+      return 0
+    fi
+
+    printf 'Kinvest image pull attempt %s of %s failed with exit code %s.\n' \
+      "$attempt" "$PULL_ATTEMPTS" "$status" >&2
+
+    if ((attempt >= PULL_ATTEMPTS)); then
+      rm -f -- "$stderr_file"
+      printf 'Kinvest image pull failed after %s attempts.\n' "$PULL_ATTEMPTS" >&2
+      return 1
+    fi
+
+    if ! pull_failure_is_transient "$status" "$stderr_file"; then
+      rm -f -- "$stderr_file"
+      printf 'Kinvest image pull failed with a non-retryable error (exit code %s).\n' "$status" >&2
+      return 1
+    fi
+
+    sleep "$wait_seconds"
+    wait_seconds=$((wait_seconds * 2))
+    attempt=$((attempt + 1))
+  done
 }
 
 run_inspect() {
@@ -373,7 +428,7 @@ fi
 
 trap 'rollback "$?"' ERR
 
-run_pull "$digest_ref" >/dev/null
+pull_with_retries "$digest_ref"
 run_compose "$digest_ref" >/dev/null
 
 if ! wait_for_health; then
