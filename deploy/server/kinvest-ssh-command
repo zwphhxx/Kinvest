@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-ALLOWED_REPOSITORY='ghcr.io/zwphhxx/kinvest'
+ALLOWED_REPOSITORY='ccr.ccs.tencentyun.com/website-dev/kinvest'
 original_command="${SSH_ORIGINAL_COMMAND:-}"
 verb=''
 digest_ref=''
@@ -21,7 +21,7 @@ if [[ "$verb" != 'deploy' || -n "$extra" || "$original_command" != "$expected_co
   exit 2
 fi
 
-if [[ ! "$digest_ref" =~ ^ghcr\.io/zwphhxx/kinvest@sha256:[0-9a-f]{64}$ ]]; then
+if [[ ! "$digest_ref" =~ ^ccr\.ccs\.tencentyun\.com/website-dev/kinvest@sha256:[0-9a-f]{64}$ ]]; then
   printf '%s\n' 'SSH command has an invalid Kinvest digest' >&2
   exit 2
 fi

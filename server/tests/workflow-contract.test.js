@@ -5,12 +5,13 @@ const os = require('node:os')
 const path = require('node:path')
 
 const rootDir = path.resolve(__dirname, '../..')
-const allowedRepository = 'ghcr.io/zwphhxx/kinvest'
+const tcrRepository = 'ccr.ccs.tencentyun.com/website-dev/kinvest'
+const ghcrRepository = 'ghcr.io/zwphhxx/kinvest'
 const candidateDigest = `sha256:${'b'.repeat(64)}`
-const candidateRef = `${allowedRepository}@${candidateDigest}`
+const candidateRef = `${tcrRepository}@${candidateDigest}`
 const candidateCommit = 'c'.repeat(40)
 const previousDigest = `sha256:${'a'.repeat(64)}`
-const previousRef = `${allowedRepository}@${previousDigest}`
+const previousRef = `${ghcrRepository}@${previousDigest}`
 const previousCommit = 'd'.repeat(40)
 
 function rootPath(relativePath) {
@@ -465,14 +466,14 @@ function readPullAttempts(fixture) {
     : []
 }
 
-function assertRejectedInput(input, messagePattern) {
+function assertRejectedInput(input, messagePattern, message) {
   const result = spawnSync(rootPath('deploy/server/deploy-kinvest.sh'), [], {
     encoding: 'utf8',
     input
   })
 
-  assert.equal(result.status, 2)
-  assert.match(result.stderr, messagePattern)
+  assert.equal(result.status, 2, message)
+  assert.match(result.stderr, messagePattern, message)
 }
 
 function runBootstrapIdentityConflict(identityKind) {
@@ -977,6 +978,50 @@ function run() {
     directScalar(publishJob, 'if', 4),
     "${{ github.event_name != 'pull_request' && github.ref == 'refs/heads/main' }}"
   )
+  assert.equal(
+    directScalar(publishJob, 'environment', 4),
+    'RegistryPublish',
+    'TCR credentials must only resolve inside the RegistryPublish environment'
+  )
+  assert.match(publishJob, /registry: ccr\.ccs\.tencentyun\.com/)
+  assert.match(publishJob, /username: \$\{\{ secrets\.TCR_USERNAME \}\}/)
+  assert.match(publishJob, /password: \$\{\{ secrets\.TCR_PASSWORD \}\}/)
+  assert.match(publishJob, /ghcr\.io\/zwphhxx\/kinvest:\$\{\{ github\.sha \}\}/)
+  assert.match(publishJob, /ccr\.ccs\.tencentyun\.com\/website-dev\/kinvest:\$\{\{ github\.sha \}\}/)
+  assert.match(
+    publishJob,
+    /tcr_image_digest: \$\{\{ steps\.digest\.outputs\.tcr_image_digest \}\}/,
+    'publish must expose an explicit TCR digest output'
+  )
+  assert.match(
+    publishJob,
+    /image_digest: \$\{\{ steps\.digest\.outputs\.ghcr_image_digest \}\}/,
+    'publish must keep the GHCR digest output for the backup registry'
+  )
+  assert.match(publishJob, /imagetools inspect "\$GHCR_REF"/)
+  assert.match(publishJob, /imagetools inspect "\$TCR_REF"/)
+  assert.match(
+    publishJob,
+    /\[\[ ! "\$TCR_DIGEST" =~ \^sha256:\[0-9a-f\]\{64\}\$ \]\]/,
+    'TCR digest must be format-validated as reported by TCR'
+  )
+  assert.match(
+    publishJob,
+    /\[\[ ! "\$GHCR_DIGEST" =~ \^sha256:\[0-9a-f\]\{64\}\$ \]\]/,
+    'GHCR digest must be format-validated as reported by GHCR'
+  )
+  assert.match(
+    publishJob,
+    /"\$GHCR_DIGEST" != "\$BUILD_DIGEST"/,
+    'GHCR digest must be verified against the build output digest'
+  )
+  assert.doesNotMatch(
+    publishJob,
+    /"\$TCR_DIGEST" != "\$BUILD_DIGEST"/,
+    'TCR digest must be consumed as reported by TCR, never assumed equal to GHCR'
+  )
+  assert.match(publishJob, /printf 'tcr_image_digest=%s\\n' "\$TCR_DIGEST"/)
+  assert.match(publishJob, /printf 'ghcr_image_digest=%s\\n' "\$GHCR_DIGEST"/)
 
   const deployJob = workflowBlock(jobs, 'deploy', 2)
   assert.equal(directScalar(deployJob, 'needs', 4), 'publish')
@@ -987,7 +1032,45 @@ function run() {
   )
   assert.match(deployJob, /\$\{\{\s*secrets\.DEPLOY_SSH_KEY\s*\}\}/)
   assert.match(deployJob, /\$\{\{\s*secrets\.DEPLOY_KNOWN_HOSTS\s*\}\}/)
+  assert.match(
+    deployJob,
+    /IMAGE_DIGEST: \$\{\{ needs\.publish\.outputs\.tcr_image_digest \}\}/,
+    'deploy must consume only the TCR digest output'
+  )
+  assert.doesNotMatch(
+    deployJob,
+    /needs\.publish\.outputs\.image_digest/,
+    'deploy must not consume the GHCR digest output'
+  )
+  assert.match(deployJob, /IMAGE_REPOSITORY='ccr\.ccs\.tencentyun\.com\/website-dev\/kinvest'/)
+  assert.match(
+    deployJob,
+    /\^ccr\\\.ccs\\\.tencentyun\\\.com\/website-dev\/kinvest@sha256:\[0-9a-f\]\{64\}\$/,
+    'deploy must validate the exact TCR digest reference before SSH'
+  )
   assert.doesNotMatch(workflow.replace(deployJob, ''), /\$\{\{\s*secrets\.DEPLOY_/)
+  assert.doesNotMatch(
+    workflow.replace(publishJob, ''),
+    /\$\{\{\s*secrets\.TCR_(USERNAME|PASSWORD)\s*\}\}/,
+    'TCR credentials must only be referenced inside the publish job'
+  )
+  for (const [jobId, job] of Object.entries(prJobs)) {
+    assert.doesNotMatch(
+      job,
+      /RegistryPublish|TCR_USERNAME|TCR_PASSWORD|ccr\.ccs\.tencentyun\.com/,
+      `${jobId} must not access TCR credentials or the RegistryPublish environment`
+    )
+  }
+  assert.doesNotMatch(
+    workflow,
+    /docker login /,
+    'registry authentication must use the pinned login action, never inline credentials'
+  )
+  assert.doesNotMatch(
+    workflow,
+    /config\.json|DOCKER_CONFIG/,
+    'workflow must never read or print docker client configuration'
+  )
 
   const usesLines = workflow.match(/^\s+uses:\s+\S+\s*$/gm) || []
   assert.ok(usesLines.length > 0)
@@ -1017,8 +1100,8 @@ function run() {
   assert.match(workflow, /docker\/build-push-action@[0-9a-f]{40}/)
   assert.match(workflow, /docker\/login-action@[0-9a-f]{40}/)
   assert.match(workflow, /docker\/setup-buildx-action@[0-9a-f]{40}/)
-  assert.match(workflow, /IMAGE_DIGEST: \$\{\{ steps\.build\.outputs\.digest \}\}/)
-  assert.match(workflow, /IMAGE_DIGEST: \$\{\{ needs\.publish\.outputs\.image_digest \}\}/)
+  assert.match(workflow, /BUILD_DIGEST: \$\{\{ steps\.build\.outputs\.digest \}\}/)
+  assert.match(workflow, /IMAGE_DIGEST: \$\{\{ needs\.publish\.outputs\.tcr_image_digest \}\}/)
   assert.match(workflow, /ghcr\.io\/zwphhxx\/kinvest/)
   assert.doesNotMatch(workflow, /github\.repository_owner/)
   assert.doesNotMatch(workflow, /:latest\b/)
@@ -1029,8 +1112,19 @@ function run() {
   assert.match(workflow, /"deploy \$IMAGE_DIGEST_REF \$DEPLOY_SHA"/)
   assert.doesNotMatch(workflow, /sudo \/usr\/local\/sbin\/deploy-kinvest/)
 
-  assert.match(deploy, /^ALLOWED_REPOSITORY='ghcr\.io\/zwphhxx\/kinvest'$/m)
-  assert.match(deploy, /\^ghcr\\\.io\/zwphhxx\/kinvest@sha256:\[0-9a-f\]\{64\}\$/)
+  assert.match(deploy, /^ALLOWED_REPOSITORY='ccr\.ccs\.tencentyun\.com\/website-dev\/kinvest'$/m)
+  assert.match(
+    deploy,
+    /^ALLOWED_DEPLOYMENT_DIGEST_PATTERN='\^ccr\\\.ccs\\\.tencentyun\\\.com\/website-dev\/kinvest@sha256:\[0-9a-f\]\{64\}\$'$/m,
+    'new deployments must only accept the exact TCR repository'
+  )
+  assert.match(
+    deploy,
+    /^ALLOWED_STATE_DIGEST_PATTERN='\^\(ccr\\\.ccs\\\.tencentyun\\\.com\/website-dev\/kinvest\|ghcr\\\.io\/zwphhxx\/kinvest\)@sha256:\[0-9a-f\]\{64\}\$'$/m,
+    'historical state must accept both GHCR and TCR repositories for migration'
+  )
+  assert.match(deploy, /digest_ref" =~ \$ALLOWED_DEPLOYMENT_DIGEST_PATTERN/)
+  assert.match(deploy, /\[\[ "\$1" =~ \$ALLOWED_STATE_DIGEST_PATTERN \]\]/)
   assert.match(deploy, /^CURRENT_STATE="\$STATE\/current\.state"$/m)
   assert.match(deploy, /^PREVIOUS_STATE="\$STATE\/previous\.state"$/m)
   assert.match(deploy, /^PULL_ATTEMPTS='3'$/m)
@@ -1173,7 +1267,12 @@ function run() {
     `worst-case ${cumulativeDeploySeconds}s deployment must leave at least 180s in the job`
   )
 
-  assert.match(wrapper, /^ALLOWED_REPOSITORY='ghcr\.io\/zwphhxx\/kinvest'$/m)
+  assert.match(wrapper, /^ALLOWED_REPOSITORY='ccr\.ccs\.tencentyun\.com\/website-dev\/kinvest'$/m)
+  assert.match(
+    wrapper,
+    /\^ccr\\\.ccs\\\.tencentyun\\\.com\/website-dev\/kinvest@sha256:\[0-9a-f\]\{64\}\$/,
+    'SSH entrypoint must only accept the exact TCR digest'
+  )
   assert.match(wrapper, /SSH_ORIGINAL_COMMAND/)
   assert.match(wrapper, /expected_command="deploy \$digest_ref \$commit_sha"/)
   assert.match(wrapper, /sudo -n \/usr\/local\/sbin\/deploy-kinvest/)
@@ -1365,15 +1464,25 @@ function run() {
 
   assertRejectedInput(
     `ghcr.io/other/kinvest@${candidateDigest}\n${candidateCommit}\n`,
-    /immutable Kinvest digest reference/
+    /immutable Kinvest TCR digest reference/
   )
   assertRejectedInput(
-    `${allowedRepository}:release\n${candidateCommit}\n`,
-    /immutable Kinvest digest reference/
+    `${ghcrRepository}@${candidateDigest}\n${candidateCommit}\n`,
+    /immutable Kinvest TCR digest reference/,
+    'legacy GHCR references must not be accepted as new deployments'
   )
   assertRejectedInput(
-    `${allowedRepository}@sha256:abcd\n${candidateCommit}\n`,
-    /immutable Kinvest digest reference/
+    `${tcrRepository}:release\n${candidateCommit}\n`,
+    /immutable Kinvest TCR digest reference/
+  )
+  assertRejectedInput(
+    `${tcrRepository}:latest\n${candidateCommit}\n`,
+    /immutable Kinvest TCR digest reference/,
+    'mutable tags must never be deployed'
+  )
+  assertRejectedInput(
+    `${tcrRepository}@sha256:abcd\n${candidateCommit}\n`,
+    /immutable Kinvest TCR digest reference/
   )
   assertRejectedInput(`${candidateRef}\n${candidateCommit}\nextra\n`, /exactly two input lines/)
 
@@ -1546,11 +1655,13 @@ function run() {
     assert.equal(success.result.status, 0, success.result.stderr)
     assert.equal(
       fs.readFileSync(path.join(success.stateDir, 'current.state'), 'utf8'),
-      `digest_ref=${candidateRef}\ncommit=${candidateCommit}\n`
+      `digest_ref=${candidateRef}\ncommit=${candidateCommit}\n`,
+      'successful TCR deployment must write the TCR digest to current.state'
     )
     assert.equal(
       fs.readFileSync(path.join(success.stateDir, 'previous.state'), 'utf8'),
-      `digest_ref=${previousRef}\ncommit=${previousCommit}\n`
+      `digest_ref=${previousRef}\ncommit=${previousCommit}\n`,
+      'legacy GHCR previous state must remain readable for verified rollback'
     )
     assert.deepEqual(
       readPullAttempts(success),
@@ -1683,6 +1794,14 @@ function run() {
     assert.doesNotMatch(
       source,
       /(?:refresh_token|api[_-]?key|BEGIN [A-Z ]*PRIVATE KEY|106\.54\.229\.241)/i
+    )
+  }
+
+  for (const source of [deploy, bootstrap, wrapper]) {
+    assert.doesNotMatch(
+      source,
+      /TCR_(USERNAME|PASSWORD)/,
+      'server-side scripts must never reference CI registry credentials'
     )
   }
 }

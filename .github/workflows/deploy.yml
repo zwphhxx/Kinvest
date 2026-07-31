@@ -133,11 +133,13 @@ jobs:
     if: ${{ github.event_name != 'pull_request' && github.ref == 'refs/heads/main' }}
     runs-on: ubuntu-latest
     timeout-minutes: 20
+    environment: RegistryPublish
     permissions:
       contents: read
       packages: write
     outputs:
-      image_digest: ${{ steps.digest.outputs.image_digest }}
+      image_digest: ${{ steps.digest.outputs.ghcr_image_digest }}
+      tcr_image_digest: ${{ steps.digest.outputs.tcr_image_digest }}
     steps:
       - name: Check out exact commit
         uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683
@@ -149,26 +151,51 @@ jobs:
           registry: ghcr.io
           username: ${{ github.actor }}
           password: ${{ secrets.GITHUB_TOKEN }}
+      - name: Log in to Tencent Cloud Registry
+        uses: docker/login-action@74a5d142397b4f367a81961eba4e8cd7edddf772
+        with:
+          registry: ccr.ccs.tencentyun.com
+          username: ${{ secrets.TCR_USERNAME }}
+          password: ${{ secrets.TCR_PASSWORD }}
       - name: Build and publish audit-tagged image
         id: build
         uses: docker/build-push-action@263435318d21b8e681c14492fe198d362a7d2c83
         with:
           context: .
           push: true
-          tags: ghcr.io/zwphhxx/kinvest:${{ github.sha }}
+          tags: |
+            ghcr.io/zwphhxx/kinvest:${{ github.sha }}
+            ccr.ccs.tencentyun.com/website-dev/kinvest:${{ github.sha }}
           provenance: true
-      - name: Validate immutable image digest
+      - name: Validate immutable image digests
         id: digest
         shell: bash
         env:
-          IMAGE_DIGEST: ${{ steps.build.outputs.digest }}
+          BUILD_DIGEST: ${{ steps.build.outputs.digest }}
+          GHCR_REF: ghcr.io/zwphhxx/kinvest:${{ github.sha }}
+          TCR_REF: ccr.ccs.tencentyun.com/website-dev/kinvest:${{ github.sha }}
         run: |
           set -euo pipefail
-          if [[ ! "$IMAGE_DIGEST" =~ ^sha256:[0-9a-f]{64}$ ]]; then
+          if [[ ! "$BUILD_DIGEST" =~ ^sha256:[0-9a-f]{64}$ ]]; then
             printf '%s\n' 'Build action returned an invalid image digest.' >&2
             exit 1
           fi
-          printf 'image_digest=%s\n' "$IMAGE_DIGEST" >> "$GITHUB_OUTPUT"
+          GHCR_DIGEST="$(docker buildx imagetools inspect "$GHCR_REF" --format '{{.Manifest.Digest}}')"
+          TCR_DIGEST="$(docker buildx imagetools inspect "$TCR_REF" --format '{{.Manifest.Digest}}')"
+          if [[ ! "$GHCR_DIGEST" =~ ^sha256:[0-9a-f]{64}$ ]]; then
+            printf '%s\n' 'GHCR did not report a valid image digest.' >&2
+            exit 1
+          fi
+          if [[ ! "$TCR_DIGEST" =~ ^sha256:[0-9a-f]{64}$ ]]; then
+            printf '%s\n' 'TCR did not report a valid image digest.' >&2
+            exit 1
+          fi
+          if [[ "$GHCR_DIGEST" != "$BUILD_DIGEST" ]]; then
+            printf '%s\n' 'GHCR digest does not match the build output digest.' >&2
+            exit 1
+          fi
+          printf 'ghcr_image_digest=%s\n' "$GHCR_DIGEST" >> "$GITHUB_OUTPUT"
+          printf 'tcr_image_digest=%s\n' "$TCR_DIGEST" >> "$GITHUB_OUTPUT"
 
   deploy:
     needs: publish
@@ -215,16 +242,16 @@ jobs:
           DEPLOY_PORT: ${{ vars.DEPLOY_PORT }}
           DEPLOY_USER: ${{ vars.DEPLOY_USER }}
           DEPLOY_SHA: ${{ github.sha }}
-          IMAGE_DIGEST: ${{ needs.publish.outputs.image_digest }}
+          IMAGE_DIGEST: ${{ needs.publish.outputs.tcr_image_digest }}
         run: |
           set -euo pipefail
-          IMAGE_REPOSITORY='ghcr.io/zwphhxx/kinvest'
+          IMAGE_REPOSITORY='ccr.ccs.tencentyun.com/website-dev/kinvest'
           IMAGE_DIGEST_REF="${IMAGE_REPOSITORY}@${IMAGE_DIGEST}"
           if [[ ! "$DEPLOY_HOST" =~ ^[A-Za-z0-9.-]+$ ]]; then exit 1; fi
           if [[ ! "$DEPLOY_PORT" =~ ^[0-9]{1,5}$ ]] || ((DEPLOY_PORT < 1 || DEPLOY_PORT > 65535)); then exit 1; fi
           if [[ ! "$DEPLOY_USER" =~ ^[a-z_][a-z0-9_-]*$ ]]; then exit 1; fi
           if [[ ! "$DEPLOY_SHA" =~ ^[0-9a-f]{40}$ ]]; then exit 1; fi
-          if [[ ! "$IMAGE_DIGEST_REF" =~ ^ghcr\.io/zwphhxx/kinvest@sha256:[0-9a-f]{64}$ ]]; then exit 1; fi
+          if [[ ! "$IMAGE_DIGEST_REF" =~ ^ccr\.ccs\.tencentyun\.com/website-dev/kinvest@sha256:[0-9a-f]{64}$ ]]; then exit 1; fi
           ssh \
             -o BatchMode=yes \
             -o IdentitiesOnly=yes \
