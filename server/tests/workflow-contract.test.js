@@ -999,7 +999,11 @@ function run() {
     'publish must keep the GHCR digest output for the backup registry'
   )
   assert.match(publishJob, /imagetools inspect "\$GHCR_REF"/)
-  assert.match(publishJob, /imagetools inspect "\$TCR_REF"/)
+  assert.match(
+    publishJob,
+    /\/tmp\/crane digest "\$TCR_REF"/,
+    'TCR digest must be queried independently after the copy'
+  )
   assert.match(
     publishJob,
     /\[\[ ! "\$TCR_DIGEST" =~ \^sha256:\[0-9a-f\]\{64\}\$ \]\]/,
@@ -1022,6 +1026,74 @@ function run() {
   )
   assert.match(publishJob, /printf 'tcr_image_digest=%s\\n' "\$TCR_DIGEST"/)
   assert.match(publishJob, /printf 'ghcr_image_digest=%s\\n' "\$GHCR_DIGEST"/)
+
+  const buildPublishStep = namedStep(publishJob, 'Build and publish audit-tagged image')
+  assert.match(buildPublishStep, /ghcr\.io\/zwphhxx\/kinvest:\$\{\{ github\.sha \}\}/)
+  assert.doesNotMatch(
+    buildPublishStep,
+    /ccr\.ccs\.tencentyun\.com/,
+    'the build-push action must only publish GHCR; TCR is populated by registry copy'
+  )
+
+  const craneInstallStep = namedStep(publishJob, 'Install pinned crane')
+  assert.match(craneInstallStep, /CRANE_VERSION: 'v0\.21\.7'/)
+  assert.match(craneInstallStep, /CRANE_SHA256: '[0-9a-f]{64}'/)
+  assert.match(craneInstallStep, /sha256sum -c -/)
+  assert.match(craneInstallStep, /curl -fsSL --max-time 60/)
+  assert.match(
+    craneInstallStep,
+    /releases\/download\/\$\{CRANE_VERSION\}\/go-containerregistry_Linux_x86_64\.tar\.gz/
+  )
+
+  const digestStepRun = multilineStepRun(namedStep(publishJob, 'Validate immutable image digests'))
+  assert.match(
+    digestStepRun,
+    /COPY_SRC="ghcr\.io\/zwphhxx\/kinvest@\$\{GHCR_DIGEST\}"/,
+    'the TCR copy source must use the verified exact GHCR digest'
+  )
+  assert.match(
+    digestStepRun,
+    /crane copy "\$COPY_SRC" "\$TCR_REF"/,
+    'the TCR copy target must use the audit commit tag'
+  )
+  assert.doesNotMatch(digestStepRun, /:latest\b/, 'registry copy must not use mutable tags')
+  assert.match(digestStepRun, /COPY_ATTEMPTS=3/)
+  assert.match(digestStepRun, /COPY_WAIT_SECONDS=2/)
+  assert.match(digestStepRun, /COPY_WAIT_SECONDS=\$\(\(COPY_WAIT_SECONDS \* 2\)\)/)
+  assert.match(
+    digestStepRun,
+    /timeout --signal=TERM --kill-after=10s 300s \\?\n\s+\/tmp\/crane copy/,
+    'each TCR copy attempt must be bounded to 300 seconds'
+  )
+  assert.match(
+    digestStepRun,
+    /copy_log"\s*2>&1 \|\| status=\$\?/,
+    'crane output must be captured, never streamed to the workflow log'
+  )
+  assert.doesNotMatch(
+    digestStepRun,
+    /cat "\$copy_log"/,
+    'captured crane output must not be printed'
+  )
+  assert.doesNotMatch(
+    digestStepRun,
+    /Authorization|TCR_USERNAME|TCR_PASSWORD/,
+    'copy step logs must not expose credentials'
+  )
+  assert.match(
+    digestStepRun,
+    /TCR registry copy attempt %s of %s failed with exit code %s\./,
+    'retry log lines must contain only attempt number and exit code'
+  )
+  assert.ok(
+    digestStepRun.indexOf('crane copy') < digestStepRun.indexOf('tcr_image_digest=%s'),
+    'a failed copy must exit before any tcr_image_digest output is produced'
+  )
+  assert.match(
+    digestStepRun,
+    /TCR registry copy failed after %s attempts\.[\s\S]*?exit 1/,
+    'exhausted copy retries must fail the publish before outputs'
+  )
 
   const deployJob = workflowBlock(jobs, 'deploy', 2)
   assert.equal(directScalar(deployJob, 'needs', 4), 'publish')
@@ -1097,6 +1169,17 @@ function run() {
   assert.ok(deployTimeoutMatch, 'deploy job must define a bounded timeout')
   const deployTimeoutMinutes = Number.parseInt(deployTimeoutMatch[1], 10)
   assert.equal(deployTimeoutMinutes, 40)
+  const publishTimeoutMatch = workflow.match(
+    /^ {2}publish:\n[\s\S]*?^ {4}timeout-minutes: ([0-9]+)$/m
+  )
+  assert.ok(publishTimeoutMatch, 'publish job must define a bounded timeout')
+  const publishTimeoutMinutes = Number.parseInt(publishTimeoutMatch[1], 10)
+  assert.equal(publishTimeoutMinutes, 30)
+  const tcrCopyWorstSeconds = 3 * (300 + 10) + 6
+  assert.ok(
+    tcrCopyWorstSeconds <= publishTimeoutMinutes * 60 - 600,
+    `bounded TCR copy retries (${tcrCopyWorstSeconds}s) must leave at least 600s for build and verification`
+  )
   assert.match(workflow, /docker\/build-push-action@[0-9a-f]{40}/)
   assert.match(workflow, /docker\/login-action@[0-9a-f]{40}/)
   assert.match(workflow, /docker\/setup-buildx-action@[0-9a-f]{40}/)
