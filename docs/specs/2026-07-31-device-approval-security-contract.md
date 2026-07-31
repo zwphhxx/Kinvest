@@ -24,6 +24,8 @@
 - 短申请码有效 10 分钟，最多尝试 5 次，锁定后不能继续审批。
 - SQLite 只保存申请码哈希和浏览器申请凭证哈希。
 - 审批调用必须显式声明 `adminAuthenticated=true`。
+- 已批准申请在申请码校验前幂等返回成功；失败计数 SQL 只更新尚未批准的申请，
+  防止并发请求重新锁定已批准申请。
 - 兑换同时校验 `requestId` 和浏览器申请凭证，并通过事务保证仅成功一次。
 - 本地契约不实现全局限速。IP、申请记录和管理员身份维度的组合限速留待 HTTP
   集成阶段；当前只完成申请记录自身的 5 次失败限制。
@@ -31,21 +33,30 @@
 ## 设备凭证
 
 - 设备 token 为 256-bit 随机值，数据库只保存 HMAC digest。
+- 首次发行生成稳定的非秘密 `deviceId`，后续轮换凭证继承同一 `deviceId`。
 - 每条凭证保存创建它的 `hmacVersionId`。
 - 新凭证使用调用方显式指定的活动 HMAC VersionId。
 - 验证时按数据库记录读取对应的显式 HMAC VersionId，不假定只有 current 和
   previous 两个版本。
 - token 每 30 天静默轮换，旧 token 仅保留 5 分钟并发宽限。
+- 认证候选只包含当前有效 active credential，或仍在 5 分钟宽限内且不可续期的
+  replaced credential；候选条件与 HMAC 版本引用保护完全一致。
 - 空闲有效期滑动 90 天，绝对有效期为首次审批后的 365 天；滑动期限不能超过
   绝对期限。
-- 支持单设备撤销、全部设备撤销和按泄露 HMAC VersionId 撤销。
+- 支持单设备撤销、全部设备撤销和按泄露 HMAC VersionId 撤销。单设备撤销传入
+  链上任一 `credentialId` 都会在事务中撤销相同 `deviceId` 的全部凭证，返回
+  `{ devicesRevoked, credentialsRevoked }`。
+- 按 HMAC VersionId 撤销会查找历史上使用该版本的全部 `deviceId`，再事务式
+  撤销这些设备的所有凭证，包括已轮换到其他版本的 replacement；返回
+  `{ devicesMatched, credentialsRevoked }`。`devicesMatched` 包含历史匹配设备，
+  `credentialsRevoked` 只计算本次从未撤销变为已撤销的凭证。
 - 仍被有效凭证引用的 HMAC VersionId 不允许删除。泄露版本应撤销关联设备，
   不继续兼容。
 
 ## 审计
 
 审计只记录事件类型、时间、非秘密主体标识和受限元数据。允许的元数据包括
-请求或凭证标识、HMAC VersionId、原因和数量；不保存 token、申请码、浏览器
+请求、逻辑设备或凭证标识、HMAC VersionId、原因和数量；不保存 token、申请码、浏览器
 申请凭证、HMAC 密钥、秘密值或这些值的明文。
 
 ## 尚未实现

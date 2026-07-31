@@ -190,6 +190,35 @@ function testRequestExpiryAndAttemptLock() {
   }), 'REQUEST_LOCKED')
 }
 
+function testApprovedRequestIsIdempotentBeforeCodeValidation() {
+  const harness = createHarness()
+  const request = harness.service.createRequest()
+  harness.service.approveRequest({
+    requestId: request.requestId,
+    requestCode: request.requestCode,
+    adminAuthenticated: true
+  })
+
+  for (let attempt = 1; attempt <= 5; attempt += 1) {
+    assert.deepStrictEqual(harness.service.approveRequest({
+      requestId: request.requestId,
+      requestCode: `wrong-after-approval-${attempt}`,
+      adminAuthenticated: true
+    }), {
+      approved: true,
+      requestId: request.requestId
+    })
+  }
+
+  const stored = harness.repository.getRequest(request.requestId)
+  assert.strictEqual(stored.failedAttempts, 0)
+  assert.strictEqual(stored.lockedAt, null)
+  assert.strictEqual(harness.service.redeemRequest({
+    requestId: request.requestId,
+    browserCredential: request.browserCredential
+  }).token.length > 0, true)
+}
+
 function testTokenStorageAndExplicitHmacVersion() {
   const harness = createHarness()
   const { credential } = issueDevice(harness)
@@ -229,9 +258,12 @@ function testRotationAndConcurrentGrace() {
   assert.strictEqual(oldDuringGrace.authenticated, true)
   assert.strictEqual(oldDuringGrace.concurrentGrace, true)
   assert.strictEqual(oldDuringGrace.rotated, false)
+  const oldRecord = harness.repository.getCredential(credential.credentialId)
+  const replacementRecord = harness.repository.getCredential(rotation.credentialId)
+  assert.strictEqual(oldRecord.deviceId, replacementRecord.deviceId)
 
   harness.clock.value += (5 * 60 * 1000) + 1
-  expectCode(() => harness.service.authenticate(credential.token), 'TOKEN_REPLACED')
+  expectCode(() => harness.service.authenticate(credential.token), 'TOKEN_INVALID')
   assert.strictEqual(harness.service.authenticate(rotation.token).authenticated, true)
 }
 
@@ -248,7 +280,7 @@ function testIdleAndAbsoluteExpiryBoundaries() {
   )
 
   idleHarness.clock.value = idleRecord.idleExpiresAt
-  expectCode(() => idleHarness.service.authenticate(idleRotation.token), 'TOKEN_EXPIRED')
+  expectCode(() => idleHarness.service.authenticate(idleRotation.token), 'TOKEN_INVALID')
 
   const absoluteHarness = createHarness()
   const absoluteCredential = issueDevice(absoluteHarness).credential
@@ -274,7 +306,7 @@ function testIdleAndAbsoluteExpiryBoundaries() {
   assert.strictEqual(activeRecord.idleExpiresAt, absoluteRecord.absoluteExpiresAt)
 
   absoluteHarness.clock.value = absoluteRecord.absoluteExpiresAt
-  expectCode(() => absoluteHarness.service.authenticate(activeToken), 'TOKEN_EXPIRED')
+  expectCode(() => absoluteHarness.service.authenticate(activeToken), 'TOKEN_INVALID')
 }
 
 function testRevocationAndVersionDeletionProtection() {
@@ -292,13 +324,19 @@ function testRevocationAndVersionDeletionProtection() {
     'HMAC_VERSION_IN_USE'
   )
 
-  assert.strictEqual(harness.service.revokeCredential(first.credentialId), 1)
+  assert.deepStrictEqual(harness.service.revokeCredential(first.credentialId), {
+    devicesRevoked: 1,
+    credentialsRevoked: 1
+  })
   expectCode(() => harness.service.authenticate(first.token), 'TOKEN_INVALID')
   assert.deepStrictEqual(harness.service.getReferencedHmacVersionIds(), [VERSION_TWO])
   assert.strictEqual(harness.service.assertHmacVersionDeletable(VERSION_ONE), true)
 
   const third = issueDevice(harness).credential
-  assert.strictEqual(harness.service.revokeByHmacVersion(VERSION_TWO), 2)
+  assert.deepStrictEqual(harness.service.revokeByHmacVersion(VERSION_TWO), {
+    devicesMatched: 2,
+    credentialsRevoked: 2
+  })
   expectCode(() => harness.service.authenticate(second.token), 'TOKEN_INVALID')
   expectCode(() => harness.service.authenticate(third.token), 'TOKEN_INVALID')
   assert.deepStrictEqual(harness.service.getReferencedHmacVersionIds(), [])
@@ -309,6 +347,50 @@ function testRevocationAndVersionDeletionProtection() {
   assert.strictEqual(harness.service.revokeAllCredentials(), 2)
   expectCode(() => harness.service.authenticate(fourth.token), 'TOKEN_INVALID')
   expectCode(() => harness.service.authenticate(fifth.token), 'TOKEN_INVALID')
+}
+
+function testLogicalDeviceRevocationAcrossRotation() {
+  const harness = createHarness()
+  const original = issueDevice(harness).credential
+  harness.service.setActiveHmacVersionId(VERSION_TWO)
+  harness.clock.value += 30 * DAY_MS
+  const replacement = harness.service.authenticate(original.token)
+
+  const result = harness.service.revokeCredential(original.credentialId)
+  assert.deepStrictEqual(result, {
+    devicesRevoked: 1,
+    credentialsRevoked: 2
+  })
+  expectCode(() => harness.service.authenticate(original.token), 'TOKEN_INVALID')
+  expectCode(() => harness.service.authenticate(replacement.token), 'TOKEN_INVALID')
+}
+
+function testExpiredVersionIsNotReadAndLeakRevokesReplacement() {
+  const harness = createHarness()
+  const original = issueDevice(harness).credential
+  harness.service.setActiveHmacVersionId(VERSION_TWO)
+  harness.clock.value += 30 * DAY_MS
+  const replacement = harness.service.authenticate(original.token)
+  harness.clock.value += (5 * 60 * 1000) + 1
+
+  assert.deepStrictEqual(
+    harness.repository.listCredentialCandidates(harness.clock.value)
+      .map((credential) => credential.credentialId),
+    [replacement.credentialId]
+  )
+  assert.strictEqual(harness.secretProvider.deleteEntry({
+    secretName: SECRET_NAME,
+    versionId: VERSION_ONE
+  }), true)
+  assert.strictEqual(harness.service.authenticate(replacement.token).authenticated, true)
+  assert.deepStrictEqual(harness.service.getReferencedHmacVersionIds(), [VERSION_TWO])
+
+  assert.deepStrictEqual(harness.service.revokeByHmacVersion(VERSION_ONE), {
+    devicesMatched: 1,
+    credentialsRevoked: 2
+  })
+  expectCode(() => harness.service.authenticate(original.token), 'TOKEN_INVALID')
+  expectCode(() => harness.service.authenticate(replacement.token), 'TOKEN_INVALID')
 }
 
 function testAuditDoesNotContainSecrets() {
@@ -342,10 +424,13 @@ async function run() {
   testSecretProviderContract()
   testRequestApprovalAndRedemption()
   testRequestExpiryAndAttemptLock()
+  testApprovedRequestIsIdempotentBeforeCodeValidation()
   testTokenStorageAndExplicitHmacVersion()
   testRotationAndConcurrentGrace()
   testIdleAndAbsoluteExpiryBoundaries()
   testRevocationAndVersionDeletionProtection()
+  testLogicalDeviceRevocationAcrossRotation()
+  testExpiredVersionIsNotReadAndLeakRevokesReplacement()
   testAuditDoesNotContainSecrets()
 }
 

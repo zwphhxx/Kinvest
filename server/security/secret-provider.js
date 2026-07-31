@@ -51,6 +51,11 @@ class MockSecretProvider {
     }
     return this.entries.get(key)
   }
+
+  deleteEntry(reference) {
+    const { secretName, versionId } = validateSecretReference(reference)
+    return this.entries.delete(`${secretName}:${versionId}`)
+  }
 }
 
 module.exports = {

@@ -2,9 +2,13 @@ const AUDIT_METADATA_KEYS = new Set([
   'requestId',
   'credentialId',
   'replacementCredentialId',
+  'deviceId',
   'hmacVersionId',
   'reason',
-  'count'
+  'count',
+  'devicesRevoked',
+  'devicesMatched',
+  'credentialsRevoked'
 ])
 
 function mapRequest(row) {
@@ -26,6 +30,7 @@ function mapCredential(row) {
   if (!row) return null
   return {
     credentialId: row.credential_id,
+    deviceId: row.device_id,
     tokenDigest: row.token_digest,
     hmacVersionId: row.hmac_version_id,
     approvedAt: row.approved_at,
@@ -70,6 +75,7 @@ class DeviceAuthRepository {
 
       CREATE TABLE IF NOT EXISTS device_credentials (
         credential_id TEXT PRIMARY KEY,
+        device_id TEXT NOT NULL,
         token_digest TEXT NOT NULL UNIQUE,
         hmac_version_id TEXT NOT NULL,
         approved_at INTEGER NOT NULL,
@@ -84,6 +90,9 @@ class DeviceAuthRepository {
 
       CREATE INDEX IF NOT EXISTS idx_device_credentials_hmac_version
         ON device_credentials (hmac_version_id);
+
+      CREATE INDEX IF NOT EXISTS idx_device_credentials_device
+        ON device_credentials (device_id);
 
       CREATE TABLE IF NOT EXISTS device_auth_audit (
         event_id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -129,6 +138,7 @@ class DeviceAuthRepository {
           ELSE locked_at
         END
       WHERE request_id = ? AND consumed_at IS NULL AND locked_at IS NULL
+        AND approved_at IS NULL
     `).run(maximumAttempts, now, requestId)
     return this.getRequest(requestId)
   }
@@ -170,6 +180,7 @@ class DeviceAuthRepository {
     this.database.prepare(`
       INSERT INTO device_credentials (
         credential_id,
+        device_id,
         token_digest,
         hmac_version_id,
         approved_at,
@@ -177,9 +188,10 @@ class DeviceAuthRepository {
         last_used_at,
         idle_expires_at,
         absolute_expires_at
-      ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+      ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
     `).run(
       credential.credentialId,
+      credential.deviceId,
       credential.tokenDigest,
       credential.hmacVersionId,
       credential.approvedAt,
@@ -196,10 +208,24 @@ class DeviceAuthRepository {
     ).get(credentialId))
   }
 
-  listCredentialCandidates() {
-    return this.database.prepare(
-      'SELECT * FROM device_credentials WHERE revoked_at IS NULL ORDER BY credential_id'
-    ).all().map(mapCredential)
+  listCredentialCandidates(now) {
+    return this.database.prepare(`
+      SELECT *
+      FROM device_credentials
+      WHERE revoked_at IS NULL
+        AND absolute_expires_at > ?
+        AND (
+          (
+            replacement_credential_id IS NULL
+            AND idle_expires_at > ?
+          )
+          OR (
+            replacement_credential_id IS NOT NULL
+            AND replacement_grace_expires_at > ?
+          )
+        )
+      ORDER BY credential_id
+    `).all(now, now, now).map(mapCredential)
   }
 
   updateCredentialUse(credentialId, lastUsedAt, idleExpiresAt) {
@@ -234,12 +260,31 @@ class DeviceAuthRepository {
   }
 
   revokeCredential(credentialId, revokedAt) {
-    const result = this.database.prepare(`
-      UPDATE device_credentials
-      SET revoked_at = ?
-      WHERE credential_id = ? AND revoked_at IS NULL
-    `).run(revokedAt, credentialId)
-    return Number(result.changes)
+    this.database.exec('BEGIN IMMEDIATE')
+    try {
+      const credential = this.database.prepare(`
+        SELECT device_id
+        FROM device_credentials
+        WHERE credential_id = ?
+      `).get(credentialId)
+      if (!credential) {
+        this.database.exec('ROLLBACK')
+        return { deviceId: null, credentialsRevoked: 0 }
+      }
+      const result = this.database.prepare(`
+        UPDATE device_credentials
+        SET revoked_at = ?
+        WHERE device_id = ? AND revoked_at IS NULL
+      `).run(revokedAt, credential.device_id)
+      this.database.exec('COMMIT')
+      return {
+        deviceId: credential.device_id,
+        credentialsRevoked: Number(result.changes)
+      }
+    } catch (error) {
+      this.database.exec('ROLLBACK')
+      throw error
+    }
   }
 
   revokeAllCredentials(revokedAt) {
@@ -252,12 +297,32 @@ class DeviceAuthRepository {
   }
 
   revokeByHmacVersion(hmacVersionId, revokedAt) {
-    const result = this.database.prepare(`
-      UPDATE device_credentials
-      SET revoked_at = ?
-      WHERE hmac_version_id = ? AND revoked_at IS NULL
-    `).run(revokedAt, hmacVersionId)
-    return Number(result.changes)
+    this.database.exec('BEGIN IMMEDIATE')
+    try {
+      const matched = this.database.prepare(`
+        SELECT COUNT(DISTINCT device_id) AS devices_matched
+        FROM device_credentials
+        WHERE hmac_version_id = ?
+      `).get(hmacVersionId)
+      const result = this.database.prepare(`
+        UPDATE device_credentials
+        SET revoked_at = ?
+        WHERE revoked_at IS NULL
+          AND device_id IN (
+            SELECT device_id
+            FROM device_credentials
+            WHERE hmac_version_id = ?
+          )
+      `).run(revokedAt, hmacVersionId)
+      this.database.exec('COMMIT')
+      return {
+        devicesMatched: Number(matched.devices_matched),
+        credentialsRevoked: Number(result.changes)
+      }
+    } catch (error) {
+      this.database.exec('ROLLBACK')
+      throw error
+    }
   }
 
   getReferencedHmacVersionIds(now) {
