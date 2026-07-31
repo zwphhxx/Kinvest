@@ -132,7 +132,7 @@ jobs:
     needs: [verify, security, container-build]
     if: ${{ github.event_name != 'pull_request' && github.ref == 'refs/heads/main' }}
     runs-on: ubuntu-latest
-    timeout-minutes: 20
+    timeout-minutes: 30
     environment: RegistryPublish
     permissions:
       contents: read
@@ -163,10 +163,22 @@ jobs:
         with:
           context: .
           push: true
-          tags: |
-            ghcr.io/zwphhxx/kinvest:${{ github.sha }}
-            ccr.ccs.tencentyun.com/website-dev/kinvest:${{ github.sha }}
+          tags: ghcr.io/zwphhxx/kinvest:${{ github.sha }}
           provenance: true
+      - name: Install pinned crane
+        shell: bash
+        env:
+          CRANE_VERSION: 'v0.21.7'
+          CRANE_SHA256: '1a57bc98207fa1c0d04bf760699099e26f8383499bfd55b99c1b919a928a7230'
+        run: |
+          set -euo pipefail
+          curl -fsSL --max-time 60 \
+            -o /tmp/crane.tar.gz \
+            "https://github.com/google/go-containerregistry/releases/download/${CRANE_VERSION}/go-containerregistry_Linux_x86_64.tar.gz"
+          printf '%s  /tmp/crane.tar.gz\n' "$CRANE_SHA256" | sha256sum -c -
+          tar -xzf /tmp/crane.tar.gz -C /tmp crane
+          rm -f /tmp/crane.tar.gz
+          /tmp/crane version
       - name: Validate immutable image digests
         id: digest
         shell: bash
@@ -181,17 +193,44 @@ jobs:
             exit 1
           fi
           GHCR_DIGEST="$(docker buildx imagetools inspect "$GHCR_REF" --format '{{.Manifest.Digest}}')"
-          TCR_DIGEST="$(docker buildx imagetools inspect "$TCR_REF" --format '{{.Manifest.Digest}}')"
           if [[ ! "$GHCR_DIGEST" =~ ^sha256:[0-9a-f]{64}$ ]]; then
             printf '%s\n' 'GHCR did not report a valid image digest.' >&2
             exit 1
           fi
-          if [[ ! "$TCR_DIGEST" =~ ^sha256:[0-9a-f]{64}$ ]]; then
-            printf '%s\n' 'TCR did not report a valid image digest.' >&2
-            exit 1
-          fi
           if [[ "$GHCR_DIGEST" != "$BUILD_DIGEST" ]]; then
             printf '%s\n' 'GHCR digest does not match the build output digest.' >&2
+            exit 1
+          fi
+
+          COPY_SRC="ghcr.io/zwphhxx/kinvest@${GHCR_DIGEST}"
+          COPY_ATTEMPTS=3
+          COPY_WAIT_SECONDS=2
+          copy_log="$(mktemp)"
+          attempt=1
+          while ((attempt <= COPY_ATTEMPTS)); do
+            status=0
+            timeout --signal=TERM --kill-after=10s 300s \
+              /tmp/crane copy "$COPY_SRC" "$TCR_REF" >"$copy_log" 2>&1 || status=$?
+            if ((status == 0)); then
+              printf 'TCR registry copy attempt %s of %s succeeded.\n' "$attempt" "$COPY_ATTEMPTS"
+              break
+            fi
+            printf 'TCR registry copy attempt %s of %s failed with exit code %s.\n' \
+              "$attempt" "$COPY_ATTEMPTS" "$status"
+            if ((attempt >= COPY_ATTEMPTS)); then
+              rm -f "$copy_log"
+              printf 'TCR registry copy failed after %s attempts.\n' "$COPY_ATTEMPTS" >&2
+              exit 1
+            fi
+            sleep "$COPY_WAIT_SECONDS"
+            COPY_WAIT_SECONDS=$((COPY_WAIT_SECONDS * 2))
+            attempt=$((attempt + 1))
+          done
+          rm -f "$copy_log"
+
+          TCR_DIGEST="$(/tmp/crane digest "$TCR_REF")"
+          if [[ ! "$TCR_DIGEST" =~ ^sha256:[0-9a-f]{64}$ ]]; then
+            printf '%s\n' 'TCR did not report a valid image digest.' >&2
             exit 1
           fi
           printf 'ghcr_image_digest=%s\n' "$GHCR_DIGEST" >> "$GITHUB_OUTPUT"
