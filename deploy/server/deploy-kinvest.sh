@@ -2,7 +2,9 @@
 set -Eeuo pipefail
 
 ROOT='/root/docker/kinvest'
-ALLOWED_REPOSITORY='ghcr.io/zwphhxx/kinvest'
+ALLOWED_REPOSITORY='ccr.ccs.tencentyun.com/website-dev/kinvest'
+ALLOWED_DEPLOYMENT_DIGEST_PATTERN='^ccr\.ccs\.tencentyun\.com/website-dev/kinvest@sha256:[0-9a-f]{64}$'
+ALLOWED_STATE_DIGEST_PATTERN='^(ccr\.ccs\.tencentyun\.com/website-dev/kinvest|ghcr\.io/zwphhxx/kinvest)@sha256:[0-9a-f]{64}$'
 COMPOSE="$ROOT/docker-compose.yml"
 STATE="$ROOT/state"
 CURRENT_STATE="$STATE/current.state"
@@ -37,8 +39,8 @@ if IFS= read -r extra_input; then
   exit 2
 fi
 
-if [[ ! "$digest_ref" =~ ^ghcr\.io/zwphhxx/kinvest@sha256:[0-9a-f]{64}$ ]]; then
-  printf '%s\n' 'deployment requires the immutable Kinvest digest reference' >&2
+if [[ ! "$digest_ref" =~ $ALLOWED_DEPLOYMENT_DIGEST_PATTERN ]]; then
+  printf '%s\n' 'deployment requires the immutable Kinvest TCR digest reference' >&2
   exit 2
 fi
 
@@ -163,7 +165,7 @@ run_compose() {
 }
 
 is_valid_digest_ref() {
-  [[ "$1" =~ ^ghcr\.io/zwphhxx/kinvest@sha256:[0-9a-f]{64}$ ]]
+  [[ "$1" =~ $ALLOWED_STATE_DIGEST_PATTERN ]]
 }
 
 is_valid_commit() {
