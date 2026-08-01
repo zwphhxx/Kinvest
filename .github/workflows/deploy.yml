@@ -180,3 +180,45 @@ jobs:
           fi
           printf 'ghcr_image_digest=%s\n' "$GHCR_DIGEST" >> "$GITHUB_OUTPUT"
           printf 'GHCR image: ghcr.io/zwphhxx/kinvest@%s\n' "$GHCR_DIGEST"
+      - name: Write GHCR release record v2
+        shell: bash
+        env:
+          GHCR_DIGEST: ${{ steps.digest.outputs.ghcr_image_digest }}
+          COMMIT_SHA: ${{ github.sha }}
+          VERIFICATION_RUN_ID: ${{ github.run_id }}
+          VERIFICATION_RUN_ATTEMPT: ${{ github.run_attempt }}
+        run: |
+          set -euo pipefail
+          [[ "$GHCR_DIGEST" =~ ^sha256:[0-9a-f]{64}$ ]]
+          [[ "$COMMIT_SHA" =~ ^[0-9a-f]{40}$ ]]
+          created_at="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
+          jq -n \
+            --argjson schema_version 2 \
+            --arg verification_run_id "$VERIFICATION_RUN_ID" \
+            --arg verification_run_attempt "$VERIFICATION_RUN_ATTEMPT" \
+            --arg commit_sha "$COMMIT_SHA" \
+            --arg artifact_source 'ghcr-public' \
+            --arg source_repository 'ghcr.io/zwphhxx/kinvest' \
+            --arg source_digest "$GHCR_DIGEST" \
+            --arg ghcr_digest "$GHCR_DIGEST" \
+            --arg created_at "$created_at" \
+            '{
+              schema_version: $schema_version,
+              verification_run_id: $verification_run_id,
+              verification_run_attempt: $verification_run_attempt,
+              commit_sha: $commit_sha,
+              artifact_source: $artifact_source,
+              source_repository: $source_repository,
+              source_digest: $source_digest,
+              ghcr_digest: $ghcr_digest,
+              tcr_digest: null,
+              created_at: $created_at
+            }' > release-record.json
+          jq -e . release-record.json >/dev/null
+      - name: Upload GHCR release record v2
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
+        with:
+          name: kinvest-release-record-v2-${{ github.run_id }}-${{ github.run_attempt }}
+          path: release-record.json
+          retention-days: 30
+          if-no-files-found: error

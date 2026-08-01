@@ -1,0 +1,745 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+ROOT='/root/docker/kinvest'
+RUN_ROOT='/run'
+COMPOSE="$ROOT/docker-compose.yml"
+DATA_DIR="$ROOT/data"
+DATABASE="$DATA_DIR/kinvest.sqlite"
+STATE="$ROOT/state"
+BACKUP_DIR="$ROOT/backups"
+CURRENT_STATE="$STATE/current.state"
+PREVIOUS_STATE="$STATE/previous.state"
+ATTEMPT_STATE="$STATE/attempt.state"
+TCR_POLICY_FILE="$ROOT/policy/tcr-basic.enabled"
+PUBLIC_HEALTH_URL='https://dearmina.cn/api/health'
+GHCR_REPOSITORY='ghcr.io/zwphhxx/kinvest'
+TCR_REPOSITORY='ccr.ccs.tencentyun.com/website-dev/kinvest'
+ALLOWED_STATE_DIGEST_PATTERN='^(ghcr\.io/zwphhxx/kinvest|ccr\.ccs\.tencentyun\.com/website-dev/kinvest)@sha256:[0-9a-f]{64}$'
+PULL_ATTEMPTS='3'
+PULL_TIMEOUT='300s'
+PULL_RETRY_BASE_WAIT_SECONDS='2'
+DOCKER_TIMEOUT='120s'
+COMPOSE_TIMEOUT='120s'
+INSPECT_TIMEOUT='15s'
+DOCKER_KILL_AFTER='10s'
+INSPECT_KILL_AFTER='5s'
+HEALTH_TIMEOUT_SECONDS='120'
+HEALTH_INTERVAL='2'
+
+if [[ "$#" -ne 0 ]]; then
+  printf '%s\n' 'deployment accepts no command-line arguments' >&2
+  exit 2
+fi
+
+protocol_magic=''
+digest_ref=''
+commit_sha=''
+registry_mode=''
+registry_host=''
+registry_username=''
+registry_password=''
+release_record_schema_version=''
+verification_run_id=''
+artifact_source=''
+secret_version_ids=''
+payload_end=''
+extra_input=''
+
+read_payload_line() {
+  local variable_name="$1"
+  local value=''
+
+  if ! IFS= read -r value; then
+    printf '%s\n' 'deployment requires a complete deploy-v2 payload' >&2
+    exit 2
+  fi
+  printf -v "$variable_name" '%s' "$value"
+}
+
+for payload_variable in \
+  protocol_magic \
+  digest_ref \
+  commit_sha \
+  registry_mode \
+  registry_host \
+  registry_username \
+  registry_password \
+  release_record_schema_version \
+  verification_run_id \
+  artifact_source \
+  secret_version_ids \
+  payload_end; do
+  read_payload_line "$payload_variable"
+done
+
+if IFS= read -r extra_input; then
+  printf '%s\n' 'deployment payload contains unexpected trailing input' >&2
+  exit 2
+fi
+
+if [[ "$protocol_magic" != 'KINVEST_DEPLOY_V2' || "$payload_end" != 'EOF' ]]; then
+  printf '%s\n' 'deployment payload has an invalid protocol envelope' >&2
+  exit 2
+fi
+
+if [[ ! "$digest_ref" =~ $ALLOWED_STATE_DIGEST_PATTERN ]]; then
+  printf '%s\n' 'deployment requires an allowed immutable Kinvest digest reference' >&2
+  exit 2
+fi
+
+if [[ ! "$commit_sha" =~ ^[0-9a-f]{40}$ ]]; then
+  printf '%s\n' 'deployment requires a 40-character lowercase audit commit SHA' >&2
+  exit 2
+fi
+
+if [[ ! "$release_record_schema_version" =~ ^[12]$ || ! "$verification_run_id" =~ ^[0-9]+$ ]]; then
+  printf '%s\n' 'deployment requires valid release record provenance' >&2
+  exit 2
+fi
+
+# Secret VersionIds are added in the CAM/SSM phase. Until then, fail closed on
+# any value except the explicit empty object rather than accepting unvalidated
+# state metadata.
+if [[ "$secret_version_ids" != '{}' ]]; then
+  printf '%s\n' 'deployment secret version metadata is not enabled' >&2
+  exit 2
+fi
+
+case "$registry_mode" in
+  ghcr-public)
+    if [[ "${digest_ref%@*}" != "$GHCR_REPOSITORY" ||
+      "$registry_host" != 'ghcr.io' ||
+      -n "$registry_username" ||
+      -n "$registry_password" ||
+      "$artifact_source" != 'ghcr-public' ||
+      "$release_record_schema_version" != '2' ]]; then
+      printf '%s\n' 'public GHCR deployment metadata is inconsistent' >&2
+      exit 2
+    fi
+    ;;
+  tcr-basic)
+    if [[ "${digest_ref%@*}" != "$TCR_REPOSITORY" ||
+      "$registry_host" != 'ccr.ccs.tencentyun.com' ||
+      ! "$registry_username" =~ ^[A-Za-z0-9._@-]{1,128}$ ||
+      -z "$registry_password" ||
+      "$registry_password" == *$'\r'* ||
+      "$artifact_source" != 'tcr-private' ]]; then
+      printf '%s\n' 'private TCR deployment metadata is inconsistent' >&2
+      exit 2
+    fi
+    ;;
+  *)
+    printf '%s\n' 'deployment registry mode is not allowed' >&2
+    exit 2
+    ;;
+esac
+
+if [[ "$(id -u)" -ne 0 ]]; then
+  printf '%s\n' 'deployment must run as root' >&2
+  exit 1
+fi
+
+assert_not_symlink() {
+  local candidate="$1"
+
+  if [[ -L "$candidate" ]]; then
+    printf '%s\n' "refusing symlinked Kinvest path: $candidate" >&2
+    exit 1
+  fi
+}
+
+ROOT_PARENT="${ROOT%/kinvest}"
+ROOT_TOP="${ROOT_PARENT%/docker}"
+for path_component in "$ROOT_TOP" "$ROOT_PARENT" "$ROOT" "$DATA_DIR" "$STATE" "$BACKUP_DIR" "$RUN_ROOT"; do
+  assert_not_symlink "$path_component"
+done
+
+if [[ ! -d "$ROOT" || ! -f "$COMPOSE" || ! -x "$ROOT/prepare-data-dir.sh" ]]; then
+  printf '%s\n' 'Kinvest server files are not bootstrapped' >&2
+  exit 1
+fi
+
+assert_not_symlink "$COMPOSE"
+assert_not_symlink "$ROOT/prepare-data-dir.sh"
+install -d -m 0700 -- "$STATE" "$BACKUP_DIR"
+assert_not_symlink "$STATE"
+assert_not_symlink "$BACKUP_DIR"
+
+exec 9>"$STATE/deploy.lock"
+if ! flock -n 9; then
+  printf '%s\n' 'another Kinvest deployment is already running' >&2
+  exit 1
+fi
+
+docker_config=''
+pull_stderr=''
+login_stderr=''
+
+cleanup_runtime() {
+  registry_password=''
+  registry_username=''
+  if [[ -n "$pull_stderr" ]]; then
+    rm -f -- "$pull_stderr"
+  fi
+  if [[ -n "$login_stderr" ]]; then
+    rm -f -- "$login_stderr"
+  fi
+  if [[ -n "$docker_config" && "$docker_config" == "$RUN_ROOT"/kinvest-docker-config.* ]]; then
+    rm -rf -- "$docker_config"
+  fi
+}
+trap cleanup_runtime EXIT INT TERM HUP
+
+on_signal() {
+  exit "$1"
+}
+trap 'on_signal 129' HUP
+trap 'on_signal 130' INT
+trap 'on_signal 143' TERM
+
+docker_config="$(mktemp -d "$RUN_ROOT/kinvest-docker-config.XXXXXX")"
+chmod 0700 "$docker_config"
+export DOCKER_CONFIG="$docker_config"
+
+assert_tcr_policy_enabled() {
+  local owner=''
+  local mode=''
+  local first_line=''
+  local extra_line=''
+
+  if [[ ! -f "$TCR_POLICY_FILE" || -L "$TCR_POLICY_FILE" ]]; then
+    printf '%s\n' 'TCR production mode is not enabled by server policy' >&2
+    exit 1
+  fi
+  owner="$(stat -c '%U:%G' "$TCR_POLICY_FILE")"
+  mode="$(stat -c '%a' "$TCR_POLICY_FILE")"
+  IFS= read -r first_line < "$TCR_POLICY_FILE" || true
+  extra_line="$(sed -n '2p' "$TCR_POLICY_FILE")"
+  if [[ "$owner" != 'root:root' || "$mode" != '600' || "$first_line" != 'enabled' || -n "$extra_line" ]]; then
+    printf '%s\n' 'TCR production policy is invalid' >&2
+    exit 1
+  fi
+}
+
+if [[ "$registry_mode" == 'tcr-basic' ]]; then
+  assert_tcr_policy_enabled
+fi
+
+run_docker() {
+  timeout --signal=TERM --kill-after="$DOCKER_KILL_AFTER" "$DOCKER_TIMEOUT" docker "$@"
+}
+
+run_pull() {
+  timeout --signal=TERM --kill-after="$DOCKER_KILL_AFTER" "$PULL_TIMEOUT" docker pull "$1"
+}
+
+run_inspect() {
+  timeout --signal=TERM --kill-after="$INSPECT_KILL_AFTER" "$INSPECT_TIMEOUT" docker "$@"
+}
+
+run_compose() {
+  local image_ref="$1"
+
+  timeout --signal=TERM --kill-after="$DOCKER_KILL_AFTER" "$COMPOSE_TIMEOUT" \
+    env KINVEST_IMAGE="$image_ref" DOCKER_CONFIG="$DOCKER_CONFIG" \
+    docker compose \
+      --project-name kinvest \
+      -f "$COMPOSE" \
+      up -d --no-deps --pull never kinvest
+}
+
+pull_failure_is_transient() {
+  local status="$1"
+  local stderr_file="$2"
+
+  if ((status == 124 || status == 137 || status == 143)); then
+    return 0
+  fi
+
+  grep -Eqi \
+    'timeout|timed out|connection reset|connection refused|EOF|temporary|try again|unreachable|no route to host|TLS handshake|Bad Gateway|Service Unavailable|Gateway Timeout|502|503|504' \
+    "$stderr_file"
+}
+
+pull_with_retries() {
+  local ref="$1"
+  local attempt=1
+  local wait_seconds="$PULL_RETRY_BASE_WAIT_SECONDS"
+  local status=0
+
+  pull_stderr="$(mktemp "$RUN_ROOT/kinvest-pull-stderr.XXXXXX")"
+
+  while ((attempt <= PULL_ATTEMPTS)); do
+    status=0
+    run_pull "$ref" >/dev/null 2>"$pull_stderr" || status=$?
+
+    if ((status == 0)); then
+      rm -f -- "$pull_stderr"
+      pull_stderr=''
+      printf 'Kinvest image pull attempt %s of %s succeeded.\n' "$attempt" "$PULL_ATTEMPTS" >&2
+      return 0
+    fi
+
+    printf 'Kinvest image pull attempt %s of %s failed with exit code %s.\n' \
+      "$attempt" "$PULL_ATTEMPTS" "$status" >&2
+
+    if ((attempt >= PULL_ATTEMPTS)); then
+      printf 'Kinvest image pull failed after %s attempts.\n' "$PULL_ATTEMPTS" >&2
+      return 1
+    fi
+
+    if ! pull_failure_is_transient "$status" "$pull_stderr"; then
+      printf 'Kinvest image pull failed with a non-retryable error (exit code %s).\n' "$status" >&2
+      return 1
+    fi
+
+    sleep "$wait_seconds"
+    wait_seconds=$((wait_seconds * 2))
+    attempt=$((attempt + 1))
+  done
+}
+
+if [[ "$registry_mode" == 'tcr-basic' ]]; then
+  login_stderr="$(mktemp "$RUN_ROOT/kinvest-login-stderr.XXXXXX")"
+  login_status=0
+  printf '%s' "$registry_password" |
+    timeout --signal=TERM --kill-after="$DOCKER_KILL_AFTER" "$DOCKER_TIMEOUT" \
+      docker login "$registry_host" --username "$registry_username" --password-stdin \
+      >/dev/null 2>"$login_stderr" || login_status=$?
+  registry_password=''
+  registry_username=''
+  rm -f -- "$login_stderr"
+  login_stderr=''
+  if ((login_status != 0)); then
+    printf 'Registry login failed with exit code %s.\n' "$login_status" >&2
+    exit 1
+  fi
+fi
+
+verify_repo_digest() {
+  local expected_ref="$1"
+  local repo_digests=''
+
+  if ! repo_digests="$(run_inspect image inspect --format '{{json .RepoDigests}}' "$expected_ref")"; then
+    return 1
+  fi
+  grep -Fq -- "\"$expected_ref\"" <<< "$repo_digests"
+}
+
+read_image_schema_range() {
+  local image_ref="$1"
+  local allow_legacy="$2"
+  local minimum=''
+  local maximum=''
+
+  minimum="$(run_inspect image inspect --format '{{index .Config.Labels "io.kinvest.schema.min"}}' "$image_ref")" || return 1
+  maximum="$(run_inspect image inspect --format '{{index .Config.Labels "io.kinvest.schema.max"}}' "$image_ref")" || return 1
+
+  if [[ "$allow_legacy" == 'true' && ( "$minimum" == '<no value>' || -z "$minimum" ) &&
+    ( "$maximum" == '<no value>' || -z "$maximum" ) ]]; then
+    printf '%s %s\n' '0' '0'
+    return 0
+  fi
+
+  if [[ ! "$minimum" =~ ^[0-9]+$ || ! "$maximum" =~ ^[0-9]+$ || "$minimum" -gt "$maximum" ]]; then
+    return 1
+  fi
+  printf '%s %s\n' "$minimum" "$maximum"
+}
+
+read_database_schema() {
+  if [[ ! -e "$DATABASE" ]]; then
+    printf '%s\n' '0'
+    return 0
+  fi
+  assert_not_symlink "$DATABASE"
+  python3 - "$DATABASE" <<'PY'
+import sqlite3
+import sys
+
+connection = sqlite3.connect(f"file:{sys.argv[1]}?mode=ro", uri=True)
+try:
+    value = connection.execute("PRAGMA user_version").fetchone()[0]
+    if not isinstance(value, int) or value < 0:
+        raise RuntimeError("invalid SQLite user_version")
+    print(value)
+finally:
+    connection.close()
+PY
+}
+
+database_backup_path='none'
+database_backup_checksum='none'
+
+create_database_backup() {
+  local timestamp=''
+  local temporary=''
+
+  if [[ ! -e "$DATABASE" ]]; then
+    return 0
+  fi
+
+  timestamp="$(date -u +%Y%m%dT%H%M%SZ)"
+  database_backup_path="$BACKUP_DIR/${timestamp}-${commit_sha}.sqlite"
+  temporary="$(mktemp "$BACKUP_DIR/.backup.XXXXXX")"
+  python3 - "$DATABASE" "$temporary" <<'PY'
+import sqlite3
+import sys
+
+source = sqlite3.connect(f"file:{sys.argv[1]}?mode=ro", uri=True)
+destination = sqlite3.connect(sys.argv[2])
+try:
+    source.backup(destination)
+    result = destination.execute("PRAGMA quick_check").fetchone()[0]
+    if result != "ok":
+        raise RuntimeError("backup quick_check failed")
+finally:
+    destination.close()
+    source.close()
+PY
+  chmod 0600 "$temporary"
+  mv -f -- "$temporary" "$database_backup_path"
+  database_backup_checksum="$(sha256sum "$database_backup_path" | awk '{print $1}')"
+  if [[ ! "$database_backup_checksum" =~ ^[0-9a-f]{64}$ ]]; then
+    printf '%s\n' 'database backup checksum is invalid' >&2
+    exit 1
+  fi
+}
+
+schema_in_range() {
+  local schema="$1"
+  local minimum="$2"
+  local maximum="$3"
+  [[ "$schema" =~ ^[0-9]+$ && "$minimum" =~ ^[0-9]+$ && "$maximum" =~ ^[0-9]+$ ]] &&
+    ((schema >= minimum && schema <= maximum))
+}
+
+wait_for_health() {
+  local deadline=$((SECONDS + HEALTH_TIMEOUT_SECONDS))
+  local health_status=''
+  local remaining=0
+
+  while ((SECONDS < deadline)); do
+    if ! health_status="$(run_inspect inspect --format '{{.State.Health.Status}}' kinvest)"; then
+      return 1
+    fi
+    if [[ "$health_status" == 'healthy' ]]; then
+      return 0
+    fi
+    if [[ "$health_status" == 'unhealthy' ]]; then
+      return 1
+    fi
+    remaining=$((deadline - SECONDS))
+    ((remaining > 0)) || break
+    if ((remaining < HEALTH_INTERVAL)); then sleep "$remaining"; else sleep "$HEALTH_INTERVAL"; fi
+  done
+  return 1
+}
+
+verify_running_image() {
+  local expected_ref="$1"
+  local expected_image_id=''
+  local actual_image_ref=''
+  local actual_image_id=''
+
+  expected_image_id="$(run_inspect image inspect --format '{{.Id}}' "$expected_ref")" || return 1
+  actual_image_ref="$(run_inspect inspect --format '{{.Config.Image}}' kinvest)" || return 1
+  actual_image_id="$(run_inspect inspect --format '{{.Image}}' kinvest)" || return 1
+
+  [[ "$actual_image_ref" == "$expected_ref" && "$actual_image_id" == "$expected_image_id" ]] &&
+    verify_repo_digest "$expected_ref"
+}
+
+atomic_write_state() {
+  local destination="$1"
+  local state_digest="$2"
+  local state_commit="$3"
+  local state_schema="$4"
+  local state_min="$5"
+  local state_max="$6"
+  local state_secret_versions="$7"
+  local state_release_schema="$8"
+  local state_run_id="$9"
+  local state_artifact_source="${10}"
+  local state_backup_path="${11}"
+  local state_backup_checksum="${12}"
+  local state_deployed_at="${13}"
+  local temporary=''
+
+  temporary="$(mktemp "$STATE/.state.XXXXXX")"
+  cat > "$temporary" <<EOF_STATE
+protocolVersion=2
+imageDigest=$state_digest
+commit=$state_commit
+schemaVersion=$state_schema
+imageSchemaMin=$state_min
+imageSchemaMax=$state_max
+secretVersionIds=$state_secret_versions
+releaseRecordSchemaVersion=$state_release_schema
+verificationRunId=$state_run_id
+artifactSource=$state_artifact_source
+databaseBackupPath=$state_backup_path
+databaseBackupChecksum=$state_backup_checksum
+deployedAt=$state_deployed_at
+EOF_STATE
+  chmod 0600 "$temporary"
+  mv -f -- "$temporary" "$destination"
+}
+
+atomic_write_attempt_state() {
+  local schema_before="$1"
+  local started_at="$2"
+  local temporary=''
+
+  temporary="$(mktemp "$STATE/.attempt.XXXXXX")"
+  cat > "$temporary" <<EOF_ATTEMPT
+protocolVersion=2
+status=pending
+imageDigest=$digest_ref
+commit=$commit_sha
+schemaBefore=$schema_before
+imageSchemaMin=$candidate_schema_min
+imageSchemaMax=$candidate_schema_max
+secretVersionIds=$secret_version_ids
+releaseRecordSchemaVersion=$release_record_schema_version
+verificationRunId=$verification_run_id
+artifactSource=$artifact_source
+databaseBackupPath=$database_backup_path
+databaseBackupChecksum=$database_backup_checksum
+startedAt=$started_at
+EOF_ATTEMPT
+  chmod 0600 "$temporary"
+  mv -f -- "$temporary" "$ATTEMPT_STATE"
+}
+
+previous_digest_ref=''
+previous_commit=''
+previous_schema='0'
+previous_schema_min='0'
+previous_schema_max='0'
+previous_secret_versions='{}'
+previous_release_schema='0'
+previous_run_id='0'
+previous_artifact_source='legacy'
+previous_backup_path='none'
+previous_backup_checksum='none'
+previous_deployed_at='legacy'
+previous_image_id=''
+
+read_current_state() {
+  local first_line=''
+  local second_line=''
+  local third_line=''
+  local key=''
+  local value=''
+  declare -A values=()
+
+  assert_not_symlink "$CURRENT_STATE"
+  IFS= read -r first_line < "$CURRENT_STATE" || return 1
+
+  if [[ "$first_line" == protocolVersion=2 ]]; then
+    while IFS='=' read -r key value; do
+      case "$key" in
+        protocolVersion|imageDigest|commit|schemaVersion|imageSchemaMin|imageSchemaMax|secretVersionIds|releaseRecordSchemaVersion|verificationRunId|artifactSource|databaseBackupPath|databaseBackupChecksum|deployedAt) ;;
+        *) return 1 ;;
+      esac
+      [[ -z "${values[$key]+present}" ]] || return 1
+      values[$key]="$value"
+    done < "$CURRENT_STATE"
+    [[ "${#values[@]}" -eq 13 && "${values[protocolVersion]}" == '2' ]] || return 1
+    previous_digest_ref="${values[imageDigest]}"
+    previous_commit="${values[commit]}"
+    previous_schema="${values[schemaVersion]}"
+    previous_schema_min="${values[imageSchemaMin]}"
+    previous_schema_max="${values[imageSchemaMax]}"
+    previous_secret_versions="${values[secretVersionIds]}"
+    previous_release_schema="${values[releaseRecordSchemaVersion]}"
+    previous_run_id="${values[verificationRunId]}"
+    previous_artifact_source="${values[artifactSource]}"
+    previous_backup_path="${values[databaseBackupPath]}"
+    previous_backup_checksum="${values[databaseBackupChecksum]}"
+    previous_deployed_at="${values[deployedAt]}"
+  else
+    IFS= read -r first_line < "$CURRENT_STATE" || return 1
+    IFS= read -r second_line < <(sed -n '2p' "$CURRENT_STATE") || return 1
+    third_line="$(sed -n '3p' "$CURRENT_STATE")"
+    [[ -z "$third_line" && "$first_line" == digest_ref=* && "$second_line" == commit=* ]] || return 1
+    previous_digest_ref="${first_line#digest_ref=}"
+    previous_commit="${second_line#commit=}"
+  fi
+
+  [[ "$previous_digest_ref" =~ $ALLOWED_STATE_DIGEST_PATTERN ]] || return 1
+  [[ "$previous_commit" =~ ^[0-9a-f]{40}$ ]] || return 1
+  schema_in_range "$previous_schema" "$previous_schema_min" "$previous_schema_max" || return 1
+}
+
+capture_previous_snapshot() {
+  local running_ref=''
+  local running_image_id=''
+  local health=''
+
+  previous_image_id="$(run_inspect image inspect --format '{{.Id}}' "$previous_digest_ref")" || return 1
+  running_ref="$(run_inspect inspect --format '{{.Config.Image}}' kinvest)" || return 1
+  running_image_id="$(run_inspect inspect --format '{{.Image}}' kinvest)" || return 1
+  health="$(run_inspect inspect --format '{{.State.Health.Status}}' kinvest)" || return 1
+  [[ "$running_ref" == "$previous_digest_ref" && "$running_image_id" == "$previous_image_id" && "$health" == 'healthy' ]]
+}
+
+rollback() {
+  local original_status="${1:-1}"
+  local current_schema=''
+  local available_previous_image_id=''
+
+  trap - ERR
+  printf '%s\n' 'Kinvest deployment failed; evaluating verified rollback.' >&2
+
+  if [[ -z "$previous_digest_ref" ]]; then
+    run_docker rm -f kinvest >/dev/null || true
+    printf '%s\n' 'No previous release exists; manual intervention is required.' >&2
+    exit "$original_status"
+  fi
+
+  current_schema="$(read_database_schema)" || enter_restore_required "$original_status"
+  if ! schema_in_range "$current_schema" "$previous_schema_min" "$previous_schema_max"; then
+    enter_restore_required "$original_status"
+  fi
+
+  available_previous_image_id="$(run_inspect image inspect --format '{{.Id}}' "$previous_digest_ref")" || {
+    printf '%s\n' 'Previous image is not locally available; manual intervention is required.' >&2
+    exit "$original_status"
+  }
+  if [[ "$available_previous_image_id" != "$previous_image_id" ]]; then
+    printf '%s\n' 'Previous image identity changed; manual intervention is required.' >&2
+    exit "$original_status"
+  fi
+
+  run_compose "$previous_digest_ref" >/dev/null || exit "$original_status"
+  wait_for_health || exit "$original_status"
+  verify_running_image "$previous_digest_ref" || exit "$original_status"
+  rm -f -- "$ATTEMPT_STATE"
+  printf '%s\n' 'Previous compatible Kinvest digest was restored.' >&2
+  exit "$original_status"
+}
+
+enter_restore_required() {
+  local original_status="$1"
+  local running_ref=''
+
+  if ! running_ref="$(run_inspect inspect --format '{{.Config.Image}}' kinvest)" ||
+    [[ "$running_ref" == "$digest_ref" ]]; then
+    if ! run_docker stop kinvest >/dev/null; then
+      printf '%s\n' 'candidate stop failed; immediate manual isolation is required' >&2
+    fi
+  fi
+  printf '%s\n' 'ROLLBACK_REQUIRES_DB_RESTORE' >&2
+  exit "$original_status"
+}
+
+verify_public_health() {
+  local response_file=''
+
+  response_file="$(mktemp "$RUN_ROOT/kinvest-public-health.XXXXXX")"
+  if ! curl -fsS --max-time 15 "$PUBLIC_HEALTH_URL" > "$response_file"; then
+    rm -f -- "$response_file"
+    return 1
+  fi
+  if ! python3 - "$response_file" <<'PY'
+import json
+import sys
+
+with open(sys.argv[1], encoding="utf-8") as stream:
+    payload = json.load(stream)
+if payload.get("status") != "ok" or payload.get("service") != "kinvest":
+    raise SystemExit(1)
+PY
+  then
+    rm -f -- "$response_file"
+    return 1
+  fi
+  rm -f -- "$response_file"
+}
+
+run_docker network inspect web >/dev/null
+"$ROOT/prepare-data-dir.sh" >/dev/null
+
+if [[ -e "$CURRENT_STATE" ]]; then
+  if ! read_current_state || ! capture_previous_snapshot; then
+    printf '%s\n' 'refusing deployment because the current release cannot be verified' >&2
+    exit 1
+  fi
+  atomic_write_state \
+    "$PREVIOUS_STATE" \
+    "$previous_digest_ref" \
+    "$previous_commit" \
+    "$previous_schema" \
+    "$previous_schema_min" \
+    "$previous_schema_max" \
+    "$previous_secret_versions" \
+    "$previous_release_schema" \
+    "$previous_run_id" \
+    "$previous_artifact_source" \
+    "$previous_backup_path" \
+    "$previous_backup_checksum" \
+    "$previous_deployed_at"
+else
+  assert_not_symlink "$CURRENT_STATE"
+  rm -f -- "$PREVIOUS_STATE"
+fi
+
+pull_with_retries "$digest_ref"
+if ! verify_repo_digest "$digest_ref"; then
+  printf '%s\n' 'pulled image RepoDigests do not contain the requested digest' >&2
+  exit 1
+fi
+
+# Remove registry material immediately after the authenticated pull. The empty
+# temporary DOCKER_CONFIG remains active so later Docker calls cannot fall back
+# to /root/.docker/config.json.
+rm -f -- "$DOCKER_CONFIG/config.json"
+
+read -r candidate_schema_min candidate_schema_max < <(read_image_schema_range "$digest_ref" 'false') || {
+  printf '%s\n' 'candidate image has invalid schema compatibility labels' >&2
+  exit 1
+}
+schema_before="$(read_database_schema)"
+if ! schema_in_range "$schema_before" "$candidate_schema_min" "$candidate_schema_max"; then
+  printf '%s\n' 'candidate image does not support the current database schema' >&2
+  exit 1
+fi
+
+create_database_backup
+attempt_started_at="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
+atomic_write_attempt_state "$schema_before" "$attempt_started_at"
+
+trap 'rollback "$?"' ERR
+run_compose "$digest_ref" >/dev/null
+wait_for_health
+verify_running_image "$digest_ref"
+
+schema_after="$(read_database_schema)"
+if ! schema_in_range "$schema_after" "$candidate_schema_min" "$candidate_schema_max"; then
+  printf '%s\n' 'candidate produced a schema outside its declared compatibility range' >&2
+  false
+fi
+verify_public_health
+
+deployed_at="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
+atomic_write_state \
+  "$CURRENT_STATE" \
+  "$digest_ref" \
+  "$commit_sha" \
+  "$schema_after" \
+  "$candidate_schema_min" \
+  "$candidate_schema_max" \
+  "$secret_version_ids" \
+  "$release_record_schema_version" \
+  "$verification_run_id" \
+  "$artifact_source" \
+  "$database_backup_path" \
+  "$database_backup_checksum" \
+  "$deployed_at"
+rm -f -- "$ATTEMPT_STATE"
+trap - ERR
+
+printf 'Kinvest deployed protocol v2 for audit commit %s.\n' "$commit_sha"

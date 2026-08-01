@@ -1,0 +1,225 @@
+name: Deploy production v2 (manual)
+
+on:
+  workflow_dispatch:
+    inputs:
+      release_run_id:
+        description: 'Successful main Deploy Kinvest workflow run ID containing release-record v2'
+        required: true
+        type: string
+      confirm:
+        description: 'Type DEPLOY_V2 for FORWARD or ROLLBACK_V2 for ROLLBACK'
+        required: true
+        type: string
+      intent:
+        description: 'FORWARD requires the current main release; historical releases require ROLLBACK'
+        required: true
+        type: choice
+        options:
+          - FORWARD
+          - ROLLBACK
+
+permissions:
+  contents: read
+
+concurrency:
+  group: kinvest-production-v2
+  cancel-in-progress: false
+  queue: max
+
+jobs:
+  validate:
+    name: validate-v2
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    permissions:
+      contents: read
+      actions: read
+    outputs:
+      artifact_source: ${{ steps.record.outputs.artifact_source }}
+      commit_sha: ${{ steps.record.outputs.commit_sha }}
+      image_digest: ${{ steps.record.outputs.image_digest }}
+      release_record_schema_version: ${{ steps.record.outputs.release_record_schema_version }}
+      source_repository: ${{ steps.record.outputs.source_repository }}
+      verification_run_id: ${{ steps.record.outputs.verification_run_id }}
+    steps:
+      - name: Check out main history
+        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683
+        with:
+          fetch-depth: 0
+      - name: Validate deployment gate
+        shell: bash
+        env:
+          RELEASE_RUN_ID: ${{ inputs.release_run_id }}
+          CONFIRM: ${{ inputs.confirm }}
+          INTENT: ${{ inputs.intent }}
+          WORKFLOW_REF: ${{ github.ref }}
+        run: |
+          set -euo pipefail
+          [[ "$WORKFLOW_REF" == 'refs/heads/main' ]]
+          [[ "$RELEASE_RUN_ID" =~ ^[0-9]+$ ]]
+          if [[ "$INTENT" == 'FORWARD' ]]; then
+            [[ "$CONFIRM" == 'DEPLOY_V2' ]]
+          elif [[ "$INTENT" == 'ROLLBACK' ]]; then
+            [[ "$CONFIRM" == 'ROLLBACK_V2' ]]
+          else
+            exit 1
+          fi
+      - name: Verify release run provenance
+        id: provenance
+        shell: bash
+        env:
+          RELEASE_RUN_ID: ${{ inputs.release_run_id }}
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -euo pipefail
+          run_json="$(gh api "repos/${GITHUB_REPOSITORY}/actions/runs/${RELEASE_RUN_ID}")"
+          [[ "$(jq -r '.path' <<<"$run_json")" == '.github/workflows/deploy.yml' ]]
+          [[ "$(jq -r '.event' <<<"$run_json")" == 'push' ]]
+          [[ "$(jq -r '.head_branch' <<<"$run_json")" == 'main' ]]
+          [[ "$(jq -r '.conclusion' <<<"$run_json")" == 'success' ]]
+          run_attempt="$(jq -r '.run_attempt' <<<"$run_json")"
+          head_sha="$(jq -r '.head_sha' <<<"$run_json")"
+          [[ "$run_attempt" =~ ^[0-9]+$ ]]
+          [[ "$head_sha" =~ ^[0-9a-f]{40}$ ]]
+          artifacts="$(gh api "repos/${GITHUB_REPOSITORY}/actions/runs/${RELEASE_RUN_ID}/artifacts")"
+          expected_name="kinvest-release-record-v2-${RELEASE_RUN_ID}-${run_attempt}"
+          matches="$(jq --arg name "$expected_name" '[.artifacts[] | select(.expired == false and .name == $name)]' <<<"$artifacts")"
+          [[ "$(jq 'length' <<<"$matches")" == '1' ]]
+          printf 'run_attempt=%s\n' "$run_attempt" >> "$GITHUB_OUTPUT"
+          printf 'head_sha=%s\n' "$head_sha" >> "$GITHUB_OUTPUT"
+      - name: Download and validate release record v2
+        id: record
+        shell: bash
+        env:
+          RELEASE_RUN_ID: ${{ inputs.release_run_id }}
+          RUN_ATTEMPT: ${{ steps.provenance.outputs.run_attempt }}
+          RUN_HEAD_SHA: ${{ steps.provenance.outputs.head_sha }}
+          INTENT: ${{ inputs.intent }}
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -euo pipefail
+          record_dir="$(mktemp -d)"
+          trap 'rm -rf "$record_dir"' EXIT
+          gh run download "$RELEASE_RUN_ID" \
+            --name "kinvest-release-record-v2-${RELEASE_RUN_ID}-${RUN_ATTEMPT}" \
+            --dir "$record_dir"
+          record="$record_dir/release-record.json"
+          expected_keys='artifact_source commit_sha created_at ghcr_digest schema_version source_digest source_repository tcr_digest verification_run_attempt verification_run_id'
+          [[ "$(jq -r 'keys | join(" ")' "$record")" == "$expected_keys" ]]
+          [[ "$(jq -r '.schema_version' "$record")" == '2' ]]
+          [[ "$(jq -r '.verification_run_id' "$record")" == "$RELEASE_RUN_ID" ]]
+          [[ "$(jq -r '.verification_run_attempt' "$record")" == "$RUN_ATTEMPT" ]]
+          commit_sha="$(jq -r '.commit_sha' "$record")"
+          artifact_source="$(jq -r '.artifact_source' "$record")"
+          source_repository="$(jq -r '.source_repository' "$record")"
+          source_digest="$(jq -r '.source_digest' "$record")"
+          ghcr_digest="$(jq -r '.ghcr_digest' "$record")"
+          [[ "$commit_sha" == "$RUN_HEAD_SHA" && "$commit_sha" =~ ^[0-9a-f]{40}$ ]]
+          [[ "$artifact_source" == 'ghcr-public' ]]
+          [[ "$source_repository" == 'ghcr.io/zwphhxx/kinvest' ]]
+          [[ "$source_digest" =~ ^sha256:[0-9a-f]{64}$ && "$source_digest" == "$ghcr_digest" ]]
+          [[ "$(jq -r '.tcr_digest == null' "$record")" == 'true' ]]
+          git merge-base --is-ancestor "$commit_sha" origin/main
+          if [[ "$INTENT" == 'FORWARD' ]]; then
+            [[ "$commit_sha" == "$(git rev-parse origin/main)" ]]
+          fi
+          printf 'artifact_source=%s\n' "$artifact_source" >> "$GITHUB_OUTPUT"
+          printf 'commit_sha=%s\n' "$commit_sha" >> "$GITHUB_OUTPUT"
+          printf 'image_digest=%s\n' "$source_digest" >> "$GITHUB_OUTPUT"
+          printf 'release_record_schema_version=2\n' >> "$GITHUB_OUTPUT"
+          printf 'source_repository=%s\n' "$source_repository" >> "$GITHUB_OUTPUT"
+          printf 'verification_run_id=%s\n' "$RELEASE_RUN_ID" >> "$GITHUB_OUTPUT"
+
+  deploy:
+    name: deploy-v2
+    needs: validate
+    runs-on: ubuntu-latest
+    timeout-minutes: 40
+    environment: Production
+    permissions:
+      contents: read
+    steps:
+      - name: Check Production v2 gate after approval
+        shell: bash
+        env:
+          DEPLOY_V2_ENABLED: ${{ vars.DEPLOY_V2_ENABLED }}
+        run: test "$DEPLOY_V2_ENABLED" = 'true'
+      - name: Configure strict SSH trust
+        shell: bash
+        env:
+          DEPLOY_HOST: ${{ vars.DEPLOY_HOST }}
+          DEPLOY_PORT: ${{ vars.DEPLOY_PORT }}
+          DEPLOY_KEY: ${{ secrets.DEPLOY_SSH_KEY }}
+          DEPLOY_KNOWN_HOSTS: ${{ secrets.DEPLOY_KNOWN_HOSTS }}
+        run: |
+          set -euo pipefail
+          [[ "$DEPLOY_HOST" =~ ^[A-Za-z0-9.-]+$ ]]
+          [[ "$DEPLOY_PORT" =~ ^[0-9]{1,5}$ ]]
+          ((DEPLOY_PORT >= 1 && DEPLOY_PORT <= 65535))
+          test -n "$DEPLOY_KEY"
+          test -n "$DEPLOY_KNOWN_HOSTS"
+          umask 077
+          install -d -m 700 "$HOME/.ssh"
+          printf '%s\n' "$DEPLOY_KEY" > "$HOME/.ssh/id_ed25519"
+          printf '%s\n' "$DEPLOY_KNOWN_HOSTS" > "$HOME/.ssh/known_hosts"
+          chmod 600 "$HOME/.ssh/id_ed25519" "$HOME/.ssh/known_hosts"
+          known_host="$DEPLOY_HOST"
+          if [[ "$DEPLOY_PORT" != '22' ]]; then known_host="[$DEPLOY_HOST]:$DEPLOY_PORT"; fi
+          ssh-keygen -F "$known_host" -f "$HOME/.ssh/known_hosts" >/dev/null
+      - name: Deploy exact GHCR digest with deploy-v2 stdin
+        shell: bash
+        env:
+          DEPLOY_HOST: ${{ vars.DEPLOY_HOST }}
+          DEPLOY_PORT: ${{ vars.DEPLOY_PORT }}
+          DEPLOY_USER: ${{ vars.DEPLOY_USER }}
+          DEPLOY_SHA: ${{ needs.validate.outputs.commit_sha }}
+          IMAGE_DIGEST: ${{ needs.validate.outputs.image_digest }}
+          RELEASE_SCHEMA: ${{ needs.validate.outputs.release_record_schema_version }}
+          VERIFICATION_RUN_ID: ${{ needs.validate.outputs.verification_run_id }}
+        run: |
+          set -euo pipefail
+          IMAGE_REPOSITORY='ghcr.io/zwphhxx/kinvest'
+          IMAGE_DIGEST_REF="${IMAGE_REPOSITORY}@${IMAGE_DIGEST}"
+          [[ "$DEPLOY_HOST" =~ ^[A-Za-z0-9.-]+$ ]]
+          [[ "$DEPLOY_PORT" =~ ^[0-9]{1,5}$ ]]
+          [[ "$DEPLOY_USER" =~ ^[a-z_][a-z0-9_-]*$ ]]
+          [[ "$DEPLOY_SHA" =~ ^[0-9a-f]{40}$ ]]
+          [[ "$IMAGE_DIGEST_REF" =~ ^ghcr\.io/zwphhxx/kinvest@sha256:[0-9a-f]{64}$ ]]
+          [[ "$RELEASE_SCHEMA" == '2' && "$VERIFICATION_RUN_ID" =~ ^[0-9]+$ ]]
+          printf '%s\n' \
+            'KINVEST_DEPLOY_V2' \
+            "$IMAGE_DIGEST_REF" \
+            "$DEPLOY_SHA" \
+            'ghcr-public' \
+            'ghcr.io' \
+            '' \
+            '' \
+            "$RELEASE_SCHEMA" \
+            "$VERIFICATION_RUN_ID" \
+            'ghcr-public' \
+            '{}' \
+            'EOF' |
+            ssh \
+              -o BatchMode=yes \
+              -o IdentitiesOnly=yes \
+              -o StrictHostKeyChecking=yes \
+              -o UserKnownHostsFile="$HOME/.ssh/known_hosts" \
+              -o ConnectTimeout=10 \
+              -o ServerAliveInterval=15 \
+              -o ServerAliveCountMax=2 \
+              -o LogLevel=ERROR \
+              -i "$HOME/.ssh/id_ed25519" \
+              -p "$DEPLOY_PORT" \
+              "$DEPLOY_USER@$DEPLOY_HOST" \
+              'deploy-v2'
+      - name: Verify public HTTPS health
+        shell: bash
+        run: |
+          set -euo pipefail
+          response="$(curl -fsS --retry 3 --retry-all-errors --max-time 15 https://dearmina.cn/api/health)"
+          jq -e '.status == "ok" and .service == "kinvest"' <<<"$response" >/dev/null
+      - name: Remove ephemeral SSH material
+        if: ${{ always() }}
+        shell: bash
+        run: rm -f "$HOME/.ssh/id_ed25519" "$HOME/.ssh/known_hosts"

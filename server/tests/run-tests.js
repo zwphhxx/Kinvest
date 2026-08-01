@@ -6,6 +6,7 @@ const tests = [
   require('./build.test'),
   require('./frontend-contract.test'),
   require('./deploy-contract.test'),
+  require('./deploy-v2-contract.test'),
   require('./data-lifecycle.test'),
   require('./workflow-contract.test')
 ]
