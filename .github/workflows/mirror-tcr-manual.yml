@@ -220,7 +220,7 @@ jobs:
       - name: Upload release record
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
         with:
-          name: kinvest-release-record-${{ github.run_id }}
+          name: kinvest-release-record-${{ github.run_id }}-${{ github.run_attempt }}
           path: release-record.json
           retention-days: 30
           if-no-files-found: error

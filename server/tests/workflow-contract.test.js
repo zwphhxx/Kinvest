@@ -1256,8 +1256,8 @@ function run() {
   )
   assert.match(
     uploadStep,
-    /name: kinvest-release-record-\$\{\{ github\.run_id \}\}/,
-    'release record artifact name must contain the mirror run id'
+    /name: kinvest-release-record-\$\{\{ github\.run_id \}\}-\$\{\{ github\.run_attempt \}\}/,
+    'release record artifact name must contain the mirror run id and attempt'
   )
   assert.match(uploadStep, /path: release-record\.json/)
   assert.match(uploadStep, /retention-days: 30/)
@@ -1362,8 +1362,38 @@ function run() {
   )
   assert.match(
     provenanceRun,
-    /expected_name="kinvest-release-record-\$\{MIRROR_RUN_ID\}"/,
-    'the release record artifact name must bind to the mirror run id'
+    /run_attempt="\$\(jq -r '\.run_attempt' <<<"\$run_json"\)"/,
+    'the mirror run attempt must be read from the runs API'
+  )
+  assert.match(
+    provenanceRun,
+    /filtered_artifacts="\$\(jq '\[\.artifacts\[\] \| select\(\.expired == false\)\]' <<<"\$artifact_json"\)"/,
+    'expired artifacts must be filtered into a standalone array first'
+  )
+  assert.match(
+    provenanceRun,
+    /artifact_count="\$\(jq 'length' <<<"\$filtered_artifacts"\)"/,
+    'artifact_count must be read from the filtered array'
+  )
+  assert.match(
+    provenanceRun,
+    /artifact_name="\$\(jq -r '\.\[0\]\.name' <<<"\$filtered_artifacts"\)"/,
+    'artifact_name must be read from the filtered array'
+  )
+  assert.match(
+    provenanceRun,
+    /artifact_id="\$\(jq -r '\.\[0\]\.id' <<<"\$filtered_artifacts"\)"/,
+    'artifact_id must be read from the filtered array'
+  )
+  assert.doesNotMatch(
+    provenanceRun,
+    /\.artifacts\[0\]/,
+    'after filtering, the raw artifacts array must never be indexed'
+  )
+  assert.match(
+    provenanceRun,
+    /expected_name="kinvest-release-record-\$\{MIRROR_RUN_ID\}-\$\{run_attempt\}"/,
+    'the release record artifact name must bind to both run id and run attempt'
   )
   assert.match(
     provenanceRun,
@@ -1371,6 +1401,11 @@ function run() {
     'the mirror run must contain exactly one release record artifact'
   )
   assert.match(provenanceRun, /"\$artifact_name" != "\$expected_name"/)
+  assert.match(
+    provenanceRun,
+    /printf 'run_attempt=%s\\n' "\$run_attempt" >> "\$GITHUB_OUTPUT"/,
+    'the verified run attempt must be passed to the record step'
+  )
 
   const recordValidateRun = multilineStepRun(
     namedStep(productionValidateJob, 'Download and validate release record')
@@ -1380,7 +1415,11 @@ function run() {
     /gh run download "\$MIRROR_RUN_ID"/,
     'the release record must be downloaded from the verified mirror run'
   )
-  assert.match(recordValidateRun, /--name "kinvest-release-record-\$\{MIRROR_RUN_ID\}"/)
+  assert.match(
+    recordValidateRun,
+    /--name "kinvest-release-record-\$\{MIRROR_RUN_ID\}-\$\{RUN_ATTEMPT\}"/,
+    'the download must use the exact run-id-and-attempt artifact name'
+  )
   assert.match(
     recordValidateRun,
     /"\$schema_version" != '1'/,
@@ -1390,6 +1429,11 @@ function run() {
     recordValidateRun,
     /"\$record_run_id" != "\$MIRROR_RUN_ID"/,
     'release record must belong to the requested mirror run'
+  )
+  assert.match(
+    recordValidateRun,
+    /"\$record_run_attempt" != "\$RUN_ATTEMPT"/,
+    'release record attempt must equal the mirror run attempt from the API'
   )
   assert.match(
     recordValidateRun,

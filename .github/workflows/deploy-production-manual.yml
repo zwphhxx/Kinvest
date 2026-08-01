@@ -67,6 +67,7 @@ jobs:
             exit 1
           fi
       - name: Verify mirror run provenance
+        id: provenance
         shell: bash
         env:
           MIRROR_RUN_ID: ${{ inputs.mirror_run_id }}
@@ -78,6 +79,7 @@ jobs:
           run_event="$(jq -r '.event' <<<"$run_json")"
           run_head_branch="$(jq -r '.head_branch' <<<"$run_json")"
           run_conclusion="$(jq -r '.conclusion' <<<"$run_json")"
+          run_attempt="$(jq -r '.run_attempt' <<<"$run_json")"
           if [[ "$run_path" != '.github/workflows/mirror-tcr-manual.yml' ]]; then
             printf '%s\n' 'mirror_run_id does not belong to mirror-tcr-manual.yml.' >&2
             exit 1
@@ -94,30 +96,42 @@ jobs:
             printf '%s\n' 'mirror run must have succeeded.' >&2
             exit 1
           fi
+          if [[ ! "$run_attempt" =~ ^[0-9]+$ ]]; then
+            printf '%s\n' 'mirror run reported an invalid run_attempt.' >&2
+            exit 1
+          fi
           artifact_json="$(gh api "repos/${GITHUB_REPOSITORY}/actions/runs/${MIRROR_RUN_ID}/artifacts")"
-          expected_name="kinvest-release-record-${MIRROR_RUN_ID}"
-          artifact_count="$(jq '[.artifacts[] | select(.expired == false)] | length' <<<"$artifact_json")"
+          filtered_artifacts="$(jq '[.artifacts[] | select(.expired == false)]' <<<"$artifact_json")"
+          expected_name="kinvest-release-record-${MIRROR_RUN_ID}-${run_attempt}"
+          artifact_count="$(jq 'length' <<<"$filtered_artifacts")"
+          artifact_name="$(jq -r '.[0].name' <<<"$filtered_artifacts")"
+          artifact_id="$(jq -r '.[0].id' <<<"$filtered_artifacts")"
           if [[ "$artifact_count" != '1' ]]; then
             printf '%s\n' 'mirror run must contain exactly one release record artifact.' >&2
             exit 1
           fi
-          artifact_name="$(jq -r '.artifacts[0].name' <<<"$artifact_json")"
           if [[ "$artifact_name" != "$expected_name" ]]; then
-            printf '%s\n' 'release record artifact name does not match the mirror run.' >&2
+            printf '%s\n' 'release record artifact name does not match the mirror run and attempt.' >&2
             exit 1
           fi
+          if [[ ! "$artifact_id" =~ ^[0-9]+$ ]]; then
+            printf '%s\n' 'release record artifact reported an invalid id.' >&2
+            exit 1
+          fi
+          printf 'run_attempt=%s\n' "$run_attempt" >> "$GITHUB_OUTPUT"
           printf '%s\n' 'Mirror run provenance verified.'
       - name: Download and validate release record
         id: record
         shell: bash
         env:
           MIRROR_RUN_ID: ${{ inputs.mirror_run_id }}
+          RUN_ATTEMPT: ${{ steps.provenance.outputs.run_attempt }}
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
           set -euo pipefail
           record_dir="$(mktemp -d)"
           gh run download "$MIRROR_RUN_ID" \
-            --name "kinvest-release-record-${MIRROR_RUN_ID}" \
+            --name "kinvest-release-record-${MIRROR_RUN_ID}-${RUN_ATTEMPT}" \
             --dir "$record_dir"
           record_file="$record_dir/release-record.json"
           test -f "$record_file"
@@ -144,6 +158,10 @@ jobs:
           fi
           if [[ ! "$record_run_attempt" =~ ^[0-9]+$ ]]; then
             printf '%s\n' 'release record has an invalid mirror_run_attempt.' >&2
+            exit 1
+          fi
+          if [[ "$record_run_attempt" != "$RUN_ATTEMPT" ]]; then
+            printf '%s\n' 'release record attempt does not match the mirror run attempt.' >&2
             exit 1
           fi
           if [[ "$tcr_repository" != 'ccr.ccs.tencentyun.com/website-dev/kinvest' ]]; then

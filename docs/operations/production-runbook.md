@@ -64,7 +64,7 @@ SQLite 持久化目录
    成功后查询 TCR 实际 digest（必须与 GHCR digest 一致），生成
    `release-record.json`（schema_version、commit_sha、ghcr_digest、tcr_digest、
    tcr_repository、mirror_run_id、mirror_run_attempt；不含任何凭据）并以
-   `kinvest-release-record-<run_id>` artifact 保留 30 天。
+   `kinvest-release-record-<run_id>-<run_attempt>` artifact 保留 30 天。
    背景：实测 GitHub runner → TCR（广州）上传吞吐约 17.6KB/s，57.8MB 镜像
    需要约 1~2 小时；crane 不支持断点续传，多次短超时重试等于每次从零重传，
    因此采用单次超长尝试，由人工选择链路状况合适的时机触发（全程需要
@@ -73,9 +73,11 @@ SQLite 持久化目录
    （workflow_dispatch），只需输入成功 mirror run 的 `mirror_run_id` 和
    `confirm=DEPLOY`，不再人工输入 commit 或 digest。`validate`（无
    Environment）校验 mirror run 的来源（本仓库、mirror-tcr-manual.yml、
-   workflow_dispatch、main 分支、success）、下载并校验唯一 release record
-   artifact（schema、仓库地址固定、digest 格式、tcr_digest 等于 ghcr_digest、
-   commit 属于 main 历史），且 `DEPLOY_ENABLED` 必须为 `true`；全部通过后
+   workflow_dispatch、main 分支、success）、下载并校验唯一未过期 release
+   record artifact（名称精确绑定 run_id 与 run_attempt、schema、仓库地址
+   固定、digest 格式、tcr_digest 等于 ghcr_digest、record 中的
+   mirror_run_attempt 等于 API 报告的 run_attempt、commit 属于 main 历史），
+   且 `DEPLOY_ENABLED` 必须为 `true`；全部通过后
    `deploy`（Production Environment + 人工审批）才通过受限 SSH 将精确 TCR
    digest 传给服务器部署入口。
 4. 服务器行为不变：从 TCR 拉取指定摘要，启动候选容器并等待健康检查；
