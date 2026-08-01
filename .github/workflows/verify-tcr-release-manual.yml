@@ -1,11 +1,10 @@
-# 手工 TCR 镜像：将 GHCR 上已发布的指定 digest 镜像复制到 TCR 个人版。
-# 背景：实验 C 确认 GitHub runner → TCR(广州)上传吞吐仅 ~17.6KB/s,
-# 57.8MB 镜像需约 1~2 小时;crane 不支持断点续传,重试等于从零重传,
-# 因此本 workflow 采用单次超长有界尝试,由人工在合适时机触发。
+# 手工 TCR 验证:镜像复制已改为管理员 Mac 本地执行
+# (scripts/mirror-release-to-tcr.sh,境内链路,GitHub 不再传输任何镜像 blob)。
+# 本 workflow 只读验证 TCR 上的镜像 digest 与 GHCR digest 一致,
+# 并签发 release-record.json 供 deploy-production-manual.yml 消费。
 # validate(无 Environment)先完成全部输入与来源校验,通过后才进入
-# mirror(RegistryPublish Environment)执行复制;成功后生成 release-record.json
-# 作为 deploy-production-manual.yml 的唯一部署凭据。
-name: Mirror to TCR (manual)
+# verify(RegistryPublish Environment)执行只读查询。
+name: Verify TCR release (manual)
 
 on:
   workflow_dispatch:
@@ -19,7 +18,7 @@ on:
         required: true
         type: string
       confirm:
-        description: '确认执行镜像复制时必须输入 MIRROR'
+        description: '确认执行 TCR 验证时必须输入 VERIFY'
         required: true
         type: string
 
@@ -27,7 +26,7 @@ permissions:
   contents: read
 
 concurrency:
-  group: kinvest-tcr-mirror
+  group: kinvest-tcr-verify
   cancel-in-progress: false
 
 jobs:
@@ -42,7 +41,7 @@ jobs:
         uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683
         with:
           fetch-depth: 0
-      - name: Validate mirror inputs
+      - name: Validate verify inputs
         shell: bash
         env:
           COMMIT_SHA: ${{ inputs.commit_sha }}
@@ -52,11 +51,11 @@ jobs:
         run: |
           set -euo pipefail
           if [[ "$WORKFLOW_REF" != 'refs/heads/main' ]]; then
-            printf '%s\n' 'Mirror workflow must run from the main branch.' >&2
+            printf '%s\n' 'Verify workflow must run from the main branch.' >&2
             exit 1
           fi
-          if [[ "$CONFIRM" != 'MIRROR' ]]; then
-            printf '%s\n' 'Confirmation input must be exactly MIRROR.' >&2
+          if [[ "$CONFIRM" != 'VERIFY' ]]; then
+            printf '%s\n' 'Confirmation input must be exactly VERIFY.' >&2
             exit 1
           fi
           if [[ ! "$COMMIT_SHA" =~ ^[0-9a-f]{40}$ ]]; then
@@ -99,25 +98,18 @@ jobs:
           fi
           printf '%s\n' 'GHCR tag and digest binding verified.'
 
-  mirror:
-    name: mirror
+  verify:
+    name: verify
     needs: validate
     runs-on: ubuntu-latest
-    timeout-minutes: 150
+    timeout-minutes: 15
     environment: RegistryPublish
     permissions:
       contents: read
-      packages: read
     outputs:
-      tcr_image_digest: ${{ steps.mirror.outputs.tcr_image_digest }}
+      tcr_image_digest: ${{ steps.verify.outputs.tcr_image_digest }}
     steps:
-      - name: Log in to GitHub Container Registry
-        uses: docker/login-action@74a5d142397b4f367a81961eba4e8cd7edddf772
-        with:
-          registry: ghcr.io
-          username: ${{ github.actor }}
-          password: ${{ secrets.GITHUB_TOKEN }}
-      - name: Log in to Tencent Cloud Registry
+      - name: Log in to Tencent Cloud Registry (read-only use)
         uses: docker/login-action@74a5d142397b4f367a81961eba4e8cd7edddf772
         with:
           registry: ccr.ccs.tencentyun.com
@@ -137,66 +129,50 @@ jobs:
           tar -xzf /tmp/crane.tar.gz -C /tmp crane
           rm -f /tmp/crane.tar.gz
           /tmp/crane version
-      - name: Mirror exact digest to TCR (single bounded attempt)
-        id: mirror
+      - name: Verify mirrored digest on TCR (read-only)
+        id: verify
         shell: bash
         env:
           COMMIT_SHA: ${{ inputs.commit_sha }}
           GHCR_DIGEST: ${{ inputs.ghcr_digest }}
         run: |
           set -euo pipefail
-          COPY_SRC="ghcr.io/zwphhxx/kinvest@${GHCR_DIGEST}"
           TCR_REF="ccr.ccs.tencentyun.com/website-dev/kinvest:${COMMIT_SHA}"
-          printf 'mirror source: %s\n' "$COPY_SRC"
-          printf 'mirror destination: %s\n' "$TCR_REF"
-          copy_log="$(mktemp)"
-          heartbeat_pid=''
+          printf 'verify target: %s\n' "$TCR_REF"
+          verify_log="$(mktemp)"
           cleanup() {
-            if [[ -n "$heartbeat_pid" ]]; then
-              kill "$heartbeat_pid" 2>/dev/null || true
-              wait "$heartbeat_pid" 2>/dev/null || true
-            fi
-            rm -f "$copy_log"
+            rm -f "$verify_log"
           }
           trap cleanup EXIT INT TERM
-          ( while :; do printf 'TCR mirror is still running.\n'; sleep 300; done ) &
-          heartbeat_pid=$!
           status=0
-          timeout --signal=TERM --kill-after=10s 7800s \
-            /tmp/crane copy "$COPY_SRC" "$TCR_REF" \
-            >"$copy_log" 2>&1 || status=$?
-          kill "$heartbeat_pid" 2>/dev/null || true
-          wait "$heartbeat_pid" 2>/dev/null || true
-          heartbeat_pid=''
+          TCR_DIGEST="$(/tmp/crane digest "$TCR_REF" 2>"$verify_log")" || status=$?
           if ((status != 0)); then
-            printf 'TCR mirror copy failed with exit code %s.\n' "$status" >&2
+            printf 'TCR digest query failed with exit code %s.\n' "$status" >&2
             exit 1
           fi
-          printf '%s\n' 'TCR mirror copy succeeded.'
-          TCR_DIGEST="$(/tmp/crane digest "$TCR_REF")"
           if [[ ! "$TCR_DIGEST" =~ ^sha256:[0-9a-f]{64}$ ]]; then
             printf '%s\n' 'TCR did not report a valid image digest.' >&2
             exit 1
           fi
           if [[ "$TCR_DIGEST" != "$GHCR_DIGEST" ]]; then
-            printf '%s\n' 'TCR digest does not match the mirrored GHCR digest.' >&2
+            printf '%s\n' 'TCR digest does not match the GHCR digest.' >&2
             exit 1
           fi
           printf 'tcr_image_digest=%s\n' "$TCR_DIGEST" >> "$GITHUB_OUTPUT"
-          printf 'TCR image: ccr.ccs.tencentyun.com/website-dev/kinvest@%s\n' "$TCR_DIGEST"
+          printf 'TCR image verified: ccr.ccs.tencentyun.com/website-dev/kinvest@%s\n' "$TCR_DIGEST"
       - name: Write release record
         id: record
         shell: bash
         env:
           COMMIT_SHA: ${{ inputs.commit_sha }}
           GHCR_DIGEST: ${{ inputs.ghcr_digest }}
-          TCR_DIGEST: ${{ steps.mirror.outputs.tcr_image_digest }}
+          TCR_DIGEST: ${{ steps.verify.outputs.tcr_image_digest }}
           MIRROR_RUN_ID: ${{ github.run_id }}
           MIRROR_RUN_ATTEMPT: ${{ github.run_attempt }}
         run: |
           set -euo pipefail
           if [[ ! "$TCR_DIGEST" =~ ^sha256:[0-9a-f]{64}$ ]]; then
-            printf '%s\n' 'Release record requires a valid mirrored TCR digest.' >&2
+            printf '%s\n' 'Release record requires a valid verified TCR digest.' >&2
             exit 1
           fi
           jq -n \
