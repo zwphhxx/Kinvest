@@ -1063,8 +1063,60 @@ function run() {
     assert.equal(directScalar(input, 'required', 8), 'true')
   }
   const mirrorJobs = workflowBlock(mirrorWorkflow, 'jobs', 0)
-  assert.deepEqual(directMappingKeys(mirrorJobs, 2), ['mirror'])
+  assert.deepEqual(directMappingKeys(mirrorJobs, 2).sort(), ['mirror', 'validate'])
+
+  const mirrorValidateJob = workflowBlock(mirrorJobs, 'validate', 2)
+  assert.equal(
+    directMappingKeys(mirrorValidateJob, 4).includes('environment'),
+    false,
+    'mirror input validation must complete before entering the RegistryPublish environment'
+  )
+  const mirrorValidatePerms = workflowBlock(mirrorValidateJob, 'permissions', 4)
+  assert.deepEqual(directMappingKeys(mirrorValidatePerms, 6), ['contents'])
+  assert.equal(directScalar(mirrorValidatePerms, 'contents', 6), 'read')
+  assert.doesNotMatch(
+    mirrorValidateJob,
+    /\$\{\{\s*secrets\.(TCR_|DEPLOY_)/,
+    'mirror validate must not access registry or deploy credentials'
+  )
+  const mirrorValidateRun = multilineStepRun(
+    namedStep(mirrorValidateJob, 'Validate mirror inputs')
+  )
+  assert.match(
+    mirrorValidateRun,
+    /"\$WORKFLOW_REF" != 'refs\/heads\/main'/,
+    'mirror workflow must reject runs from non-main refs'
+  )
+  assert.match(mirrorValidateRun, /"\$CONFIRM" != 'MIRROR'/)
+  assert.match(mirrorValidateRun, /\[\[ ! "\$COMMIT_SHA" =~ \^\[0-9a-f\]\{40\}\$ \]\]/)
+  assert.match(
+    mirrorValidateRun,
+    /\[\[ ! "\$GHCR_DIGEST" =~ \^sha256:\[0-9a-f\]\{64\}\$ \]\]/
+  )
+  assert.match(
+    mirrorValidateRun,
+    /git merge-base --is-ancestor "\$COMMIT_SHA" origin\/main/,
+    'mirror must only accept commits from main history'
+  )
+  const mirrorBindRun = multilineStepRun(
+    namedStep(mirrorValidateJob, 'Bind GHCR digest to the commit tag')
+  )
+  assert.match(
+    mirrorBindRun,
+    /TAG_DIGEST="\$\(\/tmp\/crane digest "ghcr\.io\/zwphhxx\/kinvest:\$\{COMMIT_SHA\}"\)"/
+  )
+  assert.match(
+    mirrorBindRun,
+    /"\$TAG_DIGEST" != "\$GHCR_DIGEST"/,
+    'mirror must bind ghcr_digest to the commit tag on GHCR before entering the environment'
+  )
+
   const mirrorJob = workflowBlock(mirrorJobs, 'mirror', 2)
+  assert.equal(
+    directScalar(mirrorJob, 'needs', 4),
+    'validate',
+    'the RegistryPublish environment must only be entered after validation succeeds'
+  )
   assert.equal(
     directScalar(mirrorJob, 'environment', 4),
     'RegistryPublish',
@@ -1079,21 +1131,6 @@ function run() {
   assert.match(mirrorJob, /registry: ccr\.ccs\.tencentyun\.com/)
   assert.match(mirrorJob, /username: \$\{\{ secrets\.TCR_USERNAME \}\}/)
   assert.match(mirrorJob, /password: \$\{\{ secrets\.TCR_PASSWORD \}\}/)
-
-  const mirrorValidateRun = multilineStepRun(
-    namedStep(mirrorJob, 'Validate mirror inputs')
-  )
-  assert.match(mirrorValidateRun, /"\$CONFIRM" != 'MIRROR'/)
-  assert.match(mirrorValidateRun, /\[\[ ! "\$COMMIT_SHA" =~ \^\[0-9a-f\]\{40\}\$ \]\]/)
-  assert.match(
-    mirrorValidateRun,
-    /\[\[ ! "\$GHCR_DIGEST" =~ \^sha256:\[0-9a-f\]\{64\}\$ \]\]/
-  )
-  assert.match(
-    mirrorValidateRun,
-    /git merge-base --is-ancestor "\$COMMIT_SHA" origin\/main/,
-    'mirror must only accept commits from main history'
-  )
 
   const mirrorCraneStep = namedStep(mirrorJob, 'Install pinned crane')
   assert.match(mirrorCraneStep, /CRANE_VERSION: 'v0\.21\.7'/)
@@ -1118,15 +1155,6 @@ function run() {
     /TCR_REF="ccr\.ccs\.tencentyun\.com\/website-dev\/kinvest:\$\{COMMIT_SHA\}"/,
     'the TCR copy target must use the audit commit tag'
   )
-  assert.match(
-    mirrorRun,
-    /TAG_DIGEST="\$\(\/tmp\/crane digest "ghcr\.io\/zwphhxx\/kinvest:\$\{COMMIT_SHA\}"\)"/
-  )
-  assert.match(
-    mirrorRun,
-    /"\$TAG_DIGEST" != "\$GHCR_DIGEST"/,
-    'mirror must bind ghcr_digest to the commit tag on GHCR'
-  )
   assert.doesNotMatch(mirrorRun, /:latest\b/, 'registry copy must not use mutable tags')
   assert.match(
     mirrorRun,
@@ -1138,32 +1166,44 @@ function run() {
     /COPY_ATTEMPTS|while \(\(attempt/,
     'crane cannot resume an interrupted copy; retries must not restart from zero'
   )
+  assert.doesNotMatch(
+    mirrorWorkflow,
+    /--verbose/,
+    'mirror must not run crane in verbose mode'
+  )
   assert.match(
     mirrorRun,
     /copy_log"\s*2>&1 \|\| status=\$\?/,
-    'crane output must be captured before sanitization'
+    'crane output must be captured, never streamed to the workflow log'
   )
   assert.doesNotMatch(
     mirrorRun,
-    /cat "\$copy_log"/,
-    'captured crane output must only be printed after sanitization'
+    /cat "\$copy_log"|sed -E|grep -viE/,
+    'captured crane output must never be printed'
   )
-  assert.match(mirrorRun, /REDACTED/)
   assert.match(
     mirrorRun,
-    /grep -viE 'authorization\|bearer\|dockerconfig\|config\\\.json'/,
-    'credential-bearing log lines must be filtered out'
+    /TCR mirror is still running\./,
+    'the long copy must only emit a fixed safe heartbeat'
+  )
+  assert.match(mirrorRun, /sleep 300/)
+  assert.match(
+    mirrorRun,
+    /trap cleanup EXIT INT TERM/,
+    'temp files and the heartbeat process must be cleaned up on any exit'
   )
   assert.match(mirrorRun, /rm -f "\$copy_log"/)
+  assert.match(mirrorRun, /kill "\$heartbeat_pid"/)
+  assert.match(
+    mirrorRun,
+    /TCR mirror copy failed with exit code %s\./,
+    'a failed copy must only report the exit code'
+  )
+  assert.match(mirrorRun, /TCR mirror copy succeeded\./)
   assert.doesNotMatch(
     mirrorRun,
     /TCR_USERNAME|TCR_PASSWORD/,
     'copy step logs must not expose credentials'
-  )
-  assert.match(
-    mirrorRun,
-    /TCR mirror copy failed with exit code %s\.[\s\S]*?exit 1/,
-    'a failed copy must fail the mirror before outputs'
   )
   assert.ok(
     mirrorRun.indexOf('crane copy') < mirrorRun.indexOf('tcr_image_digest=%s'),
@@ -1191,6 +1231,37 @@ function run() {
     `bounded single TCR copy (${mirrorCopyWorstSeconds}s) must leave at least 600s of job budget`
   )
 
+  const recordRun = multilineStepRun(namedStep(mirrorJob, 'Write release record'))
+  assert.match(recordRun, /--argjson schema_version 1/)
+  assert.match(recordRun, /--arg commit_sha "\$COMMIT_SHA"/)
+  assert.match(recordRun, /--arg ghcr_digest "\$GHCR_DIGEST"/)
+  assert.match(recordRun, /--arg tcr_digest "\$TCR_DIGEST"/)
+  assert.match(
+    recordRun,
+    /--arg tcr_repository 'ccr\.ccs\.tencentyun\.com\/website-dev\/kinvest'/,
+    'release record must pin the exact TCR repository'
+  )
+  assert.match(recordRun, /--arg mirror_run_id "\$MIRROR_RUN_ID"/)
+  assert.match(recordRun, /--arg mirror_run_attempt "\$MIRROR_RUN_ATTEMPT"/)
+  assert.doesNotMatch(
+    recordRun,
+    /\$\{\{\s*secrets\.|TCR_PASSWORD|token|signature/,
+    'release record must not contain credentials, tokens or URL signatures'
+  )
+  const uploadStep = namedStep(mirrorJob, 'Upload release record')
+  assert.match(
+    uploadStep,
+    /uses: actions\/upload-artifact@[0-9a-f]{40}/,
+    'release record upload must use a full-SHA pinned official action'
+  )
+  assert.match(
+    uploadStep,
+    /name: kinvest-release-record-\$\{\{ github\.run_id \}\}/,
+    'release record artifact name must contain the mirror run id'
+  )
+  assert.match(uploadStep, /path: release-record\.json/)
+  assert.match(uploadStep, /retention-days: 30/)
+
   const productionEvents = workflowBlock(productionWorkflow, 'on', 0)
   assert.deepEqual(
     directMappingKeys(productionEvents, 2),
@@ -1199,58 +1270,172 @@ function run() {
   )
   const productionDispatch = workflowBlock(productionEvents, 'workflow_dispatch', 2)
   const productionInputs = workflowBlock(productionDispatch, 'inputs', 4)
-  assert.deepEqual(directMappingKeys(productionInputs, 6).sort(), [
-    'commit_sha',
-    'confirm',
-    'tcr_digest'
-  ])
-  for (const inputName of ['commit_sha', 'confirm', 'tcr_digest']) {
+  assert.deepEqual(
+    directMappingKeys(productionInputs, 6).sort(),
+    ['confirm', 'mirror_run_id'],
+    'deploy must only accept a mirror run id, never a manual commit/digest pair'
+  )
+  for (const inputName of ['confirm', 'mirror_run_id']) {
     const input = workflowBlock(productionInputs, inputName, 6)
     assert.equal(directScalar(input, 'required', 8), 'true')
   }
   const productionJobs = workflowBlock(productionWorkflow, 'jobs', 0)
-  assert.deepEqual(directMappingKeys(productionJobs, 2), ['deploy'])
-  const productionDeployJob = workflowBlock(productionJobs, 'deploy', 2)
-  assert.equal(directScalar(productionDeployJob, 'environment', 4), 'Production')
-  assert.equal(directScalar(productionDeployJob, 'timeout-minutes', 4), '40')
+  assert.deepEqual(directMappingKeys(productionJobs, 2).sort(), ['deploy', 'validate'])
 
-  const deployGuardRun = multilineStepRun(
-    namedStep(productionDeployJob, 'Refuse when deployment is disabled')
+  const productionValidateJob = workflowBlock(productionJobs, 'validate', 2)
+  assert.equal(
+    directMappingKeys(productionValidateJob, 4).includes('environment'),
+    false,
+    'release record validation must complete before entering the Production environment'
   )
-  assert.match(deployGuardRun, /refusing to deploy/)
+  const productionValidatePerms = workflowBlock(productionValidateJob, 'permissions', 4)
+  assert.deepEqual(directMappingKeys(productionValidatePerms, 6).sort(), [
+    'actions',
+    'contents'
+  ])
+  assert.equal(directScalar(productionValidatePerms, 'contents', 6), 'read')
+  assert.equal(directScalar(productionValidatePerms, 'actions', 6), 'read')
   assert.match(
-    productionDeployJob,
-    /if: \$\{\{ vars\.DEPLOY_ENABLED != 'true' \}\}/,
-    'manual deploy must refuse to run while DEPLOY_ENABLED is not true'
+    productionValidateJob,
+    /commit_sha: \$\{\{ steps\.record\.outputs\.commit_sha \}\}/,
+    'validate must expose the verified commit sha as a job output'
+  )
+  assert.match(
+    productionValidateJob,
+    /tcr_digest: \$\{\{ steps\.record\.outputs\.tcr_digest \}\}/,
+    'validate must expose the verified TCR digest as a job output'
+  )
+  assert.doesNotMatch(
+    productionValidateJob,
+    /\$\{\{\s*secrets\.(TCR_|DEPLOY_)/,
+    'release record validation must not access registry or deploy credentials'
   )
 
   const deployValidateRun = multilineStepRun(
-    namedStep(productionDeployJob, 'Validate deploy inputs')
+    namedStep(productionValidateJob, 'Validate deploy inputs')
   )
+  assert.match(
+    deployValidateRun,
+    /"\$WORKFLOW_REF" != 'refs\/heads\/main'/,
+    'deploy workflow must reject runs from non-main refs'
+  )
+  assert.match(
+    deployValidateRun,
+    /"\$DEPLOY_ENABLED" != 'true'/,
+    'manual deploy must refuse to run while DEPLOY_ENABLED is not true'
+  )
+  assert.match(deployValidateRun, /refusing to deploy/)
   assert.match(deployValidateRun, /"\$CONFIRM" != 'DEPLOY'/)
-  assert.match(deployValidateRun, /\[\[ ! "\$COMMIT_SHA" =~ \^\[0-9a-f\]\{40\}\$ \]\]/)
   assert.match(
     deployValidateRun,
-    /\[\[ ! "\$TCR_DIGEST" =~ \^sha256:\[0-9a-f\]\{64\}\$ \]\]/,
-    'deploy must only accept an exact TCR digest'
-  )
-  assert.match(
-    deployValidateRun,
-    /git merge-base --is-ancestor "\$COMMIT_SHA" origin\/main/,
-    'deploy must only accept commits from main history'
+    /\[\[ ! "\$MIRROR_RUN_ID" =~ \^\[0-9\]\+\$ \]\]/,
+    'mirror_run_id must be validated as numeric'
   )
 
+  const provenanceRun = multilineStepRun(
+    namedStep(productionValidateJob, 'Verify mirror run provenance')
+  )
+  assert.match(
+    provenanceRun,
+    /gh api "repos\/\$\{GITHUB_REPOSITORY\}\/actions\/runs\/\$\{MIRROR_RUN_ID\}"/,
+    'the mirror run must be queried within this repository'
+  )
+  assert.match(
+    provenanceRun,
+    /"\$run_path" != '\.github\/workflows\/mirror-tcr-manual\.yml'/,
+    'the run must come from mirror-tcr-manual.yml'
+  )
+  assert.match(
+    provenanceRun,
+    /"\$run_event" != 'workflow_dispatch'/,
+    'the mirror run must be a manual dispatch'
+  )
+  assert.match(
+    provenanceRun,
+    /"\$run_head_branch" != 'main'/,
+    'the mirror run must have run on main'
+  )
+  assert.match(
+    provenanceRun,
+    /"\$run_conclusion" != 'success'/,
+    'only a successful mirror run may be deployed'
+  )
+  assert.match(
+    provenanceRun,
+    /expected_name="kinvest-release-record-\$\{MIRROR_RUN_ID\}"/,
+    'the release record artifact name must bind to the mirror run id'
+  )
+  assert.match(
+    provenanceRun,
+    /"\$artifact_count" != '1'/,
+    'the mirror run must contain exactly one release record artifact'
+  )
+  assert.match(provenanceRun, /"\$artifact_name" != "\$expected_name"/)
+
+  const recordValidateRun = multilineStepRun(
+    namedStep(productionValidateJob, 'Download and validate release record')
+  )
+  assert.match(
+    recordValidateRun,
+    /gh run download "\$MIRROR_RUN_ID"/,
+    'the release record must be downloaded from the verified mirror run'
+  )
+  assert.match(recordValidateRun, /--name "kinvest-release-record-\$\{MIRROR_RUN_ID\}"/)
+  assert.match(
+    recordValidateRun,
+    /"\$schema_version" != '1'/,
+    'release record schema_version must be enforced'
+  )
+  assert.match(
+    recordValidateRun,
+    /"\$record_run_id" != "\$MIRROR_RUN_ID"/,
+    'release record must belong to the requested mirror run'
+  )
+  assert.match(
+    recordValidateRun,
+    /"\$tcr_repository" != 'ccr\.ccs\.tencentyun\.com\/website-dev\/kinvest'/,
+    'release record repository must be pinned to the exact TCR repository'
+  )
+  assert.match(recordValidateRun, /\[\[ ! "\$commit_sha" =~ \^\[0-9a-f\]\{40\}\$ \]\]/)
+  assert.match(recordValidateRun, /\[\[ ! "\$ghcr_digest" =~ \^sha256:\[0-9a-f\]\{64\}\$ \]\]/)
+  assert.match(recordValidateRun, /\[\[ ! "\$tcr_digest" =~ \^sha256:\[0-9a-f\]\{64\}\$ \]\]/)
+  assert.match(
+    recordValidateRun,
+    /"\$tcr_digest" != "\$ghcr_digest"/,
+    'release record must keep the constraint that tcr_digest equals the verified ghcr_digest'
+  )
+  assert.match(
+    recordValidateRun,
+    /git merge-base --is-ancestor "\$commit_sha" origin\/main/,
+    'release record commit must belong to main history'
+  )
+  assert.match(recordValidateRun, /printf 'commit_sha=%s\\n' "\$commit_sha"/)
+  assert.match(recordValidateRun, /printf 'tcr_digest=%s\\n' "\$tcr_digest"/)
+
+  const productionDeployJob = workflowBlock(productionJobs, 'deploy', 2)
+  assert.equal(
+    directScalar(productionDeployJob, 'needs', 4),
+    'validate',
+    'the Production environment must only be entered after validation succeeds'
+  )
+  assert.equal(directScalar(productionDeployJob, 'environment', 4), 'Production')
+  assert.equal(directScalar(productionDeployJob, 'timeout-minutes', 4), '40')
   assert.match(productionDeployJob, /\$\{\{\s*secrets\.DEPLOY_SSH_KEY\s*\}\}/)
   assert.match(productionDeployJob, /\$\{\{\s*secrets\.DEPLOY_KNOWN_HOSTS\s*\}\}/)
   assert.match(
     productionDeployJob,
-    /IMAGE_DIGEST: \$\{\{ inputs\.tcr_digest \}\}/,
-    'deploy must consume only the manually supplied TCR digest'
+    /IMAGE_DIGEST: \$\{\{ needs\.validate\.outputs\.tcr_digest \}\}/,
+    'deploy must consume only the validated TCR digest output'
   )
   assert.match(
     productionDeployJob,
-    /DEPLOY_SHA: \$\{\{ inputs\.commit_sha \}\}/,
-    'deploy must consume only the manually supplied commit sha'
+    /DEPLOY_SHA: \$\{\{ needs\.validate\.outputs\.commit_sha \}\}/,
+    'deploy must consume only the validated commit sha output'
+  )
+  assert.doesNotMatch(
+    productionWorkflow,
+    /inputs\.(commit_sha|tcr_digest)/,
+    'deploy must not consume manually entered commit or digest values'
   )
   assert.match(productionDeployJob, /IMAGE_REPOSITORY='ccr\.ccs\.tencentyun\.com\/website-dev\/kinvest'/)
   assert.match(
