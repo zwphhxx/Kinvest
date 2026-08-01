@@ -1701,14 +1701,32 @@ function run() {
     assert.equal(fs.statSync(rootPath(relativePath)).mode & 0o111, 0o111)
   }
 
-  assert.match(workflow, /^ {2}group: kinvest-ci$/m)
-  assert.match(workflow, /^ {2}cancel-in-progress: false$/m)
+  assert.match(
+    workflow,
+    /^ {2}group: kinvest-ci-\$\{\{ github\.event\.pull_request\.number \|\| github\.run_id \}\}$/m,
+    'each pull request and non-PR run must use an independent CI concurrency group'
+  )
+  assert.match(
+    workflow,
+    /^ {2}cancel-in-progress: \$\{\{ github\.event_name == 'pull_request' \}\}$/m,
+    'only superseded pull request runs may be cancelled'
+  )
+  assert.match(
+    verifyWorkflow,
+    /^ {2}group: kinvest-tcr-verify\n {2}cancel-in-progress: false\n {2}queue: max$/m,
+    'manual TCR verification runs must serialize without replacing queued runs'
+  )
   assert.match(
     productionWorkflow,
     /^ {2}group: kinvest-production$/m,
     'manual production deploy must keep the production concurrency group'
   )
   assert.match(productionWorkflow, /^ {2}cancel-in-progress: false$/m)
+  assert.match(
+    productionWorkflow,
+    /^ {2}group: kinvest-production\n {2}cancel-in-progress: false\n {2}queue: max$/m,
+    'manual production deploy runs must serialize without replacing queued releases'
+  )
   assert.equal((workflow.match(/timeout-minutes:/g) || []).length, 4)
   const publishTimeoutMatch = workflow.match(
     /^ {2}publish:\n[\s\S]*?^ {4}timeout-minutes: ([0-9]+)$/m
