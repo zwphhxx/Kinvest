@@ -13,7 +13,7 @@ permissions:
   contents: read
 
 concurrency:
-  group: kinvest-production
+  group: kinvest-ci
   cancel-in-progress: false
 
 jobs:
@@ -133,13 +133,11 @@ jobs:
     if: ${{ github.event_name != 'pull_request' && github.ref == 'refs/heads/main' }}
     runs-on: ubuntu-latest
     timeout-minutes: 30
-    environment: RegistryPublish
     permissions:
       contents: read
       packages: write
     outputs:
       image_digest: ${{ steps.digest.outputs.ghcr_image_digest }}
-      tcr_image_digest: ${{ steps.digest.outputs.tcr_image_digest }}
     steps:
       - name: Check out exact commit
         uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683
@@ -151,12 +149,6 @@ jobs:
           registry: ghcr.io
           username: ${{ github.actor }}
           password: ${{ secrets.GITHUB_TOKEN }}
-      - name: Log in to Tencent Cloud Registry
-        uses: docker/login-action@74a5d142397b4f367a81961eba4e8cd7edddf772
-        with:
-          registry: ccr.ccs.tencentyun.com
-          username: ${{ secrets.TCR_USERNAME }}
-          password: ${{ secrets.TCR_PASSWORD }}
       - name: Build and publish audit-tagged image
         id: build
         uses: docker/build-push-action@263435318d21b8e681c14492fe198d362a7d2c83
@@ -165,27 +157,12 @@ jobs:
           push: true
           tags: ghcr.io/zwphhxx/kinvest:${{ github.sha }}
           provenance: true
-      - name: Install pinned crane
-        shell: bash
-        env:
-          CRANE_VERSION: 'v0.21.7'
-          CRANE_SHA256: '1a57bc98207fa1c0d04bf760699099e26f8383499bfd55b99c1b919a928a7230'
-        run: |
-          set -euo pipefail
-          curl -fsSL --max-time 60 \
-            -o /tmp/crane.tar.gz \
-            "https://github.com/google/go-containerregistry/releases/download/${CRANE_VERSION}/go-containerregistry_Linux_x86_64.tar.gz"
-          printf '%s  /tmp/crane.tar.gz\n' "$CRANE_SHA256" | sha256sum -c -
-          tar -xzf /tmp/crane.tar.gz -C /tmp crane
-          rm -f /tmp/crane.tar.gz
-          /tmp/crane version
-      - name: Validate immutable image digests
+      - name: Validate immutable image digest
         id: digest
         shell: bash
         env:
           BUILD_DIGEST: ${{ steps.build.outputs.digest }}
           GHCR_REF: ghcr.io/zwphhxx/kinvest:${{ github.sha }}
-          TCR_REF: ccr.ccs.tencentyun.com/website-dev/kinvest:${{ github.sha }}
         run: |
           set -euo pipefail
           if [[ ! "$BUILD_DIGEST" =~ ^sha256:[0-9a-f]{64}$ ]]; then
@@ -201,111 +178,5 @@ jobs:
             printf '%s\n' 'GHCR digest does not match the build output digest.' >&2
             exit 1
           fi
-
-          COPY_SRC="ghcr.io/zwphhxx/kinvest@${GHCR_DIGEST}"
-          COPY_ATTEMPTS=3
-          COPY_WAIT_SECONDS=2
-          copy_log="$(mktemp)"
-          attempt=1
-          while ((attempt <= COPY_ATTEMPTS)); do
-            status=0
-            timeout --signal=TERM --kill-after=10s 300s \
-              /tmp/crane copy "$COPY_SRC" "$TCR_REF" >"$copy_log" 2>&1 || status=$?
-            if ((status == 0)); then
-              printf 'TCR registry copy attempt %s of %s succeeded.\n' "$attempt" "$COPY_ATTEMPTS"
-              break
-            fi
-            printf 'TCR registry copy attempt %s of %s failed with exit code %s.\n' \
-              "$attempt" "$COPY_ATTEMPTS" "$status"
-            if ((attempt >= COPY_ATTEMPTS)); then
-              rm -f "$copy_log"
-              printf 'TCR registry copy failed after %s attempts.\n' "$COPY_ATTEMPTS" >&2
-              exit 1
-            fi
-            sleep "$COPY_WAIT_SECONDS"
-            COPY_WAIT_SECONDS=$((COPY_WAIT_SECONDS * 2))
-            attempt=$((attempt + 1))
-          done
-          rm -f "$copy_log"
-
-          TCR_DIGEST="$(/tmp/crane digest "$TCR_REF")"
-          if [[ ! "$TCR_DIGEST" =~ ^sha256:[0-9a-f]{64}$ ]]; then
-            printf '%s\n' 'TCR did not report a valid image digest.' >&2
-            exit 1
-          fi
           printf 'ghcr_image_digest=%s\n' "$GHCR_DIGEST" >> "$GITHUB_OUTPUT"
-          printf 'tcr_image_digest=%s\n' "$TCR_DIGEST" >> "$GITHUB_OUTPUT"
-
-  deploy:
-    needs: publish
-    if: ${{ github.event_name != 'pull_request' && github.ref == 'refs/heads/main' && vars.DEPLOY_ENABLED == 'true' }}
-    runs-on: ubuntu-latest
-    timeout-minutes: 40
-    environment: Production
-    permissions:
-      contents: read
-    steps:
-      - name: Configure strict SSH trust
-        shell: bash
-        env:
-          DEPLOY_HOST: ${{ vars.DEPLOY_HOST }}
-          DEPLOY_PORT: ${{ vars.DEPLOY_PORT }}
-          DEPLOY_KEY: ${{ secrets.DEPLOY_SSH_KEY }}
-          DEPLOY_KNOWN_HOSTS: ${{ secrets.DEPLOY_KNOWN_HOSTS }}
-        run: |
-          set -euo pipefail
-          if [[ ! "$DEPLOY_HOST" =~ ^[A-Za-z0-9.-]+$ ]]; then
-            printf '%s\n' 'Invalid deployment host.' >&2
-            exit 1
-          fi
-          if [[ ! "$DEPLOY_PORT" =~ ^[0-9]{1,5}$ ]] || ((DEPLOY_PORT < 1 || DEPLOY_PORT > 65535)); then
-            printf '%s\n' 'Invalid deployment port.' >&2
-            exit 1
-          fi
-          test -n "$DEPLOY_KEY"
-          test -n "$DEPLOY_KNOWN_HOSTS"
-          umask 077
-          install -d -m 700 "$HOME/.ssh"
-          printf '%s\n' "$DEPLOY_KEY" > "$HOME/.ssh/id_ed25519"
-          printf '%s\n' "$DEPLOY_KNOWN_HOSTS" > "$HOME/.ssh/known_hosts"
-          chmod 600 "$HOME/.ssh/id_ed25519" "$HOME/.ssh/known_hosts"
-          known_host="$DEPLOY_HOST"
-          if [[ "$DEPLOY_PORT" != '22' ]]; then
-            known_host="[$DEPLOY_HOST]:$DEPLOY_PORT"
-          fi
-          ssh-keygen -F "$known_host" -f "$HOME/.ssh/known_hosts" >/dev/null
-      - name: Deploy exact immutable digest
-        shell: bash
-        env:
-          DEPLOY_HOST: ${{ vars.DEPLOY_HOST }}
-          DEPLOY_PORT: ${{ vars.DEPLOY_PORT }}
-          DEPLOY_USER: ${{ vars.DEPLOY_USER }}
-          DEPLOY_SHA: ${{ github.sha }}
-          IMAGE_DIGEST: ${{ needs.publish.outputs.tcr_image_digest }}
-        run: |
-          set -euo pipefail
-          IMAGE_REPOSITORY='ccr.ccs.tencentyun.com/website-dev/kinvest'
-          IMAGE_DIGEST_REF="${IMAGE_REPOSITORY}@${IMAGE_DIGEST}"
-          if [[ ! "$DEPLOY_HOST" =~ ^[A-Za-z0-9.-]+$ ]]; then exit 1; fi
-          if [[ ! "$DEPLOY_PORT" =~ ^[0-9]{1,5}$ ]] || ((DEPLOY_PORT < 1 || DEPLOY_PORT > 65535)); then exit 1; fi
-          if [[ ! "$DEPLOY_USER" =~ ^[a-z_][a-z0-9_-]*$ ]]; then exit 1; fi
-          if [[ ! "$DEPLOY_SHA" =~ ^[0-9a-f]{40}$ ]]; then exit 1; fi
-          if [[ ! "$IMAGE_DIGEST_REF" =~ ^ccr\.ccs\.tencentyun\.com/website-dev/kinvest@sha256:[0-9a-f]{64}$ ]]; then exit 1; fi
-          ssh \
-            -o BatchMode=yes \
-            -o IdentitiesOnly=yes \
-            -o StrictHostKeyChecking=yes \
-            -o UserKnownHostsFile="$HOME/.ssh/known_hosts" \
-            -o ConnectTimeout=10 \
-            -o ServerAliveInterval=15 \
-            -o ServerAliveCountMax=2 \
-            -o LogLevel=ERROR \
-            -i "$HOME/.ssh/id_ed25519" \
-            -p "$DEPLOY_PORT" \
-            "$DEPLOY_USER@$DEPLOY_HOST" \
-            "deploy $IMAGE_DIGEST_REF $DEPLOY_SHA"
-      - name: Remove ephemeral SSH material
-        if: ${{ always() }}
-        shell: bash
-        run: |
-          rm -f "$HOME/.ssh/id_ed25519" "$HOME/.ssh/known_hosts"
+          printf 'GHCR image: ghcr.io/zwphhxx/kinvest@%s\n' "$GHCR_DIGEST"

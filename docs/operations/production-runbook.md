@@ -46,18 +46,31 @@ SQLite 持久化目录
 
 首次切换时未修改 Tailscale、防火墙和现有数据库。后续维护也不得把这些系统当作 Kinvest 发布的一部分顺带修改；如需调整，应另开变更并单独备份、评审和验证。
 
-## 3. GitHub 自动部署
+## 3. GitHub 发布与部署流程
 
-`main` 分支 push 后的生产链路：
+发布流程为"GHCR 自动发布 + TCR 手工镜像 + Production 手工部署"三段式：
 
-1. GitHub Actions 安装锁定依赖并执行质量检查。
-2. 工作流构建镜像，同时发布到 GHCR（备份仓库）和腾讯云 TCR 个人版
-   `ccr.ccs.tencentyun.com/website-dev/kinvest`（部署主用仓库）。
-3. 发布结果分别向两个仓库验证各自的实际 immutable digest，不假定两者一致；
-   Production 部署只使用 TCR 报告的 digest（`tcr_image_digest`），不使用可漂移标签。
-4. Production 环境中的受限 SSH 身份只允许调用批准的部署入口。
-5. 服务器从 TCR 拉取指定摘要，启动候选容器并等待健康检查。
-6. 候选失败时保留或恢复最近一个本地、健康的镜像，不把失败候选切到线上。
+1. `main` 分支 push 后，`deploy.yml` 自动执行 verify / security / container-build，
+   将镜像发布到 GHCR `ghcr.io/zwphhxx/kinvest:<commit>`，并验证 GHCR 报告的
+   immutable digest 与构建输出一致。自动流程不触碰 TCR、不进入 Production，
+   也不需要任何 Environment 审批。
+2. 需要部署时，管理员手工触发 `mirror-tcr-manual.yml`（workflow_dispatch），
+   输入 `commit_sha`、`ghcr_digest`、`confirm=MIRROR`。workflow 校验输入格式、
+   commit 属于 main 历史、`ghcr_digest` 与 GHCR 上该 commit 标签的实际 digest
+   一致，然后以单次有界尝试（7800 秒）将精确 digest 从 GHCR 复制到
+   `ccr.ccs.tencentyun.com/website-dev/kinvest:<commit_sha>`。成功后查询并输出
+   TCR 实际 digest（必须与 GHCR digest 一致）；失败不产生 digest 输出。
+   背景：实测 GitHub runner → TCR（广州）上传吞吐约 17.6KB/s，57.8MB 镜像
+   需要约 1~2 小时；crane 不支持断点续传，多次短超时重试等于每次从零重传，
+   因此采用单次超长尝试，由人工选择链路状况合适的时机触发（全程需要
+   RegistryPublish Environment 审批）。
+3. 镜像完成后，管理员手工触发 `deploy-production-manual.yml`
+   （workflow_dispatch），输入 `commit_sha`、`tcr_digest`（即上一步输出）、
+   `confirm=DEPLOY`。workflow 校验格式与 main 历史，经 Production Environment
+   人工审批后，通过受限 SSH 将精确 TCR digest 传给服务器部署入口。
+   `DEPLOY_ENABLED` 不为 `true` 时任务拒绝部署。
+4. 服务器行为不变：从 TCR 拉取指定摘要，启动候选容器并等待健康检查；
+   候选失败时保留或恢复最近一个本地、健康的镜像，不把失败候选切到线上。
 
 部署开关和配置只使用以下名称：
 
@@ -72,16 +85,20 @@ SQLite 持久化目录
 | RegistryPublish secret | `TCR_USERNAME` |
 | RegistryPublish secret | `TCR_PASSWORD` |
 
-本手册不记录这些配置的值。`DEPLOY_ENABLED` 关闭时仍可执行构建和检查，但生产部署必须跳过。
-`TCR_USERNAME` 和 `TCR_PASSWORD` 只允许被 `RegistryPublish` Environment 中的
-publish 任务读取；PR 事件不触发该任务，也无法访问这两个 secret。
+本手册不记录这些配置的值。`DEPLOY_ENABLED` 关闭时仍可执行构建、检查和 GHCR
+发布，但手工部署任务会拒绝执行。`TCR_USERNAME` 和 `TCR_PASSWORD` 只允许被
+`RegistryPublish` Environment 中的 mirror 任务读取；自动流程与 PR 事件都无法
+访问这两个 secret。
 
 ### 发布检查
 
 在 GitHub 仓库的 Actions 页面确认：
 
-- `verify` 和镜像发布任务成功。
-- Production 部署任务使用预期的 `main` commit。
+- `verify` 和 GHCR 发布任务成功，并记录 publish 输出的 GHCR digest。
+- 手工 mirror 任务的 `ghcr_digest` 输入与 publish 输出一致，mirror 成功后
+  记录其输出的 TCR digest。
+- 手工 Production 部署任务的 `tcr_digest` 输入与 mirror 输出一致，
+  `commit_sha` 为预期的 `main` commit。
 - 日志只显示 commit、镜像摘要和健康状态，不显示 secret 内容。
 - 失败日志中的错误已经脱敏。
 
@@ -452,7 +469,10 @@ immutable digest，拒绝其他仓库、tag 和可变引用。
 - 只重试明确的临时失败或超时（退出码 124/137/143，或 stderr 中出现连接重置、超时、5xx 等临时特征）；摘要不存在、权限拒绝和未分类错误不重试。
 - 部署日志只记录尝试编号、退出码和最终结果；拉取的原始 stderr 只用于本地失败分类，不写入部署日志。
 - 全部尝试失败后执行既有 verified rollback：不替换 `current.state`，不停止当前健康容器，previous 继续服务。
-- 重试不是无限兜底：链路持续劣化时部署仍会失败，此时应等待链路恢复后重新部署同一 digest，或按经评审的镜像分发方案处理。
+- 重试不是无限兜底：链路持续劣化时部署仍会失败，此时应等待链路恢复后重新部署同一 digest。
+- TCR 侧的镜像补给由手工 `mirror-tcr-manual.yml` 执行（单次有界 7800 秒
+  crane copy，详见第 3 节）；GitHub runner → TCR 跨境上传吞吐实测约
+  17.6KB/s，镜像补给是小时级操作，应安排在低峰时间窗口并预留充足时间。
 - 回滚只依赖服务器本地已经存在且曾健康运行的镜像。
 - 超时不等于镜像不存在或鉴权失败，应区分网络超时、摘要不存在和权限拒绝。
 - 不切换到未经审核的公共镜像代理，也不因超时关闭 TLS 或主机校验。

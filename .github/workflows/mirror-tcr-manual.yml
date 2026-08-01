@@ -1,0 +1,139 @@
+# 手工 TCR 镜像：将 GHCR 上已发布的指定 digest 镜像复制到 TCR 个人版。
+# 背景：实验 C 确认 GitHub runner → TCR(广州)上传吞吐仅 ~17.6KB/s,
+# 57.8MB 镜像需约 1~2 小时;crane 不支持断点续传,重试等于从零重传,
+# 因此本 workflow 采用单次超长有界尝试,由人工在合适时机触发。
+name: Mirror to TCR (manual)
+
+on:
+  workflow_dispatch:
+    inputs:
+      commit_sha:
+        description: 'main 分支上的完整 commit SHA(40 位小写 hex)'
+        required: true
+        type: string
+      ghcr_digest:
+        description: 'GHCR 镜像 digest(sha256:<64 位小写 hex>)'
+        required: true
+        type: string
+      confirm:
+        description: '确认执行镜像复制时必须输入 MIRROR'
+        required: true
+        type: string
+
+permissions:
+  contents: read
+
+concurrency:
+  group: kinvest-tcr-mirror
+  cancel-in-progress: false
+
+jobs:
+  mirror:
+    name: mirror
+    runs-on: ubuntu-latest
+    timeout-minutes: 150
+    environment: RegistryPublish
+    permissions:
+      contents: read
+      packages: read
+    outputs:
+      tcr_image_digest: ${{ steps.mirror.outputs.tcr_image_digest }}
+    steps:
+      - name: Check out main history
+        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683
+        with:
+          fetch-depth: 0
+      - name: Validate mirror inputs
+        shell: bash
+        env:
+          COMMIT_SHA: ${{ inputs.commit_sha }}
+          GHCR_DIGEST: ${{ inputs.ghcr_digest }}
+          CONFIRM: ${{ inputs.confirm }}
+        run: |
+          set -euo pipefail
+          if [[ "$CONFIRM" != 'MIRROR' ]]; then
+            printf '%s\n' 'Confirmation input must be exactly MIRROR.' >&2
+            exit 1
+          fi
+          if [[ ! "$COMMIT_SHA" =~ ^[0-9a-f]{40}$ ]]; then
+            printf '%s\n' 'commit_sha must be 40 lowercase hex characters.' >&2
+            exit 1
+          fi
+          if [[ ! "$GHCR_DIGEST" =~ ^sha256:[0-9a-f]{64}$ ]]; then
+            printf '%s\n' 'ghcr_digest must be sha256:<64 lowercase hex>.' >&2
+            exit 1
+          fi
+          if ! git merge-base --is-ancestor "$COMMIT_SHA" origin/main; then
+            printf '%s\n' 'commit_sha is not part of main history.' >&2
+            exit 1
+          fi
+      - name: Log in to GitHub Container Registry
+        uses: docker/login-action@74a5d142397b4f367a81961eba4e8cd7edddf772
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+      - name: Log in to Tencent Cloud Registry
+        uses: docker/login-action@74a5d142397b4f367a81961eba4e8cd7edddf772
+        with:
+          registry: ccr.ccs.tencentyun.com
+          username: ${{ secrets.TCR_USERNAME }}
+          password: ${{ secrets.TCR_PASSWORD }}
+      - name: Install pinned crane
+        shell: bash
+        env:
+          CRANE_VERSION: 'v0.21.7'
+          CRANE_SHA256: '1a57bc98207fa1c0d04bf760699099e26f8383499bfd55b99c1b919a928a7230'
+        run: |
+          set -euo pipefail
+          curl -fsSL --max-time 60 \
+            -o /tmp/crane.tar.gz \
+            "https://github.com/google/go-containerregistry/releases/download/${CRANE_VERSION}/go-containerregistry_Linux_x86_64.tar.gz"
+          printf '%s  /tmp/crane.tar.gz\n' "$CRANE_SHA256" | sha256sum -c -
+          tar -xzf /tmp/crane.tar.gz -C /tmp crane
+          rm -f /tmp/crane.tar.gz
+          /tmp/crane version
+      - name: Mirror exact digest to TCR (single bounded attempt)
+        id: mirror
+        shell: bash
+        env:
+          COMMIT_SHA: ${{ inputs.commit_sha }}
+          GHCR_DIGEST: ${{ inputs.ghcr_digest }}
+        run: |
+          set -euo pipefail
+          COPY_SRC="ghcr.io/zwphhxx/kinvest@${GHCR_DIGEST}"
+          TCR_REF="ccr.ccs.tencentyun.com/website-dev/kinvest:${COMMIT_SHA}"
+          TAG_DIGEST="$(/tmp/crane digest "ghcr.io/zwphhxx/kinvest:${COMMIT_SHA}")"
+          if [[ "$TAG_DIGEST" != "$GHCR_DIGEST" ]]; then
+            printf '%s\n' 'ghcr_digest does not match the GHCR tag for commit_sha.' >&2
+            exit 1
+          fi
+          printf 'mirror source: %s\n' "$COPY_SRC"
+          printf 'mirror destination: %s\n' "$TCR_REF"
+          copy_log="$(mktemp)"
+          status=0
+          timeout --signal=TERM --kill-after=10s 7800s \
+            /tmp/crane copy --verbose "$COPY_SRC" "$TCR_REF" \
+            >"$copy_log" 2>&1 || status=$?
+          sed -E \
+            -e 's/(signature=)[^&[:space:]]+/\1REDACTED/g' \
+            -e 's/([Tt]oken[=:])[[:space:]]*[^&[:space:]]+/\1REDACTED/g' \
+            -e 's/([Pp]assword[=:])[[:space:]]*[^&[:space:]]+/\1REDACTED/g' \
+            "$copy_log" \
+            | grep -viE 'authorization|bearer|dockerconfig|config\.json' || true
+          rm -f "$copy_log"
+          if ((status != 0)); then
+            printf 'TCR mirror copy failed with exit code %s.\n' "$status" >&2
+            exit 1
+          fi
+          TCR_DIGEST="$(/tmp/crane digest "$TCR_REF")"
+          if [[ ! "$TCR_DIGEST" =~ ^sha256:[0-9a-f]{64}$ ]]; then
+            printf '%s\n' 'TCR did not report a valid image digest.' >&2
+            exit 1
+          fi
+          if [[ "$TCR_DIGEST" != "$GHCR_DIGEST" ]]; then
+            printf '%s\n' 'TCR digest does not match the mirrored GHCR digest.' >&2
+            exit 1
+          fi
+          printf 'tcr_image_digest=%s\n' "$TCR_DIGEST" >> "$GITHUB_OUTPUT"
+          printf 'TCR image: ccr.ccs.tencentyun.com/website-dev/kinvest@%s\n' "$TCR_DIGEST"
