@@ -824,6 +824,108 @@ exec /usr/bin/mktemp "$@"
   }
 }
 
+function runMirrorSuccessFixture() {
+  const fixtureRoot = fs.mkdtempSync(path.join(os.tmpdir(), 'kinvest-mirror-success-'))
+  const fakeBin = path.join(fixtureRoot, 'bin')
+  const workDir = path.join(fixtureRoot, 'work')
+  const commit = 'e'.repeat(40)
+  const digest = `sha256:${'f'.repeat(64)}`
+
+  fs.mkdirSync(fakeBin)
+  writeExecutable(
+    path.join(fakeBin, 'uname'),
+    `#!/bin/sh
+if [ "\${1:-}" = '-s' ]; then
+  printf '%s\n' Darwin
+else
+  printf '%s\n' arm64
+fi
+`
+  )
+  writeExecutable(
+    path.join(fakeBin, 'mktemp'),
+    `#!/bin/sh
+mkdir -p "$FAKE_MIRROR_WORKDIR"
+printf '%s\n' "$FAKE_MIRROR_WORKDIR"
+`
+  )
+  writeExecutable(
+    path.join(fakeBin, 'curl'),
+    `#!/bin/sh
+set -eu
+while [ "$#" -gt 0 ]; do
+  if [ "$1" = '-o' ]; then
+    printf archive > "$2"
+    exit 0
+  fi
+  shift
+done
+exit 1
+`
+  )
+  writeExecutable(
+    path.join(fakeBin, 'shasum'),
+    `#!/bin/sh
+cat >/dev/null
+exit 0
+`
+  )
+  writeExecutable(
+    path.join(fakeBin, 'sleep'),
+    `#!/bin/sh
+exit 0
+`
+  )
+  writeExecutable(
+    path.join(fakeBin, 'tar'),
+    `#!/bin/sh
+set -eu
+destination=''
+while [ "$#" -gt 0 ]; do
+  if [ "$1" = '-C' ]; then
+    destination="$2"
+    shift 2
+    continue
+  fi
+  shift
+done
+cat > "$destination/crane" <<'CRANE'
+#!/bin/sh
+case "\${1:-}" in
+  version|copy) exit 0 ;;
+  digest) printf '%s\\n' "$FAKE_MIRROR_DIGEST" ;;
+  *) exit 1 ;;
+esac
+CRANE
+chmod +x "$destination/crane"
+`
+  )
+
+  const result = spawnSync(
+    rootPath('scripts/mirror-release-to-tcr.sh'),
+    [commit, digest],
+    {
+      encoding: 'utf8',
+      env: {
+        ...process.env,
+        PATH: `${fakeBin}:${process.env.PATH}`,
+        FAKE_MIRROR_DIGEST: digest,
+        FAKE_MIRROR_WORKDIR: workDir,
+        MIRROR_TIMEOUT_SECONDS: '60'
+      },
+      timeout: 5000
+    }
+  )
+
+  return {
+    cleanup() {
+      fs.rmSync(fixtureRoot, { recursive: true, force: true })
+    },
+    result,
+    workDir
+  }
+}
+
 function run() {
   const workflow = readRootFile('.github/workflows/deploy.yml')
   const verifyWorkflow = readRootFile('.github/workflows/verify-tcr-release-manual.yml')
@@ -1308,6 +1410,31 @@ function run() {
     'local mirror must not create release records or touch GitHub or the server'
   )
   assert.equal(fs.statSync(rootPath('scripts/mirror-release-to-tcr.sh')).mode & 0o111, 0o111)
+
+  const mirrorSuccess = runMirrorSuccessFixture()
+  try {
+    const diagnostics = JSON.stringify(
+      {
+        status: mirrorSuccess.result.status,
+        signal: mirrorSuccess.result.signal,
+        error: mirrorSuccess.result.error?.message ?? null,
+        stdout: mirrorSuccess.result.stdout,
+        stderr: mirrorSuccess.result.stderr
+      },
+      null,
+      2
+    )
+    assert.equal(mirrorSuccess.result.status, 0, diagnostics)
+    assert.equal(
+      fs.existsSync(mirrorSuccess.workDir),
+      false,
+      `successful mirror must remove its temporary directory\n${diagnostics}`
+    )
+    assert.match(mirrorSuccess.result.stdout, /TCR mirror completed successfully\./)
+    assert.doesNotMatch(mirrorSuccess.result.stderr, /unbound variable/)
+  } finally {
+    mirrorSuccess.cleanup()
+  }
 
   const productionEvents = workflowBlock(productionWorkflow, 'on', 0)
   assert.deepEqual(

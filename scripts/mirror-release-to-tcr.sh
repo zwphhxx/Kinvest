@@ -133,6 +133,8 @@ main() {
   printf 'commit_sha: %s\n' "$commit_sha"
   printf 'ghcr_digest: %s\n' "$ghcr_digest"
   printf 'tcr_digest: %s\n' "$tcr_digest"
+  cleanup
+  trap - EXIT INT TERM
   printf '%s\n' 'TCR mirror completed successfully.'
 }
 
