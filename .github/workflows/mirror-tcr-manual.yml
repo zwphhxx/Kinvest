@@ -2,6 +2,9 @@
 # 背景：实验 C 确认 GitHub runner → TCR(广州)上传吞吐仅 ~17.6KB/s,
 # 57.8MB 镜像需约 1~2 小时;crane 不支持断点续传,重试等于从零重传,
 # 因此本 workflow 采用单次超长有界尝试,由人工在合适时机触发。
+# validate(无 Environment)先完成全部输入与来源校验,通过后才进入
+# mirror(RegistryPublish Environment)执行复制;成功后生成 release-record.json
+# 作为 deploy-production-manual.yml 的唯一部署凭据。
 name: Mirror to TCR (manual)
 
 on:
@@ -28,16 +31,12 @@ concurrency:
   cancel-in-progress: false
 
 jobs:
-  mirror:
-    name: mirror
+  validate:
+    name: validate
     runs-on: ubuntu-latest
-    timeout-minutes: 150
-    environment: RegistryPublish
+    timeout-minutes: 15
     permissions:
       contents: read
-      packages: read
-    outputs:
-      tcr_image_digest: ${{ steps.mirror.outputs.tcr_image_digest }}
     steps:
       - name: Check out main history
         uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683
@@ -49,8 +48,13 @@ jobs:
           COMMIT_SHA: ${{ inputs.commit_sha }}
           GHCR_DIGEST: ${{ inputs.ghcr_digest }}
           CONFIRM: ${{ inputs.confirm }}
+          WORKFLOW_REF: ${{ github.ref }}
         run: |
           set -euo pipefail
+          if [[ "$WORKFLOW_REF" != 'refs/heads/main' ]]; then
+            printf '%s\n' 'Mirror workflow must run from the main branch.' >&2
+            exit 1
+          fi
           if [[ "$CONFIRM" != 'MIRROR' ]]; then
             printf '%s\n' 'Confirmation input must be exactly MIRROR.' >&2
             exit 1
@@ -67,6 +71,46 @@ jobs:
             printf '%s\n' 'commit_sha is not part of main history.' >&2
             exit 1
           fi
+      - name: Install pinned crane
+        shell: bash
+        env:
+          CRANE_VERSION: 'v0.21.7'
+          CRANE_SHA256: '1a57bc98207fa1c0d04bf760699099e26f8383499bfd55b99c1b919a928a7230'
+        run: |
+          set -euo pipefail
+          curl -fsSL --max-time 60 \
+            -o /tmp/crane.tar.gz \
+            "https://github.com/google/go-containerregistry/releases/download/${CRANE_VERSION}/go-containerregistry_Linux_x86_64.tar.gz"
+          printf '%s  /tmp/crane.tar.gz\n' "$CRANE_SHA256" | sha256sum -c -
+          tar -xzf /tmp/crane.tar.gz -C /tmp crane
+          rm -f /tmp/crane.tar.gz
+          /tmp/crane version
+      - name: Bind GHCR digest to the commit tag
+        shell: bash
+        env:
+          COMMIT_SHA: ${{ inputs.commit_sha }}
+          GHCR_DIGEST: ${{ inputs.ghcr_digest }}
+        run: |
+          set -euo pipefail
+          TAG_DIGEST="$(/tmp/crane digest "ghcr.io/zwphhxx/kinvest:${COMMIT_SHA}")"
+          if [[ "$TAG_DIGEST" != "$GHCR_DIGEST" ]]; then
+            printf '%s\n' 'ghcr_digest does not match the GHCR tag for commit_sha.' >&2
+            exit 1
+          fi
+          printf '%s\n' 'GHCR tag and digest binding verified.'
+
+  mirror:
+    name: mirror
+    needs: validate
+    runs-on: ubuntu-latest
+    timeout-minutes: 150
+    environment: RegistryPublish
+    permissions:
+      contents: read
+      packages: read
+    outputs:
+      tcr_image_digest: ${{ steps.mirror.outputs.tcr_image_digest }}
+    steps:
       - name: Log in to GitHub Container Registry
         uses: docker/login-action@74a5d142397b4f367a81961eba4e8cd7edddf772
         with:
@@ -103,29 +147,32 @@ jobs:
           set -euo pipefail
           COPY_SRC="ghcr.io/zwphhxx/kinvest@${GHCR_DIGEST}"
           TCR_REF="ccr.ccs.tencentyun.com/website-dev/kinvest:${COMMIT_SHA}"
-          TAG_DIGEST="$(/tmp/crane digest "ghcr.io/zwphhxx/kinvest:${COMMIT_SHA}")"
-          if [[ "$TAG_DIGEST" != "$GHCR_DIGEST" ]]; then
-            printf '%s\n' 'ghcr_digest does not match the GHCR tag for commit_sha.' >&2
-            exit 1
-          fi
           printf 'mirror source: %s\n' "$COPY_SRC"
           printf 'mirror destination: %s\n' "$TCR_REF"
           copy_log="$(mktemp)"
+          heartbeat_pid=''
+          cleanup() {
+            if [[ -n "$heartbeat_pid" ]]; then
+              kill "$heartbeat_pid" 2>/dev/null || true
+              wait "$heartbeat_pid" 2>/dev/null || true
+            fi
+            rm -f "$copy_log"
+          }
+          trap cleanup EXIT INT TERM
+          ( while :; do printf 'TCR mirror is still running.\n'; sleep 300; done ) &
+          heartbeat_pid=$!
           status=0
           timeout --signal=TERM --kill-after=10s 7800s \
-            /tmp/crane copy --verbose "$COPY_SRC" "$TCR_REF" \
+            /tmp/crane copy "$COPY_SRC" "$TCR_REF" \
             >"$copy_log" 2>&1 || status=$?
-          sed -E \
-            -e 's/(signature=)[^&[:space:]]+/\1REDACTED/g' \
-            -e 's/([Tt]oken[=:])[[:space:]]*[^&[:space:]]+/\1REDACTED/g' \
-            -e 's/([Pp]assword[=:])[[:space:]]*[^&[:space:]]+/\1REDACTED/g' \
-            "$copy_log" \
-            | grep -viE 'authorization|bearer|dockerconfig|config\.json' || true
-          rm -f "$copy_log"
+          kill "$heartbeat_pid" 2>/dev/null || true
+          wait "$heartbeat_pid" 2>/dev/null || true
+          heartbeat_pid=''
           if ((status != 0)); then
             printf 'TCR mirror copy failed with exit code %s.\n' "$status" >&2
             exit 1
           fi
+          printf '%s\n' 'TCR mirror copy succeeded.'
           TCR_DIGEST="$(/tmp/crane digest "$TCR_REF")"
           if [[ ! "$TCR_DIGEST" =~ ^sha256:[0-9a-f]{64}$ ]]; then
             printf '%s\n' 'TCR did not report a valid image digest.' >&2
@@ -137,3 +184,43 @@ jobs:
           fi
           printf 'tcr_image_digest=%s\n' "$TCR_DIGEST" >> "$GITHUB_OUTPUT"
           printf 'TCR image: ccr.ccs.tencentyun.com/website-dev/kinvest@%s\n' "$TCR_DIGEST"
+      - name: Write release record
+        id: record
+        shell: bash
+        env:
+          COMMIT_SHA: ${{ inputs.commit_sha }}
+          GHCR_DIGEST: ${{ inputs.ghcr_digest }}
+          TCR_DIGEST: ${{ steps.mirror.outputs.tcr_image_digest }}
+          MIRROR_RUN_ID: ${{ github.run_id }}
+          MIRROR_RUN_ATTEMPT: ${{ github.run_attempt }}
+        run: |
+          set -euo pipefail
+          if [[ ! "$TCR_DIGEST" =~ ^sha256:[0-9a-f]{64}$ ]]; then
+            printf '%s\n' 'Release record requires a valid mirrored TCR digest.' >&2
+            exit 1
+          fi
+          jq -n \
+            --argjson schema_version 1 \
+            --arg commit_sha "$COMMIT_SHA" \
+            --arg ghcr_digest "$GHCR_DIGEST" \
+            --arg tcr_digest "$TCR_DIGEST" \
+            --arg tcr_repository 'ccr.ccs.tencentyun.com/website-dev/kinvest' \
+            --arg mirror_run_id "$MIRROR_RUN_ID" \
+            --arg mirror_run_attempt "$MIRROR_RUN_ATTEMPT" \
+            '{
+              schema_version: $schema_version,
+              commit_sha: $commit_sha,
+              ghcr_digest: $ghcr_digest,
+              tcr_digest: $tcr_digest,
+              tcr_repository: $tcr_repository,
+              mirror_run_id: $mirror_run_id,
+              mirror_run_attempt: $mirror_run_attempt
+            }' > release-record.json
+          jq . release-record.json
+      - name: Upload release record
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
+        with:
+          name: kinvest-release-record-${{ github.run_id }}-${{ github.run_attempt }}
+          path: release-record.json
+          retention-days: 30
+          if-no-files-found: error

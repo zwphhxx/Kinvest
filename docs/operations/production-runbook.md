@@ -55,20 +55,31 @@ SQLite 持久化目录
    immutable digest 与构建输出一致。自动流程不触碰 TCR、不进入 Production，
    也不需要任何 Environment 审批。
 2. 需要部署时，管理员手工触发 `mirror-tcr-manual.yml`（workflow_dispatch），
-   输入 `commit_sha`、`ghcr_digest`、`confirm=MIRROR`。workflow 校验输入格式、
-   commit 属于 main 历史、`ghcr_digest` 与 GHCR 上该 commit 标签的实际 digest
-   一致，然后以单次有界尝试（7800 秒）将精确 digest 从 GHCR 复制到
-   `ccr.ccs.tencentyun.com/website-dev/kinvest:<commit_sha>`。成功后查询并输出
-   TCR 实际 digest（必须与 GHCR digest 一致）；失败不产生 digest 输出。
+   输入 `commit_sha`、`ghcr_digest`、`confirm=MIRROR`。workflow 分两个阶段：
+   `validate`（无 Environment）先校验输入格式、commit 属于 main 历史、
+   `ghcr_digest` 与 GHCR 上该 commit 标签的实际 digest 一致；通过后 `mirror`
+   （RegistryPublish Environment）以单次有界尝试（7800 秒）将精确 digest 从
+   GHCR 复制到 `ccr.ccs.tencentyun.com/website-dev/kinvest:<commit_sha>`。
+   复制期间日志只有固定心跳，crane 输出只写入临时文件并即时清理，永不打印。
+   成功后查询 TCR 实际 digest（必须与 GHCR digest 一致），生成
+   `release-record.json`（schema_version、commit_sha、ghcr_digest、tcr_digest、
+   tcr_repository、mirror_run_id、mirror_run_attempt；不含任何凭据）并以
+   `kinvest-release-record-<run_id>-<run_attempt>` artifact 保留 30 天。
    背景：实测 GitHub runner → TCR（广州）上传吞吐约 17.6KB/s，57.8MB 镜像
    需要约 1~2 小时；crane 不支持断点续传，多次短超时重试等于每次从零重传，
    因此采用单次超长尝试，由人工选择链路状况合适的时机触发（全程需要
    RegistryPublish Environment 审批）。
 3. 镜像完成后，管理员手工触发 `deploy-production-manual.yml`
-   （workflow_dispatch），输入 `commit_sha`、`tcr_digest`（即上一步输出）、
-   `confirm=DEPLOY`。workflow 校验格式与 main 历史，经 Production Environment
-   人工审批后，通过受限 SSH 将精确 TCR digest 传给服务器部署入口。
-   `DEPLOY_ENABLED` 不为 `true` 时任务拒绝部署。
+   （workflow_dispatch），只需输入成功 mirror run 的 `mirror_run_id` 和
+   `confirm=DEPLOY`，不再人工输入 commit 或 digest。`validate`（无
+   Environment）校验 mirror run 的来源（本仓库、mirror-tcr-manual.yml、
+   workflow_dispatch、main 分支、success）、下载并校验唯一未过期 release
+   record artifact（名称精确绑定 run_id 与 run_attempt、schema、仓库地址
+   固定、digest 格式、tcr_digest 等于 ghcr_digest、record 中的
+   mirror_run_attempt 等于 API 报告的 run_attempt、commit 属于 main 历史），
+   且 `DEPLOY_ENABLED` 必须为 `true`；全部通过后
+   `deploy`（Production Environment + 人工审批）才通过受限 SSH 将精确 TCR
+   digest 传给服务器部署入口。
 4. 服务器行为不变：从 TCR 拉取指定摘要，启动候选容器并等待健康检查；
    候选失败时保留或恢复最近一个本地、健康的镜像，不把失败候选切到线上。
 
@@ -95,10 +106,10 @@ SQLite 持久化目录
 在 GitHub 仓库的 Actions 页面确认：
 
 - `verify` 和 GHCR 发布任务成功，并记录 publish 输出的 GHCR digest。
-- 手工 mirror 任务的 `ghcr_digest` 输入与 publish 输出一致，mirror 成功后
-  记录其输出的 TCR digest。
-- 手工 Production 部署任务的 `tcr_digest` 输入与 mirror 输出一致，
-  `commit_sha` 为预期的 `main` commit。
+- 手工 mirror 任务的 `ghcr_digest` 输入与 publish 输出一致；mirror 成功后
+  记录其 run ID 与输出的 TCR digest（与 release record 内容一致）。
+- 手工 Production 部署任务的 `mirror_run_id` 输入就是上述成功的 mirror run；
+  validate 任务输出的 commit/digest 与 release record 一致。
 - 日志只显示 commit、镜像摘要和健康状态，不显示 secret 内容。
 - 失败日志中的错误已经脱敏。
 
