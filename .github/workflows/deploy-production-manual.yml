@@ -1,4 +1,4 @@
-# 手工 Production 部署:只消费 mirror-tcr-manual.yml 成功运行产出的
+# 手工 Production 部署:只消费 verify-tcr-release-manual.yml 成功运行产出的
 # release-record.json(commit_sha + tcr_digest),不再接受人工输入的
 # commit/digest 组合。validate(无 Environment)完成全部校验后,deploy
 # (Production Environment + 人工审批)才通过受限 SSH 部署精确 TCR digest。
@@ -10,7 +10,7 @@ on:
   workflow_dispatch:
     inputs:
       mirror_run_id:
-        description: '成功的 Mirror to TCR (manual) workflow run ID'
+        description: '成功的 Verify TCR release (manual) workflow run ID'
         required: true
         type: string
       confirm:
@@ -80,8 +80,8 @@ jobs:
           run_head_branch="$(jq -r '.head_branch' <<<"$run_json")"
           run_conclusion="$(jq -r '.conclusion' <<<"$run_json")"
           run_attempt="$(jq -r '.run_attempt' <<<"$run_json")"
-          if [[ "$run_path" != '.github/workflows/mirror-tcr-manual.yml' ]]; then
-            printf '%s\n' 'mirror_run_id does not belong to mirror-tcr-manual.yml.' >&2
+          if [[ "$run_path" != '.github/workflows/verify-tcr-release-manual.yml' ]]; then
+            printf '%s\n' 'mirror_run_id does not belong to verify-tcr-release-manual.yml.' >&2
             exit 1
           fi
           if [[ "$run_event" != 'workflow_dispatch' ]]; then
