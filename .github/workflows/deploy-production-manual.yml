@@ -24,6 +24,7 @@ permissions:
 concurrency:
   group: kinvest-production
   cancel-in-progress: false
+  queue: max
 
 jobs:
   validate:

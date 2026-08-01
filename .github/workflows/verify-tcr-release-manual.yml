@@ -28,6 +28,7 @@ permissions:
 concurrency:
   group: kinvest-tcr-verify
   cancel-in-progress: false
+  queue: max
 
 jobs:
   validate:
