@@ -12,6 +12,9 @@ RUN npm run build
 
 FROM node:22-alpine AS runtime
 
+LABEL io.kinvest.schema.min="0" \
+      io.kinvest.schema.max="0"
+
 ENV NODE_ENV=production \
     PORT=4173 \
     KINVEST_DB_PATH=/data/kinvest.sqlite
