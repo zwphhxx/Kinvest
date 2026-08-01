@@ -1,0 +1,78 @@
+# 实验 C 临时探针：验证 GitHub runner → TCR 个人版的镜像上传数据面是否可用。
+# 仅手动触发；向临时仓库 website-dev/rca-probe 复制 ~3MB 的 alpine(linux/amd64)。
+# 实验完成后本文件与临时仓库一并删除。
+name: TCR probe
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  probe:
+    name: probe
+    runs-on: ubuntu-latest
+    timeout-minutes: 40
+    environment: RegistryPublish
+    permissions:
+      contents: read
+    steps:
+      - name: Log in to Tencent Cloud Registry
+        uses: docker/login-action@74a5d142397b4f367a81961eba4e8cd7edddf772
+        with:
+          registry: ccr.ccs.tencentyun.com
+          username: ${{ secrets.TCR_USERNAME }}
+          password: ${{ secrets.TCR_PASSWORD }}
+      - name: Install pinned crane
+        shell: bash
+        env:
+          CRANE_VERSION: 'v0.21.7'
+          CRANE_SHA256: '1a57bc98207fa1c0d04bf760699099e26f8383499bfd55b99c1b919a928a7230'
+        run: |
+          set -euo pipefail
+          curl -fsSL --max-time 60 \
+            -o /tmp/crane.tar.gz \
+            "https://github.com/google/go-containerregistry/releases/download/${CRANE_VERSION}/go-containerregistry_Linux_x86_64.tar.gz"
+          printf '%s  /tmp/crane.tar.gz\n' "$CRANE_SHA256" | sha256sum -c -
+          tar -xzf /tmp/crane.tar.gz -C /tmp crane
+          rm -f /tmp/crane.tar.gz
+          /tmp/crane version
+      - name: Measure TCR control plane latency
+        shell: bash
+        run: |
+          set -euo pipefail
+          curl -s -o /dev/null --max-time 30 \
+            -w 'TCR /v2/ ping: http=%{http_code} connect=%{time_connect}s tls=%{time_appconnect}s total=%{time_total}s\n' \
+            https://ccr.ccs.tencentyun.com/v2/ || printf '%s\n' 'TCR /v2/ ping failed.'
+      - name: Probe tiny image copy to TCR
+        shell: bash
+        env:
+          PROBE_SRC: 'index.docker.io/library/alpine:3.21'
+          PROBE_DEST: 'ccr.ccs.tencentyun.com/website-dev/rca-probe:probe-${{ github.run_id }}'
+        run: |
+          set -euo pipefail
+          printf 'probe destination: %s\n' "$PROBE_DEST"
+          SRC_DIGEST="$(/tmp/crane digest --platform linux/amd64 "$PROBE_SRC")"
+          printf 'source linux/amd64 digest: %s\n' "$SRC_DIGEST"
+          probe_log="$(mktemp)"
+          start_ts="$(date +%s)"
+          status=0
+          timeout --signal=TERM --kill-after=10s 1800s \
+            /tmp/crane copy --verbose \
+            "index.docker.io/library/alpine@${SRC_DIGEST}" "$PROBE_DEST" \
+            >"$probe_log" 2>&1 || status=$?
+          end_ts="$(date +%s)"
+          printf 'probe exit code: %s\n' "$status"
+          printf 'probe elapsed: %ss\n' "$((end_ts - start_ts))"
+          sed -E \
+            -e 's/(signature=)[^&[:space:]]+/\1REDACTED/g' \
+            -e 's/([Tt]oken[=:])[[:space:]]*[^&[:space:]]+/\1REDACTED/g' \
+            -e 's/([Pp]assword[=:])[[:space:]]*[^&[:space:]]+/\1REDACTED/g' \
+            "$probe_log" \
+            | grep -viE 'authorization|bearer|dockerconfig|config\.json' || true
+          rm -f "$probe_log"
+          if ((status != 0)); then
+            printf '%s\n' 'TCR probe copy failed.' >&2
+            exit 1
+          fi
