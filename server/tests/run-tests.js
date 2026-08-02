@@ -1,5 +1,6 @@
 const tests = [
   require('./security-identity.test'),
+  require('./device-approval.test'),
   require('./refresh-policy.test'),
   require('./refresh-rules.test'),
   require('./health.test'),
