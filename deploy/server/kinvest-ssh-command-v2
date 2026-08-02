@@ -1,0 +1,16 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+if [[ "$#" -ne 0 ]]; then
+  printf '%s\n' 'forced deployment command accepts no arguments' >&2
+  exit 2
+fi
+
+if [[ "${SSH_ORIGINAL_COMMAND:-}" != 'deploy-v2' ]]; then
+  printf '%s\n' 'SSH command is not permitted' >&2
+  exit 2
+fi
+
+# The wrapper deliberately does not parse, buffer, or log stdin. The root
+# deployment program owns the versioned payload validation.
+exec sudo -n /usr/local/sbin/deploy-kinvest

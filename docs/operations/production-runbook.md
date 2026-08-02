@@ -46,16 +46,46 @@ SQLite 持久化目录
 
 首次切换时未修改 Tailscale、防火墙和现有数据库。后续维护也不得把这些系统当作 Kinvest 发布的一部分顺带修改；如需调整，应另开变更并单独备份、评审和验证。
 
-## 3. GitHub 自动部署
+## 3. GitHub 发布与部署流程
 
-`main` 分支 push 后的生产链路：
+发布流程为"GHCR 自动发布 → Mac 本地镜像 TCR → GitHub 验证并签发 release record → Production 部署"四段式：
 
-1. GitHub Actions 安装锁定依赖并执行质量检查。
-2. 工作流构建并发布 GHCR 镜像。
-3. 发布结果固定为 immutable image digest，不使用可漂移标签作为部署身份。
-4. Production 环境中的受限 SSH 身份只允许调用批准的部署入口。
-5. 服务器拉取指定摘要，启动候选容器并等待健康检查。
-6. 候选失败时保留或恢复最近一个本地、健康的镜像，不把失败候选切到线上。
+1. `main` 分支 push 后，`deploy.yml` 自动执行 verify / security / container-build，
+   将镜像发布到 GHCR `ghcr.io/zwphhxx/kinvest:<commit>`，并验证 GHCR 报告的
+   immutable digest 与构建输出一致。自动流程不触碰 TCR、不进入 Production，
+   也不需要任何 Environment 审批。
+2. 需要部署时，管理员在**境内网络的 Mac 上**手工执行
+   `scripts/mirror-release-to-tcr.sh <commit_sha> <ghcr_digest>`，将精确 digest
+   从 GHCR 复制到 `ccr.ccs.tencentyun.com/website-dev/kinvest:<commit_sha>`。
+   脚本只使用当前用户已有的 Docker credential store（不接受命令行密码），
+   复制前校验 GHCR 标签与 digest 绑定，单次有界复制（默认 3600 秒，
+   可用 `MIRROR_TIMEOUT_SECONDS` 调整），成功后查询 TCR 实际 digest 并要求
+   与 GHCR digest 一致。脚本不生成 release record、不操作 GitHub 或服务器。
+   背景：实测 GitHub runner → TCR（广州）跨境上传吞吐仅约 17.6KB/s，
+   57.8MB 镜像曾单次复制 7800 秒仍失败；crane 不支持断点续传，重试等于
+   从零重传，因此镜像复制改走管理员本地境内链路。
+3. 本地镜像完成后，管理员手工触发 `verify-tcr-release-manual.yml`
+   （workflow_dispatch），输入 `commit_sha`、`ghcr_digest`、`confirm=VERIFY`。
+   `validate`（无 Environment）校验输入格式、main 历史、GHCR 标签↔digest
+   绑定；`verify`（RegistryPublish Environment）**只读**查询 TCR 上该 commit
+   标签的实际 digest 并要求与 GHCR digest 一致（GitHub 不执行任何
+   copy/push/tag/delete，不传输镜像 blob）。验证通过后生成
+   `release-record.json`（schema_version、commit_sha、ghcr_digest、tcr_digest、
+   tcr_repository、mirror_run_id、mirror_run_attempt；不含任何凭据）并以
+   `kinvest-release-record-<run_id>-<run_attempt>` artifact 保留 30 天。
+4. 验证完成后，管理员手工触发 `deploy-production-manual.yml`
+   （workflow_dispatch），只需输入成功 verify run 的 `mirror_run_id` 和
+   `confirm=DEPLOY`，不再人工输入 commit 或 digest。`validate`（无
+   Environment）校验 verify run 的来源（本仓库、verify-tcr-release-manual.yml、
+   workflow_dispatch、main 分支、success）、下载并校验唯一未过期 release
+   record artifact（名称精确绑定 run_id 与 run_attempt、schema、仓库地址
+   固定、digest 格式、tcr_digest 等于 ghcr_digest、record 中的
+   mirror_run_attempt 等于 API 报告的 run_attempt、commit 属于 main 历史），
+   且 `DEPLOY_ENABLED` 必须为 `true`；全部通过后
+   `deploy`（Production Environment + 人工审批）才通过受限 SSH 将精确 TCR
+   digest 传给服务器部署入口。
+5. 服务器行为不变：从 TCR 拉取指定摘要，启动候选容器并等待健康检查；
+   候选失败时保留或恢复最近一个本地、健康的镜像，不把失败候选切到线上。
 
 部署开关和配置只使用以下名称：
 
@@ -67,15 +97,25 @@ SQLite 持久化目录
 | Production variable | `DEPLOY_USER` |
 | Production secret | `DEPLOY_SSH_KEY` |
 | Production secret | `DEPLOY_KNOWN_HOSTS` |
+| RegistryPublish secret | `TCR_USERNAME` |
+| RegistryPublish secret | `TCR_PASSWORD` |
 
-本手册不记录这些配置的值。`DEPLOY_ENABLED` 关闭时仍可执行构建和检查，但生产部署必须跳过。
+本手册不记录这些配置的值。`DEPLOY_ENABLED` 关闭时仍可执行构建、检查和 GHCR
+发布，但手工部署任务会拒绝执行。`TCR_USERNAME` 和 `TCR_PASSWORD` 只允许被
+`RegistryPublish` Environment 中的 verify 任务读取（仅用于只读查询）；自动
+流程与 PR 事件都无法访问这两个 secret。
 
 ### 发布检查
 
 在 GitHub 仓库的 Actions 页面确认：
 
-- `verify` 和镜像发布任务成功。
-- Production 部署任务使用预期的 `main` commit。
+- `verify` 和 GHCR 发布任务成功，并记录 publish 输出的 GHCR digest。
+- 管理员本地执行 `scripts/mirror-release-to-tcr.sh` 成功，输出的 TCR digest
+  与 GHCR digest 一致。
+- 手工 verify 任务的输入与上述值一致；verify 成功后记录其 run ID 与输出的
+  TCR digest（与 release record 内容一致）。
+- 手工 Production 部署任务的 `mirror_run_id` 输入就是上述成功的 verify run；
+  validate 任务输出的 commit/digest 与 release record 一致。
 - 日志只显示 commit、镜像摘要和健康状态，不显示 secret 内容。
 - 失败日志中的错误已经脱敏。
 
@@ -433,17 +473,49 @@ docker exec nginx nginx -t -c /tmp/nginx.conf.restore
 只有确认备份内路径和候选语法都正确后，才替换
 `/root/docker/nginx/conf/nginx.conf` 并 reload。恢复后分别检查 HTTP 跳转、HTTPS 页面和 Nginx 状态。若备份中的实际文件名与示例不同，停止并按备份清单操作，不猜测路径。
 
-## 9. GHCR 中国大陆冷拉取
+## 9. 镜像仓库与拉取（TCR 主用，GHCR 备份）
 
-从中国大陆服务器首次拉取 GHCR 大镜像时，CDN 连接可能很慢或超时。安全行为是：
+生产部署只从腾讯云 TCR 个人版 `ccr.ccs.tencentyun.com/website-dev/kinvest`
+拉取（与服务器同区域，避开 GHCR 跨境链路）。GHCR 继续作为备份仓库发布，
+但不接受为新的部署输入；`deploy-kinvest.sh` 与 SSH 入口只接受精确的 TCR
+immutable digest，拒绝其他仓库、tag 和可变引用。
 
-- 拉取有明确的超时上限，不无限占用部署任务。
-- 冷拉取失败时不替换 `current.state`，不停止当前健康容器。
+拉取安全行为：
+
+- 拉取由 `deploy-kinvest.sh` 执行有界重试：最多 3 次尝试，每次由 `timeout` 限制在 300 秒内，两次尝试之间递增等待（2 秒、4 秒）；任一次成功立即停止。
+- 只重试明确的临时失败或超时（退出码 124/137/143，或 stderr 中出现连接重置、超时、5xx 等临时特征）；摘要不存在、权限拒绝和未分类错误不重试。
+- 部署日志只记录尝试编号、退出码和最终结果；拉取的原始 stderr 只用于本地失败分类，不写入部署日志。
+- 全部尝试失败后执行既有 verified rollback：不替换 `current.state`，不停止当前健康容器，previous 继续服务。
+- 重试不是无限兜底：链路持续劣化时部署仍会失败，此时应等待链路恢复后重新部署同一 digest。
+- TCR 侧的镜像补给由管理员在境内 Mac 上执行 `scripts/mirror-release-to-tcr.sh`
+  完成（详见第 3 节）；GitHub runner → TCR 跨境上传吞吐实测约 17.6KB/s，
+  曾单次复制 7800 秒仍失败，因此 GitHub 侧不再传输镜像 blob，只负责
+  GHCR 发布与只读验证签发。
 - 回滚只依赖服务器本地已经存在且曾健康运行的镜像。
 - 超时不等于镜像不存在或鉴权失败，应区分网络超时、摘要不存在和权限拒绝。
 - 不切换到未经审核的公共镜像代理，也不因超时关闭 TLS 或主机校验。
 
-预热应在正式部署前、低风险时间窗口按工作流产出的完整 digest 执行：
+仓库迁移与回滚边界：
+
+- `current.state` 与 `previous.state` 可同时存在 GHCR 和 TCR 两种仓库引用；
+  首次 TCR 部署时 `current.state` 通常仍是 GHCR 地址，这是受支持的迁移路径。
+- TCR 候选失败时，verified rollback 可回滚到本地已有的 GHCR previous 镜像；
+  回滚只使用本地镜像，不从 GHCR 重新拉取。
+- TCR 部署成功后，`current.state` 写入 TCR digest，`previous.state` 保留
+  GHCR 记录，直到下一次成功部署将其替换为 TCR。
+
+TCR 个人版限制：
+
+- 个人版无 SLA，可用性与性能不作承诺；发布或部署失败时按既有重试与回滚
+  语义处理，不得为绕过故障临时改回 GHCR 输入或使用 `latest`。
+- 个人版使用固定用户名/密码凭据，没有短期令牌；凭据只允许保存在
+  `RegistryPublish` Environment 的 `TCR_USERNAME`、`TCR_PASSWORD` secret 中。
+- 怀疑凭据泄露时，立即在 TCR 控制台重置密码、更新两个 secret，并审查
+  发布日志；凭据不得写入仓库、Issue、日志、服务器文件或 docker config。
+- 工作流不向服务器分发任何 registry 凭据；服务器拉取的是私有仓库镜像，
+  其访问配置属于服务器基线，变更需单独评审。
+
+GHCR 备份仓库的预热仍在正式部署前、低风险时间窗口按工作流产出的完整 digest 执行：
 
 ```sh
 docker pull 'ghcr.io/zwphhxx/kinvest@sha256:REVIEWED_DIGEST'

@@ -5,12 +5,13 @@ const os = require('node:os')
 const path = require('node:path')
 
 const rootDir = path.resolve(__dirname, '../..')
-const allowedRepository = 'ghcr.io/zwphhxx/kinvest'
+const tcrRepository = 'ccr.ccs.tencentyun.com/website-dev/kinvest'
+const ghcrRepository = 'ghcr.io/zwphhxx/kinvest'
 const candidateDigest = `sha256:${'b'.repeat(64)}`
-const candidateRef = `${allowedRepository}@${candidateDigest}`
+const candidateRef = `${tcrRepository}@${candidateDigest}`
 const candidateCommit = 'c'.repeat(40)
 const previousDigest = `sha256:${'a'.repeat(64)}`
-const previousRef = `${allowedRepository}@${previousDigest}`
+const previousRef = `${ghcrRepository}@${previousDigest}`
 const previousCommit = 'd'.repeat(40)
 
 function rootPath(relativePath) {
@@ -294,6 +295,7 @@ case "$command_name" in
     ;;
   pull)
     ref="\${1:-}"
+    printf '%s\\n' "$ref" >> "$state/pull-attempts.log"
     if [[ -f "$state/fail-candidate-pull" && "$ref" == "$CANDIDATE_REF" ]]; then
       exit 30
     fi
@@ -305,6 +307,25 @@ case "$command_name" in
         : > "$state/old-pull-attempted"
       fi
       exit 31
+    fi
+    if [[ "$ref" == "$CANDIDATE_REF" && -f "$state/candidate-pull-timeout-once" ]]; then
+      rm -f "$state/candidate-pull-timeout-once"
+      exit 124
+    fi
+    if [[ "$ref" == "$CANDIDATE_REF" && -f "$state/candidate-pull-permanent-error" ]]; then
+      printf '%s\\n' 'Error response from daemon: manifest unknown' >&2
+      exit 1
+    fi
+    if [[ "$ref" == "$CANDIDATE_REF" ]]; then
+      remaining='0'
+      if [[ -f "$state/candidate-pull-transient-remaining" ]]; then
+        remaining="$(cat "$state/candidate-pull-transient-remaining")"
+      fi
+      if ((remaining > 0)); then
+        printf '%s\\n' "$((remaining - 1))" > "$state/candidate-pull-transient-remaining"
+        printf '%s\\n' 'Error response from daemon: Get "https://ghcr.io/v2/": dial tcp 203.0.113.10:443: i/o timeout' >&2
+        exit 1
+      fi
     fi
     printf '%s\\n' "$ref" >> "$state/pulls.log"
     ;;
@@ -396,6 +417,11 @@ function runDeployFixture(markers = [], { withPrevious = true } = {}) {
   for (const marker of markers) {
     if (marker === 'previous-unhealthy') {
       fs.writeFileSync(path.join(fakeState, 'running.health'), 'unhealthy\n')
+    } else if (marker.startsWith('candidate-pull-transient-remaining:')) {
+      fs.writeFileSync(
+        path.join(fakeState, 'candidate-pull-transient-remaining'),
+        marker.slice('candidate-pull-transient-remaining:'.length)
+      )
     } else {
       fs.writeFileSync(path.join(fakeState, marker), '')
     }
@@ -433,14 +459,21 @@ function runDeployFixture(markers = [], { withPrevious = true } = {}) {
   }
 }
 
-function assertRejectedInput(input, messagePattern) {
+function readPullAttempts(fixture) {
+  const logPath = path.join(fixture.fakeState, 'pull-attempts.log')
+  return fs.existsSync(logPath)
+    ? fs.readFileSync(logPath, 'utf8').trim().split('\n')
+    : []
+}
+
+function assertRejectedInput(input, messagePattern, message) {
   const result = spawnSync(rootPath('deploy/server/deploy-kinvest.sh'), [], {
     encoding: 'utf8',
     input
   })
 
-  assert.equal(result.status, 2)
-  assert.match(result.stderr, messagePattern)
+  assert.equal(result.status, 2, message)
+  assert.match(result.stderr, messagePattern, message)
 }
 
 function runBootstrapIdentityConflict(identityKind) {
@@ -791,13 +824,125 @@ exec /usr/bin/mktemp "$@"
   }
 }
 
+function runMirrorSuccessFixture() {
+  const fixtureRoot = fs.mkdtempSync(path.join(os.tmpdir(), 'kinvest-mirror-success-'))
+  const fakeBin = path.join(fixtureRoot, 'bin')
+  const workDir = path.join(fixtureRoot, 'work')
+  const commit = 'e'.repeat(40)
+  const digest = `sha256:${'f'.repeat(64)}`
+
+  fs.mkdirSync(fakeBin)
+  writeExecutable(
+    path.join(fakeBin, 'uname'),
+    `#!/bin/sh
+if [ "\${1:-}" = '-s' ]; then
+  printf '%s\n' Darwin
+else
+  printf '%s\n' arm64
+fi
+`
+  )
+  writeExecutable(
+    path.join(fakeBin, 'mktemp'),
+    `#!/bin/sh
+mkdir -p "$FAKE_MIRROR_WORKDIR"
+printf '%s\n' "$FAKE_MIRROR_WORKDIR"
+`
+  )
+  writeExecutable(
+    path.join(fakeBin, 'curl'),
+    `#!/bin/sh
+set -eu
+while [ "$#" -gt 0 ]; do
+  if [ "$1" = '-o' ]; then
+    printf archive > "$2"
+    exit 0
+  fi
+  shift
+done
+exit 1
+`
+  )
+  writeExecutable(
+    path.join(fakeBin, 'shasum'),
+    `#!/bin/sh
+cat >/dev/null
+exit 0
+`
+  )
+  writeExecutable(
+    path.join(fakeBin, 'sleep'),
+    `#!/bin/sh
+exit 0
+`
+  )
+  writeExecutable(
+    path.join(fakeBin, 'tar'),
+    `#!/bin/sh
+set -eu
+destination=''
+while [ "$#" -gt 0 ]; do
+  if [ "$1" = '-C' ]; then
+    destination="$2"
+    shift 2
+    continue
+  fi
+  shift
+done
+cat > "$destination/crane" <<'CRANE'
+#!/bin/sh
+case "\${1:-}" in
+  version|copy) exit 0 ;;
+  digest) printf '%s\\n' "$FAKE_MIRROR_DIGEST" ;;
+  *) exit 1 ;;
+esac
+CRANE
+chmod +x "$destination/crane"
+`
+  )
+
+  const result = spawnSync(
+    rootPath('scripts/mirror-release-to-tcr.sh'),
+    [commit, digest],
+    {
+      encoding: 'utf8',
+      env: {
+        ...process.env,
+        PATH: `${fakeBin}:${process.env.PATH}`,
+        FAKE_MIRROR_DIGEST: digest,
+        FAKE_MIRROR_WORKDIR: workDir,
+        MIRROR_TIMEOUT_SECONDS: '60'
+      },
+      timeout: 5000
+    }
+  )
+
+  return {
+    cleanup() {
+      fs.rmSync(fixtureRoot, { recursive: true, force: true })
+    },
+    result,
+    workDir
+  }
+}
+
 function run() {
   const workflow = readRootFile('.github/workflows/deploy.yml')
+  const verifyWorkflow = readRootFile('.github/workflows/verify-tcr-release-manual.yml')
+  const productionWorkflow = readRootFile('.github/workflows/deploy-production-manual.yml')
+  const mirrorScript = readRootFile('scripts/mirror-release-to-tcr.sh')
   const deploy = readRootFile('deploy/server/deploy-kinvest.sh')
   const bootstrap = readRootFile('deploy/server/bootstrap-server.sh')
   const wrapper = readRootFile('deploy/server/kinvest-ssh-command')
 
   assertBasicWorkflowYaml(workflow)
+  assertBasicWorkflowYaml(verifyWorkflow)
+  assertBasicWorkflowYaml(productionWorkflow)
+  assert.equal(
+    fs.existsSync(rootPath('.github/workflows/mirror-tcr-manual.yml')),
+    false,
+    'the runner-side TCR copy workflow must stay removed; GitHub never transfers image blobs'
+  )
 
   const events = workflowBlock(workflow, 'on', 0)
   const jobs = workflowBlock(workflow, 'jobs', 0)
@@ -827,7 +972,7 @@ function run() {
 
   assert.deepEqual(
     [...jobIds].sort(),
-    ['container-build', 'deploy', 'publish', 'security', 'verify']
+    ['container-build', 'publish', 'security', 'verify']
   )
   const prJobs = Object.fromEntries(
     ['verify', 'security', 'container-build'].map((jobId) => [
@@ -945,24 +1090,607 @@ function run() {
     directScalar(publishJob, 'if', 4),
     "${{ github.event_name != 'pull_request' && github.ref == 'refs/heads/main' }}"
   )
-
-  const deployJob = workflowBlock(jobs, 'deploy', 2)
-  assert.equal(directScalar(deployJob, 'needs', 4), 'publish')
-  assert.equal(directScalar(deployJob, 'environment', 4), 'Production')
   assert.equal(
-    directScalar(deployJob, 'if', 4),
-    "${{ github.event_name != 'pull_request' && github.ref == 'refs/heads/main' && vars.DEPLOY_ENABLED == 'true' }}"
+    directMappingKeys(publishJob, 4).includes('environment'),
+    false,
+    'GHCR-only publish must not require the RegistryPublish environment'
   )
-  assert.match(deployJob, /\$\{\{\s*secrets\.DEPLOY_SSH_KEY\s*\}\}/)
-  assert.match(deployJob, /\$\{\{\s*secrets\.DEPLOY_KNOWN_HOSTS\s*\}\}/)
-  assert.doesNotMatch(workflow.replace(deployJob, ''), /\$\{\{\s*secrets\.DEPLOY_/)
+  assert.match(publishJob, /ghcr\.io\/zwphhxx\/kinvest:\$\{\{ github\.sha \}\}/)
+  assert.match(
+    publishJob,
+    /image_digest: \$\{\{ steps\.digest\.outputs\.ghcr_image_digest \}\}/,
+    'publish must expose the GHCR digest output for the manual mirror input'
+  )
+  assert.doesNotMatch(
+    publishJob,
+    /tcr_image_digest|ccr\.ccs\.tencentyun\.com|TCR_USERNAME|TCR_PASSWORD|crane|RegistryPublish/,
+    'automatic publish must not touch TCR; mirroring is manual only'
+  )
+  const publishDigestRun = multilineStepRun(
+    namedStep(publishJob, 'Validate immutable image digest')
+  )
+  assert.match(publishDigestRun, /imagetools inspect "\$GHCR_REF"/)
+  assert.match(
+    publishDigestRun,
+    /\[\[ ! "\$GHCR_DIGEST" =~ \^sha256:\[0-9a-f\]\{64\}\$ \]\]/,
+    'GHCR digest must be format-validated as reported by GHCR'
+  )
+  assert.match(
+    publishDigestRun,
+    /"\$GHCR_DIGEST" != "\$BUILD_DIGEST"/,
+    'GHCR digest must be verified against the build output digest'
+  )
+  assert.match(publishDigestRun, /printf 'ghcr_image_digest=%s\\n' "\$GHCR_DIGEST"/)
 
-  const usesLines = workflow.match(/^\s+uses:\s+\S+\s*$/gm) || []
-  assert.ok(usesLines.length > 0)
-  for (const usesLine of usesLines) {
-    const action = usesLine.trim().match(/^uses:\s+([^@\s]+)@([^\s]+)$/)
-    assert.ok(action, `Action reference must include a commit SHA: ${usesLine.trim()}`)
-    assert.match(action[2], /^[0-9a-f]{40}$/, `${action[1]} must use a full commit SHA`)
+  const buildPublishStep = namedStep(publishJob, 'Build and publish audit-tagged image')
+  assert.match(buildPublishStep, /ghcr\.io\/zwphhxx\/kinvest:\$\{\{ github\.sha \}\}/)
+  assert.doesNotMatch(
+    buildPublishStep,
+    /ccr\.ccs\.tencentyun\.com/,
+    'the build-push action must only publish GHCR'
+  )
+
+  assert.equal(
+    jobIds.includes('deploy'),
+    false,
+    'deploy.yml must not deploy to production; production deploy is manual only'
+  )
+  assert.doesNotMatch(
+    workflow,
+    /\$\{\{\s*secrets\.(DEPLOY_|TCR_)/,
+    'the automatic pipeline must not reference deploy or TCR credentials'
+  )
+  assert.doesNotMatch(
+    workflow,
+    /environment: (Production|RegistryPublish)/,
+    'the automatic pipeline must not require any protected environment'
+  )
+  for (const [jobId, job] of Object.entries(prJobs)) {
+    assert.doesNotMatch(
+      job,
+      /RegistryPublish|TCR_USERNAME|TCR_PASSWORD|ccr\.ccs\.tencentyun\.com/,
+      `${jobId} must not access TCR credentials or the RegistryPublish environment`
+    )
+  }
+
+  const verifyEvents = workflowBlock(verifyWorkflow, 'on', 0)
+  assert.deepEqual(
+    directMappingKeys(verifyEvents, 2),
+    ['workflow_dispatch'],
+    'TCR release verification must only be triggered manually'
+  )
+  const verifyDispatch = workflowBlock(verifyEvents, 'workflow_dispatch', 2)
+  const verifyInputs = workflowBlock(verifyDispatch, 'inputs', 4)
+  assert.deepEqual(directMappingKeys(verifyInputs, 6).sort(), [
+    'commit_sha',
+    'confirm',
+    'ghcr_digest'
+  ])
+  for (const inputName of ['commit_sha', 'confirm', 'ghcr_digest']) {
+    const input = workflowBlock(verifyInputs, inputName, 6)
+    assert.equal(directScalar(input, 'required', 8), 'true')
+  }
+  const verifyJobs = workflowBlock(verifyWorkflow, 'jobs', 0)
+  assert.deepEqual(directMappingKeys(verifyJobs, 2).sort(), ['validate', 'verify'])
+
+  const verifyValidateJob = workflowBlock(verifyJobs, 'validate', 2)
+  assert.equal(
+    directMappingKeys(verifyValidateJob, 4).includes('environment'),
+    false,
+    'verify input validation must complete before entering the RegistryPublish environment'
+  )
+  const verifyValidatePerms = workflowBlock(verifyValidateJob, 'permissions', 4)
+  assert.deepEqual(directMappingKeys(verifyValidatePerms, 6), ['contents'])
+  assert.equal(directScalar(verifyValidatePerms, 'contents', 6), 'read')
+  assert.doesNotMatch(
+    verifyValidateJob,
+    /\$\{\{\s*secrets\.(TCR_|DEPLOY_)/,
+    'verify validate must not access registry or deploy credentials'
+  )
+  const verifyValidateRun = multilineStepRun(
+    namedStep(verifyValidateJob, 'Validate verify inputs')
+  )
+  assert.match(
+    verifyValidateRun,
+    /"\$WORKFLOW_REF" != 'refs\/heads\/main'/,
+    'verify workflow must reject runs from non-main refs'
+  )
+  assert.match(verifyValidateRun, /"\$CONFIRM" != 'VERIFY'/)
+  assert.match(verifyValidateRun, /\[\[ ! "\$COMMIT_SHA" =~ \^\[0-9a-f\]\{40\}\$ \]\]/)
+  assert.match(
+    verifyValidateRun,
+    /\[\[ ! "\$GHCR_DIGEST" =~ \^sha256:\[0-9a-f\]\{64\}\$ \]\]/
+  )
+  assert.match(
+    verifyValidateRun,
+    /git merge-base --is-ancestor "\$COMMIT_SHA" origin\/main/,
+    'verify must only accept commits from main history'
+  )
+  const verifyBindRun = multilineStepRun(
+    namedStep(verifyValidateJob, 'Bind GHCR digest to the commit tag')
+  )
+  assert.match(
+    verifyBindRun,
+    /TAG_DIGEST="\$\(\/tmp\/crane digest "ghcr\.io\/zwphhxx\/kinvest:\$\{COMMIT_SHA\}"\)"/
+  )
+  assert.match(
+    verifyBindRun,
+    /"\$TAG_DIGEST" != "\$GHCR_DIGEST"/,
+    'verify must bind ghcr_digest to the commit tag on GHCR before entering the environment'
+  )
+
+  const verifyJob = workflowBlock(verifyJobs, 'verify', 2)
+  assert.equal(
+    directScalar(verifyJob, 'needs', 4),
+    'validate',
+    'the RegistryPublish environment must only be entered after validation succeeds'
+  )
+  assert.equal(
+    directScalar(verifyJob, 'environment', 4),
+    'RegistryPublish',
+    'TCR credentials must only resolve inside the RegistryPublish environment'
+  )
+  assert.equal(directScalar(verifyJob, 'timeout-minutes', 4), '15')
+  assert.match(
+    verifyJob,
+    /tcr_image_digest: \$\{\{ steps\.verify\.outputs\.tcr_image_digest \}\}/,
+    'verify must expose the TCR digest output only after a verified read'
+  )
+  assert.match(verifyJob, /registry: ccr\.ccs\.tencentyun\.com/)
+  assert.match(verifyJob, /username: \$\{\{ secrets\.TCR_USERNAME \}\}/)
+  assert.match(verifyJob, /password: \$\{\{ secrets\.TCR_PASSWORD \}\}/)
+  assert.doesNotMatch(
+    verifyWorkflow,
+    /crane (copy|push|tag|delete)/,
+    'GitHub must never transfer or mutate image blobs; the verify workflow is read-only'
+  )
+
+  const verifyCraneStep = namedStep(verifyJob, 'Install pinned crane')
+  assert.match(verifyCraneStep, /CRANE_VERSION: 'v0\.21\.7'/)
+  assert.match(verifyCraneStep, /CRANE_SHA256: '[0-9a-f]{64}'/)
+  assert.match(verifyCraneStep, /sha256sum -c -/)
+  assert.match(verifyCraneStep, /curl -fsSL --max-time 60/)
+  assert.match(
+    verifyCraneStep,
+    /releases\/download\/\$\{CRANE_VERSION\}\/go-containerregistry_Linux_x86_64\.tar\.gz/
+  )
+
+  const verifyRun = multilineStepRun(
+    namedStep(verifyJob, 'Verify mirrored digest on TCR (read-only)')
+  )
+  assert.match(
+    verifyRun,
+    /TCR_REF="ccr\.ccs\.tencentyun\.com\/website-dev\/kinvest:\$\{COMMIT_SHA\}"/,
+    'verify must query the exact audit commit tag on TCR'
+  )
+  assert.doesNotMatch(verifyRun, /:latest\b/, 'verify must not use mutable tags')
+  assert.match(
+    verifyRun,
+    /TCR_DIGEST="\$\(\/tmp\/crane digest "\$TCR_REF" 2>"\$verify_log"\)"/,
+    'verify must only read the TCR digest with crane'
+  )
+  assert.match(
+    verifyRun,
+    /trap cleanup EXIT INT TERM/,
+    'the captured query log must be cleaned up on any exit'
+  )
+  assert.match(verifyRun, /rm -f "\$verify_log"/)
+  assert.doesNotMatch(
+    verifyRun,
+    /cat "\$verify_log"/,
+    'captured crane output must never be printed'
+  )
+  assert.doesNotMatch(
+    verifyRun,
+    /TCR_USERNAME|TCR_PASSWORD/,
+    'verify step logs must not expose credentials'
+  )
+  assert.match(
+    verifyRun,
+    /\[\[ ! "\$TCR_DIGEST" =~ \^sha256:\[0-9a-f\]\{64\}\$ \]\]/,
+    'TCR digest must be format-validated as reported by TCR'
+  )
+  assert.match(
+    verifyRun,
+    /"\$TCR_DIGEST" != "\$GHCR_DIGEST"/,
+    'verification must fail when the TCR digest differs from the GHCR digest'
+  )
+  assert.match(verifyRun, /printf 'tcr_image_digest=%s\\n' "\$TCR_DIGEST"/)
+  assert.ok(
+    verifyRun.indexOf('crane digest') < verifyRun.indexOf('tcr_image_digest=%s'),
+    'a failed verification must exit before any tcr_image_digest output is produced'
+  )
+
+  const recordRun = multilineStepRun(namedStep(verifyJob, 'Write release record'))
+  assert.match(recordRun, /--argjson schema_version 1/)
+  assert.match(recordRun, /--arg commit_sha "\$COMMIT_SHA"/)
+  assert.match(recordRun, /--arg ghcr_digest "\$GHCR_DIGEST"/)
+  assert.match(recordRun, /--arg tcr_digest "\$TCR_DIGEST"/)
+  assert.match(
+    recordRun,
+    /--arg tcr_repository 'ccr\.ccs\.tencentyun\.com\/website-dev\/kinvest'/,
+    'release record must pin the exact TCR repository'
+  )
+  assert.match(recordRun, /--arg mirror_run_id "\$MIRROR_RUN_ID"/)
+  assert.match(recordRun, /--arg mirror_run_attempt "\$MIRROR_RUN_ATTEMPT"/)
+  assert.doesNotMatch(
+    recordRun,
+    /\$\{\{\s*secrets\.|TCR_PASSWORD|token|signature/,
+    'release record must not contain credentials, tokens or URL signatures'
+  )
+  const uploadStep = namedStep(verifyJob, 'Upload release record')
+  assert.match(
+    uploadStep,
+    /uses: actions\/upload-artifact@[0-9a-f]{40}/,
+    'release record upload must use a full-SHA pinned official action'
+  )
+  assert.match(
+    uploadStep,
+    /name: kinvest-release-record-\$\{\{ github\.run_id \}\}-\$\{\{ github\.run_attempt \}\}/,
+    'release record artifact name must contain the verify run id and attempt'
+  )
+  assert.match(uploadStep, /path: release-record\.json/)
+  assert.match(uploadStep, /retention-days: 30/)
+
+  assert.match(
+    mirrorScript,
+    /^readonly GHCR_REPOSITORY='ghcr\.io\/zwphhxx\/kinvest'$/m,
+    'local mirror script must pin the GHCR repository'
+  )
+  assert.match(
+    mirrorScript,
+    /^readonly TCR_REPOSITORY='ccr\.ccs\.tencentyun\.com\/website-dev\/kinvest'$/m,
+    'local mirror script must pin the TCR repository'
+  )
+  assert.match(
+    mirrorScript,
+    /copy_src="\$\{GHCR_REPOSITORY\}@\$\{ghcr_digest\}"/,
+    'local mirror source must use the exact GHCR digest'
+  )
+  assert.match(
+    mirrorScript,
+    /tcr_ref="\$\{TCR_REPOSITORY\}:\$\{commit_sha\}"/,
+    'local mirror target must use the audit commit tag'
+  )
+  assert.doesNotMatch(mirrorScript, /:latest\b/, 'local mirror must not use mutable tags')
+  assert.match(
+    mirrorScript,
+    /\*latest\*/,
+    'local mirror must explicitly reject latest'
+  )
+  assert.match(mirrorScript, /\[\[ ! "\$commit_sha" =~ \^\[0-9a-f\]\{40\}\$ \]\]/)
+  assert.match(mirrorScript, /\[\[ ! "\$ghcr_digest" =~ \^sha256:\[0-9a-f\]\{64\}\$ \]\]/)
+  assert.match(mirrorScript, /CRANE_VERSION='v0\.21\.7'/)
+  assert.match(mirrorScript, /CRANE_SHA256_ARM64='[0-9a-f]{64}'/)
+  assert.match(mirrorScript, /CRANE_SHA256_X86_64='[0-9a-f]{64}'/)
+  assert.match(mirrorScript, /shasum -a 256 -c -/)
+  assert.match(
+    mirrorScript,
+    /"\$tag_digest" != "\$ghcr_digest"/,
+    'local mirror must bind the input digest to the GHCR commit tag before copying'
+  )
+  assert.match(
+    mirrorScript,
+    /MIRROR_TIMEOUT_SECONDS/,
+    'local mirror copy must be bounded'
+  )
+  assert.doesNotMatch(
+    mirrorScript,
+    /COPY_ATTEMPTS|for .*attempt|while .*attempt/,
+    'local mirror must not retry a copy from zero'
+  )
+  assert.match(
+    mirrorScript,
+    /tcr_digest="\$\("\$crane" digest "\$tcr_ref"/,
+    'local mirror must query the actual TCR digest after the copy'
+  )
+  assert.match(
+    mirrorScript,
+    /\[\[ ! "\$tcr_digest" =~ \^sha256:\[0-9a-f\]\{64\}\$ \]\]/,
+    'local mirror must format-validate the TCR digest'
+  )
+  assert.match(
+    mirrorScript,
+    /\[\[ "\$tcr_digest" != "\$ghcr_digest" \]\]/,
+    'local mirror must fail when the TCR digest differs from the GHCR digest'
+  )
+  assert.doesNotMatch(
+    mirrorScript,
+    /--password|--username|docker login|DOCKER_CONFIG|config\.json|\.env\b/,
+    'local mirror must only use the existing Docker credential store'
+  )
+  assert.doesNotMatch(
+    mirrorScript,
+    /cat "\$copy_log"|cat "\$work_dir\/copy\.log"/,
+    'local mirror must never print the captured crane output'
+  )
+  assert.doesNotMatch(
+    mirrorScript,
+    /release-record|gh api|ssh /,
+    'local mirror must not create release records or touch GitHub or the server'
+  )
+  assert.equal(fs.statSync(rootPath('scripts/mirror-release-to-tcr.sh')).mode & 0o111, 0o111)
+
+  const mirrorSuccess = runMirrorSuccessFixture()
+  try {
+    const diagnostics = JSON.stringify(
+      {
+        status: mirrorSuccess.result.status,
+        signal: mirrorSuccess.result.signal,
+        error: mirrorSuccess.result.error?.message ?? null,
+        stdout: mirrorSuccess.result.stdout,
+        stderr: mirrorSuccess.result.stderr
+      },
+      null,
+      2
+    )
+    assert.equal(mirrorSuccess.result.status, 0, diagnostics)
+    assert.equal(
+      fs.existsSync(mirrorSuccess.workDir),
+      false,
+      `successful mirror must remove its temporary directory\n${diagnostics}`
+    )
+    assert.match(mirrorSuccess.result.stdout, /TCR mirror completed successfully\./)
+    assert.doesNotMatch(mirrorSuccess.result.stderr, /unbound variable/)
+  } finally {
+    mirrorSuccess.cleanup()
+  }
+
+  const productionEvents = workflowBlock(productionWorkflow, 'on', 0)
+  assert.deepEqual(
+    directMappingKeys(productionEvents, 2),
+    ['workflow_dispatch'],
+    'production deploy must only be triggered manually'
+  )
+  const productionDispatch = workflowBlock(productionEvents, 'workflow_dispatch', 2)
+  const productionInputs = workflowBlock(productionDispatch, 'inputs', 4)
+  assert.deepEqual(
+    directMappingKeys(productionInputs, 6).sort(),
+    ['confirm', 'mirror_run_id'],
+    'deploy must only accept a mirror run id, never a manual commit/digest pair'
+  )
+  for (const inputName of ['confirm', 'mirror_run_id']) {
+    const input = workflowBlock(productionInputs, inputName, 6)
+    assert.equal(directScalar(input, 'required', 8), 'true')
+  }
+  const productionJobs = workflowBlock(productionWorkflow, 'jobs', 0)
+  assert.deepEqual(directMappingKeys(productionJobs, 2).sort(), ['deploy', 'validate'])
+
+  const productionValidateJob = workflowBlock(productionJobs, 'validate', 2)
+  assert.equal(
+    directMappingKeys(productionValidateJob, 4).includes('environment'),
+    false,
+    'release record validation must complete before entering the Production environment'
+  )
+  const productionValidatePerms = workflowBlock(productionValidateJob, 'permissions', 4)
+  assert.deepEqual(directMappingKeys(productionValidatePerms, 6).sort(), [
+    'actions',
+    'contents'
+  ])
+  assert.equal(directScalar(productionValidatePerms, 'contents', 6), 'read')
+  assert.equal(directScalar(productionValidatePerms, 'actions', 6), 'read')
+  assert.match(
+    productionValidateJob,
+    /commit_sha: \$\{\{ steps\.record\.outputs\.commit_sha \}\}/,
+    'validate must expose the verified commit sha as a job output'
+  )
+  assert.match(
+    productionValidateJob,
+    /tcr_digest: \$\{\{ steps\.record\.outputs\.tcr_digest \}\}/,
+    'validate must expose the verified TCR digest as a job output'
+  )
+  assert.doesNotMatch(
+    productionValidateJob,
+    /\$\{\{\s*secrets\.(TCR_|DEPLOY_)/,
+    'release record validation must not access registry or deploy credentials'
+  )
+
+  const deployValidateRun = multilineStepRun(
+    namedStep(productionValidateJob, 'Validate deploy inputs')
+  )
+  assert.match(
+    deployValidateRun,
+    /"\$WORKFLOW_REF" != 'refs\/heads\/main'/,
+    'deploy workflow must reject runs from non-main refs'
+  )
+  assert.match(
+    deployValidateRun,
+    /"\$DEPLOY_ENABLED" != 'true'/,
+    'manual deploy must refuse to run while DEPLOY_ENABLED is not true'
+  )
+  assert.match(deployValidateRun, /refusing to deploy/)
+  assert.match(deployValidateRun, /"\$CONFIRM" != 'DEPLOY'/)
+  assert.match(
+    deployValidateRun,
+    /\[\[ ! "\$MIRROR_RUN_ID" =~ \^\[0-9\]\+\$ \]\]/,
+    'mirror_run_id must be validated as numeric'
+  )
+
+  const provenanceRun = multilineStepRun(
+    namedStep(productionValidateJob, 'Verify mirror run provenance')
+  )
+  assert.match(
+    provenanceRun,
+    /gh api "repos\/\$\{GITHUB_REPOSITORY\}\/actions\/runs\/\$\{MIRROR_RUN_ID\}"/,
+    'the mirror run must be queried within this repository'
+  )
+  assert.match(
+    provenanceRun,
+    /"\$run_path" != '\.github\/workflows\/verify-tcr-release-manual\.yml'/,
+    'the run must come from verify-tcr-release-manual.yml'
+  )
+  assert.match(
+    provenanceRun,
+    /"\$run_event" != 'workflow_dispatch'/,
+    'the mirror run must be a manual dispatch'
+  )
+  assert.match(
+    provenanceRun,
+    /"\$run_head_branch" != 'main'/,
+    'the mirror run must have run on main'
+  )
+  assert.match(
+    provenanceRun,
+    /"\$run_conclusion" != 'success'/,
+    'only a successful mirror run may be deployed'
+  )
+  assert.match(
+    provenanceRun,
+    /run_attempt="\$\(jq -r '\.run_attempt' <<<"\$run_json"\)"/,
+    'the mirror run attempt must be read from the runs API'
+  )
+  assert.match(
+    provenanceRun,
+    /filtered_artifacts="\$\(jq '\[\.artifacts\[\] \| select\(\.expired == false\)\]' <<<"\$artifact_json"\)"/,
+    'expired artifacts must be filtered into a standalone array first'
+  )
+  assert.match(
+    provenanceRun,
+    /artifact_count="\$\(jq 'length' <<<"\$filtered_artifacts"\)"/,
+    'artifact_count must be read from the filtered array'
+  )
+  assert.match(
+    provenanceRun,
+    /artifact_name="\$\(jq -r '\.\[0\]\.name' <<<"\$filtered_artifacts"\)"/,
+    'artifact_name must be read from the filtered array'
+  )
+  assert.match(
+    provenanceRun,
+    /artifact_id="\$\(jq -r '\.\[0\]\.id' <<<"\$filtered_artifacts"\)"/,
+    'artifact_id must be read from the filtered array'
+  )
+  assert.doesNotMatch(
+    provenanceRun,
+    /\.artifacts\[0\]/,
+    'after filtering, the raw artifacts array must never be indexed'
+  )
+  assert.match(
+    provenanceRun,
+    /expected_name="kinvest-release-record-\$\{MIRROR_RUN_ID\}-\$\{run_attempt\}"/,
+    'the release record artifact name must bind to both run id and run attempt'
+  )
+  assert.match(
+    provenanceRun,
+    /"\$artifact_count" != '1'/,
+    'the mirror run must contain exactly one release record artifact'
+  )
+  assert.match(provenanceRun, /"\$artifact_name" != "\$expected_name"/)
+  assert.match(
+    provenanceRun,
+    /printf 'run_attempt=%s\\n' "\$run_attempt" >> "\$GITHUB_OUTPUT"/,
+    'the verified run attempt must be passed to the record step'
+  )
+
+  const recordValidateRun = multilineStepRun(
+    namedStep(productionValidateJob, 'Download and validate release record')
+  )
+  assert.match(
+    recordValidateRun,
+    /gh run download "\$MIRROR_RUN_ID"/,
+    'the release record must be downloaded from the verified mirror run'
+  )
+  assert.match(
+    recordValidateRun,
+    /--name "kinvest-release-record-\$\{MIRROR_RUN_ID\}-\$\{RUN_ATTEMPT\}"/,
+    'the download must use the exact run-id-and-attempt artifact name'
+  )
+  assert.match(
+    recordValidateRun,
+    /"\$schema_version" != '1'/,
+    'release record schema_version must be enforced'
+  )
+  assert.match(
+    recordValidateRun,
+    /"\$record_run_id" != "\$MIRROR_RUN_ID"/,
+    'release record must belong to the requested mirror run'
+  )
+  assert.match(
+    recordValidateRun,
+    /"\$record_run_attempt" != "\$RUN_ATTEMPT"/,
+    'release record attempt must equal the mirror run attempt from the API'
+  )
+  assert.match(
+    recordValidateRun,
+    /"\$tcr_repository" != 'ccr\.ccs\.tencentyun\.com\/website-dev\/kinvest'/,
+    'release record repository must be pinned to the exact TCR repository'
+  )
+  assert.match(recordValidateRun, /\[\[ ! "\$commit_sha" =~ \^\[0-9a-f\]\{40\}\$ \]\]/)
+  assert.match(recordValidateRun, /\[\[ ! "\$ghcr_digest" =~ \^sha256:\[0-9a-f\]\{64\}\$ \]\]/)
+  assert.match(recordValidateRun, /\[\[ ! "\$tcr_digest" =~ \^sha256:\[0-9a-f\]\{64\}\$ \]\]/)
+  assert.match(
+    recordValidateRun,
+    /"\$tcr_digest" != "\$ghcr_digest"/,
+    'release record must keep the constraint that tcr_digest equals the verified ghcr_digest'
+  )
+  assert.match(
+    recordValidateRun,
+    /git merge-base --is-ancestor "\$commit_sha" origin\/main/,
+    'release record commit must belong to main history'
+  )
+  assert.match(recordValidateRun, /printf 'commit_sha=%s\\n' "\$commit_sha"/)
+  assert.match(recordValidateRun, /printf 'tcr_digest=%s\\n' "\$tcr_digest"/)
+
+  const productionDeployJob = workflowBlock(productionJobs, 'deploy', 2)
+  assert.equal(
+    directScalar(productionDeployJob, 'needs', 4),
+    'validate',
+    'the Production environment must only be entered after validation succeeds'
+  )
+  assert.equal(directScalar(productionDeployJob, 'environment', 4), 'Production')
+  assert.equal(directScalar(productionDeployJob, 'timeout-minutes', 4), '40')
+  assert.match(productionDeployJob, /\$\{\{\s*secrets\.DEPLOY_SSH_KEY\s*\}\}/)
+  assert.match(productionDeployJob, /\$\{\{\s*secrets\.DEPLOY_KNOWN_HOSTS\s*\}\}/)
+  assert.match(
+    productionDeployJob,
+    /IMAGE_DIGEST: \$\{\{ needs\.validate\.outputs\.tcr_digest \}\}/,
+    'deploy must consume only the validated TCR digest output'
+  )
+  assert.match(
+    productionDeployJob,
+    /DEPLOY_SHA: \$\{\{ needs\.validate\.outputs\.commit_sha \}\}/,
+    'deploy must consume only the validated commit sha output'
+  )
+  assert.doesNotMatch(
+    productionWorkflow,
+    /inputs\.(commit_sha|tcr_digest)/,
+    'deploy must not consume manually entered commit or digest values'
+  )
+  assert.match(productionDeployJob, /IMAGE_REPOSITORY='ccr\.ccs\.tencentyun\.com\/website-dev\/kinvest'/)
+  assert.match(
+    productionDeployJob,
+    /\^ccr\\\.ccs\\\.tencentyun\\\.com\/website-dev\/kinvest@sha256:\[0-9a-f\]\{64\}\$/,
+    'deploy must validate the exact TCR digest reference before SSH'
+  )
+  assert.doesNotMatch(productionWorkflow, /ghcr\.io\/zwphhxx\/kinvest@/)
+  assert.doesNotMatch(productionWorkflow, /:latest\b/)
+  assert.doesNotMatch(
+    productionWorkflow,
+    /\$\{\{\s*secrets\.TCR_(USERNAME|PASSWORD)\s*\}\}/,
+    'production deploy must not reference TCR credentials'
+  )
+  assert.doesNotMatch(
+    verifyWorkflow,
+    /\$\{\{\s*secrets\.DEPLOY_/,
+    'TCR release verification must not reference deploy credentials'
+  )
+  for (const workflowSource of [workflow, verifyWorkflow, productionWorkflow]) {
+    assert.doesNotMatch(
+      workflowSource,
+      /docker login /,
+      'registry authentication must use the pinned login action, never inline credentials'
+    )
+    assert.doesNotMatch(
+      workflowSource,
+      /config\.json|DOCKER_CONFIG/,
+      'workflows must never read or print docker client configuration'
+    )
+    const usesLines = workflowSource.match(/^\s+uses:\s+\S+\s*$/gm) || []
+    assert.ok(usesLines.length > 0)
+    for (const usesLine of usesLines) {
+      const action = usesLine.trim().match(/^uses:\s+([^@\s]+)@([^\s]+)$/)
+      assert.ok(action, `Action reference must include a commit SHA: ${usesLine.trim()}`)
+      assert.match(action[2], /^[0-9a-f]{40}$/, `${action[1]} must use a full commit SHA`)
+    }
   }
 
   for (const relativePath of [
@@ -973,35 +1701,76 @@ function run() {
     assert.equal(fs.statSync(rootPath(relativePath)).mode & 0o111, 0o111)
   }
 
-  assert.match(workflow, /^ {2}group: kinvest-production$/m)
-  assert.match(workflow, /^ {2}cancel-in-progress: false$/m)
-  assert.equal((workflow.match(/timeout-minutes:/g) || []).length, 5)
-  const deployTimeoutMatch = workflow.match(
-    /^ {2}deploy:\n[\s\S]*?^ {4}timeout-minutes: ([0-9]+)$/m
+  assert.match(
+    workflow,
+    /^ {2}group: kinvest-ci-\$\{\{ github\.event\.pull_request\.number \|\| github\.run_id \}\}$/m,
+    'each pull request and non-PR run must use an independent CI concurrency group'
   )
-  assert.ok(deployTimeoutMatch, 'deploy job must define a bounded timeout')
-  const deployTimeoutMinutes = Number.parseInt(deployTimeoutMatch[1], 10)
-  assert.equal(deployTimeoutMinutes, 40)
+  assert.match(
+    workflow,
+    /^ {2}cancel-in-progress: \$\{\{ github\.event_name == 'pull_request' \}\}$/m,
+    'only superseded pull request runs may be cancelled'
+  )
+  assert.match(
+    verifyWorkflow,
+    /^ {2}group: kinvest-tcr-verify\n {2}cancel-in-progress: false\n {2}queue: max$/m,
+    'manual TCR verification runs must serialize without replacing queued runs'
+  )
+  assert.match(
+    productionWorkflow,
+    /^ {2}group: kinvest-production$/m,
+    'manual production deploy must keep the production concurrency group'
+  )
+  assert.match(productionWorkflow, /^ {2}cancel-in-progress: false$/m)
+  assert.match(
+    productionWorkflow,
+    /^ {2}group: kinvest-production\n {2}cancel-in-progress: false\n {2}queue: max$/m,
+    'manual production deploy runs must serialize without replacing queued releases'
+  )
+  assert.equal((workflow.match(/timeout-minutes:/g) || []).length, 4)
+  const publishTimeoutMatch = workflow.match(
+    /^ {2}publish:\n[\s\S]*?^ {4}timeout-minutes: ([0-9]+)$/m
+  )
+  assert.ok(publishTimeoutMatch, 'publish job must define a bounded timeout')
+  const publishTimeoutMinutes = Number.parseInt(publishTimeoutMatch[1], 10)
+  assert.equal(publishTimeoutMinutes, 30)
   assert.match(workflow, /docker\/build-push-action@[0-9a-f]{40}/)
   assert.match(workflow, /docker\/login-action@[0-9a-f]{40}/)
   assert.match(workflow, /docker\/setup-buildx-action@[0-9a-f]{40}/)
-  assert.match(workflow, /IMAGE_DIGEST: \$\{\{ steps\.build\.outputs\.digest \}\}/)
-  assert.match(workflow, /IMAGE_DIGEST: \$\{\{ needs\.publish\.outputs\.image_digest \}\}/)
+  assert.match(workflow, /BUILD_DIGEST: \$\{\{ steps\.build\.outputs\.digest \}\}/)
   assert.match(workflow, /ghcr\.io\/zwphhxx\/kinvest/)
   assert.doesNotMatch(workflow, /github\.repository_owner/)
   assert.doesNotMatch(workflow, /:latest\b/)
-  assert.match(workflow, /ConnectTimeout=10/)
-  assert.match(workflow, /ServerAliveInterval=15/)
-  assert.match(workflow, /ServerAliveCountMax=2/)
-  assert.match(workflow, /StrictHostKeyChecking=yes/)
-  assert.match(workflow, /"deploy \$IMAGE_DIGEST_REF \$DEPLOY_SHA"/)
-  assert.doesNotMatch(workflow, /sudo \/usr\/local\/sbin\/deploy-kinvest/)
+  assert.match(productionWorkflow, /ConnectTimeout=10/)
+  assert.match(productionWorkflow, /ServerAliveInterval=15/)
+  assert.match(productionWorkflow, /ServerAliveCountMax=2/)
+  assert.match(productionWorkflow, /StrictHostKeyChecking=yes/)
+  assert.match(productionWorkflow, /"deploy \$IMAGE_DIGEST_REF \$DEPLOY_SHA"/)
+  assert.match(
+    productionWorkflow,
+    /rm -f "\$HOME\/\.ssh\/id_ed25519" "\$HOME\/\.ssh\/known_hosts"/,
+    'ephemeral SSH material must always be removed'
+  )
+  assert.doesNotMatch(productionWorkflow, /sudo \/usr\/local\/sbin\/deploy-kinvest/)
 
-  assert.match(deploy, /^ALLOWED_REPOSITORY='ghcr\.io\/zwphhxx\/kinvest'$/m)
-  assert.match(deploy, /\^ghcr\\\.io\/zwphhxx\/kinvest@sha256:\[0-9a-f\]\{64\}\$/)
+  assert.match(deploy, /^ALLOWED_REPOSITORY='ccr\.ccs\.tencentyun\.com\/website-dev\/kinvest'$/m)
+  assert.match(
+    deploy,
+    /^ALLOWED_DEPLOYMENT_DIGEST_PATTERN='\^ccr\\\.ccs\\\.tencentyun\\\.com\/website-dev\/kinvest@sha256:\[0-9a-f\]\{64\}\$'$/m,
+    'new deployments must only accept the exact TCR repository'
+  )
+  assert.match(
+    deploy,
+    /^ALLOWED_STATE_DIGEST_PATTERN='\^\(ccr\\\.ccs\\\.tencentyun\\\.com\/website-dev\/kinvest\|ghcr\\\.io\/zwphhxx\/kinvest\)@sha256:\[0-9a-f\]\{64\}\$'$/m,
+    'historical state must accept both GHCR and TCR repositories for migration'
+  )
+  assert.match(deploy, /digest_ref" =~ \$ALLOWED_DEPLOYMENT_DIGEST_PATTERN/)
+  assert.match(deploy, /\[\[ "\$1" =~ \$ALLOWED_STATE_DIGEST_PATTERN \]\]/)
   assert.match(deploy, /^CURRENT_STATE="\$STATE\/current\.state"$/m)
   assert.match(deploy, /^PREVIOUS_STATE="\$STATE\/previous\.state"$/m)
-  assert.match(deploy, /^PULL_TIMEOUT='900s'$/m)
+  assert.match(deploy, /^PULL_ATTEMPTS='3'$/m)
+  assert.match(deploy, /^PULL_TIMEOUT='300s'$/m)
+  assert.match(deploy, /^PULL_RETRY_BASE_WAIT_SECONDS='2'$/m)
   assert.match(deploy, /^DOCKER_TIMEOUT='120s'$/m)
   assert.match(deploy, /^COMPOSE_TIMEOUT='120s'$/m)
   assert.match(deploy, /^INSPECT_TIMEOUT='15s'$/m)
@@ -1011,16 +1780,38 @@ function run() {
   assert.match(deploy, /--kill-after=/)
   const runPullBody = deploy.match(/^run_pull\(\) \{([\s\S]*?)^\}$/m)
   const runDockerBody = deploy.match(/^run_docker\(\) \{([\s\S]*?)^\}$/m)
+  const pullWithRetriesBody = deploy.match(/^pull_with_retries\(\) \{([\s\S]*?)^\}$/m)
+  const pullTransientBody = deploy.match(/^pull_failure_is_transient\(\) \{([\s\S]*?)^\}$/m)
   assert.ok(runPullBody, 'deployment must define a dedicated pull wrapper')
   assert.ok(runDockerBody, 'deployment must retain a bounded general Docker wrapper')
+  assert.ok(pullWithRetriesBody, 'deployment must define a bounded pull retry wrapper')
+  assert.ok(pullTransientBody, 'deployment must classify transient pull failures explicitly')
   assert.match(runPullBody[1], /\$PULL_TIMEOUT/)
   assert.match(runPullBody[1], /docker pull "\$1"/)
   assert.match(runDockerBody[1], /\$DOCKER_TIMEOUT/)
   assert.doesNotMatch(runDockerBody[1], /pull/)
+  assert.match(pullWithRetriesBody[1], /run_pull "\$ref"/)
+  assert.match(pullWithRetriesBody[1], /while \(\(attempt <= PULL_ATTEMPTS\)\)/)
+  assert.match(pullWithRetriesBody[1], /pull_failure_is_transient "\$status" "\$stderr_file"/)
+  assert.match(pullWithRetriesBody[1], /sleep "\$wait_seconds"/)
+  assert.match(pullWithRetriesBody[1], /wait_seconds=\$\(\(wait_seconds \* 2\)\)/)
+  assert.match(
+    pullWithRetriesBody[1],
+    /pull attempt %s of %s failed with exit code %s/,
+    'retry log lines must contain only attempt number and exit code'
+  )
+  assert.doesNotMatch(
+    pullWithRetriesBody[1],
+    /\bcat\b|\btee\b/,
+    'captured pull stderr must never be written to the deployment log'
+  )
+  assert.match(pullTransientBody[1], /status == 124/)
+  assert.match(pullTransientBody[1], /grep -Eqi/)
   assert.match(deploy, /run_docker network inspect web/)
   assert.match(deploy, /run_docker rm -f kinvest/)
   assert.doesNotMatch(deploy, /run_docker pull/)
-  assert.match(deploy, /run_pull "\$digest_ref"/)
+  assert.match(deploy, /pull_with_retries "\$digest_ref"/)
+  assert.doesNotMatch(deploy, /run_pull "\$digest_ref"/)
   assert.doesNotMatch(deploy, /run_pull "\$previous_digest_ref"/)
   assert.match(deploy, /verify_running_image/)
   assert.match(deploy, /\.Config\.Image/)
@@ -1049,6 +1840,8 @@ function run() {
     (functionBody(name).match(/\brun_inspect\b/g) || []).length
 
   const pullSeconds = timeoutSeconds('PULL_TIMEOUT')
+  const pullAttempts = plainSeconds('PULL_ATTEMPTS')
+  const pullRetryBaseWaitSeconds = plainSeconds('PULL_RETRY_BASE_WAIT_SECONDS')
   const dockerSeconds = timeoutSeconds('DOCKER_TIMEOUT')
   const composeSeconds = timeoutSeconds('COMPOSE_TIMEOUT')
   const inspectSeconds = timeoutSeconds('INSPECT_TIMEOUT')
@@ -1081,7 +1874,10 @@ function run() {
 
   const networkPrecheckSeconds = dockerSeconds + dockerKillSeconds
   const previousSnapshotSeconds = snapshotInspectCalls * inspectCallSeconds
-  const candidatePullSeconds = pullSeconds + dockerKillSeconds
+  const pullRetryWaitsSeconds =
+    pullRetryBaseWaitSeconds * (2 ** (pullAttempts - 1) - 1)
+  const candidatePullSeconds =
+    pullAttempts * (pullSeconds + dockerKillSeconds) + pullRetryWaitsSeconds
   const candidateComposeSeconds = composeSeconds + dockerKillSeconds
   const candidateIdentitySeconds = candidateIdentityInspectCalls * inspectCallSeconds
   const rollbackPrecheckSeconds = previousServingInspectCalls * inspectCallSeconds
@@ -1106,13 +1902,24 @@ function run() {
     rollbackFailureRecheckSeconds +
     rollbackCleanupSeconds +
     fixedOverheadSeconds
+  const productionDeployTimeoutMatch = productionWorkflow.match(
+    /^ {2}deploy:\n[\s\S]*?^ {4}timeout-minutes: ([0-9]+)$/m
+  )
+  assert.ok(productionDeployTimeoutMatch, 'manual deploy job must define a bounded timeout')
+  const deployTimeoutMinutes = Number.parseInt(productionDeployTimeoutMatch[1], 10)
+  assert.equal(deployTimeoutMinutes, 40)
   const deployJobSeconds = deployTimeoutMinutes * 60
   assert.ok(
     cumulativeDeploySeconds <= deployJobSeconds - 180,
     `worst-case ${cumulativeDeploySeconds}s deployment must leave at least 180s in the job`
   )
 
-  assert.match(wrapper, /^ALLOWED_REPOSITORY='ghcr\.io\/zwphhxx\/kinvest'$/m)
+  assert.match(wrapper, /^ALLOWED_REPOSITORY='ccr\.ccs\.tencentyun\.com\/website-dev\/kinvest'$/m)
+  assert.match(
+    wrapper,
+    /\^ccr\\\.ccs\\\.tencentyun\\\.com\/website-dev\/kinvest@sha256:\[0-9a-f\]\{64\}\$/,
+    'SSH entrypoint must only accept the exact TCR digest'
+  )
   assert.match(wrapper, /SSH_ORIGINAL_COMMAND/)
   assert.match(wrapper, /expected_command="deploy \$digest_ref \$commit_sha"/)
   assert.match(wrapper, /sudo -n \/usr\/local\/sbin\/deploy-kinvest/)
@@ -1304,15 +2111,25 @@ function run() {
 
   assertRejectedInput(
     `ghcr.io/other/kinvest@${candidateDigest}\n${candidateCommit}\n`,
-    /immutable Kinvest digest reference/
+    /immutable Kinvest TCR digest reference/
   )
   assertRejectedInput(
-    `${allowedRepository}:release\n${candidateCommit}\n`,
-    /immutable Kinvest digest reference/
+    `${ghcrRepository}@${candidateDigest}\n${candidateCommit}\n`,
+    /immutable Kinvest TCR digest reference/,
+    'legacy GHCR references must not be accepted as new deployments'
   )
   assertRejectedInput(
-    `${allowedRepository}@sha256:abcd\n${candidateCommit}\n`,
-    /immutable Kinvest digest reference/
+    `${tcrRepository}:release\n${candidateCommit}\n`,
+    /immutable Kinvest TCR digest reference/
+  )
+  assertRejectedInput(
+    `${tcrRepository}:latest\n${candidateCommit}\n`,
+    /immutable Kinvest TCR digest reference/,
+    'mutable tags must never be deployed'
+  )
+  assertRejectedInput(
+    `${tcrRepository}@sha256:abcd\n${candidateCommit}\n`,
+    /immutable Kinvest TCR digest reference/
   )
   assertRejectedInput(`${candidateRef}\n${candidateCommit}\nextra\n`, /exactly two input lines/)
 
@@ -1485,28 +2302,153 @@ function run() {
     assert.equal(success.result.status, 0, success.result.stderr)
     assert.equal(
       fs.readFileSync(path.join(success.stateDir, 'current.state'), 'utf8'),
-      `digest_ref=${candidateRef}\ncommit=${candidateCommit}\n`
+      `digest_ref=${candidateRef}\ncommit=${candidateCommit}\n`,
+      'successful TCR deployment must write the TCR digest to current.state'
     )
     assert.equal(
       fs.readFileSync(path.join(success.stateDir, 'previous.state'), 'utf8'),
-      `digest_ref=${previousRef}\ncommit=${previousCommit}\n`
+      `digest_ref=${previousRef}\ncommit=${previousCommit}\n`,
+      'legacy GHCR previous state must remain readable for verified rollback'
+    )
+    assert.deepEqual(
+      readPullAttempts(success),
+      [candidateRef],
+      'first-attempt pull success must not trigger a retry'
     )
     const timeoutLog = fs.readFileSync(path.join(success.fakeState, 'timeout.log'), 'utf8')
-    assert.match(timeoutLog, /--signal=TERM --kill-after=10s 900s docker pull/)
+    assert.match(timeoutLog, /--signal=TERM --kill-after=10s 300s docker pull/)
     assert.match(timeoutLog, /--signal=TERM --kill-after=10s 120s docker network inspect/)
     assert.match(timeoutLog, /--signal=TERM --kill-after=10s 120s env .*docker compose/)
     assert.match(timeoutLog, /--signal=TERM --kill-after=5s 15s docker image inspect/)
     assert.match(timeoutLog, /--signal=TERM --kill-after=5s 15s docker inspect/)
-    assert.doesNotMatch(timeoutLog, /900s docker (?!pull)/)
+    assert.doesNotMatch(timeoutLog, /300s docker (?!pull)/)
     assert.match(timeoutLog, /--kill-after=/)
   } finally {
     success.cleanup()
+  }
+
+  const transientRetrySuccess = runDeployFixture(['candidate-pull-transient-remaining:1'])
+  try {
+    const diagnostics = deployFixtureDiagnostics(transientRetrySuccess)
+    assert.equal(transientRetrySuccess.result.status, 0, diagnostics)
+    assert.deepEqual(
+      readPullAttempts(transientRetrySuccess),
+      [candidateRef, candidateRef],
+      'one transient pull failure must be retried exactly once before success'
+    )
+    assert.equal(
+      fs.readFileSync(path.join(transientRetrySuccess.stateDir, 'current.state'), 'utf8'),
+      `digest_ref=${candidateRef}\ncommit=${candidateCommit}\n`
+    )
+    assert.match(
+      transientRetrySuccess.result.stderr,
+      /pull attempt 1 of 3 failed with exit code 1\./
+    )
+    assert.match(
+      transientRetrySuccess.result.stderr,
+      /pull attempt 2 of 3 succeeded\./
+    )
+    assert.doesNotMatch(
+      transientRetrySuccess.result.stderr,
+      /dial tcp|i\/o timeout/,
+      'raw pull stderr must not leak into the deployment log'
+    )
+  } finally {
+    transientRetrySuccess.cleanup()
+  }
+
+  const timeoutRetrySuccess = runDeployFixture(['candidate-pull-timeout-once'])
+  try {
+    const diagnostics = deployFixtureDiagnostics(timeoutRetrySuccess)
+    assert.equal(timeoutRetrySuccess.result.status, 0, diagnostics)
+    assert.deepEqual(readPullAttempts(timeoutRetrySuccess), [candidateRef, candidateRef])
+    assert.match(
+      timeoutRetrySuccess.result.stderr,
+      /pull attempt 1 of 3 failed with exit code 124\./
+    )
+    assert.match(timeoutRetrySuccess.result.stderr, /pull attempt 2 of 3 succeeded\./)
+  } finally {
+    timeoutRetrySuccess.cleanup()
+  }
+
+  const allPullAttemptsFail = runDeployFixture(['candidate-pull-transient-remaining:3'])
+  try {
+    const diagnostics = deployFixtureDiagnostics(allPullAttemptsFail)
+    assert.notEqual(allPullAttemptsFail.result.status, 0, diagnostics)
+    assert.deepEqual(
+      readPullAttempts(allPullAttemptsFail),
+      [candidateRef, candidateRef, candidateRef],
+      'pull retries must stop after the bounded attempt budget'
+    )
+    const pullTimeoutCalls = fs
+      .readFileSync(path.join(allPullAttemptsFail.fakeState, 'timeout.log'), 'utf8')
+      .split('\n')
+      .filter((line) => /300s docker pull/.test(line))
+    assert.equal(pullTimeoutCalls.length, 3, 'each pull attempt must keep the 300s bound')
+    assert.equal(
+      fs.readFileSync(path.join(allPullAttemptsFail.fakeState, 'running.ref'), 'utf8').trim(),
+      previousRef
+    )
+    assert.equal(
+      fs.readFileSync(path.join(allPullAttemptsFail.stateDir, 'current.state'), 'utf8'),
+      `digest_ref=${previousRef}\ncommit=${previousCommit}\n`,
+      'failed deployment must not replace current.state'
+    )
+    assert.equal(fs.existsSync(path.join(allPullAttemptsFail.fakeState, 'removed')), false)
+    assert.match(allPullAttemptsFail.result.stderr, /pull failed after 3 attempts\./)
+    assert.match(allPullAttemptsFail.result.stderr, /部署失败但previous继续服务/)
+    assert.doesNotMatch(allPullAttemptsFail.result.stderr, /dial tcp|i\/o timeout/)
+  } finally {
+    allPullAttemptsFail.cleanup()
+  }
+
+  const permanentPullFailure = runDeployFixture(['candidate-pull-permanent-error'])
+  try {
+    const diagnostics = deployFixtureDiagnostics(permanentPullFailure)
+    assert.notEqual(permanentPullFailure.result.status, 0, diagnostics)
+    assert.deepEqual(
+      readPullAttempts(permanentPullFailure),
+      [candidateRef],
+      'permanent pull failures must not be retried'
+    )
+    assert.equal(
+      fs.readFileSync(path.join(permanentPullFailure.fakeState, 'running.ref'), 'utf8').trim(),
+      previousRef
+    )
+    assert.match(permanentPullFailure.result.stderr, /non-retryable error \(exit code 1\)/)
+    assert.match(permanentPullFailure.result.stderr, /部署失败但previous继续服务/)
+    assert.doesNotMatch(
+      permanentPullFailure.result.stderr,
+      /manifest unknown/,
+      'raw registry errors must not leak into the deployment log'
+    )
+  } finally {
+    permanentPullFailure.cleanup()
+  }
+
+  const unclassifiedPullFailure = runDeployFixture(['fail-candidate-pull'])
+  try {
+    assert.deepEqual(
+      readPullAttempts(unclassifiedPullFailure),
+      [candidateRef],
+      'unclassified pull failures must not be retried'
+    )
+  } finally {
+    unclassifiedPullFailure.cleanup()
   }
 
   for (const source of [workflow, deploy, bootstrap, wrapper]) {
     assert.doesNotMatch(
       source,
       /(?:refresh_token|api[_-]?key|BEGIN [A-Z ]*PRIVATE KEY|106\.54\.229\.241)/i
+    )
+  }
+
+  for (const source of [deploy, bootstrap, wrapper]) {
+    assert.doesNotMatch(
+      source,
+      /TCR_(USERNAME|PASSWORD)/,
+      'server-side scripts must never reference CI registry credentials'
     )
   }
 }

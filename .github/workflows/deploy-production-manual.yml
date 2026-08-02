@@ -1,0 +1,269 @@
+# 手工 Production 部署:只消费 verify-tcr-release-manual.yml 成功运行产出的
+# release-record.json(commit_sha + tcr_digest),不再接受人工输入的
+# commit/digest 组合。validate(无 Environment)完成全部校验后,deploy
+# (Production Environment + 人工审批)才通过受限 SSH 部署精确 TCR digest。
+# 服务器侧脚本保持:TCR 精确 digest 输入、历史 GHCR state 兼容、
+# verified rollback、健康检查与镜像身份校验。
+name: Deploy production (manual)
+
+on:
+  workflow_dispatch:
+    inputs:
+      mirror_run_id:
+        description: '成功的 Verify TCR release (manual) workflow run ID'
+        required: true
+        type: string
+      confirm:
+        description: '确认部署到生产时必须输入 DEPLOY'
+        required: true
+        type: string
+
+permissions:
+  contents: read
+
+concurrency:
+  group: kinvest-production
+  cancel-in-progress: false
+  queue: max
+
+jobs:
+  validate:
+    name: validate
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    permissions:
+      contents: read
+      actions: read
+    outputs:
+      commit_sha: ${{ steps.record.outputs.commit_sha }}
+      tcr_digest: ${{ steps.record.outputs.tcr_digest }}
+    steps:
+      - name: Check out main history
+        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683
+        with:
+          fetch-depth: 0
+      - name: Validate deploy inputs
+        shell: bash
+        env:
+          MIRROR_RUN_ID: ${{ inputs.mirror_run_id }}
+          CONFIRM: ${{ inputs.confirm }}
+          WORKFLOW_REF: ${{ github.ref }}
+          DEPLOY_ENABLED: ${{ vars.DEPLOY_ENABLED }}
+        run: |
+          set -euo pipefail
+          if [[ "$WORKFLOW_REF" != 'refs/heads/main' ]]; then
+            printf '%s\n' 'Deploy workflow must run from the main branch.' >&2
+            exit 1
+          fi
+          if [[ "$DEPLOY_ENABLED" != 'true' ]]; then
+            printf '%s\n' 'DEPLOY_ENABLED is not true; refusing to deploy.' >&2
+            exit 1
+          fi
+          if [[ "$CONFIRM" != 'DEPLOY' ]]; then
+            printf '%s\n' 'Confirmation input must be exactly DEPLOY.' >&2
+            exit 1
+          fi
+          if [[ ! "$MIRROR_RUN_ID" =~ ^[0-9]+$ ]]; then
+            printf '%s\n' 'mirror_run_id must be a numeric workflow run ID.' >&2
+            exit 1
+          fi
+      - name: Verify mirror run provenance
+        id: provenance
+        shell: bash
+        env:
+          MIRROR_RUN_ID: ${{ inputs.mirror_run_id }}
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -euo pipefail
+          run_json="$(gh api "repos/${GITHUB_REPOSITORY}/actions/runs/${MIRROR_RUN_ID}")"
+          run_path="$(jq -r '.path' <<<"$run_json")"
+          run_event="$(jq -r '.event' <<<"$run_json")"
+          run_head_branch="$(jq -r '.head_branch' <<<"$run_json")"
+          run_conclusion="$(jq -r '.conclusion' <<<"$run_json")"
+          run_attempt="$(jq -r '.run_attempt' <<<"$run_json")"
+          if [[ "$run_path" != '.github/workflows/verify-tcr-release-manual.yml' ]]; then
+            printf '%s\n' 'mirror_run_id does not belong to verify-tcr-release-manual.yml.' >&2
+            exit 1
+          fi
+          if [[ "$run_event" != 'workflow_dispatch' ]]; then
+            printf '%s\n' 'mirror run must be a manual workflow_dispatch run.' >&2
+            exit 1
+          fi
+          if [[ "$run_head_branch" != 'main' ]]; then
+            printf '%s\n' 'mirror run must have run on the main branch.' >&2
+            exit 1
+          fi
+          if [[ "$run_conclusion" != 'success' ]]; then
+            printf '%s\n' 'mirror run must have succeeded.' >&2
+            exit 1
+          fi
+          if [[ ! "$run_attempt" =~ ^[0-9]+$ ]]; then
+            printf '%s\n' 'mirror run reported an invalid run_attempt.' >&2
+            exit 1
+          fi
+          artifact_json="$(gh api "repos/${GITHUB_REPOSITORY}/actions/runs/${MIRROR_RUN_ID}/artifacts")"
+          filtered_artifacts="$(jq '[.artifacts[] | select(.expired == false)]' <<<"$artifact_json")"
+          expected_name="kinvest-release-record-${MIRROR_RUN_ID}-${run_attempt}"
+          artifact_count="$(jq 'length' <<<"$filtered_artifacts")"
+          artifact_name="$(jq -r '.[0].name' <<<"$filtered_artifacts")"
+          artifact_id="$(jq -r '.[0].id' <<<"$filtered_artifacts")"
+          if [[ "$artifact_count" != '1' ]]; then
+            printf '%s\n' 'mirror run must contain exactly one release record artifact.' >&2
+            exit 1
+          fi
+          if [[ "$artifact_name" != "$expected_name" ]]; then
+            printf '%s\n' 'release record artifact name does not match the mirror run and attempt.' >&2
+            exit 1
+          fi
+          if [[ ! "$artifact_id" =~ ^[0-9]+$ ]]; then
+            printf '%s\n' 'release record artifact reported an invalid id.' >&2
+            exit 1
+          fi
+          printf 'run_attempt=%s\n' "$run_attempt" >> "$GITHUB_OUTPUT"
+          printf '%s\n' 'Mirror run provenance verified.'
+      - name: Download and validate release record
+        id: record
+        shell: bash
+        env:
+          MIRROR_RUN_ID: ${{ inputs.mirror_run_id }}
+          RUN_ATTEMPT: ${{ steps.provenance.outputs.run_attempt }}
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -euo pipefail
+          record_dir="$(mktemp -d)"
+          gh run download "$MIRROR_RUN_ID" \
+            --name "kinvest-release-record-${MIRROR_RUN_ID}-${RUN_ATTEMPT}" \
+            --dir "$record_dir"
+          record_file="$record_dir/release-record.json"
+          test -f "$record_file"
+          record_keys="$(jq -r 'keys | join(" ")' "$record_file")"
+          expected_keys='commit_sha ghcr_digest mirror_run_attempt mirror_run_id schema_version tcr_digest tcr_repository'
+          if [[ "$record_keys" != "$expected_keys" ]]; then
+            printf '%s\n' 'release-record.json has an unexpected schema.' >&2
+            exit 1
+          fi
+          schema_version="$(jq -r '.schema_version' "$record_file")"
+          commit_sha="$(jq -r '.commit_sha' "$record_file")"
+          ghcr_digest="$(jq -r '.ghcr_digest' "$record_file")"
+          tcr_digest="$(jq -r '.tcr_digest' "$record_file")"
+          tcr_repository="$(jq -r '.tcr_repository' "$record_file")"
+          record_run_id="$(jq -r '.mirror_run_id' "$record_file")"
+          record_run_attempt="$(jq -r '.mirror_run_attempt' "$record_file")"
+          if [[ "$schema_version" != '1' ]]; then
+            printf '%s\n' 'Unsupported release record schema_version.' >&2
+            exit 1
+          fi
+          if [[ "$record_run_id" != "$MIRROR_RUN_ID" ]]; then
+            printf '%s\n' 'release record does not belong to the requested mirror run.' >&2
+            exit 1
+          fi
+          if [[ ! "$record_run_attempt" =~ ^[0-9]+$ ]]; then
+            printf '%s\n' 'release record has an invalid mirror_run_attempt.' >&2
+            exit 1
+          fi
+          if [[ "$record_run_attempt" != "$RUN_ATTEMPT" ]]; then
+            printf '%s\n' 'release record attempt does not match the mirror run attempt.' >&2
+            exit 1
+          fi
+          if [[ "$tcr_repository" != 'ccr.ccs.tencentyun.com/website-dev/kinvest' ]]; then
+            printf '%s\n' 'release record has an unexpected TCR repository.' >&2
+            exit 1
+          fi
+          if [[ ! "$commit_sha" =~ ^[0-9a-f]{40}$ ]]; then
+            printf '%s\n' 'release record has an invalid commit_sha.' >&2
+            exit 1
+          fi
+          if [[ ! "$ghcr_digest" =~ ^sha256:[0-9a-f]{64}$ ]]; then
+            printf '%s\n' 'release record has an invalid ghcr_digest.' >&2
+            exit 1
+          fi
+          if [[ ! "$tcr_digest" =~ ^sha256:[0-9a-f]{64}$ ]]; then
+            printf '%s\n' 'release record has an invalid tcr_digest.' >&2
+            exit 1
+          fi
+          if [[ "$tcr_digest" != "$ghcr_digest" ]]; then
+            printf '%s\n' 'release record tcr_digest must equal the verified ghcr_digest.' >&2
+            exit 1
+          fi
+          if ! git merge-base --is-ancestor "$commit_sha" origin/main; then
+            printf '%s\n' 'release record commit_sha is not part of main history.' >&2
+            exit 1
+          fi
+          rm -rf "$record_dir"
+          printf 'commit_sha=%s\n' "$commit_sha" >> "$GITHUB_OUTPUT"
+          printf 'tcr_digest=%s\n' "$tcr_digest" >> "$GITHUB_OUTPUT"
+          printf 'Release record verified: commit %s, digest %s\n' "$commit_sha" "$tcr_digest"
+
+  deploy:
+    name: deploy
+    needs: validate
+    runs-on: ubuntu-latest
+    timeout-minutes: 40
+    environment: Production
+    permissions:
+      contents: read
+    steps:
+      - name: Configure strict SSH trust
+        shell: bash
+        env:
+          DEPLOY_HOST: ${{ vars.DEPLOY_HOST }}
+          DEPLOY_PORT: ${{ vars.DEPLOY_PORT }}
+          DEPLOY_KEY: ${{ secrets.DEPLOY_SSH_KEY }}
+          DEPLOY_KNOWN_HOSTS: ${{ secrets.DEPLOY_KNOWN_HOSTS }}
+        run: |
+          set -euo pipefail
+          if [[ ! "$DEPLOY_HOST" =~ ^[A-Za-z0-9.-]+$ ]]; then
+            printf '%s\n' 'Invalid deployment host.' >&2
+            exit 1
+          fi
+          if [[ ! "$DEPLOY_PORT" =~ ^[0-9]{1,5}$ ]] || ((DEPLOY_PORT < 1 || DEPLOY_PORT > 65535)); then
+            printf '%s\n' 'Invalid deployment port.' >&2
+            exit 1
+          fi
+          test -n "$DEPLOY_KEY"
+          test -n "$DEPLOY_KNOWN_HOSTS"
+          umask 077
+          install -d -m 700 "$HOME/.ssh"
+          printf '%s\n' "$DEPLOY_KEY" > "$HOME/.ssh/id_ed25519"
+          printf '%s\n' "$DEPLOY_KNOWN_HOSTS" > "$HOME/.ssh/known_hosts"
+          chmod 600 "$HOME/.ssh/id_ed25519" "$HOME/.ssh/known_hosts"
+          known_host="$DEPLOY_HOST"
+          if [[ "$DEPLOY_PORT" != '22' ]]; then
+            known_host="[$DEPLOY_HOST]:$DEPLOY_PORT"
+          fi
+          ssh-keygen -F "$known_host" -f "$HOME/.ssh/known_hosts" >/dev/null
+      - name: Deploy exact immutable digest
+        shell: bash
+        env:
+          DEPLOY_HOST: ${{ vars.DEPLOY_HOST }}
+          DEPLOY_PORT: ${{ vars.DEPLOY_PORT }}
+          DEPLOY_USER: ${{ vars.DEPLOY_USER }}
+          DEPLOY_SHA: ${{ needs.validate.outputs.commit_sha }}
+          IMAGE_DIGEST: ${{ needs.validate.outputs.tcr_digest }}
+        run: |
+          set -euo pipefail
+          IMAGE_REPOSITORY='ccr.ccs.tencentyun.com/website-dev/kinvest'
+          IMAGE_DIGEST_REF="${IMAGE_REPOSITORY}@${IMAGE_DIGEST}"
+          if [[ ! "$DEPLOY_HOST" =~ ^[A-Za-z0-9.-]+$ ]]; then exit 1; fi
+          if [[ ! "$DEPLOY_PORT" =~ ^[0-9]{1,5}$ ]] || ((DEPLOY_PORT < 1 || DEPLOY_PORT > 65535)); then exit 1; fi
+          if [[ ! "$DEPLOY_USER" =~ ^[a-z_][a-z0-9_-]*$ ]]; then exit 1; fi
+          if [[ ! "$DEPLOY_SHA" =~ ^[0-9a-f]{40}$ ]]; then exit 1; fi
+          if [[ ! "$IMAGE_DIGEST_REF" =~ ^ccr\.ccs\.tencentyun\.com/website-dev/kinvest@sha256:[0-9a-f]{64}$ ]]; then exit 1; fi
+          ssh \
+            -o BatchMode=yes \
+            -o IdentitiesOnly=yes \
+            -o StrictHostKeyChecking=yes \
+            -o UserKnownHostsFile="$HOME/.ssh/known_hosts" \
+            -o ConnectTimeout=10 \
+            -o ServerAliveInterval=15 \
+            -o ServerAliveCountMax=2 \
+            -o LogLevel=ERROR \
+            -i "$HOME/.ssh/id_ed25519" \
+            -p "$DEPLOY_PORT" \
+            "$DEPLOY_USER@$DEPLOY_HOST" \
+            "deploy $IMAGE_DIGEST_REF $DEPLOY_SHA"
+      - name: Remove ephemeral SSH material
+        if: ${{ always() }}
+        shell: bash
+        run: |
+          rm -f "$HOME/.ssh/id_ed25519" "$HOME/.ssh/known_hosts"

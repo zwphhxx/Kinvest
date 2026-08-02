@@ -1,0 +1,203 @@
+# 手工 TCR 验证:镜像复制已改为管理员 Mac 本地执行
+# (scripts/mirror-release-to-tcr.sh,境内链路,GitHub 不再传输任何镜像 blob)。
+# 本 workflow 只读验证 TCR 上的镜像 digest 与 GHCR digest 一致,
+# 并签发 release-record.json 供 deploy-production-manual.yml 消费。
+# validate(无 Environment)先完成全部输入与来源校验,通过后才进入
+# verify(RegistryPublish Environment)执行只读查询。
+name: Verify TCR release (manual)
+
+on:
+  workflow_dispatch:
+    inputs:
+      commit_sha:
+        description: 'main 分支上的完整 commit SHA(40 位小写 hex)'
+        required: true
+        type: string
+      ghcr_digest:
+        description: 'GHCR 镜像 digest(sha256:<64 位小写 hex>)'
+        required: true
+        type: string
+      confirm:
+        description: '确认执行 TCR 验证时必须输入 VERIFY'
+        required: true
+        type: string
+
+permissions:
+  contents: read
+
+concurrency:
+  group: kinvest-tcr-verify
+  cancel-in-progress: false
+  queue: max
+
+jobs:
+  validate:
+    name: validate
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    permissions:
+      contents: read
+    steps:
+      - name: Check out main history
+        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683
+        with:
+          fetch-depth: 0
+      - name: Validate verify inputs
+        shell: bash
+        env:
+          COMMIT_SHA: ${{ inputs.commit_sha }}
+          GHCR_DIGEST: ${{ inputs.ghcr_digest }}
+          CONFIRM: ${{ inputs.confirm }}
+          WORKFLOW_REF: ${{ github.ref }}
+        run: |
+          set -euo pipefail
+          if [[ "$WORKFLOW_REF" != 'refs/heads/main' ]]; then
+            printf '%s\n' 'Verify workflow must run from the main branch.' >&2
+            exit 1
+          fi
+          if [[ "$CONFIRM" != 'VERIFY' ]]; then
+            printf '%s\n' 'Confirmation input must be exactly VERIFY.' >&2
+            exit 1
+          fi
+          if [[ ! "$COMMIT_SHA" =~ ^[0-9a-f]{40}$ ]]; then
+            printf '%s\n' 'commit_sha must be 40 lowercase hex characters.' >&2
+            exit 1
+          fi
+          if [[ ! "$GHCR_DIGEST" =~ ^sha256:[0-9a-f]{64}$ ]]; then
+            printf '%s\n' 'ghcr_digest must be sha256:<64 lowercase hex>.' >&2
+            exit 1
+          fi
+          if ! git merge-base --is-ancestor "$COMMIT_SHA" origin/main; then
+            printf '%s\n' 'commit_sha is not part of main history.' >&2
+            exit 1
+          fi
+      - name: Install pinned crane
+        shell: bash
+        env:
+          CRANE_VERSION: 'v0.21.7'
+          CRANE_SHA256: '1a57bc98207fa1c0d04bf760699099e26f8383499bfd55b99c1b919a928a7230'
+        run: |
+          set -euo pipefail
+          curl -fsSL --max-time 60 \
+            -o /tmp/crane.tar.gz \
+            "https://github.com/google/go-containerregistry/releases/download/${CRANE_VERSION}/go-containerregistry_Linux_x86_64.tar.gz"
+          printf '%s  /tmp/crane.tar.gz\n' "$CRANE_SHA256" | sha256sum -c -
+          tar -xzf /tmp/crane.tar.gz -C /tmp crane
+          rm -f /tmp/crane.tar.gz
+          /tmp/crane version
+      - name: Bind GHCR digest to the commit tag
+        shell: bash
+        env:
+          COMMIT_SHA: ${{ inputs.commit_sha }}
+          GHCR_DIGEST: ${{ inputs.ghcr_digest }}
+        run: |
+          set -euo pipefail
+          TAG_DIGEST="$(/tmp/crane digest "ghcr.io/zwphhxx/kinvest:${COMMIT_SHA}")"
+          if [[ "$TAG_DIGEST" != "$GHCR_DIGEST" ]]; then
+            printf '%s\n' 'ghcr_digest does not match the GHCR tag for commit_sha.' >&2
+            exit 1
+          fi
+          printf '%s\n' 'GHCR tag and digest binding verified.'
+
+  verify:
+    name: verify
+    needs: validate
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    environment: RegistryPublish
+    permissions:
+      contents: read
+    outputs:
+      tcr_image_digest: ${{ steps.verify.outputs.tcr_image_digest }}
+    steps:
+      - name: Log in to Tencent Cloud Registry (read-only use)
+        uses: docker/login-action@74a5d142397b4f367a81961eba4e8cd7edddf772
+        with:
+          registry: ccr.ccs.tencentyun.com
+          username: ${{ secrets.TCR_USERNAME }}
+          password: ${{ secrets.TCR_PASSWORD }}
+      - name: Install pinned crane
+        shell: bash
+        env:
+          CRANE_VERSION: 'v0.21.7'
+          CRANE_SHA256: '1a57bc98207fa1c0d04bf760699099e26f8383499bfd55b99c1b919a928a7230'
+        run: |
+          set -euo pipefail
+          curl -fsSL --max-time 60 \
+            -o /tmp/crane.tar.gz \
+            "https://github.com/google/go-containerregistry/releases/download/${CRANE_VERSION}/go-containerregistry_Linux_x86_64.tar.gz"
+          printf '%s  /tmp/crane.tar.gz\n' "$CRANE_SHA256" | sha256sum -c -
+          tar -xzf /tmp/crane.tar.gz -C /tmp crane
+          rm -f /tmp/crane.tar.gz
+          /tmp/crane version
+      - name: Verify mirrored digest on TCR (read-only)
+        id: verify
+        shell: bash
+        env:
+          COMMIT_SHA: ${{ inputs.commit_sha }}
+          GHCR_DIGEST: ${{ inputs.ghcr_digest }}
+        run: |
+          set -euo pipefail
+          TCR_REF="ccr.ccs.tencentyun.com/website-dev/kinvest:${COMMIT_SHA}"
+          printf 'verify target: %s\n' "$TCR_REF"
+          verify_log="$(mktemp)"
+          cleanup() {
+            rm -f "$verify_log"
+          }
+          trap cleanup EXIT INT TERM
+          status=0
+          TCR_DIGEST="$(/tmp/crane digest "$TCR_REF" 2>"$verify_log")" || status=$?
+          if ((status != 0)); then
+            printf 'TCR digest query failed with exit code %s.\n' "$status" >&2
+            exit 1
+          fi
+          if [[ ! "$TCR_DIGEST" =~ ^sha256:[0-9a-f]{64}$ ]]; then
+            printf '%s\n' 'TCR did not report a valid image digest.' >&2
+            exit 1
+          fi
+          if [[ "$TCR_DIGEST" != "$GHCR_DIGEST" ]]; then
+            printf '%s\n' 'TCR digest does not match the GHCR digest.' >&2
+            exit 1
+          fi
+          printf 'tcr_image_digest=%s\n' "$TCR_DIGEST" >> "$GITHUB_OUTPUT"
+          printf 'TCR image verified: ccr.ccs.tencentyun.com/website-dev/kinvest@%s\n' "$TCR_DIGEST"
+      - name: Write release record
+        id: record
+        shell: bash
+        env:
+          COMMIT_SHA: ${{ inputs.commit_sha }}
+          GHCR_DIGEST: ${{ inputs.ghcr_digest }}
+          TCR_DIGEST: ${{ steps.verify.outputs.tcr_image_digest }}
+          MIRROR_RUN_ID: ${{ github.run_id }}
+          MIRROR_RUN_ATTEMPT: ${{ github.run_attempt }}
+        run: |
+          set -euo pipefail
+          if [[ ! "$TCR_DIGEST" =~ ^sha256:[0-9a-f]{64}$ ]]; then
+            printf '%s\n' 'Release record requires a valid verified TCR digest.' >&2
+            exit 1
+          fi
+          jq -n \
+            --argjson schema_version 1 \
+            --arg commit_sha "$COMMIT_SHA" \
+            --arg ghcr_digest "$GHCR_DIGEST" \
+            --arg tcr_digest "$TCR_DIGEST" \
+            --arg tcr_repository 'ccr.ccs.tencentyun.com/website-dev/kinvest' \
+            --arg mirror_run_id "$MIRROR_RUN_ID" \
+            --arg mirror_run_attempt "$MIRROR_RUN_ATTEMPT" \
+            '{
+              schema_version: $schema_version,
+              commit_sha: $commit_sha,
+              ghcr_digest: $ghcr_digest,
+              tcr_digest: $tcr_digest,
+              tcr_repository: $tcr_repository,
+              mirror_run_id: $mirror_run_id,
+              mirror_run_attempt: $mirror_run_attempt
+            }' > release-record.json
+          jq . release-record.json
+      - name: Upload release record
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
+        with:
+          name: kinvest-release-record-${{ github.run_id }}-${{ github.run_attempt }}
+          path: release-record.json
+          retention-days: 30
+          if-no-files-found: error
