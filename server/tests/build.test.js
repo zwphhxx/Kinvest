@@ -28,6 +28,7 @@ async function runBuildArtifactsExist() {
     'package.json',
     'public/app.css',
     'public/app.js',
+    'public/data-source-contract.js',
     'public/finance-contract.js',
     'public/index.html',
     'public/research-contract.js',

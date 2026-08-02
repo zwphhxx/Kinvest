@@ -4,7 +4,7 @@ const {
   searchSecurityIdentities
 } = require('../domain/security-identity')
 
-const VERIFIED_METRICS = new Set([
+const SUPPORTED_FIXTURE_METRICS = new Set([
   'realtime',
   'history',
   'company',
@@ -59,21 +59,37 @@ function createIfindClient() {
       return Promise.resolve(Array.from(results.values()))
     },
     getFinancial(metricId) {
+      const contractVerified = SUPPORTED_FIXTURE_METRICS.has(metricId)
       return Promise.resolve({
         metricId,
-        verified: VERIFIED_METRICS.has(metricId),
-        source: VERIFIED_METRICS.has(metricId) ? 'iFinD mock fixture' : 'unverified',
+        dataMode: 'mock',
+        contractStatus: contractVerified ? 'verified_fixture' : 'unsupported',
+        source: {
+          sourceMode: 'mock',
+          sourceName: 'Mock fixture（模拟 iFinD 指标结构，非真实返回）',
+          sourceType: 'mock_fixture',
+          mockContractVerified: contractVerified,
+          verification: {
+            issuerIdentityStatus: 'not_applicable',
+            vendorCodeStatus: 'not_applicable',
+            entitlementStatus: 'not_applicable',
+            currencyStatus: 'not_applicable',
+            unitStatus: 'not_applicable',
+            reportPeriodStatus: 'not_applicable',
+            scopeStatus: 'not_applicable'
+          }
+        },
         value: null
       })
     }
   }
 }
 
-function getVerifiedMetrics() {
-  return Array.from(VERIFIED_METRICS)
+function getFixtureContractMetrics() {
+  return Array.from(SUPPORTED_FIXTURE_METRICS)
 }
 
 module.exports = {
   createIfindClient,
-  getVerifiedMetrics
+  getFixtureContractMetrics
 }

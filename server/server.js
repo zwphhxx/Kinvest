@@ -6,6 +6,8 @@ const { evaluateRefreshState, allowManualRefresh, recordManualRefreshAttempt } =
 const { getHealthState } = require('./services/health')
 const { createIfindClient } = require('./adapters/ifindAdapter')
 const { resolveSecurityIdentity } = require('./domain/security-identity')
+const { prepareFinanceRows } = require('../public/finance-contract')
+const { isVerifiedDataBlock } = require('../public/data-source-contract')
 
 const PORT = Number(process.env.PORT || 4173)
 const ROOT = path.join(__dirname, '..')
@@ -79,12 +81,69 @@ function toSecurityNotConfiguredError(requestedCode, targetLabel = '证券') {
   return toApiError(message, 404, details)
 }
 
-async function withMeta(company) {
+const VERIFIED_BREAKDOWN_SOURCE_TYPES = Object.freeze([
+  'ifind_indicator',
+  'ifind_topic_report',
+  'official_announcement'
+])
+
+function summarizePreparedRows(prepared) {
+  return {
+    totalCount: prepared.totalCount,
+    acceptedCount: prepared.rows.length,
+    rejectedCount: prepared.rejectedCount,
+    sourceMode: prepared.sourceMode,
+    errorCode: prepared.errorCode
+  }
+}
+
+function sanitizeCompanyData(company) {
   if (!company) return null
-  const refresh = evaluateRefreshState(company)
+  const annual = prepareFinanceRows(company.financials, 'annual')
+  const quarterly = prepareFinanceRows(company.financials, 'quarter')
+  const breakdownVerified = isVerifiedDataBlock(
+    company.businessBreakdown,
+    VERIFIED_BREAKDOWN_SOURCE_TYPES
+  )
 
   return {
     ...company,
+    financials: {
+      annual: annual.rows,
+      quarterly: quarterly.rows,
+      validation: {
+        annual: summarizePreparedRows(annual),
+        quarterly: summarizePreparedRows(quarterly)
+      }
+    },
+    businessBreakdown: breakdownVerified
+      ? {
+          ...company.businessBreakdown,
+          validation: {
+            status: 'verified',
+            sourceMode: company.businessBreakdown.dataMode,
+            errorCode: null
+          }
+        }
+      : {
+          dataMode: company.businessBreakdown && company.businessBreakdown.dataMode,
+          rows: [],
+          validation: {
+            status: 'rejected',
+            sourceMode: null,
+            errorCode: 'SOURCE_CONTRACT_REJECTED'
+          }
+        }
+  }
+}
+
+async function withMeta(company) {
+  if (!company) return null
+  const refresh = evaluateRefreshState(company)
+  const sanitizedCompany = sanitizeCompanyData(company)
+
+  return {
+    ...sanitizedCompany,
     refreshState: {
       ...refresh,
       dailyManualUsed: Math.max(0, refresh.dailyManualUsed || 0),
@@ -307,6 +366,7 @@ module.exports = {
   apiResearch,
   applyRuntimeFileCreationMask,
   startServer,
+  sanitizeCompanyData,
   toApiError,
   toSecurityNotConfiguredError
 }

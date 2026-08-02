@@ -47,7 +47,16 @@ function makeVerifiedRealRow(overrides = {}) {
     source: {
       sourceName: '已验证指标来源',
       sourceType: 'ifind_indicator',
-      scopeVerified: true,
+      sourceMode: 'real',
+      verification: {
+        issuerIdentityStatus: 'verified',
+        vendorCodeStatus: 'verified',
+        entitlementStatus: 'verified',
+        currencyStatus: 'verified',
+        unitStatus: 'verified',
+        reportPeriodStatus: 'verified',
+        scopeStatus: 'verified'
+      },
       sourceTime: '2026-07-27T20:13:00.000Z',
       fetchTime: '2026-07-28T03:10:00.000Z',
       ...sourceOverrides
@@ -70,6 +79,16 @@ function makeVerifiedMockRow(overrides = {}) {
       sourceName: 'Mock fixture（模拟 iFinD 指标结构，非真实返回）',
       sourceType: 'mock_fixture',
       mockContractVerified: true,
+      sourceMode: 'mock',
+      verification: {
+        issuerIdentityStatus: 'not_applicable',
+        vendorCodeStatus: 'not_applicable',
+        entitlementStatus: 'not_applicable',
+        currencyStatus: 'not_applicable',
+        unitStatus: 'not_applicable',
+        reportPeriodStatus: 'not_applicable',
+        scopeStatus: 'not_applicable'
+      },
       sourceTime: '2026-07-27T20:13:00.000Z',
       fetchTime: '2026-07-28T03:10:00.000Z',
       ...sourceOverrides
@@ -125,8 +144,12 @@ function assertStrictFinanceVerification() {
     (row) => { row.source.sourceName = '' },
     (row) => { row.source.sourceType = '' },
     (row) => { row.source.sourceType = 'unverified_vendor' },
-    (row) => { row.source.scopeVerified = false },
-    (row) => { delete row.source.scopeVerified },
+    (row) => { row.source.sourceMode = 'mock' },
+    (row) => { row.source.verification.issuerIdentityStatus = 'unverified' },
+    (row) => { row.source.verification.vendorCodeStatus = 'failed' },
+    (row) => { row.source.verification.entitlementStatus = 'not_applicable' },
+    (row) => { delete row.source.verification.currencyStatus },
+    (row) => { delete row.source.verification },
     (row) => { row.source.sourceTime = '' },
     (row) => { row.source.fetchTime = '' },
     (row) => { row.period = '' },
@@ -168,16 +191,18 @@ function assertMockAndRealVerificationAreDistinct() {
   })
   assert.equal(isVerifiedFinanceRow(mockPosingAsReal), false)
 
-  const realWithoutScope = makeVerifiedRealRow()
-  delete realWithoutScope.source.scopeVerified
+  const realWithoutVerification = makeVerifiedRealRow()
+  delete realWithoutVerification.source.verification
   const disguisedIfind = makeVerifiedRealRow({
-    source: { sourceName: '伪装 iFinD', sourceType: 'ifind_indicator', scopeVerified: false }
+    source: { sourceName: '伪装 iFinD', sourceType: 'ifind_indicator' }
   })
+  disguisedIfind.source.verification.scopeStatus = 'failed'
   const prepared = prepareFinanceRows({
-    annual: [verifiedMock, realWithoutScope, disguisedIfind]
+    annual: [verifiedMock, realWithoutVerification, disguisedIfind]
   }, 'annual')
-  assert.deepEqual(prepared.rows, [verifiedMock])
-  assert.equal(prepared.rejectedCount, 2)
+  assert.deepEqual(prepared.rows, [])
+  assert.equal(prepared.rejectedCount, 3)
+  assert.equal(prepared.errorCode, 'MIXED_SOURCE_MODE')
 }
 
 function assertDefaultAnomaliesRemainDeterministic() {
@@ -263,6 +288,7 @@ function assertRenderingRespectsStrictCsp() {
   assert.match(app, /el\.thermo\.dataset\.position = String\(valuationPosition\.markerPosition\)/)
   assert.match(app, /估值温度尺：区间不可用/)
   assert.match(html, /<script src="\/valuation-position\.js" defer><\/script>[\s\S]*<script src="\/app\.js" defer><\/script>/)
+  assert.match(html, /<script src="\/data-source-contract\.js" defer><\/script>[\s\S]*<script src="\/finance-contract\.js" defer><\/script>/)
   assert.match(css, /\.company-title\s*\{[^}]*margin:\s*0;/s)
   assert.match(css, /\.thermometer\.unavailable::after\s*\{[^}]*display:\s*none;/s)
   for (let position = 0; position <= 100; position += 5) {
