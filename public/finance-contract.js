@@ -1,4 +1,4 @@
-/* global module */
+/* global module, require */
 
 const FINANCE_MODE_KEYS = Object.freeze({
   annual: 'annual',
@@ -10,6 +10,13 @@ const VERIFIED_REAL_SOURCE_TYPES = Object.freeze([
   'ifind_topic_report',
   'official_announcement'
 ])
+
+function getDataSourceContracts() {
+  if (typeof module !== 'undefined' && module.exports) {
+    return require('./data-source-contract')
+  }
+  return /** @type {any} */ (window).KinvestDataSource
+}
 
 function isNonEmptyString(value) {
   return typeof value === 'string' && value.trim().length > 0
@@ -36,19 +43,10 @@ function isVerifiedFinanceRow(row) {
   if (!row || typeof row !== 'object' || Array.isArray(row)) return false
   const source = row.source
   if (!source || typeof source !== 'object' || Array.isArray(source)) return false
+  const dataSourceContracts = getDataSourceContracts()
+  if (!dataSourceContracts || typeof dataSourceContracts.isVerifiedDataBlock !== 'function') return false
 
-  const isExplicitMock = row.dataMode === 'mock' &&
-    source.sourceType === 'mock_fixture' &&
-    source.mockContractVerified === true &&
-    source.scopeVerified !== true &&
-    /mock/i.test(source.sourceName) &&
-    source.sourceName.includes('非真实')
-  const isVerifiedReal = row.dataMode === 'real' &&
-    source.scopeVerified === true &&
-    source.mockContractVerified !== true &&
-    VERIFIED_REAL_SOURCE_TYPES.includes(source.sourceType)
-
-  return (isExplicitMock || isVerifiedReal) &&
+  return dataSourceContracts.isVerifiedDataBlock(row, VERIFIED_REAL_SOURCE_TYPES) &&
     isNonEmptyString(source.sourceName) &&
     isValidTimestamp(source.sourceTime) &&
     isValidTimestamp(source.fetchTime) &&
@@ -61,11 +59,28 @@ function isVerifiedFinanceRow(row) {
 
 function prepareFinanceRows(financials, mode) {
   const selectedRows = getFinanceRowsForMode(financials, mode)
+  const declaredModes = new Set(
+    selectedRows
+      .map((row) => row && row.dataMode)
+      .filter((dataMode) => dataMode === 'mock' || dataMode === 'real')
+  )
+  if (declaredModes.size > 1) {
+    return {
+      rows: [],
+      totalCount: selectedRows.length,
+      rejectedCount: selectedRows.length,
+      sourceMode: null,
+      errorCode: 'MIXED_SOURCE_MODE'
+    }
+  }
+
   const rows = selectedRows.filter(isVerifiedFinanceRow)
   return {
     rows,
     totalCount: selectedRows.length,
-    rejectedCount: selectedRows.length - rows.length
+    rejectedCount: selectedRows.length - rows.length,
+    sourceMode: rows.length > 0 ? rows[0].dataMode : null,
+    errorCode: null
   }
 }
 

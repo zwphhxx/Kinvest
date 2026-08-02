@@ -19,6 +19,7 @@ const runtimeFiles = [
   'public/research.html',
   'public/app.css',
   'public/app.js',
+  'public/data-source-contract.js',
   'public/finance-contract.js',
   'public/research.css',
   'public/research-contract.js',

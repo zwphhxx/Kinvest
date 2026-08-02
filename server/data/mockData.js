@@ -7,6 +7,16 @@ const watchlist = [
   'AAPL.US'
 ]
 
+const MOCK_VERIFICATION = Object.freeze({
+  issuerIdentityStatus: 'not_applicable',
+  vendorCodeStatus: 'not_applicable',
+  entitlementStatus: 'not_applicable',
+  currencyStatus: 'not_applicable',
+  unitStatus: 'not_applicable',
+  reportPeriodStatus: 'not_applicable',
+  scopeStatus: 'not_applicable'
+})
+
 function mkPeriod(type, period, fields) {
   return {
     dataMode: fields.dataMode,
@@ -16,7 +26,8 @@ function mkPeriod(type, period, fields) {
       sourceName: fields.sourceName,
       sourceType: fields.sourceType,
       mockContractVerified: fields.mockContractVerified,
-      scopeVerified: fields.scopeVerified,
+      sourceMode: fields.dataMode,
+      verification: { ...MOCK_VERIFICATION },
       sourceTime: new Date(fields.sourceTime),
       fetchTime: new Date(fields.fetchTime)
     },
@@ -155,10 +166,18 @@ const companies = [
       ]
     },
     businessBreakdown: {
-      sourceName: 'iFinD data-pool 经营构成报表（已验）',
+      dataMode: 'mock',
+      sourceName: 'Mock fixture（模拟 iFinD 经营构成结构，非真实返回）',
       sourceTime: new Date('2026-07-24T12:00:00.000Z'),
       unit: '百万元',
       currency: 'HKD',
+      source: {
+        sourceMode: 'mock',
+        sourceName: 'Mock fixture（模拟 iFinD 经营构成结构，非真实返回）',
+        sourceType: 'mock_fixture',
+        mockContractVerified: true,
+        verification: { ...MOCK_VERIFICATION }
+      },
       rows: [
         {
           dimensionType: '产品',
@@ -390,10 +409,18 @@ const companies = [
       quarterly: []
     },
     businessBreakdown: {
-      sourceName: 'iFinD data-pool 经营构成报表（部分可用）',
+      dataMode: 'mock',
+      sourceName: 'Mock fixture（模拟 iFinD 经营构成结构，非真实返回）',
       sourceTime: new Date('2026-07-24T12:00:00.000Z'),
       unit: '百万美元',
       currency: 'USD',
+      source: {
+        sourceMode: 'mock',
+        sourceName: 'Mock fixture（模拟 iFinD 经营构成结构，非真实返回）',
+        sourceType: 'mock_fixture',
+        mockContractVerified: true,
+        verification: { ...MOCK_VERIFICATION }
+      },
       rows: [
         {
           dimensionType: '产品',
