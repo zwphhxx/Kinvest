@@ -2,156 +2,206 @@
 
 Date: 2026-08-11
 
-## Current boundary
+## Repository-only boundary
 
-This change prepares repository-side contracts only. It does not change the
-production Docker network, iptables, systemd, CAM role, SSM secrets, application
-startup, or running containers.
+This change defines repository contracts only. It does not authorize or perform
+a production Docker network change, Compose recreation, Docker restart,
+iptables or systemd installation, CAM operation, secret rotation, or reboot.
+Never place credentials, secret values, production inventory, or raw audit logs
+in the repository or in Compose command arguments.
 
-The production rollout remains disabled until a read-only server audit is
-recorded and the user separately approves each external change.
+## Candidate network contract
+
+`deploy/server/kinvest-metadata-network.conf` is one versioned, non-secret
+candidate topology. It is not pre-approved production topology and is not a
+claim that the candidate is conflict-free. Install an approved copy as the
+root-owned mode `0600` file `/etc/kinvest/metadata-network.conf`. Both Compose
+and the firewall consume that same file. Do not create or use a working-directory
+`.env` for these settings.
+
+The Compose release in the deployment environment supports `gw_priority`, so
+the metadata network is the Kinvest default gateway. It does not use
+`interface_name`. The deterministic host-side bridge comes from
+`com.docker.network.bridge.name`. The network is deliberately not `internal`
+because CVM metadata requires external connectivity.
+
+Kinvest remains attached to the shared proxy network and alone joins the
+metadata-egress network with its configured static address. Nginx is attached
+only to the shared proxy network. Its override drops all capabilities and adds
+back only `CHOWN`, `SETGID`, `SETUID`, and `NET_BIND_SERVICE`; it never adds
+`NET_RAW` or `NET_ADMIN`. Repository validation renders the Compose
+configuration. A local no-network smoke test with `nginx:1.27.5-alpine`
+confirmed this set starts successfully; removing `CHOWN` reproduces a startup
+failure while preparing `/var/cache/nginx/client_temp`. Production runtime
+compatibility remains a separate deployment approval and verification gate.
 
 ## Security invariants
 
-- The only metadata destination used by Kinvest is 169.254.0.23 port 80.
-- Docker startup installs a FORWARD-chain reject guard before dockerd starts.
-- The guard remains active while the dedicated DOCKER-USER chain is rebuilt.
-- The guard is removed only after rule presence, jump position, uniqueness, and
-  target order have been verified.
-- A failed apply or rollback leaves the guard active, denying metadata to every
-  container.
-- Only the audited Kinvest bridge interface and fixed container IP may pass the
-  dedicated chain.
-- All wrapper operations share one flock lock.
-- Root-executed library and config files must be regular, non-symlink,
-  root-owned files with no group or world write permission.
-- The application reads temporary credentials only from the fixed CVM metadata
-  endpoint. It has no environment SecretId or SecretKey fallback.
-- Every SSM read includes an explicit SecretName and VersionId.
-- Secret values are retained only in process memory and are not included in
-  audit events.
+- Only forwarded container traffic to `169.254.0.23/32` TCP port `80` is in
+  scope. Host metadata access is unchanged.
+- A temporary first-position FORWARD reject guard remains installed throughout
+  validation, chain rebuilding, and permanent jump installation.
+- The permanent chain is first in FORWARD, before any pre-existing jump, and is
+  also first in DOCKER-USER for defense in depth.
+- The two permanent jumps are installed in one `iptables-restore --noflush`
+  filter transaction so unrelated platform and Docker rules are preserved.
+- The guard is removed only after exact chain contents, jump order, uniqueness,
+  Docker network identity, bridge name, IPAM, sole membership, static address,
+  and metadata route source have been verified.
+- Only the dedicated bridge plus the exact Kinvest source address may reach the
+  exact metadata address and port. Every other forwarded source is rejected.
+  No rule permits all of `169.254.0.0/16`.
+- All wrapper actions share one flock lock. Root-executed library and config
+  files must be regular, non-symlink, root-owned files that are not writable by
+  group or others.
+- Cleanup removes only Kinvest-managed jumps, rules, chains, and the exact
+  temporary guard.
 
-## Read-only audit gate
+## Read-only conflict preflight
 
-Before any install, record without changing the server:
+Before requesting Compose/network recreation approval, compare every candidate
+setting with read-only evidence:
 
-1. Confirm the instance is CVM ins-qsohtsg7 in ap-shanghai and uses a VPC.
-2. Confirm Docker uses the iptables backend and the FORWARD and DOCKER-USER
-   chains exist.
-3. Resolve metadata.tencentyun.com from the host and confirm it still maps to
-   169.254.0.23. Any change is a no-go.
-4. Inspect the external web network subnet, bridge interface, Kinvest container
-   IP, Nginx container IP, and every attached container.
-5. Confirm the proposed fixed Kinvest IP is unused and survives Compose
-   recreation.
-6. Inspect effective Linux capabilities for Kinvest, Nginx, and other
-   containers. Kinvest and Nginx must not retain NET_RAW or NET_ADMIN.
-7. Confirm no CAM instance role is currently bound and no long-term Tencent
-   credential exists in environment files, Docker config, commands, logs, or
-   the repository.
+1. Enumerate all Docker network IPAM ranges and host IPv4 routes; reject any
+   overlap with the candidate subnet.
+2. Confirm the candidate gateway and static Kinvest address are unused.
+3. Confirm the deterministic bridge interface name is unused.
+4. Render the exact repository Compose model without changing containers:
 
-If the Docker backend, bridge identity, or capability boundary cannot be
-verified, do not bind a CAM role.
+       docker compose --env-file /etc/kinvest/metadata-network.conf --project-name kinvest -f /root/docker/kinvest/docker-compose.yml config
 
-## Candidate install layout
+5. Record only sanitized conclusions, not production identifiers or raw logs.
+6. Obtain explicit user confirmation after the conflict evidence is reviewed.
 
-The following paths are the intended root-owned destinations:
+The root deployment script uses the explicit state file
+`/root/docker/kinvest/state/metadata-network.state`. After the approved config
+has been installed, the operator confirms its SHA-256 and creates the pending
+state with the same approved hash. These commands are a template, not a record
+that approval or installation has occurred:
+
+    approved_hash="$(sha256sum /etc/kinvest/metadata-network.conf | awk '{print $1}')"
+    printf 'approved metadata config SHA-256: %s\n' "$approved_hash"
+    state_tmp="$(mktemp /root/docker/kinvest/state/.metadata-network.state.XXXXXX)"
+    printf 'version=1\nmode=pending\nconfig_sha256=%s\n' "$approved_hash" > "$state_tmp"
+    chown root:root "$state_tmp"
+    chmod 0600 "$state_tmp"
+    mv -f -- "$state_tmp" /root/docker/kinvest/state/metadata-network.state
+
+The state is accepted only as a regular, non-symlink, root-owned mode `0600`
+file with exactly the ordered `version`, `mode`, and `config_sha256` lines.
+Both pending and active states must match the current config byte-for-byte by
+SHA-256. A successful guarded first migration atomically changes pending to
+active while preserving the approved hash. Missing, malformed, insecure, or
+mismatched state fails closed before Compose. Every routine deployment in
+active state requires the network to exist and runs a read-only firewall
+`status` before pulling or changing the container; a failed precheck reinstalls
+and confirms the deny guard before exit. A broken active topology is never
+treated as a first migration. Only explicit, hash-matched pending state may
+create the initially absent network after the conflict preflight.
+
+## Separate approval gates
+
+### Compose/network recreation approval
+
+Required after conflict preflight and before creating or recreating the named
+bridge or Kinvest container. Every Compose `config`, `pull`, or `up` command
+must use the explicit `--env-file /etc/kinvest/metadata-network.conf` contract.
+
+### Docker restart approval
+
+Required separately because live restore is disabled and a restart interrupts
+running containers. The Docker drop-in installs only the startup/stop deny guard;
+it does not run network-dependent apply or status actions that could fail
+`docker.service`. The independent oneshot service uses `Requisite` and `After`,
+so a timer attempt never starts inactive Docker. It invokes one locked
+`reconcile` operation: guard, apply, then status. If apply or status fails,
+reconcile reinstalls and confirms the guard before returning nonzero; a later
+timer attempt retries after containers and networks become ready.
+
+### iptables/systemd installation approval
+
+Required before installing the wrapper, library, root-owned config, service,
+timer, or Docker drop-in, and before enabling any unit.
+
+### CAM role binding approval
+
+Required only after network isolation, Docker restart persistence, and negative
+reachability tests pass. Role binding is never implied by firewall rollout.
+
+### Secret rotation approval
+
+Required separately for creating or rotating external secret versions and for
+changing application references. Secret values never enter chat, repository
+files, or shell command arguments.
+
+### Reboot approval
+
+Required for a maintenance-window reboot after the Docker restart gate passes.
+Repeat firewall ordering, network membership, route, and reachability checks.
+
+## Install layout
+
+The intended root-owned destinations are:
 
     /usr/local/sbin/kinvest-metadata-firewall
     /usr/local/libexec/kinvest-metadata-firewall-lib.sh
-    /etc/kinvest/metadata-firewall.conf
+    /etc/kinvest/metadata-network.conf
     /etc/systemd/system/kinvest-metadata-firewall.service
     /etc/systemd/system/kinvest-metadata-firewall.timer
     /etc/systemd/system/docker.service.d/kinvest-metadata-firewall.conf
 
-Installation must use explicit ownership and modes:
+Installation commands are an operator checklist and are not authorization to
+run them. Install executable files mode `0755`, library and unit files mode
+`0644`, and the config mode `0600`, all owned by root.
 
-    install -o root -g root -m 0755 kinvest-metadata-firewall.sh /usr/local/sbin/kinvest-metadata-firewall
-    install -o root -g root -m 0644 kinvest-metadata-firewall-lib.sh /usr/local/libexec/kinvest-metadata-firewall-lib.sh
-    install -o root -g root -m 0600 metadata-firewall.conf /etc/kinvest/metadata-firewall.conf
-    install -o root -g root -m 0644 kinvest-metadata-firewall.service /etc/systemd/system/kinvest-metadata-firewall.service
-    install -o root -g root -m 0644 kinvest-metadata-firewall.timer /etc/systemd/system/kinvest-metadata-firewall.timer
-    install -o root -g root -m 0644 docker-kinvest-metadata-firewall.conf /etc/systemd/system/docker.service.d/kinvest-metadata-firewall.conf
+## Apply and status
 
-These commands are an operator checklist, not authorization to run them.
+Run `guard` before any approved change. `apply` retains that deny guard while it
+validates Docker and rebuilds managed rules. A failed validation or transaction
+leaves the guard first in FORWARD. Successful apply verifies staged ordering,
+removes only the guard, and verifies final ordering. Repeated `apply` and
+`status` calls are idempotent.
 
-## Approved rollout sequence
+Positive validation allows only Kinvest. Negative validation must cover Nginx,
+an unprivileged temporary container, and all other containers. No test may send
+credentials or persist a metadata response.
 
-Each numbered external step requires a fresh user approval.
+Deploy-v2 copies the approved config to one root-owned mode `0600` deployment
+snapshot under `/run`, validates that snapshot, and compares its SHA-256 with
+the activation state before any Compose or firewall Docker operation. Every
+Compose `--env-file` and firewall action in that attempt uses only the same
+snapshot; the exit trap always removes it. Deploy then installs the guard
+immediately before `compose up` and calls the single locked firewall `reconcile`
+entry point before recording `current.state`. Any failure enters deployment
+rollback and cannot write a successful release state. Rollback first installs
+and confirms the deny guard before schema, image, or container work.
+After restoring the previous container, rollback reconciles the firewall; if the
+old topology cannot satisfy the allow contract, rollback retains the deny guard
+and explicitly reports that allow-path isolation is not active.
 
-1. Add a conflict-checked fixed IP and audited bridge interface to the Kinvest
-   Compose configuration without restarting production.
-2. Install the wrapper, library, and root-only config.
-3. Run the guard action first. Verify every current container is denied access
-   to 169.254.0.23 port 80.
-4. Run apply and status. Verify Kinvest alone can reach the endpoint, while
-   Nginx, an unprivileged temporary container, and all other bridge containers
-   are denied.
-5. Install the systemd service, timer, and Docker drop-in.
-6. After a separate production interruption approval, restart Docker. Verify
-   the guard exists before startup and the dedicated chain is restored after
-   startup.
-7. Reboot only during an approved maintenance window and repeat the same
-   isolation checks.
-8. Only after both persistence tests pass may the user bind a least-privilege
-   CVM CAM role.
-9. The user creates legal SSM SecretName and VersionId values in the Tencent
-   console. Secret values never enter chat or shell commands.
-10. Start a candidate Kinvest container with explicit non-secret role name and
-    SSM VersionId configuration. Perform minimal reads and fail closed if any
-    requested version is unavailable.
+## Rollback semantics
 
-## Safe rollback
+Default `rollback` is also the post-bind rollback. It installs the global deny
+guard and removes the permanent Kinvest chain and jumps, leaving all forwarded
+container metadata traffic denied. It never restores broad metadata access.
 
-The rollback action intentionally does not restore unrestricted metadata
-access. It first installs the global FORWARD reject guard, then removes the
-KINVEST-METADATA jump and chain without reading the config file. This still
-works when the config is missing or corrupt.
+Before role binding only, an operator may run:
 
-Before removing the final guard, the user must first detach the CAM role and
-confirm that no workload needs metadata access. Removing that final guard is a
-separate manual recovery decision and is not automated by this repository.
+    kinvest-metadata-firewall rollback-pre-bind --assert-role-unbound
 
-## SSM startup contract
+The flag is an explicit operator assertion that the role is unbound. This
+operator assertion does not query, control, detach, or otherwise inspect CAM.
+Without the exact assertion, the action fails with the deny guard retained.
+After the asserted firewall cleanup, restoring any earlier Docker network state
+is still a separate approved Compose/network operation.
 
-The repository provider accepts:
-
-- an ASCII CAM role name;
-- explicit secret references containing SecretName and VersionId;
-- an SSM client factory initialized with temporary credential ID, temporary
-  key, session token, expiry, and ap-shanghai.
-
-The provider itself requests credentials from:
-
-    http://169.254.0.23/latest/meta-data/cam/security-credentials/<role-name>
-
-It enforces a 1500 millisecond timeout, a 16 KiB response limit, a successful
-Tencent response code, matching expiration fields, and at least 60 seconds of
-remaining credential lifetime before every SSM read. A partial load is wiped
-and rejected.
-
-The metadata transport injection exists only as a unit-test seam. Production
-startup must use the fixed default transport. The SSM SDK adapter and actual
-startup wiring remain a later, separately reviewed change.
-
-Tencent documents that a CVM instance with an attached CAM role can retrieve
-periodically refreshed STS credentials from this metadata path:
-https://cloud.tencent.com/document/product/213/47668
+These scripts do not revoke already issued STS credentials, invalidate external
+secrets, rotate secret versions, or prove that credentials have expired. Those
+external security actions require their own approval and provider-side process.
 
 ## Residual risk
 
-An input bridge plus source IP rule is stronger than source IP alone, but it is
-not a cryptographic workload identity. A compromised container on the same
-bridge with raw networking capability could attempt spoofing. Therefore:
-
-- remove NET_RAW and NET_ADMIN from Kinvest, Nginx, and peer containers;
-- do not permit arbitrary containers on the production web bridge;
-- grant the CVM role only read access to the exact Kinvest SSM secrets;
-- treat every same-host root or Docker administrator as inside the trust
-  boundary;
-- keep real secret loading disabled if these controls cannot be maintained.
-
-No screenshot is required for this repository-only backend contract. The later
-production validation must save non-secret evidence of rule status, container
-reachability results, Docker restart persistence, and public application
-health.
+Bridge plus source-address filtering is not cryptographic workload identity.
+Keep `NET_RAW` and `NET_ADMIN` absent from application and proxy containers,
+limit Docker administration, scope any future role to exact secret resources,
+and leave secret loading disabled whenever these controls cannot be maintained.

@@ -17,7 +17,10 @@ services:
     expose:
       - "4173"
     networks:
-      - web
+      web: {}
+      metadata-egress:
+        ipv4_address: ${KINVEST_CONTAINER_IP:?use --env-file /etc/kinvest/metadata-network.conf}
+        gw_priority: 1
     healthcheck:
       test: ["CMD", "wget", "--no-verbose", "--tries=1", "--spider", "http://127.0.0.1:4173/api/health"]
       interval: 30s
@@ -32,3 +35,12 @@ services:
 networks:
   web:
     external: true
+  metadata-egress:
+    name: ${KINVEST_METADATA_NETWORK:?use --env-file /etc/kinvest/metadata-network.conf}
+    driver: bridge
+    driver_opts:
+      com.docker.network.bridge.name: ${KINVEST_BRIDGE_INTERFACE:?use --env-file /etc/kinvest/metadata-network.conf}
+    ipam:
+      config:
+        - subnet: ${KINVEST_METADATA_SUBNET:?use --env-file /etc/kinvest/metadata-network.conf}
+          gateway: ${KINVEST_METADATA_GATEWAY:?use --env-file /etc/kinvest/metadata-network.conf}

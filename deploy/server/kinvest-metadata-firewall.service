@@ -1,9 +1,8 @@
 [Unit]
 Description=Reconcile Kinvest CVM metadata firewall
-Requires=docker.service
+Requisite=docker.service
 After=docker.service
 
 [Service]
 Type=oneshot
-ExecStart=/usr/local/sbin/kinvest-metadata-firewall apply
-ExecStartPost=/usr/local/sbin/kinvest-metadata-firewall status
+ExecStart=/usr/local/sbin/kinvest-metadata-firewall reconcile

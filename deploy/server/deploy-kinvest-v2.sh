@@ -4,9 +4,12 @@ set -euo pipefail
 ROOT='/root/docker/kinvest'
 RUN_ROOT='/run'
 COMPOSE="$ROOT/docker-compose.yml"
+METADATA_NETWORK_CONFIG='/etc/kinvest/metadata-network.conf'
+METADATA_FIREWALL='/usr/local/sbin/kinvest-metadata-firewall'
 DATA_DIR="$ROOT/data"
 DATABASE="$DATA_DIR/kinvest.sqlite"
 STATE="$ROOT/state"
+METADATA_ACTIVATION_STATE="$STATE/metadata-network.state"
 BACKUP_DIR="$ROOT/backups"
 CURRENT_STATE="$STATE/current.state"
 PREVIOUS_STATE="$STATE/previous.state"
@@ -149,19 +152,101 @@ assert_not_symlink() {
   fi
 }
 
+metadata_network_name=''
+assert_metadata_network_config() {
+  local metadata_config_path="${1:-$METADATA_NETWORK_CONFIG}"
+  local metadata_stat=''
+  local metadata_key=''
+  local metadata_value=''
+  local metadata_network_count=0
+
+  if [[ ! -f "$metadata_config_path" || -L "$metadata_config_path" ]]; then
+    printf '%s\n' 'metadata network config is missing or symlinked' >&2
+    exit 1
+  fi
+  metadata_stat="$(stat -Lc '%u:%g:%a' "$metadata_config_path")" || exit 1
+  if [[ "$metadata_stat" != '0:0:600' ]]; then
+    printf '%s\n' 'metadata network config must be root-owned mode 0600' >&2
+    exit 1
+  fi
+  while IFS='=' read -r metadata_key metadata_value; do
+    if [[ "$metadata_key" == 'KINVEST_METADATA_NETWORK' ]]; then
+      metadata_network_name="$metadata_value"
+      metadata_network_count=$((metadata_network_count + 1))
+    fi
+  done < "$metadata_config_path"
+  if [[ "$metadata_network_count" -ne 1 || ! "$metadata_network_name" =~ ^[A-Za-z0-9][A-Za-z0-9_.-]*$ ]]; then
+    printf '%s\n' 'metadata network config has an invalid network name' >&2
+    exit 1
+  fi
+}
+
+metadata_network_phase=''
+metadata_config_sha256=''
+read_metadata_network_phase() {
+  local metadata_state_stat=''
+  local metadata_state_line=''
+  local metadata_state_line_count=0
+  local metadata_state_version=''
+  local metadata_state_mode=''
+  local metadata_state_hash=''
+
+  assert_not_symlink "$METADATA_ACTIVATION_STATE"
+  if [[ ! -f "$METADATA_ACTIVATION_STATE" ]]; then
+    printf '%s\n' 'metadata network activation state is missing; explicit pending approval is required for first migration' >&2
+    exit 1
+  fi
+  metadata_state_stat="$(stat -Lc '%u:%g:%a' "$METADATA_ACTIVATION_STATE")" || exit 1
+  if [[ "$metadata_state_stat" != '0:0:600' ]]; then
+    printf '%s\n' 'metadata network activation state must be root-owned mode 0600' >&2
+    exit 1
+  fi
+  while IFS= read -r metadata_state_line || [[ -n "$metadata_state_line" ]]; do
+    metadata_state_line_count=$((metadata_state_line_count + 1))
+    case "$metadata_state_line_count" in
+      1) metadata_state_version="$metadata_state_line" ;;
+      2) metadata_state_mode="$metadata_state_line" ;;
+      3) metadata_state_hash="$metadata_state_line" ;;
+    esac
+  done < "$METADATA_ACTIVATION_STATE"
+  if [[ "$metadata_state_line_count" -ne 3 ||
+    "$metadata_state_version" != 'version=1' ||
+    ! "$metadata_state_mode" =~ ^mode=(pending|active)$ ||
+    ! "$metadata_state_hash" =~ ^config_sha256=([0-9a-f]{64})$ ]]; then
+    printf '%s\n' 'metadata network activation state is invalid' >&2
+    exit 1
+  fi
+  metadata_network_phase="${metadata_state_mode#mode=}"
+  metadata_config_sha256="${metadata_state_hash#config_sha256=}"
+}
+
+atomic_write_metadata_activation_state() {
+  local phase="$1"
+  local temporary=''
+
+  [[ "$phase" == 'pending' || "$phase" == 'active' ]] || return 1
+  temporary="$(mktemp "$STATE/.metadata-network-state.XXXXXX")"
+  printf 'version=1\nmode=%s\nconfig_sha256=%s\n' "$phase" "$metadata_config_sha256" > "$temporary"
+  chmod 0600 "$temporary"
+  chown root:root "$temporary"
+  mv -f -- "$temporary" "$METADATA_ACTIVATION_STATE"
+}
+
 ROOT_PARENT="${ROOT%/kinvest}"
 ROOT_TOP="${ROOT_PARENT%/docker}"
 for path_component in "$ROOT_TOP" "$ROOT_PARENT" "$ROOT" "$DATA_DIR" "$STATE" "$BACKUP_DIR" "$RUN_ROOT"; do
   assert_not_symlink "$path_component"
 done
 
-if [[ ! -d "$ROOT" || ! -f "$COMPOSE" || ! -x "$ROOT/prepare-data-dir.sh" ]]; then
+if [[ ! -d "$ROOT" || ! -f "$COMPOSE" || ! -x "$ROOT/prepare-data-dir.sh" || ! -x "$METADATA_FIREWALL" ]]; then
   printf '%s\n' 'Kinvest server files are not bootstrapped' >&2
   exit 1
 fi
 
 assert_not_symlink "$COMPOSE"
 assert_not_symlink "$ROOT/prepare-data-dir.sh"
+assert_not_symlink "$METADATA_FIREWALL"
+assert_metadata_network_config
 install -d -m 0700 -- "$STATE" "$BACKUP_DIR"
 assert_not_symlink "$STATE"
 assert_not_symlink "$BACKUP_DIR"
@@ -171,8 +256,8 @@ if ! flock -n 9; then
   printf '%s\n' 'another Kinvest deployment is already running' >&2
   exit 1
 fi
-
 docker_config=''
+metadata_config_snapshot=''
 pull_stderr=''
 login_stderr=''
 
@@ -188,6 +273,9 @@ cleanup_runtime() {
   if [[ -n "$docker_config" && "$docker_config" == "$RUN_ROOT"/kinvest-docker-config.* ]]; then
     rm -rf -- "$docker_config"
   fi
+  if [[ -n "$metadata_config_snapshot" && "$metadata_config_snapshot" == "$RUN_ROOT"/kinvest-metadata-network.* ]]; then
+    rm -f -- "$metadata_config_snapshot"
+  fi
 }
 trap cleanup_runtime EXIT INT TERM HUP
 
@@ -197,6 +285,13 @@ on_signal() {
 trap 'on_signal 129' HUP
 trap 'on_signal 130' INT
 trap 'on_signal 143' TERM
+
+metadata_config_snapshot="$(mktemp "$RUN_ROOT/kinvest-metadata-network.XXXXXX")"
+cp -- "$METADATA_NETWORK_CONFIG" "$metadata_config_snapshot"
+chmod 0600 "$metadata_config_snapshot"
+chown root:root "$metadata_config_snapshot"
+assert_metadata_network_config "$metadata_config_snapshot"
+read_metadata_network_phase
 
 docker_config="$(mktemp -d "$RUN_ROOT/kinvest-docker-config.XXXXXX")"
 chmod 0700 "$docker_config"
@@ -238,15 +333,33 @@ run_inspect() {
   timeout --signal=TERM --kill-after="$INSPECT_KILL_AFTER" "$INSPECT_TIMEOUT" docker "$@"
 }
 
+run_metadata_firewall() {
+  timeout --signal=TERM --kill-after="$DOCKER_KILL_AFTER" "$DOCKER_TIMEOUT" \
+    env KMF_CONFIG="$metadata_config_snapshot" "$METADATA_FIREWALL" "$@"
+}
+
 run_compose() {
   local image_ref="$1"
 
   timeout --signal=TERM --kill-after="$DOCKER_KILL_AFTER" "$COMPOSE_TIMEOUT" \
     env KINVEST_IMAGE="$image_ref" DOCKER_CONFIG="$DOCKER_CONFIG" \
     docker compose \
+      --env-file "$metadata_config_snapshot" \
       --project-name kinvest \
       -f "$COMPOSE" \
       up -d --no-deps --pull never kinvest
+}
+
+run_compose_config() {
+  local image_ref="$1"
+
+  timeout --signal=TERM --kill-after="$DOCKER_KILL_AFTER" "$COMPOSE_TIMEOUT" \
+    env KINVEST_IMAGE="$image_ref" DOCKER_CONFIG="$DOCKER_CONFIG" \
+    docker compose \
+      --env-file "$metadata_config_snapshot" \
+      --project-name kinvest \
+      -f "$COMPOSE" \
+      config
 }
 
 pull_failure_is_transient() {
@@ -592,6 +705,10 @@ rollback() {
   local available_previous_image_id=''
 
   trap - ERR
+  if ! run_metadata_firewall guard; then
+    printf '%s\n' 'metadata deny guard could not be confirmed; refusing rollback operations' >&2
+    exit "$original_status"
+  fi
   printf '%s\n' 'Kinvest deployment failed; evaluating verified rollback.' >&2
 
   if [[ -z "$previous_digest_ref" ]]; then
@@ -617,14 +734,34 @@ rollback() {
   run_compose "$previous_digest_ref" >/dev/null || exit "$original_status"
   wait_for_health || exit "$original_status"
   verify_running_image "$previous_digest_ref" || exit "$original_status"
+  metadata_firewall_outcome='verified'
+  if ! run_metadata_firewall reconcile; then
+    if run_metadata_firewall guard; then
+      metadata_firewall_outcome='deny'
+    else
+      metadata_firewall_outcome='failed'
+    fi
+  fi
+  if [[ "$metadata_network_phase" == 'pending' ]]; then
+    atomic_write_metadata_activation_state pending || printf '%s\n' 'could not restore pending metadata activation state' >&2
+  fi
   rm -f -- "$ATTEMPT_STATE"
-  printf '%s\n' 'Previous compatible Kinvest digest was restored.' >&2
+  case "$metadata_firewall_outcome" in
+    verified) printf '%s\n' 'Previous compatible Kinvest digest was restored; metadata firewall status verified.' >&2 ;;
+    deny) printf '%s\n' 'Previous compatible Kinvest digest was restored with the metadata deny guard; allow-path isolation is not active.' >&2 ;;
+    failed) printf '%s\n' 'Previous compatible Kinvest digest was restored, but metadata deny could not be confirmed; immediate manual isolation is required.' >&2 ;;
+  esac
   exit "$original_status"
 }
 
 enter_restore_required() {
   local original_status="$1"
   local running_ref=''
+
+  if ! run_metadata_firewall guard; then
+    printf '%s\n' 'metadata deny guard could not be confirmed; immediate manual isolation is required' >&2
+    exit "$original_status"
+  fi
 
   if ! running_ref="$(run_inspect inspect --format '{{.Config.Image}}' kinvest)" ||
     [[ "$running_ref" == "$digest_ref" ]]; then
@@ -660,6 +797,25 @@ PY
   rm -f -- "$response_file"
 }
 
+run_metadata_firewall validate-config
+validated_metadata_config_sha256="$(sha256sum "$metadata_config_snapshot" | awk '{print $1}')" || exit 1
+if [[ "$validated_metadata_config_sha256" != "$metadata_config_sha256" ]]; then
+  printf '%s\n' 'validated metadata config snapshot does not match the approved hash' >&2
+  exit 1
+fi
+run_compose_config "$digest_ref" >/dev/null
+if [[ "$metadata_network_phase" == 'active' ]]; then
+  if ! run_docker network inspect "$metadata_network_name" >/dev/null; then
+    run_metadata_firewall guard
+    printf '%s\n' 'active metadata network is absent; conflict detection and explicit user approval are required before recreation' >&2
+    exit 1
+  fi
+  if ! run_metadata_firewall status; then
+    run_metadata_firewall guard
+    printf '%s\n' 'active metadata network or firewall status is invalid; refusing routine deployment' >&2
+    exit 1
+  fi
+fi
 run_docker network inspect web >/dev/null
 "$ROOT/prepare-data-dir.sh" >/dev/null
 
@@ -713,7 +869,13 @@ attempt_started_at="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
 atomic_write_attempt_state "$schema_before" "$attempt_started_at"
 
 trap 'rollback "$?"' ERR
+run_metadata_firewall guard
 run_compose "$digest_ref" >/dev/null
+metadata_firewall_status=0
+run_metadata_firewall reconcile || metadata_firewall_status=$?
+if ((metadata_firewall_status != 0)); then
+  rollback "$metadata_firewall_status"
+fi
 wait_for_health
 verify_running_image "$digest_ref"
 
@@ -723,6 +885,10 @@ if ! schema_in_range "$schema_after" "$candidate_schema_min" "$candidate_schema_
   false
 fi
 verify_public_health
+
+if [[ "$metadata_network_phase" == 'pending' ]]; then
+atomic_write_metadata_activation_state active
+fi
 
 deployed_at="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
 atomic_write_state \
