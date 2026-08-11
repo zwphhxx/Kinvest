@@ -33,6 +33,23 @@
     return Number.isInteger(value) && value >= 0
   }
 
+  function hasConsistentModelStatus(research) {
+    const modelStatus = research?.modelStatus
+    if (!modelStatus || typeof modelStatus !== 'object') return false
+    if (research.sourceMode === 'mock') {
+      return modelStatus.mode === 'safe_mock' &&
+        modelStatus.called === false &&
+        typeof modelStatus.reason === 'string' &&
+        modelStatus.reason.length > 0
+    }
+    if (research.sourceMode === 'real') {
+      return modelStatus.mode === 'real' &&
+        modelStatus.called === true &&
+        modelStatus.reason === null
+    }
+    return false
+  }
+
   async function parseJsonResponse(response) {
     const validResponse = response &&
       typeof response === 'object' &&
@@ -86,6 +103,7 @@
       isValidCount(research.citedAnnouncementsCount) &&
       isValidCount(research.citedNewsCount) &&
       isStringArray(research.tags) &&
+      hasConsistentModelStatus(research) &&
       sections &&
       typeof sections === 'object' &&
       typeof sections.thesis === 'string' &&

@@ -5,6 +5,9 @@ const repositoryRoot = path.resolve(__dirname, '..')
 const distDirectory = path.join(repositoryRoot, 'dist')
 const runtimeFiles = [
   'server/server.js',
+  'server/adapters/modelAdapter.js',
+  'server/ai/model-quota.js',
+  'server/ai/research-safety.js',
   'server/adapters/ifindAdapter.js',
   'server/data/mockData.js',
   'server/db/device-auth-repository.js',

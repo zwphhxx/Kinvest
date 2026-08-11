@@ -64,6 +64,14 @@ async function loadResearch() {
   const meta = byId('research-meta')
   meta.replaceChildren()
   appendTextElement(meta, 'p', `生成时间：${new Date(research.generatedAt).toLocaleString('zh-CN')}`, 'muted')
+  appendTextElement(
+    meta,
+    'p',
+    research.modelStatus.mode === 'safe_mock'
+      ? '模型状态：安全 Mock，未调用模型'
+      : '模型状态：真实模型调用',
+    research.modelStatus.mode === 'safe_mock' ? 'tag mock' : 'tag ai'
+  )
   appendTextElement(meta, 'p', `引用公告：${research.citedAnnouncementsCount} 条｜引用资讯：${research.citedNewsCount} 条`, 'muted')
   appendTextElement(meta, 'p', `标签：${research.tags.join(' / ')}`, 'tag ai')
 

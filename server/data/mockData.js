@@ -321,7 +321,7 @@ const companies = [
       generatedAt: new Date('2026-07-21T10:30:00.000Z'),
       version: 'v1',
       state: 'ready',
-      tags: ['AI生成', '快照绑定'],
+      tags: ['安全 Mock', '未调用模型', '快照绑定'],
       snapshotTime: new Date('2026-07-28T10:20:00.000Z'),
       citedAnnouncementsCount: 2,
       citedNewsCount: 1,

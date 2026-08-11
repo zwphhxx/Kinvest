@@ -250,9 +250,15 @@ async function apiResearch(req, res, code) {
       citedAnnouncementsCount: researchState.citedAnnouncementsCount,
       citedNewsCount: researchState.citedNewsCount,
       tags: researchState.tags,
+      sourceMode: 'mock',
+      modelStatus: {
+        mode: 'safe_mock',
+        called: false,
+        reason: 'MODEL_CONFIGURATION_INCOMPLETE'
+      },
       state: 'ready',
       sections: {
-        thesis: '基于已验证披露口径与公告元数据，当前可观察到现金流转化压力增加，但未观察到盈利质量持续恶化证据。',
+        thesis: '安全 Mock 演示：未调用模型。基于模拟快照展示研究结构，不构成真实分析或投资建议。',
         bulls: ['广告与云智能现金流改善可逐步对冲地产与本地生活波动。'],
         bears: ['研发与基础设施支出偏离短期利润弹性，需警惕资本支出结构变化。'],
         catalysts: ['中长期监管披露透明度改善、用户增长与服务转化率同步提升。'],
