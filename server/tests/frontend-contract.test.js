@@ -334,6 +334,12 @@ async function assertResearchResponseContract() {
       citedAnnouncementsCount: 1,
       citedNewsCount: 2,
       tags: ['<img src=x onerror=alert(1)>'],
+      sourceMode: 'mock',
+      modelStatus: {
+        mode: 'safe_mock',
+        called: false,
+        reason: 'MODEL_CONFIGURATION_INCOMPLETE'
+      },
       sections: {
         thesis: '<script>alert(1)</script>',
         bulls: ['<b>多头</b>'],
@@ -359,6 +365,14 @@ async function assertResearchResponseContract() {
     {},
     { success: true, data: null },
     { success: true, data: { ...validPayload.data, tags: 'not-an-array' } },
+    {
+      success: true,
+      data: {
+        ...validPayload.data,
+        sourceMode: 'real',
+        modelStatus: { mode: 'safe_mock', called: false, reason: 'MODEL_CONFIGURATION_INCOMPLETE' }
+      }
+    },
     {
       success: true,
       data: {
