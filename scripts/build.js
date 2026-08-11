@@ -14,6 +14,7 @@ const runtimeFiles = [
   'server/db/refresh-db.js',
   'server/domain/security-identity.js',
   'server/security/device-approval.js',
+  'server/security/cvm-ssm-secret-provider.js',
   'server/security/secret-provider.js',
   'server/services/health.js',
   'server/services/refresh-rules.js',

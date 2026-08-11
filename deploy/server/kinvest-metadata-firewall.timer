@@ -1,0 +1,11 @@
+[Unit]
+Description=Periodically verify Kinvest CVM metadata firewall
+
+[Timer]
+OnBootSec=2min
+OnUnitActiveSec=5min
+AccuracySec=15s
+Unit=kinvest-metadata-firewall.service
+
+[Install]
+WantedBy=timers.target

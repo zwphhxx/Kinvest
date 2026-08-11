@@ -1,6 +1,8 @@
 const tests = [
   require('./security-identity.test'),
   require('./device-approval.test'),
+  require('./cvm-ssm-secret-provider.test'),
+  require('./metadata-firewall-contract.test'),
   require('./refresh-policy.test'),
   require('./refresh-rules.test'),
   require('./health.test'),
