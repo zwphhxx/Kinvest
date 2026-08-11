@@ -41,6 +41,16 @@ function serviceBlock(compose, serviceName) {
   return match[0]
 }
 
+function parseKeyValueContract(source) {
+  return Object.fromEntries(
+    source.trim().split('\n').map((line) => {
+      const separator = line.indexOf('=')
+      assert.ok(separator > 0, `invalid metadata network contract line: ${line}`)
+      return [line.slice(0, separator), line.slice(separator + 1)]
+    })
+  )
+}
+
 function nginxBlocks(source, headerPattern) {
   const blocks = []
   const opening = new RegExp(`(?:^|\\n)\\s*${headerPattern}\\s*\\{`, 'g')
@@ -326,6 +336,8 @@ exec /usr/bin/mktemp "$@"
 async function run() {
   const dockerfile = readRootFile('Dockerfile')
   const compose = readRootFile('deploy/server/docker-compose.yml')
+  const metadataNetworkSource = readRootFile('deploy/server/kinvest-metadata-network.conf')
+  const metadataNetwork = parseKeyValueContract(metadataNetworkSource)
   const dockerignore = readRootFile('.dockerignore')
   const prepareScriptPath = path.join(rootDir, 'deploy/server/prepare-data-dir.sh')
   const prepareScript = readRootFile('deploy/server/prepare-data-dir.sh')
@@ -389,15 +401,50 @@ async function run() {
     kinvestService,
     /^ {4}volumes:\n {6}- type: bind\n {8}source: \/root\/docker\/kinvest\/data\n {8}target: \/data\n {8}bind:\n {10}create_host_path: false$/m
   )
-  assert.match(kinvestService, /^ {4}networks:\n {6}- web$/m)
+  assert.match(
+    kinvestService,
+    /^ {4}networks:\n {6}web: \{\}\n {6}metadata-egress:\n {8}ipv4_address: \$\{KINVEST_CONTAINER_IP:\?[^}]+\}\n {8}gw_priority: 1$/m
+  )
   assert.match(
     kinvestService,
     /^ {6}test: \["CMD", "wget", "--no-verbose", "--tries=1", "--spider", "http:\/\/127\.0\.0\.1:4173\/api\/health"\]$/m
   )
   assert.match(kinvestService, /^ {4}security_opt:\n {6}- no-new-privileges:true$/m)
   assert.match(kinvestService, /^ {4}cap_drop:\n {6}- ALL$/m)
+  assert.doesNotMatch(kinvestService, /^ {4}cap_add:/m)
   assert.doesNotMatch(compose, /^\s*ports\s*:/m)
   assert.match(networks, /^ {2}web:\n {4}external: true$/m)
+  assert.match(networks, /^ {2}metadata-egress:\n {4}name: \$\{KINVEST_METADATA_NETWORK:\?[^}]+\}$/m)
+  assert.match(networks, /^ {4}driver: bridge$/m)
+  assert.match(
+    networks,
+    /^ {4}driver_opts:\n {6}com\.docker\.network\.bridge\.name: \$\{KINVEST_BRIDGE_INTERFACE:\?[^}]+\}$/m
+  )
+  assert.match(
+    networks,
+    /^ {4}ipam:\n {6}config:\n {8}- subnet: \$\{KINVEST_METADATA_SUBNET:\?[^}]+\}\n {10}gateway: \$\{KINVEST_METADATA_GATEWAY:\?[^}]+\}$/m
+  )
+  assert.doesNotMatch(compose, /\binterface_name\s*:/)
+  assert.doesNotMatch(compose, /^\s*internal\s*:/m)
+  assert.deepEqual(metadataNetwork, {
+    KINVEST_METADATA_NETWORK: 'kinvest-metadata-egress',
+    KINVEST_METADATA_SUBNET: '172.31.252.0/29',
+    KINVEST_METADATA_GATEWAY: '172.31.252.1',
+    KINVEST_CONTAINER_NAME: 'kinvest',
+    KINVEST_CONTAINER_IP: '172.31.252.2',
+    KINVEST_BRIDGE_INTERFACE: 'br-kinvest-meta',
+    KINVEST_METADATA_IP: '169.254.0.23'
+  })
+  for (const value of [
+    metadataNetwork.KINVEST_METADATA_NETWORK,
+    metadataNetwork.KINVEST_METADATA_SUBNET,
+    metadataNetwork.KINVEST_METADATA_GATEWAY,
+    metadataNetwork.KINVEST_CONTAINER_IP,
+    metadataNetwork.KINVEST_BRIDGE_INTERFACE
+  ]) {
+    assert.doesNotMatch(compose, new RegExp(value.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')))
+  }
+  assert.equal(fs.existsSync(path.join(rootDir, 'deploy/server/.env')), false)
 
   assert.equal(fs.statSync(prepareScriptPath).mode & 0o111, 0o111, 'data directory preparation script must be executable')
   assert.match(prepareScript, /^#!\/usr\/bin\/env sh\nset -eu$/m)
@@ -638,9 +685,17 @@ async function run() {
     [
       'services:',
       '  nginx:',
-      '    networks:',
-      '      - default',
-      '      - web',
+      '    networks: !override',
+      '      web: {}',
+      '    security_opt:',
+      '      - no-new-privileges:true',
+      '    cap_drop:',
+      '      - ALL',
+      '    cap_add:',
+      '      - CHOWN',
+      '      - SETGID',
+      '      - SETUID',
+      '      - NET_BIND_SERVICE',
       '',
       'networks:',
       '  web:',
@@ -648,6 +703,9 @@ async function run() {
     ].join('\n'),
     'Explicit Nginx Compose file must only attach the existing service to the private web network'
   )
+  assert.doesNotMatch(explicitNginxCompose, /\bdefault\b/)
+  assert.doesNotMatch(explicitNginxCompose, /\bmetadata-egress\b/)
+  assert.doesNotMatch(explicitNginxCompose, /NET_(?:RAW|ADMIN)/)
   assert.equal(
     fs.existsSync(path.join(rootDir, 'deploy/server/docker-compose.override.yml')),
     false,
