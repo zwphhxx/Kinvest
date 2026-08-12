@@ -437,6 +437,33 @@ class OfflineImageAttestationTests(unittest.TestCase):
             "OFFLINE_ARCHIVE_TAR_EXTENSION_UNSUPPORTED",
         )
 
+    def test_raw_preflight_rejects_huge_solaris_pax_before_tarfile(self):
+        archive_bytes = raw_tar_header(
+            "solaris-pax",
+            self.module.MAX_ARCHIVE_BYTES + 1,
+            b"X",
+        )
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            archive_path = Path(temporary_directory) / "huge-solaris-pax.tar"
+            archive_path.write_bytes(archive_bytes)
+            archive_sha256 = hashlib.sha256(archive_bytes).hexdigest()
+            with mock.patch.object(
+                self.module.tarfile,
+                "open",
+                side_effect=AssertionError("tarfile must not process Solaris PAX headers"),
+            ) as tarfile_open:
+                with self.assertRaises(Exception) as raised:
+                    self.module._verify_archive(
+                        archive_path,
+                        archive_sha256,
+                        "ghcr.io/zwphhxx/kinvest@sha256:" + "1" * 64,
+                    )
+            self.assertEqual(
+                str(raised.exception),
+                "OFFLINE_ARCHIVE_TAR_EXTENSION_UNSUPPORTED",
+            )
+            tarfile_open.assert_not_called()
+
     def test_gzip_preflight_rejects_huge_gnu_longname_before_tarfile(self):
         archive = Path(self.temp.name) / "huge-longname.tar.gz"
         payload = (

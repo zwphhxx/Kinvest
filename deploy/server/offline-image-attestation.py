@@ -60,7 +60,7 @@ MAX_RECORD_BYTES = 4096
 RAW_TAR_BLOCK_BYTES = 512
 MAX_RAW_TAR_HEADERS = MAX_MEMBERS
 MAX_RAW_TAR_STREAM_BYTES = MAX_ARCHIVE_BYTES + (MAX_RAW_TAR_HEADERS + 2) * 1024
-UNSUPPORTED_TAR_TYPEFLAGS = frozenset((b"x", b"g", b"L", b"K", b"S"))
+UNSUPPORTED_TAR_TYPEFLAGS = frozenset((b"x", b"g", b"L", b"K", b"S", b"X"))
 
 
 class ArchiveVerificationError(RuntimeError):
