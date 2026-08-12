@@ -10,6 +10,15 @@ const MODES = new Set([
   'admin-password-verifier',
   'device-token-hmac'
 ])
+const GENERATOR_ERROR_CODES = new Set([
+  'ADMIN_PASSWORD_INVALID',
+  'ADMIN_PASSWORD_MISMATCH',
+  'ADMIN_VERIFIER_GENERATION_FAILED',
+  'SSM_MATERIAL_CLI_USAGE_INVALID',
+  'SSM_MATERIAL_CLIPBOARD_FAILED',
+  'SSM_MATERIAL_TTY_REQUIRED'
+])
+const CLIPBOARD_TIMEOUT_MS = 5000
 
 class SsmMaterialGeneratorError extends Error {
   constructor(code) {
@@ -30,7 +39,7 @@ function stableErrorCode(error) {
   const code = error && typeof error === 'object' && 'code' in error
     ? error.code
     : undefined
-  return typeof code === 'string' && /^[A-Z][A-Z0-9_]{2,63}$/.test(code)
+  return typeof code === 'string' && GENERATOR_ERROR_CODES.has(code)
     ? code
     : 'SSM_MATERIAL_GENERATION_FAILED'
 }
@@ -64,10 +73,18 @@ async function waitForClipboardClear(input, output) {
 
 /**
  * @param {string | Buffer} value
- * @param {typeof spawn} [spawnImpl]
- * @param {NodeJS.Platform} [platform]
+ * @param {object} [options]
+ * @param {(command: string, args: string[], options: any) => any} [options.spawnImpl]
+ * @param {NodeJS.Platform} [options.platform]
+ * @param {(handler: () => void, timeoutMs: number) => any} [options.setTimer]
+ * @param {(timer: any) => void} [options.clearTimer]
  */
-function writeMacClipboard(value, spawnImpl = spawn, platform = process.platform) {
+function writeMacClipboard(value, {
+  spawnImpl = spawn,
+  platform = process.platform,
+  setTimer = setTimeout,
+  clearTimer = clearTimeout
+} = {}) {
   if (platform !== 'darwin') {
     return Promise.reject(new SsmMaterialGeneratorError('SSM_MATERIAL_CLIPBOARD_FAILED'))
   }
@@ -75,12 +92,37 @@ function writeMacClipboard(value, spawnImpl = spawn, platform = process.platform
     const payload = Buffer.from(value)
     let child
     let settled = false
+    let timer
+    let stdin
+    const removeListeners = () => {
+      if (child) {
+        child.removeListener('error', handleChildError)
+        child.removeListener('close', handleClose)
+      }
+      if (stdin) stdin.removeListener('error', handleStdinError)
+    }
     const finish = (error) => {
       payload.fill(0)
       if (settled) return
       settled = true
+      if (timer !== undefined) clearTimer(timer)
+      removeListeners()
       if (error) reject(new SsmMaterialGeneratorError('SSM_MATERIAL_CLIPBOARD_FAILED'))
       else resolve()
+    }
+    const terminateAndFinish = () => {
+      if (child && typeof child.kill === 'function') {
+        try { child.kill('SIGKILL') } catch {
+          // Best effort: finish still clears owned buffers and rejects safely.
+        }
+      }
+      finish(new Error('clipboard failed'))
+    }
+    const handleChildError = () => terminateAndFinish()
+    const handleStdinError = () => terminateAndFinish()
+    const handleClose = (code) => {
+      if (code === 0) finish()
+      else terminateAndFinish()
     }
     try {
       child = spawnImpl('/usr/bin/pbcopy', [], {
@@ -90,10 +132,18 @@ function writeMacClipboard(value, spawnImpl = spawn, platform = process.platform
       finish(new Error('clipboard spawn failed'))
       return
     }
-    child.once('error', finish)
-    child.once('close', (code) => finish(code === 0 ? null : new Error('clipboard failed')))
-    child.stdin.once('error', finish)
-    child.stdin.end(payload)
+    stdin = child.stdin
+    child.once('error', handleChildError)
+    child.once('close', handleClose)
+    stdin.once('error', handleStdinError)
+    timer = setTimer(terminateAndFinish, CLIPBOARD_TIMEOUT_MS)
+    try {
+      stdin.end(payload)
+    } catch {
+      terminateAndFinish()
+    } finally {
+      payload.fill(0)
+    }
   })
 }
 
@@ -116,7 +166,9 @@ async function runGenerator({
 
   /** @type {Buffer | undefined} */
   let material
-  let copied = false
+  let clipboardWriteAttempted = false
+  let primaryError
+  let result
   try {
     if (mode === 'admin-password-verifier') {
       const password = await promptHidden('Administrator password: ')
@@ -129,18 +181,26 @@ async function runGenerator({
       material = Buffer.from(generateDeviceHmacSecret(randomBytes))
     }
 
+    clipboardWriteAttempted = true
     await writeClipboard(material)
-    copied = true
     output.write('SSM material copied to the macOS clipboard.\n')
     await waitForClear()
-    return Object.freeze({ kind: mode })
+    result = Object.freeze({ kind: mode })
+  } catch (error) {
+    primaryError = error
   } finally {
     if (material) material.fill(0)
-    if (copied) {
-      await writeClipboard('')
-      output.write('Clipboard cleared.\n')
+    if (clipboardWriteAttempted) {
+      try {
+        await writeClipboard(Buffer.alloc(0))
+        output.write('Clipboard cleared.\n')
+      } catch (cleanupError) {
+        if (!primaryError) primaryError = cleanupError
+      }
     }
   }
+  if (primaryError) throw primaryError
+  return result
 }
 
 /** @param {any} [options] */
