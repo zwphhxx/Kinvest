@@ -187,6 +187,10 @@ class ArchiveFixture:
             del self.members[f"blobs/sha256/{layer_digests[-1]}"]
         if self.case == "unreferenced_blob":
             self._add_blob(b"not reachable from the source descriptor\n")
+        if self.case == "streaming_layer_tampering":
+            layer_path = f"blobs/sha256/{layer_digests[-1]}"
+            original_layer = self.members[layer_path]
+            self.members[layer_path] = b"X" + original_layer[1:]
         if self.case == "traversal":
             self.special_members.append(("../outside", b"unsafe", tarfile.REGTYPE))
         if self.case == "symlink":
@@ -407,6 +411,44 @@ class OfflineImageAttestationTests(unittest.TestCase):
                 ),
                 "OFFLINE_ARCHIVE_METADATA_LIMIT",
             )
+
+    def test_rejects_cumulative_metadata_above_aggregate_limit(self):
+        fixture = self.fixture()
+        captured_metadata = [
+            content
+            for content in fixture.members.values()
+            if content.lstrip(b" \t\r\n").startswith((b"{", b"["))
+        ]
+        self.assertGreater(len(captured_metadata), 1)
+        aggregate_limit = max(len(content) for content in captured_metadata) + 1
+        self.assertTrue(
+            all(len(content) < aggregate_limit for content in captured_metadata)
+        )
+        self.assertGreater(sum(len(content) for content in captured_metadata), aggregate_limit)
+        with mock.patch.object(
+            self.module,
+            "MAX_CAPTURED_METADATA_BYTES",
+            aggregate_limit,
+        ):
+            self.assert_archive_error(
+                lambda: self.module.verify_archive(
+                    fixture.archive,
+                    fixture.archive_sha,
+                    fixture.source_ref,
+                ),
+                "OFFLINE_ARCHIVE_METADATA_LIMIT",
+            )
+
+    def test_rejects_tampered_streamed_non_json_layer(self):
+        fixture = self.fixture("streaming_layer_tampering")
+        tampered_layers = [
+            content
+            for name, content in fixture.members.items()
+            if name.startswith("blobs/sha256/")
+            and not content.lstrip(b" \t\r\n").startswith((b"{", b"["))
+        ]
+        self.assertGreater(len(tampered_layers), 0)
+        self.assert_rejected("streaming_layer_tampering")
 
     def test_rejects_deep_json_with_stable_error(self):
         self.assert_rejected(
