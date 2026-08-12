@@ -37,7 +37,11 @@ function runRootFixture(deploySource, {
   activationHash = null,
   activationStateSource = null,
   activationStat = '0:0:600',
-  activationSymlink = false
+  activationSymlink = false,
+  secretVersionIds = '{}',
+  currentSecretVersionIds = null,
+  previousStateSource = null,
+  preflightReferences = '2'
 } = {}) {
   const fixture = fs.mkdtempSync(path.join(os.tmpdir(), 'kinvest-deploy-v2-root-'))
   const root = path.join(fixture, 'root', 'docker', 'kinvest')
@@ -54,6 +58,7 @@ function runRootFixture(deploySource, {
   const candidateDigest = `ghcr.io/zwphhxx/kinvest@sha256:${'2'.repeat(64)}`
   const previousCommit = '3'.repeat(40)
   const candidateCommit = '4'.repeat(40)
+  const secretValidator = path.join(root, 'secret-version-config.py')
 
   fs.mkdirSync(dataDir, { recursive: true })
   fs.mkdirSync(stateDir)
@@ -83,8 +88,38 @@ function runRootFixture(deploySource, {
   const approvedConfigHash = crypto.createHash('sha256').update(metadataConfigSource).digest('hex')
   writeExecutable(path.join(root, 'prepare-data-dir.sh'), '#!/bin/sh\nexit 0\n')
   createSqlite(database)
-  const initialCurrentState = `digest_ref=${previousDigest}\ncommit=${previousCommit}\n`
+  const initialCurrentState = currentSecretVersionIds === null
+    ? `digest_ref=${previousDigest}\ncommit=${previousCommit}\n`
+    : [
+        'protocolVersion=2',
+        `imageDigest=${previousDigest}`,
+        `commit=${previousCommit}`,
+        'schemaVersion=0',
+        'imageSchemaMin=0',
+        'imageSchemaMax=0',
+        `secretVersionIds=${currentSecretVersionIds}`,
+        'releaseRecordSchemaVersion=2',
+        'verificationRunId=123456',
+        'artifactSource=ghcr-public',
+        'databaseBackupPath=none',
+        'databaseBackupChecksum=none',
+        'deployedAt=2026-08-11T00:00:00Z',
+        ''
+      ].join('\n')
   fs.writeFileSync(path.join(stateDir, 'current.state'), initialCurrentState)
+  const initialPreviousState = previousStateSource === null
+    ? null
+    : previousStateSource
+        .replaceAll('__DIGEST__', candidateDigest)
+        .replaceAll('__COMMIT__', candidateCommit)
+  if (initialPreviousState !== null) {
+    fs.writeFileSync(
+      path.join(stateDir, 'previous.state'),
+      initialPreviousState
+    )
+  }
+  fs.copyFileSync(path.join(rootDir, 'deploy/server/secret-version-config.py'), secretValidator)
+  fs.chmodSync(secretValidator, 0o755)
   if (metadataPhase !== null || activationStateSource !== null) {
     const stateSource = activationStateSource === null
       ? `version=1\nmode=${metadataPhase}\nconfig_sha256=${activationHash || approvedConfigHash}\n`
@@ -171,6 +206,9 @@ printf '%s\n' '{"status":"ok","service":"kinvest"}'
     `#!/bin/sh
 printf '%s\n' "$*" >> "$KINVEST_FAKE_STATE/docker.log"
 printf 'docker:%s\n' "$*" >> "$KINVEST_FAKE_STATE/lifecycle.log"
+if [ "$1" = run ] || [ "$1" = compose ]; then
+  printf '%s|%s|%s\n' "$1" "\${KINVEST_SECRET_PROVIDER_MODE:-}" "\${KINVEST_SECRET_VERSION_IDS:-}" >> "$KINVEST_FAKE_STATE/runtime-env.log"
+fi
 if [ "$1" = network ]; then
   target=''
   for argument in "$@"; do target="$argument"; done
@@ -194,8 +232,21 @@ if [ "$1" = image ] && [ "$2" = inspect ]; then
       fi
       ;;
     *schema.min*|*schema.max*) printf '0\n' ;;
+    *secret-bootstrap*)
+      if [ "$KINVEST_FAKE_MODE" = preflight-label-missing ]; then printf '<no value>\n'; else printf '1\n'; fi
+      ;;
     *Id*) printf 'sha256:fixture-image-id\n' ;;
   esac
+  exit 0
+fi
+if [ "$1" = run ]; then
+  case "$KINVEST_FAKE_MODE" in
+    preflight-failure) printf 'SSM_PREFLIGHT_FAILED\n' >&2; exit 1 ;;
+    preflight-stderr) printf 'unexpected\n' >&2 ;;
+    preflight-extra-output) printf 'KINVEST_SSM_PREFLIGHT_OK references=%s\nextra\n' "$KINVEST_PREFLIGHT_REFERENCES"; exit 0 ;;
+    preflight-missing-entry) exit 127 ;;
+  esac
+  printf 'KINVEST_SSM_PREFLIGHT_OK references=%s\n' "$KINVEST_PREFLIGHT_REFERENCES"
   exit 0
 fi
 if [ "$1" = inspect ]; then
@@ -254,6 +305,7 @@ esac
     .replace("RUN_ROOT='/run'", `RUN_ROOT='${runRoot}'`)
     .replace("METADATA_NETWORK_CONFIG='/etc/kinvest/metadata-network.conf'", `METADATA_NETWORK_CONFIG='${metadataNetworkConfig}'`)
     .replace("METADATA_FIREWALL='/usr/local/sbin/kinvest-metadata-firewall'", `METADATA_FIREWALL='${fakeMetadataFirewall}'`)
+    .replace("SECRET_VERSION_VALIDATOR='/usr/local/libexec/kinvest-secret-version-config'", `SECRET_VERSION_VALIDATOR='${secretValidator}'`)
   const scriptPath = path.join(fixture, 'deploy-v2')
   writeExecutable(scriptPath, instrumented)
   const payload = [
@@ -267,7 +319,7 @@ esac
     '2',
     '987654',
     'ghcr-public',
-    '{}',
+    secretVersionIds,
     'EOF'
   ].join('\n') + '\n'
   const result = spawnSync(scriptPath, [], {
@@ -280,6 +332,7 @@ esac
       KINVEST_FAKE_DB: database,
       KINVEST_FAKE_MODE: mode,
       KINVEST_FAKE_STATE: fakeState,
+      KINVEST_PREFLIGHT_REFERENCES: preflightReferences,
       KINVEST_METADATA_CONFIG_PATH: metadataNetworkConfig,
       KINVEST_METADATA_ACTIVATION_PATH: metadataActivationState,
       KINVEST_METADATA_ACTIVATION_STAT: activationStat,
@@ -290,13 +343,18 @@ esac
 
   return {
     candidateDigest,
+    candidateCommit,
     cleanup() { fs.rmSync(fixture, { recursive: true, force: true }) },
     fakeState,
     initialCurrentState,
+    initialPreviousState,
     metadataActivationState,
     metadataNetworkConfig,
     approvedConfigHash,
     result,
+    previousCommit,
+    previousDigest,
+    root,
     runRoot,
     stateDir
   }
@@ -358,6 +416,10 @@ async function run() {
 
   assert.match(installer, /deploy-kinvest-v2\.sh/)
   assert.match(installer, /kinvest-ssh-command-v2/)
+  assert.match(installer, /secret-version-config\.py/)
+  assert.match(installer, /install -d -o root -g root -m 0755 -- \/usr\/local\/libexec/)
+  assert.doesNotMatch(installer, /for source_file in [^\n]*secret-version-config\.py/)
+  assert.match(installer, /python3 "\$SOURCE_DIR\/secret-version-config\.py" mapping/)
   assert.match(installer, /no container was restarted/)
 
   assert.match(workflow, /DEPLOY_V2_ENABLED/)
@@ -726,4 +788,4 @@ cat > "${path.join(fixture, 'stdin')}"
   }
 }
 
-module.exports = { run }
+module.exports = { readLogLines, run, runRootFixture }

@@ -8,6 +8,8 @@ services:
       TZ: ${TZ:-Asia/Shanghai}
       PORT: 4173
       KINVEST_DB_PATH: /data/kinvest.sqlite
+      KINVEST_SECRET_PROVIDER_MODE: ${KINVEST_SECRET_PROVIDER_MODE:-disabled}
+      KINVEST_SECRET_VERSION_IDS: ${KINVEST_SECRET_VERSION_IDS:-{}}
     volumes:
       - type: bind
         source: /root/docker/kinvest/data
