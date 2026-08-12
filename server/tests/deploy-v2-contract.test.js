@@ -40,6 +40,7 @@ function runRootFixture(deploySource, {
   activationSymlink = false,
   secretVersionIds = '{}',
   currentSecretVersionIds = null,
+  currentStateSource = null,
   previousStateSource = null,
   preflightReferences = '2'
 } = {}) {
@@ -58,7 +59,10 @@ function runRootFixture(deploySource, {
   const candidateDigest = `ghcr.io/zwphhxx/kinvest@sha256:${'2'.repeat(64)}`
   const previousCommit = '3'.repeat(40)
   const candidateCommit = '4'.repeat(40)
+  const previousImageId = `sha256:${'5'.repeat(64)}`
+  const candidateImageId = `sha256:${'6'.repeat(64)}`
   const secretValidator = path.join(root, 'secret-version-config.py')
+  const offlineImageAttestation = path.join(fakeBin, 'kinvest-offline-image-attestation')
 
   fs.mkdirSync(dataDir, { recursive: true })
   fs.mkdirSync(stateDir)
@@ -88,9 +92,10 @@ function runRootFixture(deploySource, {
   const approvedConfigHash = crypto.createHash('sha256').update(metadataConfigSource).digest('hex')
   writeExecutable(path.join(root, 'prepare-data-dir.sh'), '#!/bin/sh\nexit 0\n')
   createSqlite(database)
-  const initialCurrentState = currentSecretVersionIds === null
-    ? `digest_ref=${previousDigest}\ncommit=${previousCommit}\n`
-    : [
+  const initialCurrentState = currentStateSource === null
+    ? currentSecretVersionIds === null
+      ? `digest_ref=${previousDigest}\ncommit=${previousCommit}\n`
+      : [
         'protocolVersion=2',
         `imageDigest=${previousDigest}`,
         `commit=${previousCommit}`,
@@ -106,11 +111,16 @@ function runRootFixture(deploySource, {
         'deployedAt=2026-08-11T00:00:00Z',
         ''
       ].join('\n')
+    : currentStateSource
+        .replaceAll('__DIGEST__', previousDigest)
+        .replaceAll('__RUNTIME_IMAGE_ID__', previousImageId)
+        .replaceAll('__COMMIT__', previousCommit)
   fs.writeFileSync(path.join(stateDir, 'current.state'), initialCurrentState)
   const initialPreviousState = previousStateSource === null
     ? null
     : previousStateSource
         .replaceAll('__DIGEST__', candidateDigest)
+        .replaceAll('__RUNTIME_IMAGE_ID__', candidateImageId)
         .replaceAll('__COMMIT__', candidateCommit)
   if (initialPreviousState !== null) {
     fs.writeFileSync(
@@ -132,7 +142,11 @@ function runRootFixture(deploySource, {
       fs.writeFileSync(metadataActivationState, stateSource, { mode: 0o600 })
     }
   }
-  fs.writeFileSync(path.join(fakeState, 'running.ref'), `${previousDigest}\n`)
+  fs.writeFileSync(
+    path.join(fakeState, 'running.ref'),
+    `${initialCurrentState.startsWith('protocolVersion=3\n') ? previousImageId : previousDigest}\n`
+  )
+  fs.writeFileSync(path.join(fakeState, 'running.id'), `${previousImageId}\n`)
   fs.writeFileSync(path.join(fakeState, 'running.health'), 'healthy\n')
 
   writeExecutable(
@@ -202,12 +216,36 @@ printf '%s\n' '{"status":"ok","service":"kinvest"}'
 `
   )
   writeExecutable(
+    offlineImageAttestation,
+    `#!/bin/sh
+printf '%s\n' "$*" >> "$KINVEST_FAKE_STATE/offline-helper.log"
+[ "$1" = resolve ] || exit 2
+case "$KINVEST_FAKE_MODE" in
+  exact-digest-with-helper|offline-valid|offline-missing-local-id)
+    printf '%s\n' "$KINVEST_CANDIDATE_IMAGE_ID"
+    ;;
+  offline-malformed|offline-pull-failure)
+    printf '%s\n' 'sha256:not-an-image-id'
+    ;;
+  offline-wrong-commit|offline-wrong-run)
+    exit 1
+    ;;
+  *)
+    exit 1
+    ;;
+esac
+`
+  )
+  writeExecutable(
     path.join(fakeBin, 'docker'),
     `#!/bin/sh
 printf '%s\n' "$*" >> "$KINVEST_FAKE_STATE/docker.log"
 printf 'docker:%s\n' "$*" >> "$KINVEST_FAKE_STATE/lifecycle.log"
 if [ "$1" = run ] || [ "$1" = compose ]; then
   printf '%s|%s|%s\n' "$1" "\${KINVEST_SECRET_PROVIDER_MODE:-}" "\${KINVEST_SECRET_VERSION_IDS:-}" >> "$KINVEST_FAKE_STATE/runtime-env.log"
+fi
+if [ "$1" = compose ]; then
+  printf 'compose|%s\n' "\${KINVEST_IMAGE:-}" >> "$KINVEST_FAKE_STATE/image-env.log"
 fi
 if [ "$1" = network ]; then
   target=''
@@ -222,6 +260,7 @@ if [ "$1" = pull ]; then
   pull_count=$((pull_count + 1))
   printf '%s\n' "$pull_count" > "$KINVEST_FAKE_STATE/pull-count"
   if [ "$KINVEST_FAKE_MODE" = local-digest-transient ] && [ "$pull_count" -eq 1 ]; then exit 124; fi
+  if [ "$KINVEST_FAKE_MODE" = offline-pull-failure ]; then printf 'access denied\n' >&2; exit 1; fi
   : > "$KINVEST_FAKE_STATE/pulled"
   exit 0
 fi
@@ -233,17 +272,33 @@ if [ "$1" = image ] && [ "$2" = inspect ]; then
     *RepoDigests*)
       if [ "$KINVEST_FAKE_MODE" = wrong-digest ] && [ "$ref" = "$KINVEST_CANDIDATE" ]; then
         printf '["ghcr.io/zwphhxx/kinvest@sha256:%064d"]\n' 0
-      elif { [ "$KINVEST_FAKE_MODE" = local-tag-and-id-only ] || [ "$KINVEST_FAKE_MODE" = local-digest-transient ] || [ "$KINVEST_FAKE_MODE" = signal ]; } && [ ! -f "$KINVEST_FAKE_STATE/pulled" ]; then
-        printf '["ghcr.io/zwphhxx/kinvest:offline-import"]\n'
       else
-        printf '["%s"]\n' "$ref"
+        case "$KINVEST_FAKE_MODE" in
+          local-tag-and-id-only|local-digest-transient|signal|offline-*)
+            if [ ! -f "$KINVEST_FAKE_STATE/pulled" ]; then
+              printf '["ghcr.io/zwphhxx/kinvest:offline-import"]\n'
+            else
+              printf '["%s"]\n' "$ref"
+            fi
+            ;;
+          *) printf '["%s"]\n' "$ref" ;;
+        esac
       fi
       ;;
     *schema.min*|*schema.max*) printf '0\n' ;;
     *secret-bootstrap*)
       if [ "$KINVEST_FAKE_MODE" = preflight-label-missing ]; then printf '<no value>\n'; else printf '1\n'; fi
       ;;
-    *Id*) printf 'sha256:fixture-image-id\n' ;;
+    *Id*)
+      case "$ref" in
+        "$KINVEST_CANDIDATE"|"$KINVEST_CANDIDATE_IMAGE_ID")
+          if [ "$KINVEST_FAKE_MODE" = offline-missing-local-id ] && [ "$ref" = "$KINVEST_CANDIDATE_IMAGE_ID" ] && [ ! -f "$KINVEST_FAKE_STATE/pulled" ]; then exit 1; fi
+          printf '%s\n' "$KINVEST_CANDIDATE_IMAGE_ID"
+          ;;
+        "$KINVEST_PREVIOUS"|"$KINVEST_PREVIOUS_IMAGE_ID") printf '%s\n' "$KINVEST_PREVIOUS_IMAGE_ID" ;;
+        *) exit 1 ;;
+      esac
+      ;;
   esac
   exit 0
 fi
@@ -262,7 +317,7 @@ if [ "$1" = inspect ]; then
   case "$format" in
     *Health.Status*) cat "$KINVEST_FAKE_STATE/running.health" ;;
     *Config.Image*) cat "$KINVEST_FAKE_STATE/running.ref" ;;
-    *Image*) printf 'sha256:fixture-image-id\n' ;;
+    *Image*) cat "$KINVEST_FAKE_STATE/running.id" ;;
   esac
   exit 0
 fi
@@ -271,6 +326,13 @@ if [ "$1" = compose ]; then
     *" config "*) printf '%s\n' 'services: {}'; exit 0 ;;
   esac
   printf '%s\n' "$KINVEST_IMAGE" > "$KINVEST_FAKE_STATE/running.ref"
+  case "$KINVEST_IMAGE" in
+    "$KINVEST_CANDIDATE"|"$KINVEST_CANDIDATE_IMAGE_ID") printf '%s\n' "$KINVEST_CANDIDATE_IMAGE_ID" > "$KINVEST_FAKE_STATE/running.id" ;;
+    "$KINVEST_PREVIOUS"|"$KINVEST_PREVIOUS_IMAGE_ID") printf '%s\n' "$KINVEST_PREVIOUS_IMAGE_ID" > "$KINVEST_FAKE_STATE/running.id" ;;
+    *) exit 1 ;;
+  esac
+  if [ "$KINVEST_FAKE_MODE" = runtime-ref-mismatch ]; then printf '%s\n' "$KINVEST_CANDIDATE" > "$KINVEST_FAKE_STATE/running.ref"; fi
+  if [ "$KINVEST_FAKE_MODE" = runtime-id-mismatch ]; then printf 'sha256:%064d\n' 9 > "$KINVEST_FAKE_STATE/running.id"; fi
   if [ "$KINVEST_FAKE_MODE" = incompatible ]; then
     python3 -c "import sqlite3; c=sqlite3.connect('$KINVEST_FAKE_DB'); c.execute('pragma user_version=1'); c.close()"
     printf 'unhealthy\n' > "$KINVEST_FAKE_STATE/running.health"
@@ -314,6 +376,7 @@ esac
     .replace("METADATA_NETWORK_CONFIG='/etc/kinvest/metadata-network.conf'", `METADATA_NETWORK_CONFIG='${metadataNetworkConfig}'`)
     .replace("METADATA_FIREWALL='/usr/local/sbin/kinvest-metadata-firewall'", `METADATA_FIREWALL='${fakeMetadataFirewall}'`)
     .replace("SECRET_VERSION_VALIDATOR='/usr/local/libexec/kinvest-secret-version-config'", `SECRET_VERSION_VALIDATOR='${secretValidator}'`)
+    .replace("OFFLINE_IMAGE_ATTESTATION='/usr/local/libexec/kinvest-offline-image-attestation'", `OFFLINE_IMAGE_ATTESTATION='${offlineImageAttestation}'`)
   const scriptPath = path.join(fixture, 'deploy-v2')
   writeExecutable(scriptPath, instrumented)
   const payload = [
@@ -337,6 +400,9 @@ esac
       ...process.env,
       PATH: `${fakeBin}:${process.env.PATH}`,
       KINVEST_CANDIDATE: candidateDigest,
+      KINVEST_CANDIDATE_IMAGE_ID: candidateImageId,
+      KINVEST_PREVIOUS: previousDigest,
+      KINVEST_PREVIOUS_IMAGE_ID: previousImageId,
       KINVEST_FAKE_DB: database,
       KINVEST_FAKE_MODE: mode,
       KINVEST_FAKE_STATE: fakeState,
@@ -352,6 +418,7 @@ esac
   return {
     candidateDigest,
     candidateCommit,
+    candidateImageId,
     cleanup() { fs.rmSync(fixture, { recursive: true, force: true }) },
     fakeState,
     initialCurrentState,
@@ -362,6 +429,7 @@ esac
     result,
     previousCommit,
     previousDigest,
+    previousImageId,
     root,
     runRoot,
     stateDir
@@ -387,24 +455,26 @@ async function run() {
   assert.match(deploy, /docker login "\$registry_host" --username "\$registry_username" --password-stdin/)
   assert.match(deploy, /rm -f -- "\$DOCKER_CONFIG\/config\.json"/)
   assert.match(deploy, /\.RepoDigests/)
+  assert.match(deploy, /^OFFLINE_IMAGE_ATTESTATION='\/usr\/local\/libexec\/kinvest-offline-image-attestation'$/m)
   assert.match(deploy, /ROLLBACK_REQUIRES_DB_RESTORE/)
   assert.match(deploy, /TCR_POLICY_FILE/)
   assert.match(deploy, /atomic_write_attempt_state/)
   assert.match(deploy, /run_docker stop kinvest/)
   assert.match(deploy, /verify_public_health/)
-  assert.match(deploy, /protocolVersion=2/)
+  assert.match(deploy, /protocolVersion=3/)
   assert.match(deploy, /^METADATA_NETWORK_CONFIG='\/etc\/kinvest\/metadata-network\.conf'$/m)
   assert.match(deploy, /^METADATA_FIREWALL='\/usr\/local\/sbin\/kinvest-metadata-firewall'$/m)
   assert.match(deploy, /atomic_write_metadata_activation_state/)
   assert.match(deploy, /metadata_config_snapshot=.*mktemp.*\$RUN_ROOT/)
   assert.match(deploy, /run_metadata_firewall validate-config/)
   assert.match(deploy, /run_metadata_firewall status/)
-  assert.match(deploy, /run_metadata_firewall guard[\s\S]{0,300}run_compose "\$digest_ref"/)
-  assert.match(deploy, /run_compose "\$digest_ref"[\s\S]{0,300}run_metadata_firewall reconcile/)
+  assert.match(deploy, /run_metadata_firewall guard[\s\S]{0,300}run_compose "\$candidate_runtime_image_id"/)
+  assert.match(deploy, /run_compose "\$candidate_runtime_image_id"[\s\S]{0,300}run_metadata_firewall reconcile/)
   assert.match(deploy, /docker compose[\s\\]*\n?[\s\S]{0,300}--env-file "\$metadata_config_snapshot"/)
   assert.doesNotMatch(deploy, /--env-file\s+(?:\.env|"\.env")/)
   for (const field of [
     'imageDigest',
+    'runtimeImageId',
     'commit',
     'schemaVersion',
     'imageSchemaMin',
@@ -486,8 +556,9 @@ async function run() {
   try {
     assert.equal(successfulRoot.result.status, 0, successfulRoot.result.stderr)
     const currentState = fs.readFileSync(path.join(successfulRoot.stateDir, 'current.state'), 'utf8')
-    assert.match(currentState, /^protocolVersion=2$/m)
+    assert.match(currentState, /^protocolVersion=3$/m)
     assert.match(currentState, new RegExp(`^imageDigest=${successfulRoot.candidateDigest.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')}$`, 'm'))
+    assert.match(currentState, new RegExp(`^runtimeImageId=${successfulRoot.candidateImageId}$`, 'm'))
     assert.match(currentState, /^verificationRunId=987654$/m)
     assert.match(currentState, /^databaseBackupChecksum=[0-9a-f]{64}$/m)
     assert.equal(fs.existsSync(path.join(successfulRoot.stateDir, 'attempt.state')), false)
@@ -499,6 +570,11 @@ async function run() {
       'an exact locally available RepoDigest must skip the registry pull'
     )
     assert.match(successfulRoot.result.stderr, /RepoDigest is already verified locally; registry pull skipped/)
+    assert.deepEqual(readLogLines(path.join(successfulRoot.fakeState, 'offline-helper.log')), [])
+    assert.ok(
+      readLogLines(path.join(successfulRoot.fakeState, 'image-env.log')).some((line) => line === `compose|${successfulRoot.candidateImageId}`),
+      'Compose must receive the immutable candidate Image ID'
+    )
     const composeOperations = dockerOperations.filter((operation) => operation.startsWith('compose '))
     assert.ok(composeOperations.some((operation) => /\bconfig\b/.test(operation)))
     assert.ok(composeOperations.some((operation) => /\bup\b/.test(operation)))
@@ -536,6 +612,74 @@ async function run() {
     )
   } finally {
     successfulRoot.cleanup()
+  }
+
+  const exactDigestPrecedence = runRootFixture(deploy, { mode: 'exact-digest-with-helper' })
+  try {
+    assert.equal(exactDigestPrecedence.result.status, 0, exactDigestPrecedence.result.stderr)
+    assert.deepEqual(readLogLines(path.join(exactDigestPrecedence.fakeState, 'offline-helper.log')), [])
+    assert.equal(readLogLines(path.join(exactDigestPrecedence.fakeState, 'docker.log')).filter((line) => line.startsWith('pull ')).length, 0)
+  } finally {
+    exactDigestPrecedence.cleanup()
+  }
+
+  const offlineValid = runRootFixture(deploy, { mode: 'offline-valid' })
+  try {
+    assert.equal(offlineValid.result.status, 0, offlineValid.result.stderr)
+    assert.equal(readLogLines(path.join(offlineValid.fakeState, 'docker.log')).filter((line) => line.startsWith('pull ')).length, 0)
+    assert.deepEqual(readLogLines(path.join(offlineValid.fakeState, 'offline-helper.log')), [
+      `resolve ${offlineValid.candidateDigest} ${offlineValid.candidateCommit} 987654`
+    ])
+    assert.ok(readLogLines(path.join(offlineValid.fakeState, 'image-env.log')).some((line) => line === `compose|${offlineValid.candidateImageId}`))
+  } finally {
+    offlineValid.cleanup()
+  }
+
+  for (const mode of ['offline-wrong-commit', 'offline-wrong-run', 'offline-malformed', 'offline-missing-local-id']) {
+    const invalidOffline = runRootFixture(deploy, { mode })
+    try {
+      assert.equal(invalidOffline.result.status, 0, invalidOffline.result.stderr)
+      assert.equal(readLogLines(path.join(invalidOffline.fakeState, 'offline-helper.log')).length, 1)
+      assert.deepEqual(
+        readLogLines(path.join(invalidOffline.fakeState, 'docker.log')).filter((line) => line.startsWith('pull ')),
+        [`pull ${invalidOffline.candidateDigest}`],
+        `${mode} must fall back to the bounded registry pull`
+      )
+    } finally {
+      invalidOffline.cleanup()
+    }
+  }
+
+  const invalidOfflineWithoutRegistry = runRootFixture(deploy, { mode: 'offline-pull-failure' })
+  try {
+    assert.notEqual(invalidOfflineWithoutRegistry.result.status, 0)
+    assert.equal(readLogLines(path.join(invalidOfflineWithoutRegistry.fakeState, 'offline-helper.log')).length, 1)
+    assert.deepEqual(
+      readLogLines(path.join(invalidOfflineWithoutRegistry.fakeState, 'docker.log')).filter((line) => line.startsWith('pull ')),
+      [`pull ${invalidOfflineWithoutRegistry.candidateDigest}`]
+    )
+  } finally {
+    invalidOfflineWithoutRegistry.cleanup()
+  }
+
+  const v2Migration = runRootFixture(deploy, { currentSecretVersionIds: '{}' })
+  try {
+    assert.equal(v2Migration.result.status, 0, v2Migration.result.stderr)
+    const previous = fs.readFileSync(path.join(v2Migration.stateDir, 'previous.state'), 'utf8')
+    assert.match(previous, /^protocolVersion=3$/m)
+    assert.match(previous, new RegExp(`^runtimeImageId=${v2Migration.previousImageId}$`, 'm'))
+  } finally {
+    v2Migration.cleanup()
+  }
+
+  const legacyMigration = runRootFixture(deploy)
+  try {
+    assert.equal(legacyMigration.result.status, 0, legacyMigration.result.stderr)
+    const previous = fs.readFileSync(path.join(legacyMigration.stateDir, 'previous.state'), 'utf8')
+    assert.match(previous, /^protocolVersion=3$/m)
+    assert.match(previous, new RegExp(`^runtimeImageId=${legacyMigration.previousImageId}$`, 'm'))
+  } finally {
+    legacyMigration.cleanup()
   }
 
   const localTagAndIdOnly = runRootFixture(deploy, { mode: 'local-tag-and-id-only' })
@@ -780,8 +924,23 @@ async function run() {
     assert.notEqual(publicHealthFailure.result.status, 0)
     assert.match(publicHealthFailure.result.stderr, /evaluating verified rollback/)
     assert.equal(fs.existsSync(path.join(publicHealthFailure.stateDir, 'attempt.state')), false)
+    const composeImages = readLogLines(path.join(publicHealthFailure.fakeState, 'image-env.log'))
+    assert.deepEqual(composeImages.slice(-2), [
+      `compose|${publicHealthFailure.candidateImageId}`,
+      `compose|${publicHealthFailure.previousImageId}`
+    ])
   } finally {
     publicHealthFailure.cleanup()
+  }
+
+  for (const mode of ['runtime-ref-mismatch', 'runtime-id-mismatch']) {
+    const runtimeMismatch = runRootFixture(deploy, { mode })
+    try {
+      assert.notEqual(runtimeMismatch.result.status, 0, `${mode} must fail runtime identity verification`)
+      assert.match(runtimeMismatch.result.stderr, /evaluating verified rollback/)
+    } finally {
+      runtimeMismatch.cleanup()
+    }
   }
 
   const signal = runRootFixture(deploy, { mode: 'signal' })
@@ -834,3 +993,10 @@ cat > "${path.join(fixture, 'stdin')}"
 }
 
 module.exports = { readLogLines, run, runRootFixture }
+
+if (require.main === module) {
+  run().catch((error) => {
+    console.error(error)
+    process.exitCode = 1
+  })
+}

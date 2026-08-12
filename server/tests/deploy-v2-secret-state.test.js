@@ -8,10 +8,15 @@ const rootDir = path.resolve(__dirname, '../..')
 const enabledOne = '{"adminPasswordVerifier":"v20260812-001","deviceTokenHmac":{"accepted":["v20260812-001"],"active":"v20260812-001"}}'
 const enabledTwo = '{"adminPasswordVerifier":"v20260812-001","deviceTokenHmac":{"accepted":["v20260812-001","v20260812-002"],"active":"v20260812-002"}}'
 
-function stateSource(mapping, { digest = '__DIGEST__', commit = '__COMMIT__' } = {}) {
+function stateSource(mapping, {
+  digest = '__DIGEST__',
+  runtimeImageId = '__RUNTIME_IMAGE_ID__',
+  commit = '__COMMIT__'
+} = {}) {
   return [
-    'protocolVersion=2',
+    'protocolVersion=3',
     `imageDigest=${digest}`,
+    `runtimeImageId=${runtimeImageId}`,
     `commit=${commit}`,
     'schemaVersion=0',
     'imageSchemaMin=0',
@@ -60,6 +65,7 @@ async function run() {
   assert.match(deploy, /KINVEST_SSM_PREFLIGHT_OK references=/)
   assert.match(deploy, /--user 10001:10001[\s\\]*\n?[\s\S]{0,300}--read-only[\s\\]*\n?[\s\S]{0,300}--cap-drop ALL[\s\\]*\n?[\s\S]{0,300}--security-opt no-new-privileges:true[\s\\]*\n?[\s\S]{0,300}--network container:kinvest/)
   assert.match(deploy, /--entrypoint node[\s\\]*\n?[\s\S]{0,200}server\/secret-preflight\.js/)
+  assert.match(deploy, /^OFFLINE_IMAGE_ATTESTATION='\/usr\/local\/libexec\/kinvest-offline-image-attestation'$/m)
   assert.match(compose, /KINVEST_SECRET_PROVIDER_MODE: \$\{KINVEST_SECRET_PROVIDER_MODE/)
   assert.match(compose, /KINVEST_SECRET_VERSION_IDS: \$\{KINVEST_SECRET_VERSION_IDS/)
   assert.doesNotMatch(compose, /SecretString|secretId|secretKey|SECRET_KEY|HMAC_KEY/)
@@ -85,12 +91,14 @@ async function run() {
     assert.match(preflight, /^run --rm --user 10001:10001 --read-only --cap-drop ALL --security-opt no-new-privileges:true --network container:kinvest /)
     assert.match(preflight, /--env KINVEST_SECRET_PROVIDER_MODE=cvm-ssm /)
     assert.match(preflight, /--env KINVEST_SECRET_VERSION_IDS=/)
-    assert.match(preflight, /--entrypoint node .* server\/secret-preflight\.js$/)
+    assert.match(preflight, new RegExp(`--entrypoint node ${enabled.candidateImageId} server/secret-preflight\\.js$`))
     const preflightIndex = calls.indexOf(preflight)
     const composeUpIndex = calls.findIndex((line) => /^compose .*\bup\b/.test(line))
     assert.ok(preflightIndex >= 0 && composeUpIndex > preflightIndex)
     assert.ok(runtimeEnvLog(enabled).some((line) => line === `compose|cvm-ssm|${enabledTwo}`))
     const current = fs.readFileSync(path.join(enabled.stateDir, 'current.state'), 'utf8')
+    assert.match(current, /^protocolVersion=3$/m)
+    assert.match(current, new RegExp(`^runtimeImageId=${enabled.candidateImageId}$`, 'm'))
     assert.match(current, new RegExp(`^secretVersionIds=${enabledTwo.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')}$`, 'm'))
     assert.equal(fs.statSync(path.join(enabled.stateDir, 'current.state')).mode & 0o777, 0o600)
   } finally {
@@ -139,7 +147,7 @@ async function run() {
   })
   try {
     assert.equal(rollbackEnabled.result.status, 0, rollbackEnabled.result.stderr)
-    assert.ok(dockerLog(rollbackEnabled).some((line) => line.startsWith('run ')))
+    assert.ok(dockerLog(rollbackEnabled).some((line) => line.startsWith('run ') && line.includes(` ${rollbackEnabled.candidateImageId} `)))
     assert.ok(runtimeEnvLog(rollbackEnabled).some((line) => line === `compose|cvm-ssm|${enabledOne}`))
     assert.match(
       fs.readFileSync(path.join(rollbackEnabled.stateDir, 'current.state'), 'utf8'),
@@ -160,6 +168,23 @@ async function run() {
     assert.ok(runtimeEnvLog(rollbackDisabled).some((line) => line === 'compose|disabled|{}'))
   } finally {
     rollbackDisabled.cleanup()
+  }
+
+  const validV3 = stateSource('{}')
+  const invalidV3States = [
+    validV3.replace('runtimeImageId=__RUNTIME_IMAGE_ID__\ncommit=', 'commit=__COMMIT__\nruntimeImageId='),
+    validV3.replace('runtimeImageId=__RUNTIME_IMAGE_ID__\n', ''),
+    validV3.replace('runtimeImageId=__RUNTIME_IMAGE_ID__', 'runtimeImageId=sha256:not-valid'),
+    validV3.replace('commit=__COMMIT__\n', 'unexpected=value\ncommit=__COMMIT__\n')
+  ]
+  for (const currentStateSource of invalidV3States) {
+    const invalidState = runRootFixture(deploy, { currentStateSource })
+    try {
+      assert.notEqual(invalidState.result.status, 0)
+      assertNoMutation(invalidState)
+    } finally {
+      invalidState.cleanup()
+    }
   }
 
   for (const previousStateSource of [
@@ -185,16 +210,26 @@ async function run() {
 
   const automaticRollback = runRootFixture(deploy, {
     mode: 'public-health-failure',
-    secretVersionIds: '{}',
+    secretVersionIds: enabledOne,
     currentSecretVersionIds: enabledOne
   })
   try {
     assert.notEqual(automaticRollback.result.status, 0)
     const composeEnvironments = runtimeEnvLog(automaticRollback).filter((line) => line.startsWith('compose|'))
     assert.equal(composeEnvironments.at(-1), `compose|cvm-ssm|${enabledOne}`)
+    const preflights = dockerLog(automaticRollback).filter((line) => line.startsWith('run '))
+    assert.ok(preflights[0].includes(` ${automaticRollback.candidateImageId} `))
+    assert.ok(preflights.at(-1).includes(` ${automaticRollback.previousImageId} `))
   } finally {
     automaticRollback.cleanup()
   }
 }
 
 module.exports = { run }
+
+if (require.main === module) {
+  run().catch((error) => {
+    console.error(error)
+    process.exitCode = 1
+  })
+}

@@ -7,6 +7,7 @@ COMPOSE="$ROOT/docker-compose.yml"
 METADATA_NETWORK_CONFIG='/etc/kinvest/metadata-network.conf'
 METADATA_FIREWALL='/usr/local/sbin/kinvest-metadata-firewall'
 SECRET_VERSION_VALIDATOR='/usr/local/libexec/kinvest-secret-version-config'
+OFFLINE_IMAGE_ATTESTATION='/usr/local/libexec/kinvest-offline-image-attestation'
 DATA_DIR="$ROOT/data"
 DATABASE="$DATA_DIR/kinvest.sqlite"
 STATE="$ROOT/state"
@@ -473,6 +474,57 @@ verify_repo_digest() {
   grep -Fq -- "\"$expected_ref\"" <<< "$repo_digests"
 }
 
+inspect_image_id() {
+  local image_ref="$1"
+  local image_id=''
+
+  image_id="$(run_inspect image inspect --format '{{.Id}}' "$image_ref")" || return 1
+  [[ "$image_id" =~ ^sha256:[0-9a-f]{64}$ ]] || return 1
+  printf '%s\n' "$image_id"
+}
+
+resolve_offline_image_id() {
+  local value=''
+  local available_image_id=''
+
+  [[ -x "$OFFLINE_IMAGE_ATTESTATION" && ! -L "$OFFLINE_IMAGE_ATTESTATION" ]] || return 1
+  value="$(
+    "$OFFLINE_IMAGE_ATTESTATION" resolve \
+      "$digest_ref" \
+      "$commit_sha" \
+      "$verification_run_id" 2>/dev/null
+  )" || return 1
+  [[ "$value" =~ ^sha256:[0-9a-f]{64}$ ]] || return 1
+  available_image_id="$(inspect_image_id "$value")" || return 1
+  [[ "$available_image_id" == "$value" ]] || return 1
+  printf '%s\n' "$value"
+}
+
+resolve_candidate_runtime_image_id() {
+  local resolved_image_id=''
+
+  candidate_runtime_image_id=''
+  if verify_repo_digest "$digest_ref"; then
+    resolved_image_id="$(inspect_image_id "$digest_ref")" || return 1
+    printf '%s\n' 'Kinvest image RepoDigest is already verified locally; registry pull skipped.' >&2
+    candidate_runtime_image_id="$resolved_image_id"
+    return 0
+  fi
+
+  if resolved_image_id="$(resolve_offline_image_id)"; then
+    printf '%s\n' 'Kinvest offline image attestation resolved a verified local Image ID; registry pull skipped.' >&2
+    candidate_runtime_image_id="$resolved_image_id"
+    return 0
+  fi
+
+  pull_with_retries "$digest_ref"
+  if ! verify_repo_digest "$digest_ref"; then
+    printf '%s\n' 'pulled image RepoDigests do not contain the requested digest' >&2
+    return 1
+  fi
+  candidate_runtime_image_id="$(inspect_image_id "$digest_ref")" || return 1
+}
+
 read_image_schema_range() {
   local image_ref="$1"
   local allow_legacy="$2"
@@ -633,39 +685,43 @@ wait_for_health() {
 }
 
 verify_running_image() {
-  local expected_ref="$1"
-  local expected_image_id=''
+  local expected_image_id="$1"
+  local available_image_id=''
   local actual_image_ref=''
   local actual_image_id=''
 
-  expected_image_id="$(run_inspect image inspect --format '{{.Id}}' "$expected_ref")" || return 1
+  [[ "$expected_image_id" =~ ^sha256:[0-9a-f]{64}$ ]] || return 1
+  available_image_id="$(inspect_image_id "$expected_image_id")" || return 1
   actual_image_ref="$(run_inspect inspect --format '{{.Config.Image}}' kinvest)" || return 1
   actual_image_id="$(run_inspect inspect --format '{{.Image}}' kinvest)" || return 1
 
-  [[ "$actual_image_ref" == "$expected_ref" && "$actual_image_id" == "$expected_image_id" ]] &&
-    verify_repo_digest "$expected_ref"
+  [[ "$available_image_id" == "$expected_image_id" &&
+    "$actual_image_ref" == "$expected_image_id" &&
+    "$actual_image_id" == "$expected_image_id" ]]
 }
 
 atomic_write_state() {
   local destination="$1"
   local state_digest="$2"
-  local state_commit="$3"
-  local state_schema="$4"
-  local state_min="$5"
-  local state_max="$6"
-  local state_secret_versions="$7"
-  local state_release_schema="$8"
-  local state_run_id="$9"
-  local state_artifact_source="${10}"
-  local state_backup_path="${11}"
-  local state_backup_checksum="${12}"
-  local state_deployed_at="${13}"
+  local state_runtime_image_id="$3"
+  local state_commit="$4"
+  local state_schema="$5"
+  local state_min="$6"
+  local state_max="$7"
+  local state_secret_versions="$8"
+  local state_release_schema="$9"
+  local state_run_id="${10}"
+  local state_artifact_source="${11}"
+  local state_backup_path="${12}"
+  local state_backup_checksum="${13}"
+  local state_deployed_at="${14}"
   local temporary=''
 
   temporary="$(mktemp "$STATE/.state.XXXXXX")"
   cat > "$temporary" <<EOF_STATE
-protocolVersion=2
+protocolVersion=3
 imageDigest=$state_digest
+runtimeImageId=$state_runtime_image_id
 commit=$state_commit
 schemaVersion=$state_schema
 imageSchemaMin=$state_min
@@ -690,9 +746,10 @@ atomic_write_attempt_state() {
 
   temporary="$(mktemp "$STATE/.attempt.XXXXXX")"
   cat > "$temporary" <<EOF_ATTEMPT
-protocolVersion=2
+protocolVersion=3
 status=pending
 imageDigest=$digest_ref
+runtimeImageId=$candidate_runtime_image_id
 commit=$commit_sha
 schemaBefore=$schema_before
 imageSchemaMin=$candidate_schema_min
@@ -711,6 +768,7 @@ EOF_ATTEMPT
 }
 
 previous_digest_ref=''
+previous_state_protocol='legacy'
 previous_commit=''
 previous_schema='0'
 previous_schema_min='0'
@@ -733,10 +791,49 @@ read_current_state() {
   local state_line=''
   local state_line_count=0
 
+  previous_digest_ref=''
+  previous_state_protocol='legacy'
+  previous_commit=''
+  previous_schema='0'
+  previous_schema_min='0'
+  previous_schema_max='0'
+  previous_secret_versions='{}'
+  previous_release_schema='0'
+  previous_run_id='0'
+  previous_artifact_source='legacy'
+  previous_backup_path='none'
+  previous_backup_checksum='none'
+  previous_deployed_at='legacy'
+  previous_image_id=''
+
   assert_not_symlink "$source"
   IFS= read -r first_line < "$source" || return 1
 
-  if [[ "$first_line" == protocolVersion=2 ]]; then
+  if [[ "$first_line" == protocolVersion=3 ]]; then
+    previous_state_protocol='3'
+    while IFS= read -r state_line || [[ -n "$state_line" ]]; do
+      state_line_count=$((state_line_count + 1))
+      case "$state_line_count" in
+        1) [[ "$state_line" == 'protocolVersion=3' ]] || return 1 ;;
+        2) [[ "$state_line" == imageDigest=* ]] || return 1; previous_digest_ref="${state_line#imageDigest=}" ;;
+        3) [[ "$state_line" == runtimeImageId=* ]] || return 1; previous_image_id="${state_line#runtimeImageId=}" ;;
+        4) [[ "$state_line" == commit=* ]] || return 1; previous_commit="${state_line#commit=}" ;;
+        5) [[ "$state_line" == schemaVersion=* ]] || return 1; previous_schema="${state_line#schemaVersion=}" ;;
+        6) [[ "$state_line" == imageSchemaMin=* ]] || return 1; previous_schema_min="${state_line#imageSchemaMin=}" ;;
+        7) [[ "$state_line" == imageSchemaMax=* ]] || return 1; previous_schema_max="${state_line#imageSchemaMax=}" ;;
+        8) [[ "$state_line" == secretVersionIds=* ]] || return 1; previous_secret_versions="${state_line#secretVersionIds=}" ;;
+        9) [[ "$state_line" == releaseRecordSchemaVersion=* ]] || return 1; previous_release_schema="${state_line#releaseRecordSchemaVersion=}" ;;
+        10) [[ "$state_line" == verificationRunId=* ]] || return 1; previous_run_id="${state_line#verificationRunId=}" ;;
+        11) [[ "$state_line" == artifactSource=* ]] || return 1; previous_artifact_source="${state_line#artifactSource=}" ;;
+        12) [[ "$state_line" == databaseBackupPath=* ]] || return 1; previous_backup_path="${state_line#databaseBackupPath=}" ;;
+        13) [[ "$state_line" == databaseBackupChecksum=* ]] || return 1; previous_backup_checksum="${state_line#databaseBackupChecksum=}" ;;
+        14) [[ "$state_line" == deployedAt=* ]] || return 1; previous_deployed_at="${state_line#deployedAt=}" ;;
+        *) return 1 ;;
+      esac
+    done < "$source"
+    [[ "$state_line_count" -eq 14 ]] || return 1
+  elif [[ "$first_line" == protocolVersion=2 ]]; then
+    previous_state_protocol='2'
     while IFS= read -r state_line || [[ -n "$state_line" ]]; do
       state_line_count=$((state_line_count + 1))
       case "$state_line_count" in
@@ -767,6 +864,9 @@ read_current_state() {
   fi
 
   [[ "$previous_digest_ref" =~ $ALLOWED_STATE_DIGEST_PATTERN ]] || return 1
+  if [[ "$previous_state_protocol" == '3' && ! "$previous_image_id" =~ ^sha256:[0-9a-f]{64}$ ]]; then
+    return 1
+  fi
   [[ "$previous_commit" =~ ^[0-9a-f]{40}$ ]] || return 1
   schema_in_range "$previous_schema" "$previous_schema_min" "$previous_schema_max" || return 1
   previous_secret_versions="$(validate_secret_mapping "$previous_secret_versions")" || return 1
@@ -775,13 +875,22 @@ read_current_state() {
 capture_previous_snapshot() {
   local running_ref=''
   local running_image_id=''
+  local available_image_id=''
   local health=''
 
-  previous_image_id="$(run_inspect image inspect --format '{{.Id}}' "$previous_digest_ref")" || return 1
   running_ref="$(run_inspect inspect --format '{{.Config.Image}}' kinvest)" || return 1
   running_image_id="$(run_inspect inspect --format '{{.Image}}' kinvest)" || return 1
   health="$(run_inspect inspect --format '{{.State.Health.Status}}' kinvest)" || return 1
-  [[ "$running_ref" == "$previous_digest_ref" && "$running_image_id" == "$previous_image_id" && "$health" == 'healthy' ]]
+  [[ "$running_image_id" =~ ^sha256:[0-9a-f]{64}$ && "$health" == 'healthy' ]] || return 1
+  available_image_id="$(inspect_image_id "$running_image_id")" || return 1
+  [[ "$available_image_id" == "$running_image_id" ]] || return 1
+
+  if [[ "$previous_state_protocol" == '3' ]]; then
+    [[ "$running_ref" == "$previous_image_id" && "$running_image_id" == "$previous_image_id" ]]
+  else
+    [[ "$running_ref" == "$previous_digest_ref" ]] || return 1
+    previous_image_id="$running_image_id"
+  fi
 }
 
 rollback() {
@@ -807,7 +916,7 @@ rollback() {
     enter_restore_required "$original_status"
   fi
 
-  available_previous_image_id="$(run_inspect image inspect --format '{{.Id}}' "$previous_digest_ref")" || {
+  available_previous_image_id="$(inspect_image_id "$previous_image_id")" || {
     printf '%s\n' 'Previous image is not locally available; manual intervention is required.' >&2
     exit "$original_status"
   }
@@ -816,13 +925,13 @@ rollback() {
     exit "$original_status"
   fi
 
-  if ! run_secret_preflight "$previous_digest_ref" "$previous_secret_versions"; then
+  if ! run_secret_preflight "$previous_image_id" "$previous_secret_versions"; then
     printf '%s\n' 'previous release secret preflight failed; manual intervention is required' >&2
     exit "$original_status"
   fi
-  run_compose "$previous_digest_ref" "$previous_secret_versions" >/dev/null || exit "$original_status"
+  run_compose "$previous_image_id" "$previous_secret_versions" >/dev/null || exit "$original_status"
   wait_for_health || exit "$original_status"
-  verify_running_image "$previous_digest_ref" || exit "$original_status"
+  verify_running_image "$previous_image_id" || exit "$original_status"
   metadata_firewall_outcome='verified'
   if ! run_metadata_firewall reconcile; then
     if run_metadata_firewall guard; then
@@ -853,7 +962,7 @@ enter_restore_required() {
   fi
 
   if ! running_ref="$(run_inspect inspect --format '{{.Config.Image}}' kinvest)" ||
-    [[ "$running_ref" == "$digest_ref" ]]; then
+    [[ "$running_ref" == "$candidate_runtime_image_id" ]]; then
     if ! run_docker stop kinvest >/dev/null; then
       printf '%s\n' 'candidate stop failed; immediate manual isolation is required' >&2
     fi
@@ -892,6 +1001,7 @@ if [[ "$validated_metadata_config_sha256" != "$metadata_config_sha256" ]]; then
   printf '%s\n' 'validated metadata config snapshot does not match the approved hash' >&2
   exit 1
 fi
+rollback_target_runtime_image_id=''
 if [[ "$deployment_intent" == 'rollback' ]]; then
   if [[ ! -f "$PREVIOUS_STATE" ]] || ! read_current_state "$PREVIOUS_STATE" ||
     [[ "$previous_digest_ref" != "$digest_ref" || "$previous_commit" != "$commit_sha" ]]; then
@@ -899,6 +1009,7 @@ if [[ "$deployment_intent" == 'rollback' ]]; then
     exit 1
   fi
   secret_version_ids="$previous_secret_versions"
+  rollback_target_runtime_image_id="$previous_image_id"
 else
   secret_version_ids="$(validate_secret_mapping "$secret_version_ids")" || {
     printf '%s\n' 'deployment secret version metadata is invalid' >&2
@@ -906,7 +1017,6 @@ else
   }
 fi
 
-run_compose_config "$digest_ref" "$secret_version_ids" >/dev/null
 if [[ "$metadata_network_phase" == 'active' ]]; then
   if ! run_docker network inspect "$metadata_network_name" >/dev/null; then
     run_metadata_firewall guard
@@ -932,13 +1042,13 @@ else
   assert_not_symlink "$CURRENT_STATE"
 fi
 
-if verify_repo_digest "$digest_ref"; then
-  printf '%s\n' 'Kinvest image RepoDigest is already verified locally; registry pull skipped.' >&2
-else
-  pull_with_retries "$digest_ref"
-fi
-if ! verify_repo_digest "$digest_ref"; then
-  printf '%s\n' 'pulled image RepoDigests do not contain the requested digest' >&2
+resolve_candidate_runtime_image_id || {
+  printf '%s\n' 'candidate image could not be resolved to an immutable local Image ID' >&2
+  exit 1
+}
+if [[ "$deployment_intent" == 'rollback' && -n "$rollback_target_runtime_image_id" &&
+  "$candidate_runtime_image_id" != "$rollback_target_runtime_image_id" ]]; then
+  printf '%s\n' 'manual rollback runtime Image ID does not match verified previous state' >&2
   exit 1
 fi
 
@@ -947,7 +1057,9 @@ fi
 # to /root/.docker/config.json.
 rm -f -- "$DOCKER_CONFIG/config.json"
 
-read -r candidate_schema_min candidate_schema_max < <(read_image_schema_range "$digest_ref" 'false') || {
+run_compose_config "$candidate_runtime_image_id" "$secret_version_ids" >/dev/null
+
+read -r candidate_schema_min candidate_schema_max < <(read_image_schema_range "$candidate_runtime_image_id" 'false') || {
   printf '%s\n' 'candidate image has invalid schema compatibility labels' >&2
   exit 1
 }
@@ -957,13 +1069,14 @@ if ! schema_in_range "$schema_before" "$candidate_schema_min" "$candidate_schema
   exit 1
 fi
 
-run_secret_preflight "$digest_ref" "$secret_version_ids"
+run_secret_preflight "$candidate_runtime_image_id" "$secret_version_ids"
 
 create_database_backup
 if [[ "$has_previous_release" == 'true' ]]; then
   atomic_write_state \
     "$PREVIOUS_STATE" \
     "$previous_digest_ref" \
+    "$previous_image_id" \
     "$previous_commit" \
     "$previous_schema" \
     "$previous_schema_min" \
@@ -983,14 +1096,14 @@ atomic_write_attempt_state "$schema_before" "$attempt_started_at"
 
 trap 'rollback "$?"' ERR
 run_metadata_firewall guard
-run_compose "$digest_ref" "$secret_version_ids" >/dev/null
+run_compose "$candidate_runtime_image_id" "$secret_version_ids" >/dev/null
 metadata_firewall_status=0
 run_metadata_firewall reconcile || metadata_firewall_status=$?
 if ((metadata_firewall_status != 0)); then
   rollback "$metadata_firewall_status"
 fi
 wait_for_health
-verify_running_image "$digest_ref"
+verify_running_image "$candidate_runtime_image_id"
 
 schema_after="$(read_database_schema)"
 if ! schema_in_range "$schema_after" "$candidate_schema_min" "$candidate_schema_max"; then
@@ -1007,6 +1120,7 @@ deployed_at="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
 atomic_write_state \
   "$CURRENT_STATE" \
   "$digest_ref" \
+  "$candidate_runtime_image_id" \
   "$commit_sha" \
   "$schema_after" \
   "$candidate_schema_min" \
@@ -1021,4 +1135,4 @@ atomic_write_state \
 rm -f -- "$ATTEMPT_STATE"
 trap - ERR
 
-printf 'Kinvest deployed protocol v2 for audit commit %s.\n' "$commit_sha"
+printf 'Kinvest deployed protocol v3 for audit commit %s.\n' "$commit_sha"
