@@ -32,6 +32,29 @@ function stateSource(mapping, {
   ].join('\n')
 }
 
+function stateSourceV2(mapping, { digest = '__DIGEST__', commit = '__COMMIT__' } = {}) {
+  return [
+    'protocolVersion=2',
+    `imageDigest=${digest}`,
+    `commit=${commit}`,
+    'schemaVersion=0',
+    'imageSchemaMin=0',
+    'imageSchemaMax=0',
+    `secretVersionIds=${mapping}`,
+    'releaseRecordSchemaVersion=2',
+    'verificationRunId=654321',
+    'artifactSource=ghcr-public',
+    'databaseBackupPath=none',
+    'databaseBackupChecksum=none',
+    'deployedAt=2026-08-12T00:00:00Z',
+    ''
+  ].join('\n')
+}
+
+function replaceStateField(source, field, value) {
+  return source.replace(new RegExp(`^${field}=.*$`, 'm'), `${field}=${value}`)
+}
+
 function dockerLog(fixture) {
   return readLogLines(path.join(fixture.fakeState, 'docker.log'))
 }
@@ -171,13 +194,13 @@ async function run() {
   }
 
   const validV3 = stateSource('{}')
-  const invalidV3States = [
+  const invalidV3Structure = [
     validV3.replace('runtimeImageId=__RUNTIME_IMAGE_ID__\ncommit=', 'commit=__COMMIT__\nruntimeImageId='),
     validV3.replace('runtimeImageId=__RUNTIME_IMAGE_ID__\n', ''),
     validV3.replace('runtimeImageId=__RUNTIME_IMAGE_ID__', 'runtimeImageId=sha256:not-valid'),
     validV3.replace('commit=__COMMIT__\n', 'unexpected=value\ncommit=__COMMIT__\n')
   ]
-  for (const currentStateSource of invalidV3States) {
+  for (const currentStateSource of invalidV3Structure) {
     const invalidState = runRootFixture(deploy, { currentStateSource })
     try {
       assert.notEqual(invalidState.result.status, 0)
@@ -185,6 +208,64 @@ async function run() {
     } finally {
       invalidState.cleanup()
     }
+  }
+
+  for (const [protocol, validSource] of [
+    ['v2', stateSourceV2('{}')],
+    ['v3', validV3]
+  ]) {
+    const approvedBackup = '__BACKUP_DIR__/20260812T000000Z-__COMMIT__.sqlite'
+    const invalidFields = [
+      ['release schema below range', replaceStateField(validSource, 'releaseRecordSchemaVersion', '0')],
+      ['release schema above range', replaceStateField(validSource, 'releaseRecordSchemaVersion', '3')],
+      ['release schema nonnumeric', replaceStateField(validSource, 'releaseRecordSchemaVersion', 'x')],
+      ['empty verification run', replaceStateField(validSource, 'verificationRunId', '')],
+      ['long verification run', replaceStateField(validSource, 'verificationRunId', '1'.repeat(21))],
+      ['signed verification run', replaceStateField(validSource, 'verificationRunId', '-1')],
+      ['unknown artifact source', replaceStateField(validSource, 'artifactSource', 'offline-local')],
+      ['artifact source repository mismatch', replaceStateField(validSource, 'artifactSource', 'tcr-private')],
+      ['none path with checksum', replaceStateField(validSource, 'databaseBackupChecksum', 'a'.repeat(64))],
+      ['backup path with none checksum', replaceStateField(validSource, 'databaseBackupPath', approvedBackup)],
+      ['backup outside approved directory', replaceStateField(replaceStateField(validSource, 'databaseBackupPath', '/tmp/backup.sqlite'), 'databaseBackupChecksum', 'a'.repeat(64))],
+      ['backup checksum uppercase', replaceStateField(replaceStateField(validSource, 'databaseBackupPath', approvedBackup), 'databaseBackupChecksum', 'A'.repeat(64))],
+      ['backup filename commit mismatch', replaceStateField(replaceStateField(validSource, 'databaseBackupPath', '__BACKUP_DIR__/20260812T000000Z-' + '9'.repeat(40) + '.sqlite'), 'databaseBackupChecksum', 'a'.repeat(64))],
+      ['timestamp offset', replaceStateField(validSource, 'deployedAt', '2026-08-12T08:00:00+08:00')],
+      ['fractional timestamp', replaceStateField(validSource, 'deployedAt', '2026-08-12T00:00:00.000Z')],
+      ['invalid calendar timestamp', replaceStateField(validSource, 'deployedAt', '2026-13-40T25:61:61Z')],
+      ['extra persisted line', validSource.replace('deployedAt=', 'unexpected=value\ndeployedAt=')],
+      ['wrong persisted order', validSource.replace('verificationRunId=654321\nartifactSource=ghcr-public', 'artifactSource=ghcr-public\nverificationRunId=654321')]
+    ]
+    for (const [caseName, currentStateSource] of invalidFields) {
+      const invalidState = runRootFixture(deploy, { currentStateSource })
+      try {
+        assert.notEqual(invalidState.result.status, 0, `${protocol} ${caseName} must be rejected`)
+        assertNoMutation(invalidState)
+      } finally {
+        invalidState.cleanup()
+      }
+    }
+  }
+
+  const validV2ReleaseOne = runRootFixture(deploy, {
+    currentStateSource: replaceStateField(stateSourceV2('{}'), 'releaseRecordSchemaVersion', '1')
+  })
+  try {
+    assert.equal(validV2ReleaseOne.result.status, 0, validV2ReleaseOne.result.stderr)
+  } finally {
+    validV2ReleaseOne.cleanup()
+  }
+
+  const validBackupPair = runRootFixture(deploy, {
+    currentStateSource: replaceStateField(
+      replaceStateField(stateSource('{}'), 'databaseBackupPath', '__BACKUP_DIR__/20260812T000000Z-__COMMIT__.sqlite'),
+      'databaseBackupChecksum',
+      'a'.repeat(64)
+    )
+  })
+  try {
+    assert.equal(validBackupPair.result.status, 0, validBackupPair.result.stderr)
+  } finally {
+    validBackupPair.cleanup()
   }
 
   for (const previousStateSource of [

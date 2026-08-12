@@ -32,6 +32,7 @@ function createSqlite(databasePath, userVersion = 0) {
 
 function runRootFixture(deploySource, {
   mode = 'success',
+  registryMode = 'ghcr-public',
   metadataPhase = 'active',
   metadataConfigVariant = 'valid',
   activationHash = null,
@@ -54,9 +55,13 @@ function runRootFixture(deploySource, {
   const dataDir = path.join(root, 'data')
   const stateDir = path.join(root, 'state')
   const metadataActivationState = path.join(stateDir, 'metadata-network.state')
+  const tcrPolicyFile = path.join(root, 'policy', 'tcr-basic.enabled')
   const database = path.join(dataDir, 'kinvest.sqlite')
   const previousDigest = `ghcr.io/zwphhxx/kinvest@sha256:${'1'.repeat(64)}`
-  const candidateDigest = `ghcr.io/zwphhxx/kinvest@sha256:${'2'.repeat(64)}`
+  const candidateRepository = registryMode === 'tcr-basic'
+    ? 'ccr.ccs.tencentyun.com/website-dev/kinvest'
+    : 'ghcr.io/zwphhxx/kinvest'
+  const candidateDigest = `${candidateRepository}@sha256:${'2'.repeat(64)}`
   const previousCommit = '3'.repeat(40)
   const candidateCommit = '4'.repeat(40)
   const previousImageId = `sha256:${'5'.repeat(64)}`
@@ -70,6 +75,10 @@ function runRootFixture(deploySource, {
   fs.mkdirSync(fakeBin)
   fs.mkdirSync(fakeState)
   fs.mkdirSync(metadataConfigDir, { recursive: true })
+  if (registryMode === 'tcr-basic') {
+    fs.mkdirSync(path.dirname(tcrPolicyFile), { recursive: true })
+    fs.writeFileSync(tcrPolicyFile, 'enabled\n', { mode: 0o600 })
+  }
   fs.writeFileSync(path.join(root, 'docker-compose.yml'), 'services: {}\n')
   let metadataConfigSource = [
     'KINVEST_METADATA_NETWORK=kinvest-metadata-egress',
@@ -115,6 +124,7 @@ function runRootFixture(deploySource, {
         .replaceAll('__DIGEST__', previousDigest)
         .replaceAll('__RUNTIME_IMAGE_ID__', previousImageId)
         .replaceAll('__COMMIT__', previousCommit)
+        .replaceAll('__BACKUP_DIR__', path.join(root, 'backups'))
   fs.writeFileSync(path.join(stateDir, 'current.state'), initialCurrentState)
   const initialPreviousState = previousStateSource === null
     ? null
@@ -122,6 +132,7 @@ function runRootFixture(deploySource, {
         .replaceAll('__DIGEST__', candidateDigest)
         .replaceAll('__RUNTIME_IMAGE_ID__', candidateImageId)
         .replaceAll('__COMMIT__', candidateCommit)
+        .replaceAll('__BACKUP_DIR__', path.join(root, 'backups'))
   if (initialPreviousState !== null) {
     fs.writeFileSync(
       path.join(stateDir, 'previous.state'),
@@ -184,6 +195,14 @@ if [ "$target" = "$KINVEST_METADATA_ACTIVATION_PATH" ]; then
   printf '%s\n' "$KINVEST_METADATA_ACTIVATION_STAT"
   exit 0
 fi
+if [ "$target" = "$KINVEST_TCR_POLICY_PATH" ]; then
+  case " $* " in
+    *" %U:%G "*) printf '%s\n' 'root:root' ;;
+    *" %a "*) printf '%s\n' '600' ;;
+    *) exit 1 ;;
+  esac
+  exit 0
+fi
 case "$target" in
   "$KINVEST_METADATA_SNAPSHOT_PREFIX"*) printf '%s\n' '0:0:600'; exit 0 ;;
 esac
@@ -221,8 +240,20 @@ printf '%s\n' '{"status":"ok","service":"kinvest"}'
 printf '%s\n' "$*" >> "$KINVEST_FAKE_STATE/offline-helper.log"
 [ "$1" = resolve ] || exit 2
 case "$KINVEST_FAKE_MODE" in
-  exact-digest-with-helper|offline-valid|offline-missing-local-id)
+  exact-digest-with-helper|offline-valid|offline-missing-local-id|tcr-exact-with-helper|tcr-helper-valid|tcr-helper-valid-pull-failure)
     printf '%s\n' "$KINVEST_CANDIDATE_IMAGE_ID"
+    ;;
+  offline-error-code)
+    printf '%s\n' 'OFFLINE_ATTESTATION_NOT_FOUND' >&2
+    exit 1
+    ;;
+  offline-arbitrary-stderr)
+    printf '%s\n' 'secret-like-payload-must-never-escape' >&2
+    exit 1
+    ;;
+  offline-multiline-stderr)
+    printf '%s\n%s\n' 'OFFLINE_ATTESTATION_NOT_FOUND' 'secret-like-payload-must-never-escape' >&2
+    exit 1
     ;;
   offline-malformed|offline-pull-failure)
     printf '%s\n' 'sha256:not-an-image-id'
@@ -260,7 +291,7 @@ if [ "$1" = pull ]; then
   pull_count=$((pull_count + 1))
   printf '%s\n' "$pull_count" > "$KINVEST_FAKE_STATE/pull-count"
   if [ "$KINVEST_FAKE_MODE" = local-digest-transient ] && [ "$pull_count" -eq 1 ]; then exit 124; fi
-  if [ "$KINVEST_FAKE_MODE" = offline-pull-failure ]; then printf 'access denied\n' >&2; exit 1; fi
+  if [ "$KINVEST_FAKE_MODE" = offline-pull-failure ] || [ "$KINVEST_FAKE_MODE" = tcr-helper-valid-pull-failure ]; then printf 'access denied\n' >&2; exit 1; fi
   : > "$KINVEST_FAKE_STATE/pulled"
   exit 0
 fi
@@ -274,7 +305,7 @@ if [ "$1" = image ] && [ "$2" = inspect ]; then
         printf '["ghcr.io/zwphhxx/kinvest@sha256:%064d"]\n' 0
       else
         case "$KINVEST_FAKE_MODE" in
-          local-tag-and-id-only|local-digest-transient|signal|offline-*)
+          local-tag-and-id-only|local-digest-transient|signal|offline-*|tcr-helper-valid|tcr-helper-valid-pull-failure)
             if [ ! -f "$KINVEST_FAKE_STATE/pulled" ]; then
               printf '["ghcr.io/zwphhxx/kinvest:offline-import"]\n'
             else
@@ -377,19 +408,20 @@ esac
     .replace("METADATA_FIREWALL='/usr/local/sbin/kinvest-metadata-firewall'", `METADATA_FIREWALL='${fakeMetadataFirewall}'`)
     .replace("SECRET_VERSION_VALIDATOR='/usr/local/libexec/kinvest-secret-version-config'", `SECRET_VERSION_VALIDATOR='${secretValidator}'`)
     .replace("OFFLINE_IMAGE_ATTESTATION='/usr/local/libexec/kinvest-offline-image-attestation'", `OFFLINE_IMAGE_ATTESTATION='${offlineImageAttestation}'`)
+    .replace('TCR_POLICY_FILE="$ROOT/policy/tcr-basic.enabled"', `TCR_POLICY_FILE='${tcrPolicyFile}'`)
   const scriptPath = path.join(fixture, 'deploy-v2')
   writeExecutable(scriptPath, instrumented)
   const payload = [
     'KINVEST_DEPLOY_V2',
     candidateDigest,
     candidateCommit,
-    'ghcr-public',
-    'ghcr.io',
-    '',
-    '',
+    registryMode,
+    registryMode === 'tcr-basic' ? 'ccr.ccs.tencentyun.com' : 'ghcr.io',
+    registryMode === 'tcr-basic' ? 'pull-only-user' : '',
+    registryMode === 'tcr-basic' ? 'registry-password-fixture-never-log' : '',
     '2',
     '987654',
-    'ghcr-public',
+    registryMode === 'tcr-basic' ? 'tcr-private' : 'ghcr-public',
     secretVersionIds,
     'EOF'
   ].join('\n') + '\n'
@@ -410,6 +442,7 @@ esac
       KINVEST_METADATA_CONFIG_PATH: metadataNetworkConfig,
       KINVEST_METADATA_ACTIVATION_PATH: metadataActivationState,
       KINVEST_METADATA_ACTIVATION_STAT: activationStat,
+      KINVEST_TCR_POLICY_PATH: tcrPolicyFile,
       KINVEST_METADATA_SNAPSHOT_PREFIX: path.join(runRoot, 'kinvest-metadata-network.'),
       KINVEST_FAKE_CONFIG_VALID: metadataConfigVariant === 'valid' ? '1' : '0'
     }
@@ -430,6 +463,7 @@ esac
     previousCommit,
     previousDigest,
     previousImageId,
+    registryMode,
     root,
     runRoot,
     stateDir
@@ -660,6 +694,68 @@ async function run() {
     )
   } finally {
     invalidOfflineWithoutRegistry.cleanup()
+  }
+
+  const allowedHelperCode = runRootFixture(deploy, { mode: 'offline-error-code' })
+  try {
+    assert.equal(allowedHelperCode.result.status, 0, allowedHelperCode.result.stderr)
+    assert.match(allowedHelperCode.result.stderr, /^OFFLINE_ATTESTATION_NOT_FOUND$/m)
+    assert.equal(fs.readdirSync(allowedHelperCode.runRoot).length, 0)
+  } finally {
+    allowedHelperCode.cleanup()
+  }
+
+  for (const mode of ['offline-arbitrary-stderr', 'offline-multiline-stderr']) {
+    const suppressedHelperError = runRootFixture(deploy, { mode })
+    try {
+      assert.equal(suppressedHelperError.result.status, 0, suppressedHelperError.result.stderr)
+      assert.doesNotMatch(suppressedHelperError.result.stderr, /secret-like-payload|OFFLINE_ATTESTATION_NOT_FOUND/)
+      assert.equal(fs.readdirSync(suppressedHelperError.runRoot).length, 0)
+    } finally {
+      suppressedHelperError.cleanup()
+    }
+  }
+
+  const tcrExactDigest = runRootFixture(deploy, {
+    mode: 'tcr-exact-with-helper',
+    registryMode: 'tcr-basic'
+  })
+  try {
+    assert.equal(tcrExactDigest.result.status, 0, tcrExactDigest.result.stderr)
+    assert.deepEqual(readLogLines(path.join(tcrExactDigest.fakeState, 'offline-helper.log')), [])
+    assert.equal(readLogLines(path.join(tcrExactDigest.fakeState, 'docker.log')).filter((line) => line.startsWith('pull ')).length, 0)
+  } finally {
+    tcrExactDigest.cleanup()
+  }
+
+  const tcrPullFallback = runRootFixture(deploy, {
+    mode: 'tcr-helper-valid',
+    registryMode: 'tcr-basic'
+  })
+  try {
+    assert.equal(tcrPullFallback.result.status, 0, tcrPullFallback.result.stderr)
+    assert.deepEqual(readLogLines(path.join(tcrPullFallback.fakeState, 'offline-helper.log')), [])
+    assert.deepEqual(
+      readLogLines(path.join(tcrPullFallback.fakeState, 'docker.log')).filter((line) => line.startsWith('pull ')),
+      [`pull ${tcrPullFallback.candidateDigest}`]
+    )
+  } finally {
+    tcrPullFallback.cleanup()
+  }
+
+  const tcrPullFailure = runRootFixture(deploy, {
+    mode: 'tcr-helper-valid-pull-failure',
+    registryMode: 'tcr-basic'
+  })
+  try {
+    assert.notEqual(tcrPullFailure.result.status, 0)
+    assert.deepEqual(readLogLines(path.join(tcrPullFailure.fakeState, 'offline-helper.log')), [])
+    assert.deepEqual(
+      readLogLines(path.join(tcrPullFailure.fakeState, 'docker.log')).filter((line) => line.startsWith('pull ')),
+      [`pull ${tcrPullFailure.candidateDigest}`]
+    )
+  } finally {
+    tcrPullFailure.cleanup()
   }
 
   const v2Migration = runRootFixture(deploy, { currentSecretVersionIds: '{}' })

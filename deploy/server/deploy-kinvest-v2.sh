@@ -99,7 +99,7 @@ if [[ ! "$commit_sha" =~ ^[0-9a-f]{40}$ ]]; then
   exit 2
 fi
 
-if [[ ! "$release_record_schema_version" =~ ^[12]$ || ! "$verification_run_id" =~ ^[0-9]+$ ]]; then
+if [[ ! "$release_record_schema_version" =~ ^[12]$ || ! "$verification_run_id" =~ ^[0-9]{1,20}$ ]]; then
   printf '%s\n' 'deployment requires valid release record provenance' >&2
   exit 2
 fi
@@ -261,6 +261,7 @@ docker_config=''
 metadata_config_snapshot=''
 pull_stderr=''
 login_stderr=''
+offline_attestation_stderr=''
 preflight_stdout=''
 preflight_stderr=''
 preflight_expected=''
@@ -273,6 +274,10 @@ cleanup_runtime() {
   fi
   if [[ -n "$login_stderr" ]]; then
     rm -f -- "$login_stderr"
+  fi
+  if [[ -n "$offline_attestation_stderr" &&
+    "$offline_attestation_stderr" == "$RUN_ROOT"/kinvest-offline-attestation.stderr.* ]]; then
+    rm -f -- "$offline_attestation_stderr"
   fi
   if [[ -n "$docker_config" && "$docker_config" == "$RUN_ROOT"/kinvest-docker-config.* ]]; then
     rm -rf -- "$docker_config"
@@ -486,18 +491,73 @@ inspect_image_id() {
 resolve_offline_image_id() {
   local value=''
   local available_image_id=''
+  local helper_status=0
 
+  if [[ "$registry_mode" != 'ghcr-public' ||
+    "$artifact_source" != 'ghcr-public' ||
+    "${digest_ref%@*}" != "$GHCR_REPOSITORY" ]]; then
+    return 1
+  fi
   [[ -x "$OFFLINE_IMAGE_ATTESTATION" && ! -L "$OFFLINE_IMAGE_ATTESTATION" ]] || return 1
+  offline_attestation_stderr="$(mktemp "$RUN_ROOT/kinvest-offline-attestation.stderr.XXXXXX")"
+  chmod 0600 "$offline_attestation_stderr"
+  helper_status=0
   value="$(
-    "$OFFLINE_IMAGE_ATTESTATION" resolve \
-      "$digest_ref" \
-      "$commit_sha" \
-      "$verification_run_id" 2>/dev/null
-  )" || return 1
+    (
+      ulimit -f 1
+      exec "$OFFLINE_IMAGE_ATTESTATION" resolve \
+        "$digest_ref" \
+        "$commit_sha" \
+        "$verification_run_id"
+    ) 2>"$offline_attestation_stderr"
+  )" || helper_status=$?
+  if ((helper_status != 0)); then
+    surface_offline_attestation_error "$offline_attestation_stderr"
+    rm -f -- "$offline_attestation_stderr"
+    offline_attestation_stderr=''
+    return 1
+  fi
+  if [[ -s "$offline_attestation_stderr" ]]; then
+    rm -f -- "$offline_attestation_stderr"
+    offline_attestation_stderr=''
+    return 1
+  fi
+  rm -f -- "$offline_attestation_stderr"
+  offline_attestation_stderr=''
   [[ "$value" =~ ^sha256:[0-9a-f]{64}$ ]] || return 1
   available_image_id="$(inspect_image_id "$value")" || return 1
   [[ "$available_image_id" == "$value" ]] || return 1
   printf '%s\n' "$value"
+}
+
+surface_offline_attestation_error() {
+  local source="$1"
+  local content=''
+  local byte_count=''
+
+  [[ -f "$source" && ! -L "$source" ]] || return 0
+  content="$(cat -- "$source" 2>/dev/null)" || return 0
+  byte_count="$(wc -c < "$source" | tr -d '[:space:]')" || return 0
+  case "$content" in
+    OFFLINE_ATTESTATION_CONFLICT|\
+    OFFLINE_ATTESTATION_DOCKER_FAILED|\
+    OFFLINE_ATTESTATION_IMAGE_MISMATCH|\
+    OFFLINE_ATTESTATION_IMAGE_UNAVAILABLE|\
+    OFFLINE_ATTESTATION_INVALID|\
+    OFFLINE_ATTESTATION_LOAD_FAILED|\
+    OFFLINE_ATTESTATION_NOT_FOUND|\
+    OFFLINE_ATTESTATION_PROVENANCE_MISMATCH|\
+    OFFLINE_ATTESTATION_RECORD_TOO_LARGE|\
+    OFFLINE_ATTESTATION_RECORD_UNSAFE|\
+    OFFLINE_ATTESTATION_ROOT_REQUIRED|\
+    OFFLINE_ATTESTATION_STATE_UNSAFE|\
+    OFFLINE_ATTESTATION_USAGE|\
+    OFFLINE_ATTESTATION_WRITE_FAILED)
+      if [[ "$byte_count" == "${#content}" || "$byte_count" == "$(( ${#content} + 1 ))" ]]; then
+        printf '%s\n' "$content" >&2
+      fi
+      ;;
+  esac
 }
 
 resolve_candidate_runtime_image_id() {
@@ -700,6 +760,75 @@ verify_running_image() {
     "$actual_image_id" == "$expected_image_id" ]]
 }
 
+validate_deployed_at() {
+  local value="$1"
+
+  [[ "$value" =~ ^[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}Z$ ]] || return 1
+  python3 - "$value" >/dev/null 2>&1 <<'PY'
+from datetime import datetime
+import sys
+
+value = sys.argv[1]
+parsed = datetime.strptime(value, "%Y-%m-%dT%H:%M:%SZ")
+if parsed.strftime("%Y-%m-%dT%H:%M:%SZ") != value:
+    raise SystemExit(1)
+PY
+}
+
+validate_backup_metadata() {
+  local backup_path="$1"
+  local backup_checksum="$2"
+  local state_commit="$3"
+  local backup_name=''
+
+  if [[ "$backup_path" == 'none' || "$backup_checksum" == 'none' ]]; then
+    [[ "$backup_path" == 'none' && "$backup_checksum" == 'none' ]]
+    return
+  fi
+  [[ "$backup_checksum" =~ ^[0-9a-f]{64}$ ]] || return 1
+  [[ "$backup_path" == "$BACKUP_DIR/"* ]] || return 1
+  backup_name="${backup_path#"$BACKUP_DIR/"}"
+  [[ "$backup_name" =~ ^[0-9]{8}T[0-9]{6}Z-${state_commit}\.sqlite$ ]]
+}
+
+validate_persisted_state_fields() {
+  local state_protocol="$1"
+  local state_digest="$2"
+  local state_runtime_image_id="$3"
+  local state_commit="$4"
+  local state_schema="$5"
+  local state_min="$6"
+  local state_max="$7"
+  local state_secret_versions="$8"
+  local state_release_schema="$9"
+  local state_run_id="${10}"
+  local state_artifact_source="${11}"
+  local state_backup_path="${12}"
+  local state_backup_checksum="${13}"
+  local state_deployed_at="${14}"
+  local canonical_secret_versions=''
+
+  [[ "$state_protocol" == '2' || "$state_protocol" == '3' ]] || return 1
+  [[ "$state_digest" =~ $ALLOWED_STATE_DIGEST_PATTERN ]] || return 1
+  [[ "$state_commit" =~ ^[0-9a-f]{40}$ ]] || return 1
+  if [[ "$state_protocol" == '3' ]]; then
+    [[ "$state_runtime_image_id" =~ ^sha256:[0-9a-f]{64}$ ]] || return 1
+  else
+    [[ -z "$state_runtime_image_id" ]] || return 1
+  fi
+  schema_in_range "$state_schema" "$state_min" "$state_max" || return 1
+  canonical_secret_versions="$(validate_secret_mapping "$state_secret_versions")" || return 1
+  [[ "$canonical_secret_versions" == "$state_secret_versions" ]] || return 1
+  [[ "$state_release_schema" =~ ^[12]$ ]] || return 1
+  [[ "$state_run_id" =~ ^[0-9]{1,20}$ ]] || return 1
+  case "${state_digest%@*}:$state_artifact_source" in
+    "$GHCR_REPOSITORY:ghcr-public"|"$TCR_REPOSITORY:tcr-private") ;;
+    *) return 1 ;;
+  esac
+  validate_backup_metadata "$state_backup_path" "$state_backup_checksum" "$state_commit" || return 1
+  validate_deployed_at "$state_deployed_at"
+}
+
 atomic_write_state() {
   local destination="$1"
   local state_digest="$2"
@@ -717,6 +846,24 @@ atomic_write_state() {
   local state_deployed_at="${14}"
   local temporary=''
 
+  if ! validate_persisted_state_fields \
+    '3' \
+    "$state_digest" \
+    "$state_runtime_image_id" \
+    "$state_commit" \
+    "$state_schema" \
+    "$state_min" \
+    "$state_max" \
+    "$state_secret_versions" \
+    "$state_release_schema" \
+    "$state_run_id" \
+    "$state_artifact_source" \
+    "$state_backup_path" \
+    "$state_backup_checksum" \
+    "$state_deployed_at"; then
+    printf '%s\n' 'refusing to write invalid Kinvest deployment state' >&2
+    return 1
+  fi
   temporary="$(mktemp "$STATE/.state.XXXXXX")"
   cat > "$temporary" <<EOF_STATE
 protocolVersion=3
@@ -744,6 +891,24 @@ atomic_write_attempt_state() {
   local started_at="$2"
   local temporary=''
 
+  if ! validate_persisted_state_fields \
+    '3' \
+    "$digest_ref" \
+    "$candidate_runtime_image_id" \
+    "$commit_sha" \
+    "$schema_before" \
+    "$candidate_schema_min" \
+    "$candidate_schema_max" \
+    "$secret_version_ids" \
+    "$release_record_schema_version" \
+    "$verification_run_id" \
+    "$artifact_source" \
+    "$database_backup_path" \
+    "$database_backup_checksum" \
+    "$started_at"; then
+    printf '%s\n' 'refusing to write invalid Kinvest deployment attempt state' >&2
+    return 1
+  fi
   temporary="$(mktemp "$STATE/.attempt.XXXXXX")"
   cat > "$temporary" <<EOF_ATTEMPT
 protocolVersion=3
@@ -863,13 +1028,28 @@ read_current_state() {
     previous_commit="${second_line#commit=}"
   fi
 
-  [[ "$previous_digest_ref" =~ $ALLOWED_STATE_DIGEST_PATTERN ]] || return 1
-  if [[ "$previous_state_protocol" == '3' && ! "$previous_image_id" =~ ^sha256:[0-9a-f]{64}$ ]]; then
-    return 1
+  if [[ "$previous_state_protocol" == 'legacy' ]]; then
+    [[ "$previous_digest_ref" =~ $ALLOWED_STATE_DIGEST_PATTERN ]] || return 1
+    [[ "$previous_commit" =~ ^[0-9a-f]{40}$ ]] || return 1
+    schema_in_range "$previous_schema" "$previous_schema_min" "$previous_schema_max" || return 1
+    previous_secret_versions="$(validate_secret_mapping "$previous_secret_versions")" || return 1
+  else
+    validate_persisted_state_fields \
+      "$previous_state_protocol" \
+      "$previous_digest_ref" \
+      "$previous_image_id" \
+      "$previous_commit" \
+      "$previous_schema" \
+      "$previous_schema_min" \
+      "$previous_schema_max" \
+      "$previous_secret_versions" \
+      "$previous_release_schema" \
+      "$previous_run_id" \
+      "$previous_artifact_source" \
+      "$previous_backup_path" \
+      "$previous_backup_checksum" \
+      "$previous_deployed_at" || return 1
   fi
-  [[ "$previous_commit" =~ ^[0-9a-f]{40}$ ]] || return 1
-  schema_in_range "$previous_schema" "$previous_schema_min" "$previous_schema_max" || return 1
-  previous_secret_versions="$(validate_secret_mapping "$previous_secret_versions")" || return 1
 }
 
 capture_previous_snapshot() {
@@ -890,6 +1070,16 @@ capture_previous_snapshot() {
   else
     [[ "$running_ref" == "$previous_digest_ref" ]] || return 1
     previous_image_id="$running_image_id"
+    if [[ "$previous_state_protocol" == 'legacy' ]]; then
+      previous_release_schema='1'
+      previous_run_id='0'
+      case "${previous_digest_ref%@*}" in
+        "$GHCR_REPOSITORY") previous_artifact_source='ghcr-public' ;;
+        "$TCR_REPOSITORY") previous_artifact_source='tcr-private' ;;
+        *) return 1 ;;
+      esac
+      previous_deployed_at="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
+    fi
   fi
 }
 
