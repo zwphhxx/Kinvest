@@ -17,6 +17,7 @@ const tests = [
   require('./frontend-contract.test'),
   require('./data-source-contract.test'),
   require('./model-security-contract.test'),
+  require('./offline-image-attestation.test'),
   require('./deploy-contract.test'),
   require('./deploy-secret-version-config.test'),
   require('./deploy-v2-contract.test'),
