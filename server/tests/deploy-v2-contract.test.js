@@ -6,6 +6,8 @@ const os = require('node:os')
 const path = require('node:path')
 
 const rootDir = path.resolve(__dirname, '../..')
+const transactionalInstallerTimeoutMs = 30_000
+const transactionalInstallerNestedTimeoutSeconds = 20
 
 function read(relativePath) {
   return fs.readFileSync(path.join(rootDir, relativePath), 'utf8')
@@ -823,7 +825,7 @@ with open(sys.argv[3], "a+b") as lock_file:
         stdout=subprocess.PIPE,
         stderr=subprocess.PIPE,
         text=True,
-        timeout=5,
+        timeout=${transactionalInstallerNestedTimeoutSeconds},
     )
 sys.stdout.write(completed.stdout)
 sys.stderr.write(completed.stderr)
@@ -831,12 +833,12 @@ raise SystemExit(completed.returncode)
 `, installerPath, sourceDir, deployLock], {
         encoding: 'utf8',
         env: installerEnvironment,
-        timeout: 5000
+        timeout: transactionalInstallerTimeoutMs
       })
     : spawnSync('bash', [installerPath, sourceDir], {
     encoding: 'utf8',
     env: installerEnvironment,
-    timeout: 5000
+    timeout: transactionalInstallerTimeoutMs
   })
 
   return {
@@ -850,6 +852,15 @@ raise SystemExit(completed.returncode)
     runDir,
     targets
   }
+}
+
+function assertTransactionalFixtureCompleted(result, scenario) {
+  assert.notEqual(
+    result.error?.code,
+    'ETIMEDOUT',
+    `${scenario}: transactional installer fixture exceeded ${transactionalInstallerTimeoutMs}ms`
+  )
+  assert.equal(result.signal, null, `${scenario}: transactional installer fixture was terminated by ${result.signal}`)
 }
 
 async function run() {
@@ -996,6 +1007,7 @@ async function run() {
   ]) {
     const transactional = runTransactionalInstallerFixture(installer, scenario)
     try {
+      assertTransactionalFixtureCompleted(transactional.result, scenario.fault)
       assert.notEqual(transactional.result.status, 0, JSON.stringify(transactional.result, null, 2))
       assert.equal(transactional.result.stdout, '')
       for (const [name, target] of Object.entries(transactional.targets)) {
@@ -1031,6 +1043,7 @@ async function run() {
   for (const fault of ['restore-stage-failure', 'rollback-second-signal']) {
     const failedRestore = runTransactionalInstallerFixture(installer, { fault })
     try {
+      assertTransactionalFixtureCompleted(failedRestore.result, fault)
       assert.notEqual(failedRestore.result.status, 0)
       assert.equal(failedRestore.result.stdout, '')
       assert.match(failedRestore.result.stderr, /transactional restoration failed/)
@@ -1073,6 +1086,7 @@ async function run() {
     deploymentOwnsLock: true
   })
   try {
+    assertTransactionalFixtureCompleted(deploymentLockedInstaller.result, 'deployment-lock-owned')
     assert.notEqual(deploymentLockedInstaller.result.status, 0)
     assert.match(deploymentLockedInstaller.result.stderr, /another Kinvest deployment is already running/)
     assert.equal(deploymentLockedInstaller.result.stdout, '')
