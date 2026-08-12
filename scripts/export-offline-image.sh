@@ -7,6 +7,8 @@ SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd -P)"
 REPOSITORY_ROOT="$(cd -- "$SCRIPT_DIR/.." && pwd -P)"
 VERIFIER="$REPOSITORY_ROOT/deploy/server/offline-image-attestation.py"
 TEMPORARY_PATH=''
+PUBLICATION_STATE=''
+SUCCESS_METADATA_COMPLETED='false'
 
 usage() {
   printf '%s\n' 'usage: export-offline-image.sh <full-ghcr-digest-ref> <absolute-output.tar>' >&2
@@ -14,9 +16,41 @@ usage() {
 }
 
 cleanup() {
+  cleanup_status="$?"
+  trap - EXIT INT TERM HUP
+  if [[ "$SUCCESS_METADATA_COMPLETED" != 'true' && -n "$PUBLICATION_STATE" && -f "$PUBLICATION_STATE" ]]; then
+    python3 - cleanup-created-link "$PUBLICATION_STATE" "$OUTPUT_PATH" <<'PY' || true
+import os
+import stat
+import sys
+
+mode, state_path, output_path = sys.argv[1:]
+if mode != "cleanup-created-link":
+    raise SystemExit(1)
+try:
+    with open(state_path, "r", encoding="ascii") as state:
+        fields = state.read().split()
+    if len(fields) != 3 or fields[0] != "created":
+        raise SystemExit(0)
+    expected_device, expected_inode = map(int, fields[1:])
+    target = os.lstat(output_path)
+    if (
+        stat.S_ISREG(target.st_mode)
+        and target.st_dev == expected_device
+        and target.st_ino == expected_inode
+    ):
+        os.unlink(output_path)
+except (FileNotFoundError, OSError, ValueError):
+    pass
+PY
+  fi
   if [[ -n "$TEMPORARY_PATH" ]]; then
     rm -f -- "$TEMPORARY_PATH"
   fi
+  if [[ -n "$PUBLICATION_STATE" ]]; then
+    rm -f -- "$PUBLICATION_STATE"
+  fi
+  return "$cleanup_status"
 }
 
 on_signal() {
@@ -41,6 +75,9 @@ fi
 if [[ "$OUTPUT_PATH" != /* || "$OUTPUT_PATH" != *.tar ]]; then
   usage
 fi
+if [[ "$OUTPUT_PATH" =~ [[:cntrl:]] ]]; then
+  usage
+fi
 if [[ -e "$OUTPUT_PATH" || -L "$OUTPUT_PATH" ]]; then
   printf '%s\n' 'offline image export output already exists' >&2
   exit 2
@@ -56,7 +93,9 @@ fi
 
 umask 077
 TEMPORARY_PATH="$(mktemp "$OUTPUT_PATH.temporary.XXXXXX")"
+PUBLICATION_STATE="$(mktemp "$OUTPUT_PATH.publication.XXXXXX")"
 chmod 0600 "$TEMPORARY_PATH"
+chmod 0600 "$PUBLICATION_STATE"
 
 docker pull --platform linux/amd64 "$SOURCE_REFERENCE" >/dev/null
 repo_digests="$(
@@ -85,6 +124,38 @@ chmod 0600 "$TEMPORARY_PATH"
 archive_checksum="$(shasum -a 256 "$TEMPORARY_PATH" | awk '{print $1}')"
 if [[ ! "$archive_checksum" =~ ^[0-9a-f]{64}$ ]]; then
   printf '%s\n' 'offline image export checksum is invalid' >&2
+  exit 1
+fi
+
+archive_identity="$(
+  python3 - capture-identity "$TEMPORARY_PATH" "$archive_checksum" <<'PY'
+import hashlib
+import os
+import stat
+import sys
+
+mode, archive_path, expected_checksum = sys.argv[1:]
+if mode != "capture-identity":
+    raise SystemExit(1)
+archive = os.lstat(archive_path)
+if (
+    not stat.S_ISREG(archive.st_mode)
+    or stat.S_ISLNK(archive.st_mode)
+    or stat.S_IMODE(archive.st_mode) != 0o600
+    or archive.st_uid != os.getuid()
+):
+    raise SystemExit(1)
+digest = hashlib.sha256()
+with open(archive_path, "rb", buffering=0) as source:
+    for chunk in iter(lambda: source.read(1024 * 1024), b""):
+        digest.update(chunk)
+if digest.hexdigest() != expected_checksum:
+    raise SystemExit(1)
+print(f"{archive.st_dev}:{archive.st_ino}:{archive.st_size}:{stat.S_IMODE(archive.st_mode)}:{archive.st_uid}")
+PY
+)"
+if [[ ! "$archive_identity" =~ ^[0-9]+:[0-9]+:[0-9]+:384:[0-9]+$ ]]; then
+  printf '%s\n' 'offline image export identity is invalid' >&2
   exit 1
 fi
 
@@ -134,6 +205,38 @@ if [[ "$platform_manifest_line" != "platform_manifest_digest=$platform_manifest_
   exit 1
 fi
 
+post_verification_identity="$(
+  python3 - capture-identity "$TEMPORARY_PATH" "$archive_checksum" <<'PY'
+import hashlib
+import os
+import stat
+import sys
+
+mode, archive_path, expected_checksum = sys.argv[1:]
+if mode != "capture-identity":
+    raise SystemExit(1)
+archive = os.lstat(archive_path)
+if (
+    not stat.S_ISREG(archive.st_mode)
+    or stat.S_ISLNK(archive.st_mode)
+    or stat.S_IMODE(archive.st_mode) != 0o600
+    or archive.st_uid != os.getuid()
+):
+    raise SystemExit(1)
+digest = hashlib.sha256()
+with open(archive_path, "rb", buffering=0) as source:
+    for chunk in iter(lambda: source.read(1024 * 1024), b""):
+        digest.update(chunk)
+if digest.hexdigest() != expected_checksum:
+    raise SystemExit(1)
+print(f"{archive.st_dev}:{archive.st_ino}:{archive.st_size}:{stat.S_IMODE(archive.st_mode)}:{archive.st_uid}")
+PY
+)"
+if [[ "$post_verification_identity" != "$archive_identity" ]]; then
+  printf '%s\n' 'offline image archive changed after verification' >&2
+  exit 1
+fi
+
 archive_size="$(wc -c < "$TEMPORARY_PATH" | tr -d '[:space:]')"
 if [[ ! "$archive_size" =~ ^[1-9][0-9]*$ ]]; then
   printf '%s\n' 'offline image export size is invalid' >&2
@@ -143,14 +246,25 @@ if [[ -e "$OUTPUT_PATH" || -L "$OUTPUT_PATH" ]]; then
   printf '%s\n' 'offline image export output appeared during export' >&2
   exit 1
 fi
-python3 - publish-no-replace "$TEMPORARY_PATH" "$OUTPUT_PATH" <<'PY'
+python3 - publish-no-replace "$TEMPORARY_PATH" "$OUTPUT_PATH" "$archive_checksum" "$archive_identity" "$PUBLICATION_STATE" <<'PY'
+import hashlib
 import os
 import stat
 import sys
 
-mode, temporary_path, output_path = sys.argv[1:]
+mode, temporary_path, output_path, expected_checksum, expected_identity, state_path = sys.argv[1:]
 if mode != "publish-no-replace":
     raise SystemExit(1)
+
+def checksum(path):
+    digest = hashlib.sha256()
+    with open(path, "rb", buffering=0) as source:
+        for chunk in iter(lambda: source.read(1024 * 1024), b""):
+            digest.update(chunk)
+    return digest.hexdigest()
+
+def identity(value):
+    return f"{value.st_dev}:{value.st_ino}:{value.st_size}:{stat.S_IMODE(value.st_mode)}:{value.st_uid}"
 
 def publication_failed(source_stat=None):
     if source_stat is not None:
@@ -165,6 +279,8 @@ def publication_failed(source_stat=None):
 
 try:
     source_stat = os.lstat(temporary_path)
+    if identity(source_stat) != expected_identity or checksum(temporary_path) != expected_checksum:
+        publication_failed()
     os.link(temporary_path, output_path, follow_symlinks=False)
 except OSError:
     publication_failed()
@@ -177,8 +293,14 @@ try:
         or stat.S_IMODE(target_stat.st_mode) != 0o600
         or target_stat.st_uid != os.getuid()
         or not os.path.samestat(source_stat, target_stat)
+        or identity(target_stat) != expected_identity
+        or checksum(output_path) != expected_checksum
     ):
         publication_failed(source_stat)
+    with open(state_path, "w", encoding="ascii") as state:
+        state.write(f"created {target_stat.st_dev} {target_stat.st_ino}\n")
+        state.flush()
+        os.fsync(state.fileno())
     os.unlink(temporary_path)
     final_stat = os.lstat(output_path)
     if (
@@ -187,6 +309,8 @@ try:
         or stat.S_IMODE(final_stat.st_mode) != 0o600
         or final_stat.st_uid != os.getuid()
         or not os.path.samestat(source_stat, final_stat)
+        or identity(final_stat) != expected_identity
+        or checksum(output_path) != expected_checksum
     ):
         publication_failed(source_stat)
 except OSError:
@@ -194,10 +318,14 @@ except OSError:
 PY
 TEMPORARY_PATH=''
 
-printf 'path=%s\n' "$OUTPUT_PATH"
-printf 'checksum=sha256:%s\n' "$archive_checksum"
-printf 'size=%s\n' "$archive_size"
-printf 'source=%s\n' "$SOURCE_REFERENCE"
-printf '%s\n' 'platform=linux/amd64'
-printf 'platformManifest=%s\n' "$platform_manifest_digest"
-printf 'runtimeImageId=%s\n' "$runtime_image_id"
+final_checksum="$(shasum -a 256 "$OUTPUT_PATH" | awk '{print $1}')"
+if [[ "$final_checksum" != "$archive_checksum" ]]; then
+  printf '%s\n' 'offline image export final checksum mismatch' >&2
+  exit 1
+fi
+
+success_metadata="$(printf 'path=%s\nchecksum=sha256:%s\nsize=%s\nsource=%s\nplatform=linux/amd64\nplatformManifest=%s\nruntimeImageId=%s' \
+  "$OUTPUT_PATH" "$archive_checksum" "$archive_size" "$SOURCE_REFERENCE" \
+  "$platform_manifest_digest" "$runtime_image_id")"
+printf '%s\n' "$success_metadata"
+SUCCESS_METADATA_COMPLETED='true'

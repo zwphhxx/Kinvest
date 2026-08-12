@@ -89,7 +89,10 @@ scripts/export-offline-image.sh \
 The exporter requires macOS, pulls only `linux/amd64`, checks that Docker reports
 the exact requested RepoDigest, writes mode `0600` through a private temporary
 file, and invokes the repository verifier before an atomic no-overwrite hard link
-publication followed by unlinking the temporary name. It does not
+publication followed by unlinking the temporary name. Before verification it
+captures the temporary file's device, inode, size, mode, owner, and SHA-256. The
+same identity and checksum must still hold after verification, across the hard
+link, and after a final output re-hash. It does not
 log in to Docker or read Docker credential configuration. Preserve the printed
 path, SHA-256, byte size, source reference, platform manifest digest, and runtime
 Image ID as non-secret transfer metadata. Transfer the archive separately and
@@ -119,6 +122,10 @@ the requested output absent. Import failure must not write or replace an
 attestation record. Do not retry blindly, do not retag the image as proof, and
 do not hand-edit an attestation. Remove a transferred archive only after import,
 record verification, and a separately approved deployment have completed.
+Until all success metadata has been written, signal and exit cleanup removes the
+final path only when it is still the same process-created inode recorded at link
+creation; a raced replacement is never removed. Output paths containing control
+characters are rejected so metadata remains one field per line.
 
 ## Release record v2
 
@@ -215,9 +222,13 @@ disabled `{}` baseline deployment belong to J4-C and require their own explicit
 approvals.
 
 The installer validates `offline-image-attestation.py` as a regular non-symlink,
-runs `py_compile` and the exact `self-check`, stages it under
-`/usr/local/libexec`, and atomically installs it as `root:root` mode `0755` at
-`/usr/local/libexec/kinvest-offline-image-attestation`. Installation never runs
+runs `py_compile` and the exact `self-check`, and installs all four assets as one
+four-asset transaction. Before its first exact-target replacement it records each
+prior file or prior absence in a root-private backup directory together with
+hash, mode, and ownership. Any replacement failure, validation failure, or
+handled signal restores and verifies all four prior states. The forced-command
+wrapper remains last, after the installed helper is verified as exact
+`root:root` mode `0755`, hash-matched, and self-checking. Installation never runs
 `import`, invokes Docker, restarts a service, or changes deployment state.
 
 Keep the approval gates separate:

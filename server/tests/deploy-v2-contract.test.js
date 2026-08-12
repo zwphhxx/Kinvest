@@ -569,6 +569,202 @@ function runUnsafeInstallerTargetFixture(installerSource) {
   }
 }
 
+function runTransactionalInstallerFixture(installerSource, {
+  fault,
+  helperInitiallyAbsent = false
+}) {
+  const fixtureRoot = fs.mkdtempSync(path.join(os.tmpdir(), 'kinvest-installer-transaction-'))
+  const fakeBin = path.join(fixtureRoot, 'bin')
+  const sourceDir = path.join(fixtureRoot, 'source')
+  const localSbin = path.join(fixtureRoot, 'root', 'usr', 'local', 'sbin')
+  const localLibexec = path.join(fixtureRoot, 'root', 'usr', 'local', 'libexec')
+  const runDir = path.join(fixtureRoot, 'root', 'run')
+  const fakeState = path.join(fixtureRoot, 'state')
+  const moveCount = path.join(fakeState, 'move-count')
+  const pythonCount = path.join(fakeState, 'python-count')
+  for (const directory of [fakeBin, sourceDir, localSbin, localLibexec, runDir, fakeState]) {
+    fs.mkdirSync(directory, { recursive: true })
+  }
+
+  const sourceAssets = {
+    'deploy-kinvest-v2.sh': '#!/usr/bin/env bash\nprintf \'%s\\n\' new-deployer\n',
+    'kinvest-ssh-command-v2': '#!/usr/bin/env bash\nprintf \'%s\\n\' new-wrapper\n',
+    'secret-version-config.py': '#!/usr/bin/env python3\nimport sys\nassert sys.argv[1:] == ["mapping"]\nassert sys.stdin.read() == "{}\\n"\nprint("{}")\n',
+    'offline-image-attestation.py': '#!/usr/bin/env python3\nimport sys\nif sys.argv[1:] == ["self-check"]:\n    print("KINVEST_OFFLINE_ATTESTATION_SELF_CHECK_OK")\nelse:\n    raise SystemExit(1)\n'
+  }
+  for (const [name, contents] of Object.entries(sourceAssets)) {
+    fs.writeFileSync(path.join(sourceDir, name), contents, { mode: 0o755 })
+  }
+
+  const targets = {
+    deployer: path.join(localSbin, 'deploy-kinvest'),
+    wrapper: path.join(localSbin, 'kinvest-ssh-command'),
+    validator: path.join(localLibexec, 'kinvest-secret-version-config'),
+    helper: path.join(localLibexec, 'kinvest-offline-image-attestation')
+  }
+  const originals = {
+    deployer: { contents: 'original-deployer\n', mode: 0o700 },
+    wrapper: { contents: 'original-wrapper\n', mode: 0o710 },
+    validator: { contents: 'original-validator\n', mode: 0o720 },
+    helper: helperInitiallyAbsent ? null : { contents: 'original-helper\n', mode: 0o730 }
+  }
+  for (const [name, target] of Object.entries(targets)) {
+    const original = originals[name]
+    if (original !== null) {
+      fs.writeFileSync(target, original.contents, { mode: original.mode })
+      fs.chmodSync(target, original.mode)
+    }
+  }
+
+  const realPython = spawnSync('python3', ['-c', 'import sys; print(sys.executable)'], {
+    encoding: 'utf8'
+  }).stdout.trim()
+  const realMv = spawnSync('sh', ['-c', 'command -v mv'], { encoding: 'utf8' }).stdout.trim()
+  const realCp = spawnSync('sh', ['-c', 'command -v cp'], { encoding: 'utf8' }).stdout.trim()
+  const realShasum = spawnSync('sh', ['-c', 'command -v shasum'], { encoding: 'utf8' }).stdout.trim()
+
+  fs.writeFileSync(path.join(fakeBin, 'id'), '#!/bin/sh\nprintf \'%s\\n\' 0\n', { mode: 0o755 })
+  fs.writeFileSync(
+    path.join(fakeBin, 'realpath'),
+    '#!/bin/sh\nfor argument do canonical="$argument"; done\nprintf \'%s\\n\' "$canonical"\n',
+    { mode: 0o755 }
+  )
+  fs.writeFileSync(
+    path.join(fakeBin, 'sha256sum'),
+    `#!/bin/sh
+set -eu
+for path do :; done
+checksum="$("$KINVEST_REAL_SHASUM" -a 256 "$path" | awk '{print $1}')"
+printf '%s  %s\n' "$checksum" "$path"
+`,
+    { mode: 0o755 }
+  )
+  fs.writeFileSync(
+    path.join(fakeBin, 'stat'),
+    `#!/bin/sh
+set -eu
+for path do :; done
+mode="$(/usr/bin/stat -f '%Lp' "$path")"
+printf '0:0:%s\n' "$mode"
+`,
+    { mode: 0o755 }
+  )
+  fs.writeFileSync(path.join(fakeBin, 'chown'), '#!/bin/sh\nexit 0\n', { mode: 0o755 })
+  fs.writeFileSync(
+    path.join(fakeBin, 'install'),
+    `#!/bin/sh
+set -eu
+directory_mode=0
+mode=0755
+source=''
+target=''
+while [ "$#" -gt 0 ]; do
+  case "$1" in
+    -d) directory_mode=1; shift ;;
+    -o|-g|-m) [ "$1" = '-m' ] && mode="$2"; shift 2 ;;
+    --) shift ;;
+    *) if [ -z "$source" ]; then source="$1"; else target="$1"; fi; shift ;;
+  esac
+done
+if [ "$directory_mode" -eq 1 ]; then
+  target="$source"
+  mkdir -p "$target"
+  chmod "$mode" "$target"
+else
+  cat "$source" > "$target"
+  chmod "$mode" "$target"
+fi
+`,
+    { mode: 0o755 }
+  )
+  fs.writeFileSync(
+    path.join(fakeBin, 'cp'),
+    `#!/bin/sh
+set -eu
+while [ "$#" -gt 0 ]; do
+  case "$1" in --preserve=*|--) shift ;; *) break ;; esac
+done
+exec "$KINVEST_REAL_CP" -p "$1" "$2"
+`,
+    { mode: 0o755 }
+  )
+  fs.writeFileSync(
+    path.join(fakeBin, 'mv'),
+    `#!/bin/sh
+set -eu
+count=0
+[ ! -f "$KINVEST_MOVE_COUNT" ] || count="$(cat "$KINVEST_MOVE_COUNT")"
+count=$((count + 1))
+printf '%s\n' "$count" > "$KINVEST_MOVE_COUNT"
+while [ "$#" -gt 0 ]; do
+  case "$1" in -fT|--|-f) shift ;; *) break ;; esac
+done
+if [ "$KINVEST_INSTALL_FAULT" = "move-$count" ]; then exit 97; fi
+"$KINVEST_REAL_MV" -f "$1" "$2"
+if [ "$KINVEST_INSTALL_FAULT" = "signal-$count" ]; then
+  kill -TERM "$PPID"
+  sleep 1
+  exit 143
+fi
+`,
+    { mode: 0o755 }
+  )
+  fs.writeFileSync(
+    path.join(fakeBin, 'python3'),
+    `#!/bin/sh
+set -eu
+case " $* " in
+  *' self-check '*)
+    count=0
+    [ ! -f "$KINVEST_PYTHON_COUNT" ] || count="$(cat "$KINVEST_PYTHON_COUNT")"
+    count=$((count + 1))
+    printf '%s\n' "$count" > "$KINVEST_PYTHON_COUNT"
+    if [ "$KINVEST_INSTALL_FAULT" = 'post-helper-validation' ] && [ "$count" -eq 3 ]; then
+      exit 96
+    fi
+    ;;
+esac
+exec "$KINVEST_REAL_PYTHON" "$@"
+`,
+    { mode: 0o755 }
+  )
+
+  const instrumentedInstaller = installerSource
+    .replaceAll('/usr/local/sbin', localSbin)
+    .replaceAll('/usr/local/libexec', localLibexec)
+    .replaceAll('/run/kinvest-offline-pycache', path.join(runDir, 'kinvest-offline-pycache'))
+    .replaceAll('/run/kinvest-deploy-v2-backup', path.join(runDir, 'kinvest-deploy-v2-backup'))
+  const installerPath = path.join(fixtureRoot, 'install-deploy-v2.sh')
+  fs.writeFileSync(installerPath, instrumentedInstaller, { mode: 0o755 })
+  const result = spawnSync('bash', [installerPath, sourceDir], {
+    encoding: 'utf8',
+    env: {
+      ...process.env,
+      KINVEST_INSTALL_FAULT: fault,
+      KINVEST_MOVE_COUNT: moveCount,
+      KINVEST_PYTHON_COUNT: pythonCount,
+      KINVEST_REAL_CP: realCp,
+      KINVEST_REAL_MV: realMv,
+      KINVEST_REAL_PYTHON: realPython,
+      KINVEST_REAL_SHASUM: realShasum,
+      PATH: `${fakeBin}:${process.env.PATH}`
+    },
+    timeout: 5000
+  })
+
+  return {
+    cleanup() {
+      fs.rmSync(fixtureRoot, { recursive: true, force: true })
+    },
+    localLibexec,
+    localSbin,
+    originals,
+    result,
+    runDir,
+    targets
+  }
+}
+
 async function run() {
   const wrapper = read('deploy/server/kinvest-ssh-command-v2')
   const deploy = read('deploy/server/deploy-kinvest-v2.sh')
@@ -648,9 +844,10 @@ async function run() {
   assert.match(installer, /mv -fT -- "\$attestation_temporary" "\$LOCAL_OFFLINE_ATTESTATION"/)
   assert.match(installer, /\( -e "\$target" \|\| -L "\$target" \)/)
   assert.match(installer, /\( ! -f "\$target" \|\| -L "\$target" \)/)
-  assert.equal((installer.match(/mv -fT --/g) ?? []).length, 4)
+  assert.ok((installer.match(/mv -fT --/g) ?? []).length >= 5)
   assert.match(installer, /stat -c ['"]%u:%g:%a['"] "\$LOCAL_OFFLINE_ATTESTATION"/)
-  assert.match(installer, /sha256sum "\$SOURCE_DIR\/offline-image-attestation\.py"/)
+  assert.match(installer, /SOURCE_ASSETS=.*offline-image-attestation\.py/)
+  assert.match(installer, /EXPECTED_ASSET_HASHES\+=\("\$\(sha256sum "\$SOURCE_DIR\/\$source_asset"/)
   assert.match(installer, /sha256sum "\$LOCAL_OFFLINE_ATTESTATION"/)
   assert.match(installer, /python3 "\$LOCAL_OFFLINE_ATTESTATION" self-check/)
   assert.ok(
@@ -682,6 +879,48 @@ async function run() {
     assert.match(unsafeInstallerTarget.result.stderr, /non-regular deploy-v2 target/)
   } finally {
     unsafeInstallerTarget.cleanup()
+  }
+
+  for (const scenario of [
+    { fault: 'move-1' },
+    { fault: 'move-2' },
+    { fault: 'move-3' },
+    { fault: 'move-4', helperInitiallyAbsent: true },
+    { fault: 'post-helper-validation' },
+    { fault: 'signal-2' }
+  ]) {
+    const transactional = runTransactionalInstallerFixture(installer, scenario)
+    try {
+      assert.notEqual(transactional.result.status, 0, JSON.stringify(transactional.result, null, 2))
+      assert.equal(transactional.result.stdout, '')
+      for (const [name, target] of Object.entries(transactional.targets)) {
+        const original = transactional.originals[name]
+        if (original === null) {
+          assert.equal(fs.existsSync(target), false, `${scenario.fault}: ${name} must return to absent`)
+        } else {
+          assert.equal(fs.readFileSync(target, 'utf8'), original.contents, `${scenario.fault}: ${name} contents`)
+          assert.equal(fs.statSync(target).mode & 0o777, original.mode, `${scenario.fault}: ${name} mode`)
+        }
+      }
+      assert.deepEqual(
+        fs.readdirSync(transactional.localSbin).filter((name) => name.startsWith('.')),
+        [],
+        `${scenario.fault}: sbin temporaries`
+      )
+      assert.deepEqual(
+        fs.readdirSync(transactional.localLibexec).filter((name) => name.startsWith('.')),
+        [],
+        `${scenario.fault}: libexec temporaries`
+      )
+      assert.deepEqual(fs.readdirSync(transactional.runDir), [], `${scenario.fault}: backup cleanup`)
+      for (const target of Object.values(transactional.targets)) {
+        if (fs.existsSync(target)) {
+          assert.equal(fs.lstatSync(target).isFile(), true, `${scenario.fault}: no nested target`)
+        }
+      }
+    } finally {
+      transactional.cleanup()
+    }
   }
 
   assert.match(workflow, /DEPLOY_V2_ENABLED/)

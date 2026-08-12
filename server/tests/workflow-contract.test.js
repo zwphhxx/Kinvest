@@ -1,5 +1,6 @@
 const assert = require('node:assert/strict')
 const { spawnSync } = require('node:child_process')
+const crypto = require('node:crypto')
 const fs = require('node:fs')
 const os = require('node:os')
 const path = require('node:path')
@@ -930,19 +931,24 @@ function runOfflineExportFixture({
   sourceReference = `ghcr.io/zwphhxx/kinvest@sha256:${'7'.repeat(64)}`,
   outputMode = 'new',
   verifierFails = false,
-  publishRace = false
+  publishRace = false,
+  mutateAfterVerify = 'none',
+  signalAfterLink = false,
+  outputSuffix = ''
 } = {}) {
   const fixtureRoot = fs.mkdtempSync(path.join(os.tmpdir(), 'kinvest-offline-export-'))
   const fakeBin = path.join(fixtureRoot, 'bin')
   const fakeState = path.join(fixtureRoot, 'state')
-  const outputPath = outputMode === 'relative' ? 'candidate.tar' : path.join(fixtureRoot, 'candidate.tar')
-  const checksum = '8'.repeat(64)
+  const outputPath = outputMode === 'relative' ? 'candidate.tar' : path.join(fixtureRoot, `candidate${outputSuffix}.tar`)
+  const archiveBytes = 'verified-archive-bytes'
+  const checksum = crypto.createHash('sha256').update(archiveBytes).digest('hex')
   const platformManifest = `sha256:${'9'.repeat(64)}`
   const runtimeImageId = `sha256:${'a'.repeat(64)}`
   const realPython = spawnSync('python3', ['-c', 'import sys; print(sys.executable)'], {
     encoding: 'utf8'
   }).stdout.trim()
   const realMv = spawnSync('sh', ['-c', 'command -v mv'], { encoding: 'utf8' }).stdout.trim()
+  const realShasum = spawnSync('sh', ['-c', 'command -v shasum'], { encoding: 'utf8' }).stdout.trim()
 
   fs.mkdirSync(fakeBin)
   fs.mkdirSync(fakeState)
@@ -968,7 +974,7 @@ case "$1 $2" in
     ;;
   'image save')
     [ "$3" = '--output' ]
-    printf 'verified-archive-bytes' > "$4"
+    printf '%s' "$FAKE_EXPORT_ARCHIVE_BYTES" > "$4"
     chmod 0600 "$4"
     [ "$5" = "$FAKE_EXPORT_SOURCE" ]
     ;;
@@ -978,9 +984,7 @@ esac
   )
   writeExecutable(
     path.join(fakeBin, 'shasum'),
-    `#!/bin/sh
-printf '%s  %s\n' "$FAKE_EXPORT_CHECKSUM" "\${3:-}"
-`
+    '#!/bin/sh\nexec "$FAKE_EXPORT_REAL_SHASUM" "$@"\n'
   )
   writeExecutable(
     path.join(fakeBin, 'python3'),
@@ -988,9 +992,28 @@ printf '%s  %s\n' "$FAKE_EXPORT_CHECKSUM" "\${3:-}"
 set -eu
 printf '%s\n' "$*" >> "$FAKE_EXPORT_STATE/python.log"
 if [ "$1" = '-' ]; then
+  if [ "\${2:-}" = 'capture-identity' ] || [ "\${2:-}" = 'cleanup-created-link' ]; then
+    exec "$FAKE_EXPORT_REAL_PYTHON" "$@"
+  fi
   if [ "\${2:-}" = 'publish-no-replace' ]; then
     if [ "$FAKE_EXPORT_PUBLISH_RACE" = '1' ]; then
       mkdir "$FAKE_EXPORT_RACE_OUTPUT"
+    fi
+    if [ "$FAKE_EXPORT_SIGNAL_AFTER_LINK" = '1' ]; then
+      "$FAKE_EXPORT_REAL_PYTHON" - "$3" "$4" "$7" <<'PY'
+import os
+import sys
+temporary_path, output_path, publication_state = sys.argv[1:]
+os.link(temporary_path, output_path, follow_symlinks=False)
+created = os.lstat(output_path)
+with open(publication_state, "w", encoding="ascii") as state:
+    state.write(f"created {created.st_dev} {created.st_ino}\n")
+    state.flush()
+    os.fsync(state.fileno())
+PY
+      kill -TERM "$PPID"
+      sleep 1
+      exit 143
     fi
     exec "$FAKE_EXPORT_REAL_PYTHON" "$@"
   fi
@@ -1005,6 +1028,17 @@ if [ "$2" = 'verify-archive' ]; then
     exit 1
   fi
   printf 'KINVEST_OFFLINE_ARCHIVE_OK runtimeImageId=%s\n' "$FAKE_EXPORT_RUNTIME_IMAGE_ID"
+  case "$FAKE_EXPORT_MUTATE_AFTER_VERIFY" in
+    in-place)
+      printf '%s' 'tampered-archive-bytes' > "$3"
+      chmod 0600 "$3"
+      ;;
+    replace-path)
+      rm -f -- "$3"
+      printf '%s' "$FAKE_EXPORT_ARCHIVE_BYTES" > "$3"
+      chmod 0600 "$3"
+      ;;
+  esac
   exit 0
 fi
 exit 92
@@ -1030,11 +1064,15 @@ exec "$FAKE_EXPORT_REAL_MV" "$@"
         ...process.env,
         PATH: `${fakeBin}:${process.env.PATH}`,
         FAKE_EXPORT_CHECKSUM: checksum,
+        FAKE_EXPORT_ARCHIVE_BYTES: archiveBytes,
         FAKE_EXPORT_PLATFORM_MANIFEST: platformManifest,
         FAKE_EXPORT_PUBLISH_RACE: publishRace ? '1' : '0',
         FAKE_EXPORT_RACE_OUTPUT: outputPath,
         FAKE_EXPORT_REAL_PYTHON: realPython,
         FAKE_EXPORT_REAL_MV: realMv,
+        FAKE_EXPORT_REAL_SHASUM: realShasum,
+        FAKE_EXPORT_MUTATE_AFTER_VERIFY: mutateAfterVerify,
+        FAKE_EXPORT_SIGNAL_AFTER_LINK: signalAfterLink ? '1' : '0',
         FAKE_EXPORT_RUNTIME_IMAGE_ID: runtimeImageId,
         FAKE_EXPORT_SOURCE: sourceReference,
         FAKE_EXPORT_STATE: fakeState,
@@ -1555,6 +1593,10 @@ function run() {
   )
   assert.match(deployV2Runbook, /atomic no-overwrite hard link/i)
   assert.doesNotMatch(deployV2Runbook, /atomic rename/i)
+  assert.match(deployV2Runbook, /device, inode, size, mode, owner, and SHA-256/i)
+  assert.match(deployV2Runbook, /same process-created inode/i)
+  assert.match(deployV2Runbook, /four-asset transaction/i)
+  assert.match(deployV2Runbook, /prior file or prior absence/i)
 
   const offlineExport = runOfflineExportFixture()
   try {
@@ -1656,6 +1698,49 @@ function run() {
     )
   } finally {
     publishRace.cleanup()
+  }
+
+  for (const mutateAfterVerify of ['in-place', 'replace-path']) {
+    const mutated = runOfflineExportFixture({ mutateAfterVerify })
+    try {
+      assert.notEqual(mutated.result.status, 0)
+      assert.equal(mutated.result.stdout, '')
+      assert.equal(fs.existsSync(mutated.outputPath), false)
+      assert.deepEqual(
+        fs.readdirSync(path.dirname(mutated.outputPath)).filter((name) =>
+          name.includes('temporary') || name.includes('publication')
+        ),
+        []
+      )
+    } finally {
+      mutated.cleanup()
+    }
+  }
+
+  const linkedSignal = runOfflineExportFixture({ signalAfterLink: true })
+  try {
+    assert.notEqual(linkedSignal.result.status, 0)
+    assert.equal(linkedSignal.result.stdout, '')
+    assert.equal(fs.existsSync(linkedSignal.outputPath), false)
+    assert.deepEqual(
+      fs.readdirSync(path.dirname(linkedSignal.outputPath)).filter((name) =>
+        name.includes('temporary') || name.includes('publication')
+      ),
+      []
+    )
+  } finally {
+    linkedSignal.cleanup()
+  }
+
+  for (const outputSuffix of ['\nforged=1', '\rforged=1', '\tforged=1', '\u001fforged=1', '\u007fforged=1']) {
+    const injected = runOfflineExportFixture({ outputSuffix })
+    try {
+      assert.equal(injected.result.status, 2)
+      assert.equal(injected.result.stdout, '')
+      assert.equal(fs.existsSync(path.join(injected.fakeState, 'docker.log')), false)
+    } finally {
+      injected.cleanup()
+    }
   }
 
   const mirrorSuccess = runMirrorSuccessFixture()
