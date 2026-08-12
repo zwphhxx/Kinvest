@@ -19,6 +19,7 @@ const GENERATOR_ERROR_CODES = new Set([
   'SSM_MATERIAL_TTY_REQUIRED'
 ])
 const CLIPBOARD_TIMEOUT_MS = 5000
+const CLIPBOARD_KILL_GRACE_MS = 250
 
 class SsmMaterialGeneratorError extends Error {
   constructor(code) {
@@ -92,8 +93,26 @@ function writeMacClipboard(value, {
     const payload = Buffer.from(value)
     let child
     let settled = false
-    let timer
+    let operationTimer
+    let killGraceTimer
     let stdin
+    let terminationStarted = false
+    let payloadCleared = false
+    const clearPayload = () => {
+      if (payloadCleared) return
+      payloadCleared = true
+      payload.fill(0)
+    }
+    const clearOperationTimer = () => {
+      if (operationTimer === undefined) return
+      clearTimer(operationTimer)
+      operationTimer = undefined
+    }
+    const clearKillGraceTimer = () => {
+      if (killGraceTimer === undefined) return
+      clearTimer(killGraceTimer)
+      killGraceTimer = undefined
+    }
     const removeListeners = () => {
       if (child) {
         child.removeListener('error', handleChildError)
@@ -102,27 +121,36 @@ function writeMacClipboard(value, {
       if (stdin) stdin.removeListener('error', handleStdinError)
     }
     const finish = (error) => {
-      payload.fill(0)
       if (settled) return
       settled = true
-      if (timer !== undefined) clearTimer(timer)
+      clearPayload()
+      clearOperationTimer()
+      clearKillGraceTimer()
       removeListeners()
       if (error) reject(new SsmMaterialGeneratorError('SSM_MATERIAL_CLIPBOARD_FAILED'))
       else resolve()
     }
-    const terminateAndFinish = () => {
+    const terminateAndWaitForClose = () => {
+      if (settled || terminationStarted) return
+      terminationStarted = true
+      clearOperationTimer()
       if (child && typeof child.kill === 'function') {
         try { child.kill('SIGKILL') } catch {
-          // Best effort: finish still clears owned buffers and rejects safely.
+          // Best effort: the grace timer still clears buffers and rejects safely.
         }
       }
-      finish(new Error('clipboard failed'))
+      // OS-level SIGKILL normally produces close; this bounds a malicious or
+      // broken child implementation that never emits it.
+      killGraceTimer = setTimer(
+        () => finish(new Error('clipboard failed')),
+        CLIPBOARD_KILL_GRACE_MS
+      )
     }
-    const handleChildError = () => terminateAndFinish()
-    const handleStdinError = () => terminateAndFinish()
+    const handleChildError = () => terminateAndWaitForClose()
+    const handleStdinError = () => terminateAndWaitForClose()
     const handleClose = (code) => {
-      if (code === 0) finish()
-      else terminateAndFinish()
+      if (!terminationStarted && code === 0) finish()
+      else finish(new Error('clipboard failed'))
     }
     try {
       child = spawnImpl('/usr/bin/pbcopy', [], {
@@ -136,13 +164,11 @@ function writeMacClipboard(value, {
     child.once('error', handleChildError)
     child.once('close', handleClose)
     stdin.once('error', handleStdinError)
-    timer = setTimer(terminateAndFinish, CLIPBOARD_TIMEOUT_MS)
+    operationTimer = setTimer(terminateAndWaitForClose, CLIPBOARD_TIMEOUT_MS)
     try {
-      stdin.end(payload)
+      stdin.end(payload, clearPayload)
     } catch {
-      terminateAndFinish()
-    } finally {
-      payload.fill(0)
+      terminateAndWaitForClose()
     }
   })
 }

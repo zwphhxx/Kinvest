@@ -107,7 +107,7 @@ async function run() {
     code: 'ADMIN_PASSWORD_INVALID'
   })), 'ADMIN_PASSWORD_INVALID')
 
-  function createHungChild() {
+  function createAsyncChild() {
     /** @type {any} */
     const child = new EventEmitter()
     child.killCalls = []
@@ -116,36 +116,106 @@ async function run() {
       return true
     }
     child.stdin = new EventEmitter()
-    child.stdin.end = (payload) => {
+    child.stdin.end = (payload, callback) => {
       child.payload = payload
+      child.handoffCallback = callback
+    }
+    child.consumeAndClose = (code = 0) => {
+      child.received = Buffer.from(child.payload)
+      child.handoffCallback()
+      child.emit('close', code)
     }
     return child
   }
-  const hungChild = createHungChild()
-  /** @type {(() => void) | undefined} */
-  let timeoutHandler
-  let clearedTimeout = false
-  const hungSecret = Buffer.from('sensitive-working-buffer')
-  const hungPromise = writeMacClipboard(hungSecret, {
-    spawnImpl: () => hungChild,
+
+  const asyncChild = createAsyncChild()
+  const asyncSecret = Buffer.from('exact-async-secret')
+  const asyncTimers = []
+  const asyncPromise = writeMacClipboard(asyncSecret, {
+    spawnImpl: () => asyncChild,
     platform: 'darwin',
     setTimer: (handler, timeoutMs) => {
-      assert.equal(timeoutMs, 5000)
-      timeoutHandler = handler
-      return 'timer-id'
+      asyncTimers.push({ handler, timeoutMs })
+      return asyncTimers.length
     },
-    clearTimer: (timerId) => {
-      assert.equal(timerId, 'timer-id')
-      clearedTimeout = true
-    }
+    clearTimer() {}
   })
-  if (!timeoutHandler) assert.fail('clipboard timeout handler was not installed')
-  timeoutHandler()
-  await assert.rejects(hungPromise, hasCode('SSM_MATERIAL_CLIPBOARD_FAILED'))
-  assert.deepEqual(hungChild.killCalls, ['SIGKILL'])
-  assert.equal(clearedTimeout, true)
-  assert.equal(hungChild.payload.every((byte) => byte === 0), true)
-  assert.equal(hungSecret.toString(), 'sensitive-working-buffer')
+  assert.equal(asyncTimers[0].timeoutMs, 5000)
+  assert.equal(asyncChild.payload.toString(), 'exact-async-secret')
+  asyncChild.consumeAndClose()
+  await asyncPromise
+  assert.equal(asyncChild.received.toString(), 'exact-async-secret')
+  assert.equal(asyncChild.payload.every((byte) => byte === 0), true)
+  assert.equal(asyncSecret.toString(), 'exact-async-secret')
+
+  function timerHarness() {
+    const timers = []
+    const cleared = []
+    return {
+      timers,
+      cleared,
+      setTimer(handler, timeoutMs) {
+        timers.push({ handler, timeoutMs })
+        return timers.length
+      },
+      clearTimer(timerId) {
+        cleared.push(timerId)
+      }
+    }
+  }
+
+  const timeoutChild = createAsyncChild()
+  const timeoutTimers = timerHarness()
+  const timeoutPromise = writeMacClipboard(Buffer.from('timeout-secret'), {
+    spawnImpl: () => timeoutChild,
+    platform: 'darwin',
+    setTimer: timeoutTimers.setTimer,
+    clearTimer: timeoutTimers.clearTimer
+  })
+  let timeoutSettled = false
+  timeoutPromise.catch(() => { timeoutSettled = true })
+  assert.equal(timeoutTimers.timers[0].timeoutMs, 5000)
+  timeoutTimers.timers[0].handler()
+  await Promise.resolve()
+  assert.deepEqual(timeoutChild.killCalls, ['SIGKILL'])
+  assert.equal(timeoutSettled, false)
+  assert.equal(timeoutTimers.timers[1].timeoutMs, 250)
+  assert.equal(timeoutChild.payload.toString(), 'timeout-secret')
+  timeoutChild.emit('close', null, 'SIGKILL')
+  await assert.rejects(timeoutPromise, hasCode('SSM_MATERIAL_CLIPBOARD_FAILED'))
+  assert.equal(timeoutChild.payload.every((byte) => byte === 0), true)
+  assert.deepEqual(timeoutTimers.cleared.sort(), [1, 2])
+
+  const stuckChild = createAsyncChild()
+  const stuckTimers = timerHarness()
+  const stuckPromise = writeMacClipboard(Buffer.from('stuck-secret'), {
+    spawnImpl: () => stuckChild,
+    platform: 'darwin',
+    setTimer: stuckTimers.setTimer,
+    clearTimer: stuckTimers.clearTimer
+  })
+  stuckTimers.timers[0].handler()
+  assert.deepEqual(stuckChild.killCalls, ['SIGKILL'])
+  stuckTimers.timers[1].handler()
+  await assert.rejects(stuckPromise, hasCode('SSM_MATERIAL_CLIPBOARD_FAILED'))
+  assert.equal(stuckChild.payload.every((byte) => byte === 0), true)
+
+  for (const source of ['child', 'stdin']) {
+    const errorChild = createAsyncChild()
+    const errorTimers = timerHarness()
+    const errorPromise = writeMacClipboard(Buffer.from(`${source}-error-secret`), {
+      spawnImpl: () => errorChild,
+      platform: 'darwin',
+      setTimer: errorTimers.setTimer,
+      clearTimer: errorTimers.clearTimer
+    })
+    if (source === 'child') errorChild.emit('error', new Error('fixture child error'))
+    else errorChild.stdin.emit('error', new Error('fixture stdin error'))
+    assert.deepEqual(errorChild.killCalls, ['SIGKILL'])
+    errorChild.emit('close', null, 'SIGKILL')
+    await assert.rejects(errorPromise, hasCode('SSM_MATERIAL_CLIPBOARD_FAILED'))
+    assert.equal(errorChild.payload.every((byte) => byte === 0), true)
+  }
 
   await assert.rejects(runGenerator({
     mode: 'admin-password-verifier',
