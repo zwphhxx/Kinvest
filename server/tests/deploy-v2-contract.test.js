@@ -571,7 +571,8 @@ function runUnsafeInstallerTargetFixture(installerSource) {
 
 function runTransactionalInstallerFixture(installerSource, {
   fault,
-  helperInitiallyAbsent = false
+  helperInitiallyAbsent = false,
+  deploymentOwnsLock = false
 }) {
   const fixtureRoot = fs.mkdtempSync(path.join(os.tmpdir(), 'kinvest-installer-transaction-'))
   const fakeBin = path.join(fixtureRoot, 'bin')
@@ -580,9 +581,11 @@ function runTransactionalInstallerFixture(installerSource, {
   const localLibexec = path.join(fixtureRoot, 'root', 'usr', 'local', 'libexec')
   const runDir = path.join(fixtureRoot, 'root', 'run')
   const fakeState = path.join(fixtureRoot, 'state')
+  const deployState = path.join(fixtureRoot, 'deploy-state')
+  const deployLock = path.join(deployState, 'deploy.lock')
   const moveCount = path.join(fakeState, 'move-count')
   const pythonCount = path.join(fakeState, 'python-count')
-  for (const directory of [fakeBin, sourceDir, localSbin, localLibexec, runDir, fakeState]) {
+  for (const directory of [fakeBin, sourceDir, localSbin, localLibexec, runDir, fakeState, deployState]) {
     fs.mkdirSync(directory, { recursive: true })
   }
 
@@ -651,6 +654,24 @@ printf '0:0:%s\n' "$mode"
   )
   fs.writeFileSync(path.join(fakeBin, 'chown'), '#!/bin/sh\nexit 0\n', { mode: 0o755 })
   fs.writeFileSync(
+    path.join(fakeBin, 'flock'),
+    `#!/bin/sh
+exec "$KINVEST_REAL_PYTHON" - "$@" <<'PY'
+import fcntl
+import sys
+
+operation = fcntl.LOCK_EX
+if "-n" in sys.argv[1:]:
+    operation |= fcntl.LOCK_NB
+try:
+    fcntl.flock(int(sys.argv[-1]), operation)
+except BlockingIOError:
+    raise SystemExit(1)
+PY
+`,
+    { mode: 0o755 }
+  )
+  fs.writeFileSync(
     path.join(fakeBin, 'install'),
     `#!/bin/sh
 set -eu
@@ -692,6 +713,22 @@ exec "$KINVEST_REAL_CP" -p "$1" "$2"
     path.join(fakeBin, 'mv'),
     `#!/bin/sh
 set -eu
+"$KINVEST_REAL_PYTHON" - "$KINVEST_DEPLOY_LOCK_PATH" <<'PY'
+import fcntl
+import os
+import sys
+
+descriptor = os.open(sys.argv[1], os.O_RDWR | os.O_CREAT, 0o600)
+try:
+    try:
+        fcntl.flock(descriptor, fcntl.LOCK_EX | fcntl.LOCK_NB)
+    except BlockingIOError:
+        pass
+    else:
+        raise SystemExit(95)
+finally:
+    os.close(descriptor)
+PY
 count=0
 [ ! -f "$KINVEST_MOVE_COUNT" ] || count="$(cat "$KINVEST_MOVE_COUNT")"
 count=$((count + 1))
@@ -744,21 +781,49 @@ exec "$KINVEST_REAL_PYTHON" "$@"
     .replaceAll('/usr/local/libexec', localLibexec)
     .replaceAll('/run/kinvest-offline-pycache', path.join(runDir, 'kinvest-offline-pycache'))
     .replaceAll('/run/kinvest-deploy-v2-backup', path.join(runDir, 'kinvest-deploy-v2-backup'))
+    .replaceAll('/root/docker/kinvest/state/deploy.lock', deployLock)
   const installerPath = path.join(fixtureRoot, 'install-deploy-v2.sh')
   fs.writeFileSync(installerPath, instrumentedInstaller, { mode: 0o755 })
-  const result = spawnSync('bash', [installerPath, sourceDir], {
+  const installerEnvironment = {
+    ...process.env,
+    KINVEST_DEPLOY_LOCK_PATH: deployLock,
+    KINVEST_INSTALL_FAULT: fault,
+    KINVEST_MOVE_COUNT: moveCount,
+    KINVEST_PYTHON_COUNT: pythonCount,
+    KINVEST_REAL_CP: realCp,
+    KINVEST_REAL_MV: realMv,
+    KINVEST_REAL_PYTHON: realPython,
+    KINVEST_REAL_SHASUM: realShasum,
+    PATH: `${fakeBin}:${process.env.PATH}`
+  }
+  const result = deploymentOwnsLock
+    ? spawnSync(realPython, ['-c', `
+import fcntl
+import os
+import subprocess
+import sys
+
+with open(sys.argv[3], "a+b") as lock_file:
+    fcntl.flock(lock_file.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+    completed = subprocess.run(
+        ["bash", sys.argv[1], sys.argv[2]],
+        env=os.environ,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        text=True,
+        timeout=5,
+    )
+sys.stdout.write(completed.stdout)
+sys.stderr.write(completed.stderr)
+raise SystemExit(completed.returncode)
+`, installerPath, sourceDir, deployLock], {
+        encoding: 'utf8',
+        env: installerEnvironment,
+        timeout: 5000
+      })
+    : spawnSync('bash', [installerPath, sourceDir], {
     encoding: 'utf8',
-    env: {
-      ...process.env,
-      KINVEST_INSTALL_FAULT: fault,
-      KINVEST_MOVE_COUNT: moveCount,
-      KINVEST_PYTHON_COUNT: pythonCount,
-      KINVEST_REAL_CP: realCp,
-      KINVEST_REAL_MV: realMv,
-      KINVEST_REAL_PYTHON: realPython,
-      KINVEST_REAL_SHASUM: realShasum,
-      PATH: `${fakeBin}:${process.env.PATH}`
-    },
+    env: installerEnvironment,
     timeout: 5000
   })
 
@@ -782,6 +847,8 @@ async function run() {
   const workflow = read('.github/workflows/deploy-production-v2-manual.yml')
   const publishWorkflow = read('.github/workflows/deploy.yml')
   const dockerfile = read('Dockerfile')
+  const attestationDesign = read('docs/superpowers/specs/2026-08-12-offline-artifact-attestation-design.md')
+  const deployRunbook = read('docs/operations/deploy-v2-runbook.md')
 
   assert.match(wrapper, /SSH_ORIGINAL_COMMAND:-.*!= 'deploy-v2'/)
   assert.match(wrapper, /exec sudo -n \/usr\/local\/sbin\/deploy-kinvest/)
@@ -868,6 +935,17 @@ async function run() {
   assert.doesNotMatch(installer, /offline-image-attestation\.py" (?:import|resolve)/)
   assert.doesNotMatch(installer, /^\s*(?:docker|systemctl|service)\b/m)
   assert.match(installer, /no container was restarted/)
+  assert.match(installer, /^DEPLOY_LOCK='\/root\/docker\/kinvest\/state\/deploy\.lock'$/m)
+  assert.match(installer, /exec 9>"\$DEPLOY_LOCK"/)
+  assert.match(installer, /flock -n 9/)
+  assert.ok(
+    installer.indexOf('flock -n 9') < installer.lastIndexOf('\nsnapshot_targets\n'),
+    'the shared deployment lock must be acquired before any target snapshot or replacement'
+  )
+  assert.doesNotMatch(attestationDesign, /atomically\s+renames/i)
+  assert.match(attestationDesign, /durable armed-state[\s\S]{0,300}no-overwrite hard link/i)
+  assert.doesNotMatch(deployRunbook, /sourceReference|source_reference/)
+  assert.match(deployRunbook, /deployer,\s+validator,\s+helper,\s+wrapper last/i)
 
   const unsafeInstallerTarget = runUnsafeInstallerTargetFixture(installer)
   try {
@@ -971,6 +1049,35 @@ async function run() {
     } finally {
       failedRestore.cleanup()
     }
+  }
+
+  const deploymentLockedInstaller = runTransactionalInstallerFixture(installer, {
+    fault: 'none',
+    deploymentOwnsLock: true
+  })
+  try {
+    assert.notEqual(deploymentLockedInstaller.result.status, 0)
+    assert.match(deploymentLockedInstaller.result.stderr, /another Kinvest deployment is already running/)
+    assert.equal(deploymentLockedInstaller.result.stdout, '')
+    for (const [name, target] of Object.entries(deploymentLockedInstaller.targets)) {
+      const original = deploymentLockedInstaller.originals[name]
+      assert.equal(fs.readFileSync(target, 'utf8'), original.contents, `lock busy: ${name}`)
+      assert.equal(fs.statSync(target).mode & 0o777, original.mode, `lock busy: ${name} mode`)
+    }
+  } finally {
+    deploymentLockedInstaller.cleanup()
+  }
+
+  const directAdapterFixture = fs.mkdtempSync(path.join(os.tmpdir(), 'kinvest-attestation-adapter-'))
+  try {
+    writeExecutable(path.join(directAdapterFixture, 'python3'), '#!/bin/sh\nexit 23\n')
+    const directAdapter = spawnSync(process.execPath, [path.join(__dirname, 'offline-image-attestation.test.js')], {
+      encoding: 'utf8',
+      env: { ...process.env, PATH: `${directAdapterFixture}:${process.env.PATH}` }
+    })
+    assert.notEqual(directAdapter.status, 0, 'direct adapter invocation must propagate the Python suite failure')
+  } finally {
+    fs.rmSync(directAdapterFixture, { recursive: true, force: true })
   }
 
   assert.match(workflow, /DEPLOY_V2_ENABLED/)

@@ -6,6 +6,7 @@ from __future__ import annotations
 import contextlib
 import dataclasses
 import datetime
+import gzip
 import hashlib
 import json
 import os
@@ -56,6 +57,10 @@ DOCKER_LOAD_TIMEOUT_SECONDS = 120
 DOCKER_INSPECT_TIMEOUT_SECONDS = 10
 MAX_DOCKER_OUTPUT_BYTES = 1024 * 1024
 MAX_RECORD_BYTES = 4096
+RAW_TAR_BLOCK_BYTES = 512
+MAX_RAW_TAR_HEADERS = MAX_MEMBERS
+MAX_RAW_TAR_STREAM_BYTES = MAX_ARCHIVE_BYTES + (MAX_RAW_TAR_HEADERS + 2) * 1024
+UNSUPPORTED_TAR_TYPEFLAGS = frozenset((b"x", b"g", b"L", b"K", b"S"))
 
 
 class ArchiveVerificationError(RuntimeError):
@@ -157,6 +162,109 @@ def _safe_member_name(name: str) -> bool:
         return False
     path = PurePosixPath(name)
     return not path.is_absolute() and all(part not in ("", ".", "..") for part in path.parts)
+
+
+def _parse_raw_tar_size(field: bytes) -> int:
+    if len(field) != 12:
+        _reject("OFFLINE_ARCHIVE_TAR_SIZE_INVALID")
+    if field[0] & 0x80:
+        if field[0] != 0x80:
+            _reject("OFFLINE_ARCHIVE_TAR_SIZE_INVALID")
+        return int.from_bytes(field[1:], "big", signed=False)
+    stripped = field.rstrip(b"\0 ").lstrip(b" ")
+    if not stripped:
+        return 0
+    if any(value < ord("0") or value > ord("7") for value in stripped):
+        _reject("OFFLINE_ARCHIVE_TAR_SIZE_INVALID")
+    try:
+        return int(stripped, 8)
+    except (TypeError, ValueError, OverflowError):
+        _reject("OFFLINE_ARCHIVE_TAR_SIZE_INVALID")
+
+
+def _read_raw_tar_exact(stream: BinaryIO, amount: int) -> bytes:
+    if amount < 0 or amount > 1024 * 1024:
+        _reject("OFFLINE_ARCHIVE_TAR_LIMIT")
+    chunks = bytearray()
+    while len(chunks) < amount:
+        chunk = stream.read(amount - len(chunks))
+        if not chunk:
+            _reject("OFFLINE_ARCHIVE_TAR_TRUNCATED")
+        chunks.extend(chunk)
+    return bytes(chunks)
+
+
+def _skip_raw_tar_exact(stream: BinaryIO, amount: int) -> None:
+    remaining = amount
+    while remaining:
+        chunk_size = min(1024 * 1024, remaining)
+        _read_raw_tar_exact(stream, chunk_size)
+        remaining -= chunk_size
+
+
+def _validate_raw_tar_checksum(header: bytes) -> None:
+    checksum_field = header[148:156]
+    stripped = checksum_field.rstrip(b"\0 ").lstrip(b" ")
+    if not stripped or any(value < ord("0") or value > ord("7") for value in stripped):
+        _reject("OFFLINE_ARCHIVE_TAR_HEADER_INVALID")
+    try:
+        expected = int(stripped, 8)
+    except (TypeError, ValueError, OverflowError):
+        _reject("OFFLINE_ARCHIVE_TAR_HEADER_INVALID")
+    actual = sum(header[:148]) + 8 * ord(" ") + sum(header[156:])
+    if expected != actual:
+        _reject("OFFLINE_ARCHIVE_TAR_HEADER_INVALID")
+
+
+def _raw_tar_preflight(source: BinaryIO) -> None:
+    try:
+        source.seek(0)
+        prefix = source.read(10)
+        source.seek(0)
+        if prefix.startswith(b"\x1f\x8b"):
+            if len(prefix) != 10 or prefix[2] != 8 or prefix[3] != 0:
+                _reject("OFFLINE_ARCHIVE_GZIP_UNSUPPORTED")
+            stream: BinaryIO = gzip.GzipFile(fileobj=source, mode="rb")
+        else:
+            stream = source
+        header_count = 0
+        expanded_bytes = 0
+        stream_bytes = 0
+        while True:
+            header = _read_raw_tar_exact(stream, RAW_TAR_BLOCK_BYTES)
+            stream_bytes += RAW_TAR_BLOCK_BYTES
+            if stream_bytes > MAX_RAW_TAR_STREAM_BYTES:
+                _reject("OFFLINE_ARCHIVE_TAR_LIMIT")
+            if header == b"\0" * RAW_TAR_BLOCK_BYTES:
+                trailer = _read_raw_tar_exact(stream, RAW_TAR_BLOCK_BYTES)
+                if trailer != b"\0" * RAW_TAR_BLOCK_BYTES:
+                    _reject("OFFLINE_ARCHIVE_TAR_HEADER_INVALID")
+                return
+            header_count += 1
+            if header_count > MAX_RAW_TAR_HEADERS:
+                _reject("OFFLINE_ARCHIVE_TAR_LIMIT")
+            _validate_raw_tar_checksum(header)
+            typeflag = header[156:157]
+            if typeflag in UNSUPPORTED_TAR_TYPEFLAGS:
+                _reject("OFFLINE_ARCHIVE_TAR_EXTENSION_UNSUPPORTED")
+            size = _parse_raw_tar_size(header[124:136])
+            if size > MAX_ARCHIVE_BYTES - expanded_bytes:
+                _reject("OFFLINE_ARCHIVE_TAR_LIMIT")
+            expanded_bytes += size
+            padded_size = ((size + RAW_TAR_BLOCK_BYTES - 1) // RAW_TAR_BLOCK_BYTES) * RAW_TAR_BLOCK_BYTES
+            if padded_size > MAX_RAW_TAR_STREAM_BYTES - stream_bytes:
+                _reject("OFFLINE_ARCHIVE_TAR_LIMIT")
+            _skip_raw_tar_exact(stream, padded_size)
+            stream_bytes += padded_size
+    except ArchiveVerificationError:
+        raise
+    except (OSError, EOFError, gzip.BadGzipFile):
+        _reject("OFFLINE_ARCHIVE_UNREADABLE")
+    finally:
+        try:
+            source.seek(0)
+        except OSError:
+            pass
 
 
 def _read_regular_member(
@@ -449,6 +557,7 @@ def _verify_archive(
                 _reject()
             if _sha256_stream(source) != archive_sha256:
                 _reject("OFFLINE_ARCHIVE_CHECKSUM_MISMATCH")
+            _raw_tar_preflight(source)
             roots, blobs = _read_archive(source)
             final_checksum = _sha256_stream(source)
             final_metadata = os.fstat(source.fileno())

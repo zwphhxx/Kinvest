@@ -45,10 +45,14 @@ contain both:
 - exactly one Docker `manifest.json` entry selecting the `linux/amd64` config
   and layer blobs that `docker load` can consume.
 
-The helper writes through a temporary file, validates the archive, atomically
-renames it, and prints only the path, SHA-256, size, source digest, platform
-manifest digest, and runtime config digest. It never reads registry credentials
-directly or writes them to the archive.
+The helper writes through a private same-filesystem temporary file and records a
+durable armed-state cleanup identity before publication. After validation it
+publishes the exact destination with a no-overwrite hard link, confirms that the
+temporary and final names still identify the same verified inode, and re-hashes
+the final bytes before reporting success. Interruption before completed success
+removes only that process's linked inode. Output contains only the path, SHA-256,
+size, source digest, platform manifest digest, and runtime config digest. The
+helper never reads registry credentials directly or writes them to the archive.
 
 ## Import verification
 
@@ -180,8 +184,9 @@ rollback path.
 
 The existing installer adds the importer and verifier under
 `/usr/local/libexec`. Installation validates Python syntax and a non-mutating
-self-check, installs root-owned files atomically, and does not import an image,
-restart a container, or deploy.
+self-check, acquires the deployment lock, and transactionally installs root-owned
+assets in the explicit order deployer, validator, helper, wrapper last. It does
+not import an image, restart a container, or deploy.
 
 After the PR is merged, production remains split into separate approvals:
 

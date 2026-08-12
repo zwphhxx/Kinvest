@@ -6,6 +6,7 @@ LOCAL_DEPLOY_SCRIPT='/usr/local/sbin/deploy-kinvest'
 LOCAL_SSH_COMMAND='/usr/local/sbin/kinvest-ssh-command'
 LOCAL_SECRET_VALIDATOR='/usr/local/libexec/kinvest-secret-version-config'
 LOCAL_OFFLINE_ATTESTATION='/usr/local/libexec/kinvest-offline-image-attestation'
+DEPLOY_LOCK='/root/docker/kinvest/state/deploy.lock'
 TARGETS=("$LOCAL_DEPLOY_SCRIPT" "$LOCAL_SSH_COMMAND" "$LOCAL_SECRET_VALIDATOR" "$LOCAL_OFFLINE_ATTESTATION")
 TARGET_NAMES=('deployer' 'wrapper' 'validator' 'offline-attestation')
 SOURCE_ASSETS=('deploy-kinvest-v2.sh' 'kinvest-ssh-command-v2' 'secret-version-config.py' 'offline-image-attestation.py')
@@ -208,6 +209,11 @@ attestation_output="$(python3 "$attestation_temporary" self-check)"
 
 # Install the root program first. Until the wrapper is replaced, an old two-line
 # request fails closed against the v2 envelope. No deployment is started here.
+exec 9>"$DEPLOY_LOCK"
+if ! flock -n 9; then
+  printf '%s\n' 'another Kinvest deployment is already running' >&2
+  exit 1
+fi
 snapshot_targets
 transaction_started='true'
 mv -fT -- "$deploy_temporary" "$LOCAL_DEPLOY_SCRIPT"

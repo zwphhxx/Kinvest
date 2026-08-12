@@ -71,7 +71,7 @@ RepoDigest.
 Start from one validated release record v2 and retain these exact inputs:
 
 ```text
-source_reference=ghcr.io/zwphhxx/kinvest@sha256:<64-lowercase-hex>
+source_digest=ghcr.io/zwphhxx/kinvest@sha256:<64-lowercase-hex>
 commit_sha=<40-lowercase-hex>
 verification_run_id=<GitHub Actions run id>
 archive_sha256=<calculated by the exporter>
@@ -94,7 +94,7 @@ captures the temporary file's device, inode, size, mode, owner, and SHA-256. The
 same identity and checksum must still hold after verification, across the hard
 link, and after a final output re-hash. It does not
 log in to Docker or read Docker credential configuration. Preserve the printed
-path, SHA-256, byte size, source reference, platform manifest digest, and runtime
+path, SHA-256, byte size, source digest, platform manifest digest, and runtime
 Image ID as non-secret transfer metadata. Transfer the archive separately and
 recalculate its SHA-256 on the server before import; both checksums must match.
 
@@ -112,7 +112,7 @@ sudo /usr/local/libexec/kinvest-offline-image-attestation import \
 
 The helper binds the verified archive bytes to Docker's loaded immutable Image
 ID. Its root-owned attestation record contains only `version`,
-`sourceReference`, `platform`, `platformManifestDigest`, `runtimeImageId`,
+`sourceDigest`, `platform`, `platformManifestDigest`, `runtimeImageId`,
 `archiveSha256`, `commit`, `verificationRunId`, and `importedAt`. The directory
 is root-only and records are `root:root` mode `0600`; no Registry credential,
 SecretString, STS credential, or application data is stored.
@@ -216,9 +216,12 @@ and `ROLLBACK_V2` confirmation.
 
 After the PR is merged and all checks pass, compare repository and server hashes.
 Only after explicit approval run the repository installer as root with the
-canonical server-source directory. The installer replaces the root program
-first and the forced wrapper second, validates shell syntax, prints only
-non-secret hashes, and does not restart a container.
+canonical server-source directory. The installer takes the same nonblocking
+deployment lock as `deploy-kinvest-v2.sh`; an active deployment makes installation
+fail before snapshots or replacements. While holding that lock through validation
+or rollback, it installs in the explicit order deployer, validator, helper,
+wrapper last. It validates shell syntax, prints only non-secret hashes, and does
+not restart a container.
 
 The J4-B repository changes do not install these assets or deploy production.
 Installing the validator, deployment script, and Compose file and performing a

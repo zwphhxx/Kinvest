@@ -1,5 +1,6 @@
 #!/usr/bin/env python3
 import hashlib
+import gzip
 import importlib.util
 import inspect
 import io
@@ -31,6 +32,28 @@ def canonical_json(value):
 
 def digest_bytes(value):
     return hashlib.sha256(value).hexdigest()
+
+
+def raw_tar_header(name, size, typeflag, *, base256=False):
+    header = bytearray(512)
+    encoded_name = name.encode("ascii")
+    header[: len(encoded_name)] = encoded_name
+    header[100:108] = b"0000600\0"
+    header[108:116] = b"0000000\0"
+    header[116:124] = b"0000000\0"
+    if base256:
+        encoded_size = size.to_bytes(11, "big")
+        header[124:136] = b"\x80" + encoded_size
+    else:
+        header[124:136] = f"{size:011o}\0".encode("ascii")
+    header[136:148] = b"00000000000\0"
+    header[148:156] = b"        "
+    header[156:157] = typeflag
+    header[257:263] = b"ustar\0"
+    header[263:265] = b"00"
+    checksum = sum(header)
+    header[148:156] = f"{checksum:06o}\0 ".encode("ascii")
+    return bytes(header)
 
 
 def descriptor(media_type, content, **extra):
@@ -391,6 +414,63 @@ class OfflineImageAttestationTests(unittest.TestCase):
 
     def test_rejects_symlink_member(self):
         self.assert_rejected("symlink")
+
+    def test_raw_preflight_rejects_huge_pax_before_tarfile(self):
+        archive = Path(self.temp.name) / "huge-pax.tar"
+        archive.write_bytes(
+            raw_tar_header("pax", self.module.MAX_ARCHIVE_BYTES + 1, b"x")
+            + b"\0" * 1024
+        )
+        checksum = digest_bytes(archive.read_bytes())
+        with mock.patch.object(
+            self.module.tarfile,
+            "open",
+            side_effect=AssertionError("tarfile must not process PAX headers"),
+        ), self.assertRaises(self.module.ArchiveVerificationError) as raised:
+            self.module.verify_archive(
+                archive,
+                checksum,
+                f"{REPOSITORY}@sha256:{'a' * 64}",
+            )
+        self.assertEqual(
+            str(raised.exception),
+            "OFFLINE_ARCHIVE_TAR_EXTENSION_UNSUPPORTED",
+        )
+
+    def test_gzip_preflight_rejects_huge_gnu_longname_before_tarfile(self):
+        archive = Path(self.temp.name) / "huge-longname.tar.gz"
+        payload = (
+            raw_tar_header(
+                "gnu-longname",
+                self.module.MAX_ARCHIVE_BYTES + 1,
+                b"L",
+                base256=True,
+            )
+            + b"\0" * 1024
+        )
+        archive.write_bytes(gzip.compress(payload, mtime=0))
+        checksum = digest_bytes(archive.read_bytes())
+        with mock.patch.object(
+            self.module.tarfile,
+            "open",
+            side_effect=AssertionError("tarfile must not process GNU headers"),
+        ), self.assertRaises(self.module.ArchiveVerificationError) as raised:
+            self.module.verify_archive(
+                archive,
+                checksum,
+                f"{REPOSITORY}@sha256:{'b' * 64}",
+            )
+        self.assertEqual(
+            str(raised.exception),
+            "OFFLINE_ARCHIVE_TAR_EXTENSION_UNSUPPORTED",
+        )
+
+    def test_raw_tar_size_parser_accepts_positive_base256_and_rejects_negative(self):
+        positive = b"\x80" + (513).to_bytes(11, "big")
+        self.assertEqual(self.module._parse_raw_tar_size(positive), 513)
+        with self.assertRaises(self.module.ArchiveVerificationError) as raised:
+            self.module._parse_raw_tar_size(b"\xff" + b"\0" * 11)
+        self.assertEqual(str(raised.exception), "OFFLINE_ARCHIVE_TAR_SIZE_INVALID")
 
     def test_rejects_duplicate_member(self):
         self.assert_rejected("duplicate_member")
