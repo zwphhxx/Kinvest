@@ -28,6 +28,7 @@ BLOB_PATH = re.compile(r"^blobs/sha256/([0-9a-f]{64})$")
 MAX_ARCHIVE_BYTES = 2 * 1024 * 1024 * 1024
 MAX_MEMBERS = 4096
 MAX_JSON_BYTES = 1024 * 1024
+MAX_JSON_NESTING = 128
 MAX_CAPTURED_METADATA_BYTES = 16 * 1024 * 1024
 MAX_DESCRIPTOR_DEPTH = 8
 SOURCE_ANNOTATION = "containerd.io/distribution.source.ghcr.io"
@@ -142,9 +143,32 @@ def _reject_json_constant(_value: str) -> None:
     _reject("OFFLINE_ARCHIVE_JSON_INVALID")
 
 
+def _enforce_json_nesting_limit(content: bytes) -> None:
+    depth = 0
+    in_string = False
+    escaped = False
+    for character in content:
+        if in_string:
+            if escaped:
+                escaped = False
+            elif character == ord("\\"):
+                escaped = True
+            elif character == ord('"'):
+                in_string = False
+        elif character == ord('"'):
+            in_string = True
+        elif character in (ord("{"), ord("[")):
+            depth += 1
+            if depth > MAX_JSON_NESTING:
+                _reject("OFFLINE_ARCHIVE_JSON_INVALID")
+        elif character in (ord("}"), ord("]")) and depth:
+            depth -= 1
+
+
 def _parse_json(content: bytes | None) -> Any:
     if content is None or len(content) > MAX_JSON_BYTES:
         _reject()
+    _enforce_json_nesting_limit(content)
     try:
         return json.loads(
             content.decode("utf-8"),

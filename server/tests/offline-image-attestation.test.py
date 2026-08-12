@@ -652,10 +652,34 @@ class OfflineImageAttestationTests(unittest.TestCase):
         self.assert_rejected("streaming_layer_tampering")
 
     def test_rejects_deep_json_with_stable_error(self):
-        self.assert_rejected(
-            "deep_json",
-            expected_code="OFFLINE_ARCHIVE_JSON_INVALID",
-        )
+        original_recursion_limit = sys.getrecursionlimit()
+        try:
+            for recursion_limit in (700, 5000):
+                with self.subTest(recursion_limit=recursion_limit):
+                    sys.setrecursionlimit(recursion_limit)
+                    self.assert_rejected(
+                        "deep_json",
+                        expected_code="OFFLINE_ARCHIVE_JSON_INVALID",
+                    )
+        finally:
+            sys.setrecursionlimit(original_recursion_limit)
+
+    def test_json_depth_scan_ignores_structural_characters_inside_strings(self):
+        deeply_looking_string = '[{"quoted":"\\\\\\\"","array":[]}]' * 2000
+        payload = {"value": deeply_looking_string}
+        self.assertEqual(self.module._parse_json(canonical_json(payload)), payload)
+
+    def test_json_depth_scan_defers_unclosed_input_to_json_parser(self):
+        with mock.patch.object(
+            self.module.json,
+            "loads",
+            wraps=self.module.json.loads,
+        ) as json_loads:
+            self.assert_archive_error(
+                lambda: self.module._parse_json(b'{"value":[1,2}'),
+                "OFFLINE_ARCHIVE_JSON_INVALID",
+            )
+        json_loads.assert_called_once()
 
     def test_rejects_nonfinite_json_constants(self):
         for case in ("nonfinite_nan", "nonfinite_infinity"):
