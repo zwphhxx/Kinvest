@@ -46,6 +46,7 @@ async function runBuildArtifactsExist() {
     'server/domain/security-identity.js',
     'server/security/cvm-ssm-secret-provider.js',
     'server/security/device-approval.js',
+    'server/security/secret-bootstrap-contract.js',
     'server/security/secret-provider.js',
     'server/server.js',
     'server/services/health.js',
