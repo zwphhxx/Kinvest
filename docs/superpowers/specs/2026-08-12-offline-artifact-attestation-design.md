@@ -1,5 +1,4 @@
 # Kinvest Offline Artifact Attestation Design
-
 ## Context
 
 Kinvest production runs Docker 28 with the classic `overlay2` image store. An
@@ -204,4 +203,3 @@ invalid or stale attestations, no-pull offline success, normal bounded pull,
 state v3, legacy/v2 migration, candidate preflight by Image ID, and rollback by
 previous Image ID. Full tests, typecheck, lint, build, shell/Python syntax,
 sensitive-pattern scanning, and all three PR checks are required before merge.
-

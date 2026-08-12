@@ -1,5 +1,4 @@
 # Offline Artifact Attestation Implementation Plan
-
 > **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development (recommended) or superpowers:executing-plans to implement this plan task-by-task. Steps use checkbox (`- [ ]`) syntax for tracking.
 
 **Goal:** Allow Kinvest to deploy a cryptographically verified offline GHCR artifact by binding its published source digest to the immutable local Docker Image ID without fabricating a RepoDigest.
@@ -349,4 +348,3 @@ merge; the user performs the manual merge.
 After user merge, separately request approval to install the new assets, import
 the candidate archive, and trigger the disabled-SSM J4-C deployment. Do not
 combine those approvals.
-
