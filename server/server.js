@@ -14,6 +14,17 @@ const PORT = Number(process.env.PORT || 4173)
 const ROOT = path.join(__dirname, '..')
 const PUBLIC_DIR = path.join(ROOT, 'public')
 const RUNTIME_FILE_CREATION_MASK = 0o077
+const SECRET_BOOTSTRAP_ERROR_CODES = new Set([
+  'SECRET_BOOTSTRAP_CONFIG_INVALID',
+  'SECRET_MATERIAL_INVALID',
+  'SECRET_MATERIAL_LOAD_FAILED',
+  'SECRET_MATERIAL_PROVIDER_INVALID',
+  'SECRET_VERSION_CONFIG_INVALID',
+  'SSM_BOOTSTRAP_INVALID',
+  'SSM_CLIENT_UNAVAILABLE',
+  'SSM_SECRET_LOAD_FAILED',
+  'TEMPORARY_CREDENTIALS_REQUIRED'
+])
 
 const MIME = {
   '.html': 'text/html; charset=utf-8',
@@ -360,7 +371,7 @@ function stableStartupErrorCode(error) {
   const code = error && typeof error === 'object' && 'code' in error
     ? error.code
     : undefined
-  return typeof code === 'string' && /^[A-Z][A-Z0-9_]{2,63}$/.test(code)
+  return typeof code === 'string' && SECRET_BOOTSTRAP_ERROR_CODES.has(code)
     ? code
     : 'SECRET_BOOTSTRAP_FAILED'
 }
@@ -382,6 +393,7 @@ async function startServer({
     cleaned = true
     processRef.removeListener('SIGTERM', handleSignal)
     processRef.removeListener('SIGINT', handleSignal)
+    runtimeServer.removeListener('close', cleanup)
     secretRuntime.clear()
   }
   const handleSignal = () => {
@@ -391,7 +403,9 @@ async function startServer({
     } catch (error) {
       if (!error || typeof error !== 'object' ||
         !('code' in error) || error.code !== 'ERR_SERVER_NOT_RUNNING') {
-        throw error
+        throw Object.assign(new Error('Server close failed'), {
+          code: 'SERVER_CLOSE_FAILED'
+        })
       }
     }
   }

@@ -77,6 +77,22 @@ async function run() {
   assert.equal(executableStderr.join(''), 'SSM_SECRET_LOAD_FAILED\n')
   assert.equal(executableStderr.join('').includes(secretMarker), false)
 
+  const upstreamCode = 'ADMIN_PASSWORD_VERIFIER_V20260812_001'
+  const allowlistStderr = []
+  assert.equal(await runServerExecutable({
+    runtimeServer: new FakeServer(),
+    bootstrap: async () => {
+      throw Object.assign(new Error('sensitive upstream failure'), {
+        code: upstreamCode
+      })
+    },
+    processRef: new EventEmitter(),
+    logger: { log() {} },
+    stderr: { write: (value) => allowlistStderr.push(String(value)) }
+  }), 1)
+  assert.equal(allowlistStderr.join(''), 'SECRET_BOOTSTRAP_FAILED\n')
+  assert.equal(allowlistStderr.join('').includes(upstreamCode), false)
+
   const throwingProcess = new EventEmitter()
   const throwingServer = new FakeServer()
   throwingServer.close = () => {
@@ -98,6 +114,73 @@ async function run() {
   assert.doesNotThrow(() => throwingProcess.emit('SIGINT'))
   assert.equal(throwingServer.closeCalls, 1)
   assert.equal(throwingClearCount, 1)
+  assert.equal(throwingProcess.listenerCount('SIGTERM'), 0)
+  assert.equal(throwingProcess.listenerCount('SIGINT'), 0)
+  assert.equal(throwingServer.listenerCount('close'), 0)
+
+  const normalProcess = new EventEmitter()
+  const normalServer = new FakeServer()
+  let normalClearCount = 0
+  await startServer({
+    runtimeServer: normalServer,
+    bootstrap: async () => ({
+      status: Object.freeze({ mode: 'disabled', referenceCount: 0 }),
+      clear() { normalClearCount += 1 }
+    }),
+    processRef: normalProcess,
+    logger: { log() {} }
+  })
+  normalServer.close()
+  assert.equal(normalClearCount, 1)
+  assert.equal(normalProcess.listenerCount('SIGTERM'), 0)
+  assert.equal(normalProcess.listenerCount('SIGINT'), 0)
+  assert.equal(normalServer.listenerCount('close'), 0)
+
+  const listenFailureProcess = new EventEmitter()
+  const listenFailureServer = new FakeServer()
+  listenFailureServer.listen = function listen() {
+    this.listenCalls += 1
+    this.emit('error', new Error('fixture listen failure'))
+    return this
+  }
+  let listenFailureClearCount = 0
+  await assert.rejects(startServer({
+    runtimeServer: listenFailureServer,
+    bootstrap: async () => ({
+      status: Object.freeze({ mode: 'disabled', referenceCount: 0 }),
+      clear() { listenFailureClearCount += 1 }
+    }),
+    processRef: listenFailureProcess,
+    logger: { log() {} }
+  }))
+  assert.equal(listenFailureClearCount, 1)
+  assert.equal(listenFailureProcess.listenerCount('SIGTERM'), 0)
+  assert.equal(listenFailureProcess.listenerCount('SIGINT'), 0)
+  assert.equal(listenFailureServer.listenerCount('close'), 0)
+
+  const closeErrorProcess = new EventEmitter()
+  const closeErrorServer = new FakeServer()
+  closeErrorServer.close = () => {
+    throw Object.assign(new Error('sensitive arbitrary close text'), {
+      code: 'ARBITRARY_UPSTREAM_CLOSE_CODE'
+    })
+  }
+  await startServer({
+    runtimeServer: closeErrorServer,
+    bootstrap: async () => ({
+      status: Object.freeze({ mode: 'disabled', referenceCount: 0 }),
+      clear() {}
+    }),
+    processRef: closeErrorProcess,
+    logger: { log() {} }
+  })
+  assert.throws(() => closeErrorProcess.emit('SIGTERM'), (error) => {
+    assert.ok(error instanceof Error)
+    assert.equal('code' in error && error.code, 'SERVER_CLOSE_FAILED')
+    assert.equal(error.message.includes('sensitive arbitrary close text'), false)
+    assert.equal(error.message.includes('ARBITRARY_UPSTREAM_CLOSE_CODE'), false)
+    return true
+  })
 }
 
 module.exports = { run }

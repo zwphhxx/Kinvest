@@ -41,6 +41,22 @@ async function run() {
   assert.equal(failedErr.value(), 'SSM_SECRET_LOAD_FAILED\n')
   assert.equal(failedErr.value().includes(secretMarker), false)
 
+  const allowlistOut = capture()
+  const allowlistErr = capture()
+  const upstreamCode = 'DEVICE_TOKEN_HMAC_V20260812_001'
+  assert.equal(await runPreflight({
+    bootstrap: async () => {
+      throw Object.assign(new Error('sensitive upstream failure'), {
+        code: upstreamCode
+      })
+    },
+    stdout: allowlistOut.stream,
+    stderr: allowlistErr.stream
+  }), 1)
+  assert.equal(allowlistOut.value(), '')
+  assert.equal(allowlistErr.value(), 'SSM_PREFLIGHT_FAILED\n')
+  assert.equal(allowlistErr.value().includes(upstreamCode), false)
+
   const disabledOut = capture()
   const disabledErr = capture()
   let disabledClearCount = 0

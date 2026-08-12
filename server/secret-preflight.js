@@ -1,11 +1,24 @@
 const { bootstrapSecrets } = require('./security/secret-bootstrap')
 
+const SSM_PREFLIGHT_ERROR_CODES = new Set([
+  'SECRET_BOOTSTRAP_CONFIG_INVALID',
+  'SECRET_MATERIAL_INVALID',
+  'SECRET_MATERIAL_LOAD_FAILED',
+  'SECRET_MATERIAL_PROVIDER_INVALID',
+  'SECRET_VERSION_CONFIG_INVALID',
+  'SSM_BOOTSTRAP_INVALID',
+  'SSM_CLIENT_UNAVAILABLE',
+  'SSM_PREFLIGHT_REQUIRES_CVM_SSM',
+  'SSM_SECRET_LOAD_FAILED',
+  'TEMPORARY_CREDENTIALS_REQUIRED'
+])
+
 /** @param {unknown} error */
 function stableErrorCode(error, fallback = 'SSM_PREFLIGHT_FAILED') {
   const code = error && typeof error === 'object' && 'code' in error
     ? error.code
     : undefined
-  return typeof code === 'string' && /^[A-Z][A-Z0-9_]{2,63}$/.test(code)
+  return typeof code === 'string' && SSM_PREFLIGHT_ERROR_CODES.has(code)
     ? code
     : fallback
 }
