@@ -1000,20 +1000,25 @@ if [ "$1" = '-' ]; then
       mkdir "$FAKE_EXPORT_RACE_OUTPUT"
     fi
     if [ "$FAKE_EXPORT_SIGNAL_AFTER_LINK" = '1' ]; then
-      "$FAKE_EXPORT_REAL_PYTHON" - "$3" "$4" "$7" <<'PY'
+      publisher_script="$FAKE_EXPORT_STATE/publisher.py"
+      cat > "$publisher_script"
+      exec "$FAKE_EXPORT_REAL_PYTHON" - "$publisher_script" "$@" <<'PY'
 import os
+import signal
 import sys
-temporary_path, output_path, publication_state = sys.argv[1:]
-os.link(temporary_path, output_path, follow_symlinks=False)
-created = os.lstat(output_path)
-with open(publication_state, "w", encoding="ascii") as state:
-    state.write(f"created {created.st_dev} {created.st_ino}\n")
-    state.flush()
-    os.fsync(state.fileno())
+script_path = sys.argv[1]
+publisher_argv = sys.argv[2:]
+real_link = os.link
+def link_then_signal(*args, **kwargs):
+    result = real_link(*args, **kwargs)
+    os.kill(os.getppid(), signal.SIGTERM)
+    raise SystemExit(143)
+os.link = link_then_signal
+sys.argv = publisher_argv
+with open(script_path, "rb") as source:
+    source_code = compile(source.read(), script_path, "exec")
+exec(source_code, {"__name__": "__main__"})
 PY
-      kill -TERM "$PPID"
-      sleep 1
-      exit 143
     fi
     exec "$FAKE_EXPORT_REAL_PYTHON" "$@"
   fi
@@ -1595,8 +1600,11 @@ function run() {
   assert.doesNotMatch(deployV2Runbook, /atomic rename/i)
   assert.match(deployV2Runbook, /device, inode, size, mode, owner, and SHA-256/i)
   assert.match(deployV2Runbook, /same process-created inode/i)
+  assert.match(deployV2Runbook, /armed.*before.*hard link/i)
   assert.match(deployV2Runbook, /four-asset transaction/i)
   assert.match(deployV2Runbook, /prior file or prior absence/i)
+  assert.match(deployV2Runbook, /ignore handled signals during restoration/i)
+  assert.match(deployV2Runbook, /backup[\s\S]{0,80}preserved[\s\S]{0,80}restoration\s+verification fails/i)
 
   const offlineExport = runOfflineExportFixture()
   try {

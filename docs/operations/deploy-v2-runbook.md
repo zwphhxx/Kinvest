@@ -126,6 +126,9 @@ Until all success metadata has been written, signal and exit cleanup removes the
 final path only when it is still the same process-created inode recorded at link
 creation; a raced replacement is never removed. Output paths containing control
 characters are rejected so metadata remains one field per line.
+The exporter fsyncs an `armed` device/inode cleanup record before the hard link.
+If a signal lands after link creation but before normal `created` state is
+persisted, cleanup can therefore remove only that still-matching archive inode.
 
 ## Release record v2
 
@@ -230,6 +233,10 @@ handled signal restores and verifies all four prior states. The forced-command
 wrapper remains last, after the installed helper is verified as exact
 `root:root` mode `0755`, hash-matched, and self-checking. Installation never runs
 `import`, invokes Docker, restarts a service, or changes deployment state.
+Cleanup will ignore handled signals during restoration so a second signal cannot
+interrupt the rollback. The root-private backup is preserved when restoration
+verification fails, and only its non-secret recovery path is reported; operators
+must not treat that outcome as a successful restore.
 
 Keep the approval gates separate:
 

@@ -155,7 +155,8 @@ restore_targets() {
 
 cleanup() {
   cleanup_status="$?"
-  trap - EXIT INT TERM HUP
+  trap - EXIT
+  trap '' HUP INT TERM
   set +e
   restore_status=0
   if [[ "$transaction_started" == 'true' && "$transaction_committed" != 'true' ]]; then
@@ -165,11 +166,12 @@ cleanup() {
   if [[ -n "$compile_cache" ]]; then
     rm -rf -- "$compile_cache"
   fi
-  if [[ -n "$backup_dir" ]]; then
+  if [[ -n "$backup_dir" && "$restore_status" -eq 0 ]]; then
     rm -rf -- "$backup_dir"
   fi
   if [[ "$restore_status" -ne 0 ]]; then
     printf '%s\n' 'deploy-v2 transactional restoration failed' >&2
+    printf 'deploy-v2 recovery backup preserved at %s\n' "$backup_dir" >&2
     cleanup_status=1
   fi
   exit "$cleanup_status"

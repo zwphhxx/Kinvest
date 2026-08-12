@@ -700,8 +700,18 @@ while [ "$#" -gt 0 ]; do
   case "$1" in -fT|--|-f) shift ;; *) break ;; esac
 done
 if [ "$KINVEST_INSTALL_FAULT" = "move-$count" ]; then exit 97; fi
+if [ "$KINVEST_INSTALL_FAULT" = 'restore-stage-failure' ]; then
+  [ "$count" -ne 4 ] || exit 97
+  [ "$count" -ne 5 ] || exit 98
+fi
+if [ "$KINVEST_INSTALL_FAULT" = 'rollback-second-signal' ] && [ "$count" -eq 4 ]; then exit 97; fi
 "$KINVEST_REAL_MV" -f "$1" "$2"
 if [ "$KINVEST_INSTALL_FAULT" = "signal-$count" ]; then
+  kill -TERM "$PPID"
+  sleep 1
+  exit 143
+fi
+if [ "$KINVEST_INSTALL_FAULT" = 'rollback-second-signal' ] && [ "$count" -eq 5 ]; then
   kill -TERM "$PPID"
   sleep 1
   exit 143
@@ -920,6 +930,46 @@ async function run() {
       }
     } finally {
       transactional.cleanup()
+    }
+  }
+
+  for (const fault of ['restore-stage-failure', 'rollback-second-signal']) {
+    const failedRestore = runTransactionalInstallerFixture(installer, { fault })
+    try {
+      assert.notEqual(failedRestore.result.status, 0)
+      assert.equal(failedRestore.result.stdout, '')
+      assert.match(failedRestore.result.stderr, /transactional restoration failed/)
+      const recoveryMatch = failedRestore.result.stderr.match(/backup preserved at ([^\n]+)/)
+      assert.ok(recoveryMatch, `${fault}: a non-secret recovery path must be reported`)
+      const recoveryPath = recoveryMatch[1]
+      assert.equal(path.dirname(recoveryPath), failedRestore.runDir)
+      assert.equal(fs.lstatSync(recoveryPath).isDirectory(), true)
+      assert.equal(fs.statSync(recoveryPath).mode & 0o777, 0o700)
+      assert.ok(fs.readdirSync(recoveryPath).length >= 4)
+      assert.doesNotMatch(failedRestore.result.stderr, /restoration (?:complete|succeeded)/i)
+      assert.deepEqual(
+        fs.readdirSync(failedRestore.localSbin).filter((name) => name.startsWith('.')),
+        []
+      )
+      assert.deepEqual(
+        fs.readdirSync(failedRestore.localLibexec).filter((name) => name.startsWith('.')),
+        []
+      )
+      if (fault === 'restore-stage-failure') {
+        assert.notEqual(
+          fs.readFileSync(failedRestore.targets.deployer, 'utf8'),
+          failedRestore.originals.deployer.contents,
+          'a failed restore must not be falsely reported as restored'
+        )
+      } else {
+        for (const [name, target] of Object.entries(failedRestore.targets)) {
+          const original = failedRestore.originals[name]
+          assert.equal(fs.readFileSync(target, 'utf8'), original.contents, `${fault}: ${name}`)
+          assert.equal(fs.statSync(target).mode & 0o777, original.mode, `${fault}: ${name} mode`)
+        }
+      }
+    } finally {
+      failedRestore.cleanup()
     }
   }
 
