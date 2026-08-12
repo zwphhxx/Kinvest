@@ -11,7 +11,7 @@ from pathlib import Path, PurePosixPath
 import re
 import stat
 import tarfile
-from typing import Any
+from typing import Any, BinaryIO
 
 
 ALLOWED_SOURCE = re.compile(
@@ -60,15 +60,16 @@ def _reject(code: str = "OFFLINE_ARCHIVE_INVALID") -> None:
     raise ArchiveVerificationError(code)
 
 
-def _sha256_file(path: Path) -> str:
+def _sha256_stream(source: BinaryIO) -> str:
     digest = hashlib.sha256()
     try:
-        with path.open("rb") as source:
-            while True:
-                chunk = source.read(1024 * 1024)
-                if not chunk:
-                    break
-                digest.update(chunk)
+        source.seek(0)
+        while True:
+            chunk = source.read(1024 * 1024)
+            if not chunk:
+                break
+            digest.update(chunk)
+        source.seek(0)
     except OSError:
         _reject("OFFLINE_ARCHIVE_UNREADABLE")
     return digest.hexdigest()
@@ -121,13 +122,13 @@ def _read_regular_member(archive: tarfile.TarFile, member: tarfile.TarInfo) -> t
     return digest.hexdigest(), bytes(captured) if captured is not None else None
 
 
-def _read_archive(path: Path) -> tuple[dict[str, bytes], dict[str, _StoredBlob]]:
+def _read_archive(source: BinaryIO) -> tuple[dict[str, bytes], dict[str, _StoredBlob]]:
     roots: dict[str, bytes] = {}
     blobs: dict[str, _StoredBlob] = {}
     seen: set[str] = set()
     expanded_bytes = 0
     try:
-        with tarfile.open(path, "r:*") as archive:
+        with tarfile.open(fileobj=source, mode="r:*") as archive:
             for count, member in enumerate(archive, start=1):
                 if count > MAX_MEMBERS or not _safe_member_name(member.name):
                     _reject()
@@ -219,6 +220,9 @@ class _DescriptorGraph:
                 _reject()
             for child in manifests:
                 self.visit(child, depth + 1)
+            subject = document.get("subject")
+            if subject is not None:
+                self.visit(subject, depth + 1)
         elif media_type == OCI_MANIFEST:
             document = self.blob_json(digest)
             if not isinstance(document, dict) or document.get("schemaVersion") != 2:
@@ -277,6 +281,8 @@ def _runtime_descriptor(source_index: Any) -> dict[str, Any]:
         ) == "attestation-manifest"
         if (
             not is_attestation
+            and "artifactType" not in value
+            and "subject" not in value
             and isinstance(platform, dict)
             and platform.get("os") == "linux"
             and platform.get("architecture") == "amd64"
@@ -318,7 +324,7 @@ def _validate_docker_manifest(value: Any, config_path: str, layer_paths: list[st
     if not isinstance(value, list) or len(value) != 1 or not isinstance(value[0], dict):
         _reject()
     entry = value[0]
-    if entry.get("RepoTags") not in (None, []):
+    if "RepoTags" not in entry or entry["RepoTags"] not in (None, []):
         _reject()
     if entry.get("Config") != config_path or entry.get("Layers") != layer_paths:
         _reject()
@@ -331,17 +337,47 @@ def verify_archive(archive: os.PathLike[str] | str, archive_sha256: str, source_
         _reject()
     try:
         path = Path(archive)
-        metadata = path.lstat()
+        path_metadata = path.lstat()
     except (OSError, TypeError, ValueError):
         _reject("OFFLINE_ARCHIVE_UNREADABLE")
-    if not stat.S_ISREG(metadata.st_mode) or stat.S_ISLNK(metadata.st_mode):
+    if not stat.S_ISREG(path_metadata.st_mode) or stat.S_ISLNK(path_metadata.st_mode):
         _reject()
-    if metadata.st_size <= 0 or metadata.st_size > MAX_ARCHIVE_BYTES:
+    if path_metadata.st_size <= 0 or path_metadata.st_size > MAX_ARCHIVE_BYTES:
         _reject()
-    if _sha256_file(path) != archive_sha256:
-        _reject("OFFLINE_ARCHIVE_CHECKSUM_MISMATCH")
-
-    roots, blobs = _read_archive(path)
+    flags = os.O_RDONLY | getattr(os, "O_CLOEXEC", 0) | getattr(os, "O_NOFOLLOW", 0)
+    try:
+        descriptor = os.open(path, flags)
+    except OSError:
+        _reject("OFFLINE_ARCHIVE_UNREADABLE")
+    try:
+        with os.fdopen(descriptor, "rb") as source:
+            opened_metadata = os.fstat(source.fileno())
+            if (
+                not stat.S_ISREG(opened_metadata.st_mode)
+                or (path_metadata.st_dev, path_metadata.st_ino)
+                != (opened_metadata.st_dev, opened_metadata.st_ino)
+                or opened_metadata.st_size <= 0
+                or opened_metadata.st_size > MAX_ARCHIVE_BYTES
+            ):
+                _reject()
+            if _sha256_stream(source) != archive_sha256:
+                _reject("OFFLINE_ARCHIVE_CHECKSUM_MISMATCH")
+            roots, blobs = _read_archive(source)
+            final_checksum = _sha256_stream(source)
+            final_metadata = os.fstat(source.fileno())
+            stable_fields = ("st_dev", "st_ino", "st_mode", "st_size", "st_mtime_ns")
+            if (
+                final_checksum != archive_sha256
+                or any(
+                    getattr(opened_metadata, field) != getattr(final_metadata, field)
+                    for field in stable_fields
+                )
+            ):
+                _reject("OFFLINE_ARCHIVE_CHANGED")
+    except ArchiveVerificationError:
+        raise
+    except OSError:
+        _reject("OFFLINE_ARCHIVE_UNREADABLE")
     if _parse_json(roots["oci-layout"]) != {"imageLayoutVersion": "1.0.0"}:
         _reject()
     source_descriptor = _validate_root_index(
@@ -355,7 +391,12 @@ def verify_archive(archive: os.PathLike[str] | str, archive_sha256: str, source_
     source_index = graph.blob_json(source_descriptor["digest"])
     runtime_descriptor = _runtime_descriptor(source_index)
     runtime_manifest = graph.blob_json(runtime_descriptor["digest"])
-    if not isinstance(runtime_manifest, dict):
+    if (
+        not isinstance(runtime_manifest, dict)
+        or runtime_manifest.get("mediaType") != OCI_MANIFEST
+        or "artifactType" in runtime_manifest
+        or "subject" in runtime_manifest
+    ):
         _reject()
     config_descriptor = runtime_manifest.get("config")
     layer_descriptors = runtime_manifest.get("layers")

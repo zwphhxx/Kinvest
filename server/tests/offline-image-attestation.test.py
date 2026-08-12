@@ -9,6 +9,7 @@ import sys
 import tarfile
 import tempfile
 import unittest
+from unittest import mock
 
 
 ROOT = Path(__file__).resolve().parents[2]
@@ -89,6 +90,10 @@ class ArchiveFixture:
             "mediaType": OCI_MANIFEST,
             "schemaVersion": 2,
         }
+        if self.case == "runtime_manifest_artifact_type":
+            runtime_manifest["artifactType"] = "application/vnd.in-toto+json"
+        if self.case == "runtime_manifest_subject":
+            runtime_manifest["subject"] = dict(runtime_manifest["config"])
         runtime_bytes = canonical_json(runtime_manifest)
         runtime_digest = self._add_blob(runtime_bytes)
         runtime_descriptor = descriptor(
@@ -96,6 +101,10 @@ class ArchiveFixture:
             runtime_bytes,
             platform={"architecture": "amd64", "os": "linux"},
         )
+        if self.case == "runtime_descriptor_artifact_type":
+            runtime_descriptor["artifactType"] = "application/vnd.in-toto+json"
+        if self.case == "runtime_descriptor_subject":
+            runtime_descriptor["subject"] = dict(runtime_manifest["config"])
 
         manifests = [runtime_descriptor]
         if self.case == "duplicate_runtime":
@@ -122,6 +131,16 @@ class ArchiveFixture:
             "mediaType": OCI_INDEX,
             "schemaVersion": 2,
         }
+        if self.case == "valid_index_subject":
+            source_index["subject"] = dict(runtime_descriptor)
+        if self.case == "missing_index_subject":
+            missing_subject = b"missing index subject"
+            source_index["subject"] = descriptor(OCI_CONFIG, missing_subject)
+        if self.case == "tampered_index_subject":
+            source_index["subject"] = {
+                **descriptor(OCI_MANIFEST, runtime_bytes),
+                "size": len(runtime_bytes) + 1,
+            }
         source_bytes = canonical_json(source_index)
         source_digest = self._add_blob(source_bytes)
         self.source_ref = f"{REPOSITORY}@sha256:{source_digest}"
@@ -145,13 +164,15 @@ class ArchiveFixture:
         if self.case == "docker_layer_mismatch":
             docker_layers = list(reversed(docker_layers))
 
+        docker_manifest = {
+            "Config": docker_config,
+            "Layers": docker_layers,
+        }
+        if self.case != "missing_repo_tags":
+            docker_manifest["RepoTags"] = None
         self.members.update({
             "index.json": canonical_json(layout_index),
-            "manifest.json": canonical_json([{
-                "Config": docker_config,
-                "Layers": docker_layers,
-                "RepoTags": None,
-            }]),
+            "manifest.json": canonical_json([docker_manifest]),
             "oci-layout": canonical_json({"imageLayoutVersion": "1.0.0"}),
         })
 
@@ -280,6 +301,62 @@ class OfflineImageAttestationTests(unittest.TestCase):
 
     def test_rejects_wrong_config_platform(self):
         self.assert_rejected("wrong_config_platform")
+
+    def test_validates_reachable_oci_index_subject(self):
+        fixture = self.fixture("valid_index_subject")
+        result = self.module.verify_archive(
+            fixture.archive,
+            fixture.archive_sha,
+            fixture.source_ref,
+        )
+        self.assertEqual(result.runtime_image_id, fixture.runtime_image_id)
+
+    def test_rejects_missing_oci_index_subject_blob(self):
+        self.assert_rejected("missing_index_subject")
+
+    def test_rejects_tampered_oci_index_subject_descriptor(self):
+        self.assert_rejected("tampered_index_subject")
+
+    def test_rejects_runtime_descriptor_artifact_type(self):
+        self.assert_rejected("runtime_descriptor_artifact_type")
+
+    def test_rejects_runtime_descriptor_subject(self):
+        self.assert_rejected("runtime_descriptor_subject")
+
+    def test_rejects_in_toto_runtime_manifest_artifact_type(self):
+        self.assert_rejected("runtime_manifest_artifact_type")
+
+    def test_rejects_runtime_manifest_subject(self):
+        self.assert_rejected("runtime_manifest_subject")
+
+    def test_archive_path_swap_cannot_change_verified_bytes(self):
+        fixture = self.fixture("valid")
+        replacement = ArchiveFixture(self.temp.name, "traversal")
+        real_tar_open = tarfile.open
+        swapped = False
+
+        def swap_path_before_tar_parse(name=None, mode="r", fileobj=None, **kwargs):
+            nonlocal swapped
+            if not swapped:
+                os.replace(replacement.archive, fixture.archive)
+                swapped = True
+            return real_tar_open(name=name, mode=mode, fileobj=fileobj, **kwargs)
+
+        with mock.patch.object(
+            self.module.tarfile,
+            "open",
+            side_effect=swap_path_before_tar_parse,
+        ):
+            result = self.module.verify_archive(
+                fixture.archive,
+                fixture.archive_sha,
+                fixture.source_ref,
+            )
+        self.assertTrue(swapped)
+        self.assertEqual(result.runtime_image_id, fixture.runtime_image_id)
+
+    def test_rejects_manifest_without_repo_tags_key(self):
+        self.assert_rejected("missing_repo_tags")
 
 
 if __name__ == "__main__":
