@@ -484,6 +484,91 @@ esac
   }
 }
 
+function runUnsafeInstallerTargetFixture(installerSource) {
+  const fixtureRoot = fs.mkdtempSync(path.join(os.tmpdir(), 'kinvest-installer-target-'))
+  const fakeBin = path.join(fixtureRoot, 'bin')
+  const sourceDir = path.join(fixtureRoot, 'source')
+  const localSbin = path.join(fixtureRoot, 'root', 'usr', 'local', 'sbin')
+  const localLibexec = path.join(fixtureRoot, 'root', 'usr', 'local', 'libexec')
+  const runDir = path.join(fixtureRoot, 'root', 'run')
+  const operationsLog = path.join(fixtureRoot, 'operations.log')
+  const deployTarget = path.join(localSbin, 'deploy-kinvest')
+  const wrapperTarget = path.join(localSbin, 'kinvest-ssh-command')
+  const validatorTarget = path.join(localLibexec, 'kinvest-secret-version-config')
+  const helperTarget = path.join(localLibexec, 'kinvest-offline-image-attestation')
+
+  for (const directory of [fakeBin, sourceDir, localSbin, localLibexec, runDir]) {
+    fs.mkdirSync(directory, { recursive: true })
+  }
+  for (const sourceFile of ['deploy-kinvest-v2.sh', 'kinvest-ssh-command-v2']) {
+    fs.writeFileSync(path.join(sourceDir, sourceFile), '#!/usr/bin/env bash\nexit 0\n', {
+      mode: 0o755
+    })
+  }
+  fs.writeFileSync(
+    path.join(sourceDir, 'secret-version-config.py'),
+    '#!/usr/bin/env python3\nimport sys\nassert sys.argv[1:] == ["mapping"]\nassert sys.stdin.read() == "{}\\n"\nprint("{}")\n',
+    { mode: 0o755 }
+  )
+  fs.writeFileSync(
+    path.join(sourceDir, 'offline-image-attestation.py'),
+    '#!/usr/bin/env python3\nimport sys\nif sys.argv[1:] == ["self-check"]:\n    print("KINVEST_OFFLINE_ATTESTATION_SELF_CHECK_OK")\nelse:\n    raise SystemExit(1)\n',
+    { mode: 0o755 }
+  )
+  fs.writeFileSync(deployTarget, 'original-deployer\n', { mode: 0o755 })
+  fs.writeFileSync(wrapperTarget, 'original-wrapper\n', { mode: 0o755 })
+  fs.writeFileSync(validatorTarget, 'original-validator\n', { mode: 0o755 })
+  fs.mkdirSync(helperTarget)
+
+  fs.writeFileSync(
+    path.join(fakeBin, 'id'),
+    '#!/bin/sh\n[ "${1:-}" = "-u" ] || exit 90\nprintf \'%s\\n\' 0\n',
+    { mode: 0o755 }
+  )
+  fs.writeFileSync(
+    path.join(fakeBin, 'realpath'),
+    '#!/bin/sh\nfor argument do canonical="$argument"; done\nprintf \'%s\\n\' "$canonical"\n',
+    { mode: 0o755 }
+  )
+  for (const command of ['install', 'mv', 'chown']) {
+    fs.writeFileSync(
+      path.join(fakeBin, command),
+      `#!/bin/sh\nprintf '%s\\n' '${command}' >> "$KINVEST_INSTALLER_OPERATIONS"\nexit 97\n`,
+      { mode: 0o755 }
+    )
+  }
+
+  const instrumentedInstaller = installerSource
+    .replaceAll('/usr/local/sbin', localSbin)
+    .replaceAll('/usr/local/libexec', localLibexec)
+    .replaceAll('/run/kinvest-offline-pycache', path.join(runDir, 'kinvest-offline-pycache'))
+  const installerPath = path.join(fixtureRoot, 'install-deploy-v2.sh')
+  fs.writeFileSync(installerPath, instrumentedInstaller, { mode: 0o755 })
+  const result = spawnSync('bash', [installerPath, sourceDir], {
+    encoding: 'utf8',
+    env: {
+      ...process.env,
+      KINVEST_INSTALLER_OPERATIONS: operationsLog,
+      PATH: `${fakeBin}:${process.env.PATH}`
+    },
+    timeout: 5000
+  })
+
+  return {
+    cleanup() {
+      fs.rmSync(fixtureRoot, { recursive: true, force: true })
+    },
+    deployTarget,
+    helperTarget,
+    localLibexec,
+    localSbin,
+    operationsLog,
+    result,
+    validatorTarget,
+    wrapperTarget
+  }
+}
+
 async function run() {
   const wrapper = read('deploy/server/kinvest-ssh-command-v2')
   const deploy = read('deploy/server/deploy-kinvest-v2.sh')
@@ -560,10 +645,44 @@ async function run() {
   assert.match(installer, /rm -rf -- "\$compile_cache"/)
   assert.match(installer, /mktemp \/usr\/local\/libexec\/\.kinvest-offline-image-attestation\.XXXXXX/)
   assert.match(installer, /install -o root -g root -m 0755 -- "\$SOURCE_DIR\/offline-image-attestation\.py"/)
-  assert.match(installer, /mv -f -- "\$attestation_temporary" "\$LOCAL_OFFLINE_ATTESTATION"/)
+  assert.match(installer, /mv -fT -- "\$attestation_temporary" "\$LOCAL_OFFLINE_ATTESTATION"/)
+  assert.match(installer, /\( -e "\$target" \|\| -L "\$target" \)/)
+  assert.match(installer, /\( ! -f "\$target" \|\| -L "\$target" \)/)
+  assert.equal((installer.match(/mv -fT --/g) ?? []).length, 4)
+  assert.match(installer, /stat -c ['"]%u:%g:%a['"] "\$LOCAL_OFFLINE_ATTESTATION"/)
+  assert.match(installer, /sha256sum "\$SOURCE_DIR\/offline-image-attestation\.py"/)
+  assert.match(installer, /sha256sum "\$LOCAL_OFFLINE_ATTESTATION"/)
+  assert.match(installer, /python3 "\$LOCAL_OFFLINE_ATTESTATION" self-check/)
+  assert.ok(
+    installer.indexOf('python3 "$LOCAL_OFFLINE_ATTESTATION" self-check') <
+      installer.indexOf('mv -fT -- "$wrapper_temporary" "$LOCAL_SSH_COMMAND"'),
+    'the installed helper must be verified before the forced-command wrapper is replaced'
+  )
   assert.doesNotMatch(installer, /offline-image-attestation\.py" (?:import|resolve)/)
   assert.doesNotMatch(installer, /^\s*(?:docker|systemctl|service)\b/m)
   assert.match(installer, /no container was restarted/)
+
+  const unsafeInstallerTarget = runUnsafeInstallerTargetFixture(installer)
+  try {
+    assert.notEqual(unsafeInstallerTarget.result.status, 0)
+    assert.equal(fs.readFileSync(unsafeInstallerTarget.deployTarget, 'utf8'), 'original-deployer\n')
+    assert.equal(fs.readFileSync(unsafeInstallerTarget.wrapperTarget, 'utf8'), 'original-wrapper\n')
+    assert.equal(fs.readFileSync(unsafeInstallerTarget.validatorTarget, 'utf8'), 'original-validator\n')
+    assert.equal(fs.lstatSync(unsafeInstallerTarget.helperTarget).isDirectory(), true)
+    assert.deepEqual(fs.readdirSync(unsafeInstallerTarget.helperTarget), [])
+    assert.equal(fs.existsSync(unsafeInstallerTarget.operationsLog), false)
+    assert.deepEqual(
+      fs.readdirSync(unsafeInstallerTarget.localSbin).filter((name) => name.startsWith('.')),
+      []
+    )
+    assert.deepEqual(
+      fs.readdirSync(unsafeInstallerTarget.localLibexec).filter((name) => name.startsWith('.')),
+      []
+    )
+    assert.match(unsafeInstallerTarget.result.stderr, /non-regular deploy-v2 target/)
+  } finally {
+    unsafeInstallerTarget.cleanup()
+  }
 
   assert.match(workflow, /DEPLOY_V2_ENABLED/)
   assert.match(workflow, /FORWARD/)

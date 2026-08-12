@@ -929,7 +929,8 @@ chmod +x "$destination/crane"
 function runOfflineExportFixture({
   sourceReference = `ghcr.io/zwphhxx/kinvest@sha256:${'7'.repeat(64)}`,
   outputMode = 'new',
-  verifierFails = false
+  verifierFails = false,
+  publishRace = false
 } = {}) {
   const fixtureRoot = fs.mkdtempSync(path.join(os.tmpdir(), 'kinvest-offline-export-'))
   const fakeBin = path.join(fixtureRoot, 'bin')
@@ -938,6 +939,10 @@ function runOfflineExportFixture({
   const checksum = '8'.repeat(64)
   const platformManifest = `sha256:${'9'.repeat(64)}`
   const runtimeImageId = `sha256:${'a'.repeat(64)}`
+  const realPython = spawnSync('python3', ['-c', 'import sys; print(sys.executable)'], {
+    encoding: 'utf8'
+  }).stdout.trim()
+  const realMv = spawnSync('sh', ['-c', 'command -v mv'], { encoding: 'utf8' }).stdout.trim()
 
   fs.mkdirSync(fakeBin)
   fs.mkdirSync(fakeState)
@@ -983,6 +988,12 @@ printf '%s  %s\n' "$FAKE_EXPORT_CHECKSUM" "\${3:-}"
 set -eu
 printf '%s\n' "$*" >> "$FAKE_EXPORT_STATE/python.log"
 if [ "$1" = '-' ]; then
+  if [ "\${2:-}" = 'publish-no-replace' ]; then
+    if [ "$FAKE_EXPORT_PUBLISH_RACE" = '1' ]; then
+      mkdir "$FAKE_EXPORT_RACE_OUTPUT"
+    fi
+    exec "$FAKE_EXPORT_REAL_PYTHON" "$@"
+  fi
   cat >/dev/null
   printf 'platform_manifest_digest=%s\nruntime_image_id=%s\n' \
     "$FAKE_EXPORT_PLATFORM_MANIFEST" "$FAKE_EXPORT_RUNTIME_IMAGE_ID"
@@ -999,6 +1010,16 @@ fi
 exit 92
 `
   )
+  writeExecutable(
+    path.join(fakeBin, 'mv'),
+    `#!/bin/sh
+set -eu
+if [ "$FAKE_EXPORT_PUBLISH_RACE" = '1' ]; then
+  mkdir "$FAKE_EXPORT_RACE_OUTPUT"
+fi
+exec "$FAKE_EXPORT_REAL_MV" "$@"
+`
+  )
 
   const result = spawnSync(
     rootPath('scripts/export-offline-image.sh'),
@@ -1010,6 +1031,10 @@ exit 92
         PATH: `${fakeBin}:${process.env.PATH}`,
         FAKE_EXPORT_CHECKSUM: checksum,
         FAKE_EXPORT_PLATFORM_MANIFEST: platformManifest,
+        FAKE_EXPORT_PUBLISH_RACE: publishRace ? '1' : '0',
+        FAKE_EXPORT_RACE_OUTPUT: outputPath,
+        FAKE_EXPORT_REAL_PYTHON: realPython,
+        FAKE_EXPORT_REAL_MV: realMv,
         FAKE_EXPORT_RUNTIME_IMAGE_ID: runtimeImageId,
         FAKE_EXPORT_SOURCE: sourceReference,
         FAKE_EXPORT_STATE: fakeState,
@@ -1039,6 +1064,7 @@ function run() {
   const productionWorkflow = readRootFile('.github/workflows/deploy-production-manual.yml')
   const mirrorScript = readRootFile('scripts/mirror-release-to-tcr.sh')
   const offlineExportScript = readRootFile('scripts/export-offline-image.sh')
+  const deployV2Runbook = readRootFile('docs/operations/deploy-v2-runbook.md')
   const deploy = readRootFile('deploy/server/deploy-kinvest.sh')
   const bootstrap = readRootFile('deploy/server/bootstrap-server.sh')
   const wrapper = readRootFile('deploy/server/kinvest-ssh-command')
@@ -1527,6 +1553,8 @@ function run() {
     offlineExportScript,
     /docker login|DOCKER_CONFIG|config\.json|security find|credential/i
   )
+  assert.match(deployV2Runbook, /atomic no-overwrite hard link/i)
+  assert.doesNotMatch(deployV2Runbook, /atomic rename/i)
 
   const offlineExport = runOfflineExportFixture()
   try {
@@ -1609,6 +1637,25 @@ function run() {
     )
   } finally {
     verifierFailure.cleanup()
+  }
+
+  const publishRace = runOfflineExportFixture({ publishRace: true })
+  try {
+    assert.notEqual(publishRace.result.status, 0)
+    assert.equal(publishRace.result.stdout, '')
+    assert.equal(fs.lstatSync(publishRace.outputPath).isDirectory(), true)
+    assert.deepEqual(
+      fs.readdirSync(publishRace.outputPath),
+      [],
+      'a raced output directory must never absorb the archive'
+    )
+    assert.deepEqual(
+      fs.readdirSync(path.dirname(publishRace.outputPath)).filter((name) => name.includes('temporary')),
+      [],
+      'publication failure must clean the private temporary archive'
+    )
+  } finally {
+    publishRace.cleanup()
   }
 
   const mirrorSuccess = runMirrorSuccessFixture()

@@ -39,9 +39,10 @@ if [[ ! -f "$SOURCE_DIR/offline-image-attestation.py" || -L "$SOURCE_DIR/offline
   printf '%s\n' 'invalid deploy-v2 source file: offline-image-attestation.py' >&2
   exit 1
 fi
+expected_attestation_hash="$(sha256sum "$SOURCE_DIR/offline-image-attestation.py" | awk '{print $1}')"
 for target in "$LOCAL_DEPLOY_SCRIPT" "$LOCAL_SSH_COMMAND" "$LOCAL_SECRET_VALIDATOR" "$LOCAL_OFFLINE_ATTESTATION"; do
-  if [[ -L "$target" ]]; then
-    printf '%s\n' "refusing symlinked deploy-v2 target: $target" >&2
+  if [[ ( -e "$target" || -L "$target" ) && ( ! -f "$target" || -L "$target" ) ]]; then
+    printf '%s\n' "refusing non-regular deploy-v2 target: $target" >&2
     exit 1
   fi
 done
@@ -94,13 +95,26 @@ attestation_output="$(python3 "$attestation_temporary" self-check)"
 
 # Install the root program first. Until the wrapper is replaced, an old two-line
 # request fails closed against the v2 envelope. No deployment is started here.
-mv -f -- "$deploy_temporary" "$LOCAL_DEPLOY_SCRIPT"
+mv -fT -- "$deploy_temporary" "$LOCAL_DEPLOY_SCRIPT"
 deploy_temporary=''
-mv -f -- "$validator_temporary" "$LOCAL_SECRET_VALIDATOR"
+mv -fT -- "$validator_temporary" "$LOCAL_SECRET_VALIDATOR"
 validator_temporary=''
-mv -f -- "$attestation_temporary" "$LOCAL_OFFLINE_ATTESTATION"
+mv -fT -- "$attestation_temporary" "$LOCAL_OFFLINE_ATTESTATION"
 attestation_temporary=''
-mv -f -- "$wrapper_temporary" "$LOCAL_SSH_COMMAND"
+
+installed_attestation_attributes="$(stat -c '%u:%g:%a' "$LOCAL_OFFLINE_ATTESTATION")"
+installed_attestation_hash="$(sha256sum "$LOCAL_OFFLINE_ATTESTATION" | awk '{print $1}')"
+installed_attestation_output="$(python3 "$LOCAL_OFFLINE_ATTESTATION" self-check)"
+if [[ ! -f "$LOCAL_OFFLINE_ATTESTATION" \
+  || -L "$LOCAL_OFFLINE_ATTESTATION" \
+  || "$installed_attestation_attributes" != '0:0:755' \
+  || "$installed_attestation_hash" != "$expected_attestation_hash" \
+  || "$installed_attestation_output" != 'KINVEST_OFFLINE_ATTESTATION_SELF_CHECK_OK' ]]; then
+  printf '%s\n' 'installed offline attestation helper verification failed' >&2
+  exit 1
+fi
+
+mv -fT -- "$wrapper_temporary" "$LOCAL_SSH_COMMAND"
 wrapper_temporary=''
 
 sha256sum "$LOCAL_DEPLOY_SCRIPT" "$LOCAL_SSH_COMMAND" "$LOCAL_SECRET_VALIDATOR" "$LOCAL_OFFLINE_ATTESTATION"

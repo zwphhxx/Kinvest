@@ -99,11 +99,13 @@ fi
 verified_runtime_image_id="${verification_output#KINVEST_OFFLINE_ARCHIVE_OK runtimeImageId=}"
 
 verification_metadata="$(
-  python3 - "$VERIFIER" "$TEMPORARY_PATH" "$archive_checksum" "$SOURCE_REFERENCE" <<'PY'
+  python3 - metadata "$VERIFIER" "$TEMPORARY_PATH" "$archive_checksum" "$SOURCE_REFERENCE" <<'PY'
 import importlib.util
 import sys
 
-helper_path, archive_path, archive_checksum, source_reference = sys.argv[1:]
+mode, helper_path, archive_path, archive_checksum, source_reference = sys.argv[1:]
+if mode != "metadata":
+    raise SystemExit(1)
 spec = importlib.util.spec_from_file_location("kinvest_offline_image_attestation", helper_path)
 if spec is None or spec.loader is None:
     raise SystemExit(1)
@@ -141,11 +143,55 @@ if [[ -e "$OUTPUT_PATH" || -L "$OUTPUT_PATH" ]]; then
   printf '%s\n' 'offline image export output appeared during export' >&2
   exit 1
 fi
-mv -n -- "$TEMPORARY_PATH" "$OUTPUT_PATH"
-if [[ -e "$TEMPORARY_PATH" ]]; then
-  printf '%s\n' 'offline image export refused to replace an existing output' >&2
-  exit 1
-fi
+python3 - publish-no-replace "$TEMPORARY_PATH" "$OUTPUT_PATH" <<'PY'
+import os
+import stat
+import sys
+
+mode, temporary_path, output_path = sys.argv[1:]
+if mode != "publish-no-replace":
+    raise SystemExit(1)
+
+def publication_failed(source_stat=None):
+    if source_stat is not None:
+        try:
+            target_stat = os.lstat(output_path)
+            if os.path.samestat(source_stat, target_stat):
+                os.unlink(output_path)
+        except OSError:
+            pass
+    print("offline image publication failed", file=sys.stderr)
+    raise SystemExit(1)
+
+try:
+    source_stat = os.lstat(temporary_path)
+    os.link(temporary_path, output_path, follow_symlinks=False)
+except OSError:
+    publication_failed()
+
+try:
+    target_stat = os.lstat(output_path)
+    if (
+        not stat.S_ISREG(target_stat.st_mode)
+        or stat.S_ISLNK(target_stat.st_mode)
+        or stat.S_IMODE(target_stat.st_mode) != 0o600
+        or target_stat.st_uid != os.getuid()
+        or not os.path.samestat(source_stat, target_stat)
+    ):
+        publication_failed(source_stat)
+    os.unlink(temporary_path)
+    final_stat = os.lstat(output_path)
+    if (
+        not stat.S_ISREG(final_stat.st_mode)
+        or stat.S_ISLNK(final_stat.st_mode)
+        or stat.S_IMODE(final_stat.st_mode) != 0o600
+        or final_stat.st_uid != os.getuid()
+        or not os.path.samestat(source_stat, final_stat)
+    ):
+        publication_failed(source_stat)
+except OSError:
+    publication_failed(source_stat)
+PY
 TEMPORARY_PATH=''
 
 printf 'path=%s\n' "$OUTPUT_PATH"

@@ -88,7 +88,8 @@ scripts/export-offline-image.sh \
 
 The exporter requires macOS, pulls only `linux/amd64`, checks that Docker reports
 the exact requested RepoDigest, writes mode `0600` through a private temporary
-file, and invokes the repository verifier before an atomic rename. It does not
+file, and invokes the repository verifier before an atomic no-overwrite hard link
+publication followed by unlinking the temporary name. It does not
 log in to Docker or read Docker credential configuration. Preserve the printed
 path, SHA-256, byte size, source reference, platform manifest digest, and runtime
 Image ID as non-secret transfer metadata. Transfer the archive separately and
