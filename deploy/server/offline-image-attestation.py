@@ -37,7 +37,7 @@ OCI_CONFIG = "application/vnd.oci.image.config.v1+json"
 DEFAULT_STATE_DIR = Path("/root/docker/kinvest/state/offline-images")
 IMAGE_ID = re.compile(r"^sha256:[0-9a-f]{64}$")
 COMMIT = re.compile(r"^[0-9a-f]{40}$")
-RUN_ID = re.compile(r"^[0-9]+$")
+RUN_ID = re.compile(r"^[0-9]{1,20}$")
 RFC3339_UTC = re.compile(
     r"^[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}Z$"
 )
@@ -55,6 +55,7 @@ RECORD_FIELDS = (
 DOCKER_LOAD_TIMEOUT_SECONDS = 120
 DOCKER_INSPECT_TIMEOUT_SECONDS = 10
 MAX_DOCKER_OUTPUT_BYTES = 1024 * 1024
+MAX_RECORD_BYTES = 4096
 
 
 class ArchiveVerificationError(RuntimeError):
@@ -952,7 +953,7 @@ class AttestationStore:
                     or opened.st_uid != self.owner_uid
                     or opened.st_gid != self.owner_gid
                     or opened.st_size <= 0
-                    or opened.st_size > 4096
+                    or opened.st_size > MAX_RECORD_BYTES
                 ):
                     _attestation_reject("OFFLINE_ATTESTATION_RECORD_UNSAFE")
                 content = source.read(4097)
@@ -969,6 +970,8 @@ class AttestationStore:
         self._check_directory()
         target = self._path(record.source_reference)
         content = _record_text(record).encode("utf-8")
+        if len(content) > MAX_RECORD_BYTES:
+            _attestation_reject("OFFLINE_ATTESTATION_RECORD_TOO_LARGE")
         if target.exists() or target.is_symlink():
             existing = self.read(record.source_reference)
             if _same_import(existing, record):
@@ -1072,14 +1075,26 @@ def _inspect_image(runtime_image_id: str, docker: Any, unavailable_code: str) ->
         DOCKER_INSPECT_TIMEOUT_SECONDS,
         unavailable_code,
     )
+    def unique_inspect_object(pairs: list[tuple[str, Any]]) -> dict[str, Any]:
+        result: dict[str, Any] = {}
+        for key, value in pairs:
+            if key in result:
+                _attestation_reject("OFFLINE_ATTESTATION_IMAGE_MISMATCH")
+            result[key] = value
+        return result
+
     try:
         inspection = json.loads(
             output,
-            object_pairs_hook=_unique_object,
-            parse_constant=lambda _value: _attestation_reject(),
+            object_pairs_hook=unique_inspect_object,
+            parse_constant=lambda _value: _attestation_reject(
+                "OFFLINE_ATTESTATION_IMAGE_MISMATCH"
+            ),
         )
     except OfflineAttestationError:
         raise
+    except ArchiveVerificationError:
+        _attestation_reject("OFFLINE_ATTESTATION_IMAGE_MISMATCH")
     except (json.JSONDecodeError, RecursionError, ValueError, OverflowError):
         _attestation_reject("OFFLINE_ATTESTATION_IMAGE_MISMATCH")
     if not isinstance(inspection, dict):

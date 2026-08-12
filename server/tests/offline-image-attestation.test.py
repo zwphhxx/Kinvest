@@ -235,11 +235,19 @@ class ArchiveFixture:
 
 
 class FakeDocker:
-    def __init__(self, inspected=None, load_returncode=0, inspect_returncode=0, stderr=""):
+    def __init__(
+        self,
+        inspected=None,
+        load_returncode=0,
+        inspect_returncode=0,
+        stderr="",
+        inspect_stdout=None,
+    ):
         self.inspected = inspected
         self.load_returncode = load_returncode
         self.inspect_returncode = inspect_returncode
         self.stderr = stderr
+        self.inspect_stdout = inspect_stdout
         self.calls = []
         self.loaded_archive_path = None
         self.loaded_bytes = None
@@ -259,7 +267,11 @@ class FakeDocker:
             return subprocess.CompletedProcess(
                 arguments,
                 self.inspect_returncode,
-                stdout=json.dumps(self.inspected) if self.inspect_returncode == 0 else "",
+                stdout=(
+                    self.inspect_stdout
+                    if self.inspect_stdout is not None
+                    else json.dumps(self.inspected)
+                ) if self.inspect_returncode == 0 else "",
                 stderr=self.stderr,
             )
         raise AssertionError(f"unexpected Docker arguments: {arguments!r}")
@@ -878,6 +890,98 @@ class OfflineImageAttestationTests(unittest.TestCase):
         self.assertIn("archive_path", parameters)
         self.assertIn("archive_sha256", parameters)
         self.assertIn("source_reference", parameters)
+
+    def test_verification_run_id_accepts_twenty_digit_boundary_and_round_trips(self):
+        run_id = "9" * 20
+        _, verified, _, record, options = self.import_fixture(
+            verification_run_id=run_id,
+        )
+        self.assertEqual(record.verification_run_id, run_id)
+        store = self.module.AttestationStore(options["state_dir"], **self.state_options())
+        self.assertEqual(store.read(verified.source_reference), record)
+
+    def test_verification_run_id_rejects_one_over_before_docker_or_state(self):
+        fixture, verified = self.verified_fixture()
+        docker = FakeDocker(self.docker_inspection(verified))
+        state_dir = Path(self.temp.name) / "offline-images"
+        with self.assertRaises(self.module.OfflineAttestationError) as raised:
+            self.module.import_archive(
+                fixture.archive,
+                archive_sha256=fixture.archive_sha,
+                source_reference=fixture.source_ref,
+                commit="a" * 40,
+                verification_run_id="9" * 21,
+                state_dir=state_dir,
+                docker=docker,
+                **self.state_options(),
+            )
+        self.assertEqual(str(raised.exception), "OFFLINE_ATTESTATION_INVALID")
+        self.assertEqual(docker.calls, [])
+        self.assertFalse(state_dir.exists())
+
+    def test_very_long_verification_run_id_writes_no_record(self):
+        fixture, verified = self.verified_fixture()
+        docker = FakeDocker(self.docker_inspection(verified))
+        state_dir = Path(self.temp.name) / "offline-images"
+        with self.assertRaises(self.module.OfflineAttestationError):
+            self.module.import_archive(
+                fixture.archive,
+                archive_sha256=fixture.archive_sha,
+                source_reference=fixture.source_ref,
+                commit="a" * 40,
+                verification_run_id="7" * 100_000,
+                state_dir=state_dir,
+                docker=docker,
+                **self.state_options(),
+            )
+        self.assertEqual(docker.calls, [])
+        self.assertFalse(state_dir.exists())
+
+    def test_oversized_canonical_record_is_rejected_before_temp_file_creation(self):
+        _, _, _, record, _ = self.import_fixture()
+        state_dir = Path(self.temp.name) / "bounded-records"
+        store = self.module.AttestationStore(state_dir, **self.state_options())
+        with mock.patch.object(
+            self.module,
+            "MAX_RECORD_BYTES",
+            1,
+        ), mock.patch.object(
+            self.module.tempfile,
+            "mkstemp",
+            side_effect=AssertionError("temporary file must not be created"),
+        ), self.assertRaises(self.module.OfflineAttestationError) as raised:
+            store.write(record)
+        self.assertEqual(str(raised.exception), "OFFLINE_ATTESTATION_RECORD_TOO_LARGE")
+        self.assertEqual(list(state_dir.iterdir()), [])
+
+    def test_docker_inspect_invalid_json_maps_to_image_mismatch(self):
+        _, verified, _, _, options = self.import_fixture()
+        payloads = (
+            '{"Id":"sha256:' + "a" * 64 + '","Id":"sha256:' + "b" * 64 + '"}',
+            "{malformed",
+            '{"Id":NaN}',
+            '{"Id":Infinity}',
+        )
+        for payload in payloads:
+            with self.subTest(payload=payload), self.assertRaises(
+                self.module.OfflineAttestationError
+            ) as raised:
+                self.module.resolve_attestation(
+                    verified.source_reference,
+                    "a" * 40,
+                    "31601622272",
+                    state_dir=options["state_dir"],
+                    docker=FakeDocker(inspect_stdout=payload),
+                    **self.state_options(),
+                )
+            self.assertEqual(
+                str(raised.exception),
+                "OFFLINE_ATTESTATION_IMAGE_MISMATCH",
+            )
+            self.assertNotIsInstance(
+                raised.exception,
+                self.module.ArchiveVerificationError,
+            )
 
     def test_source_replacement_after_verification_cannot_change_docker_bytes(self):
         fixture = self.fixture("valid")
