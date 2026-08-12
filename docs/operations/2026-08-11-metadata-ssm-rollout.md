@@ -114,9 +114,24 @@ running containers. The Docker drop-in installs only the startup/stop deny guard
 it does not run network-dependent apply or status actions that could fail
 `docker.service`. The independent oneshot service uses `Requisite` and `After`,
 so a timer attempt never starts inactive Docker. It invokes one locked
-`reconcile` operation: guard, apply, then status. If apply or status fails,
-reconcile reinstalls and confirms the guard before returning nonzero; a later
-timer attempt retries after containers and networks become ready.
+`reconcile-active` operation. Before any firewall or Docker call, the wrapper requires
+the activation state to be a regular, non-symlink, root-owned mode `0600` file
+with exactly `version=1`, `mode=active`, and the installed config SHA-256. Under
+the same lock it opens the state once, verifies that the path and descriptor
+still identify the same inode, and parses only that descriptor. It installs
+cleanup traps before creating a process-unique mode `0600` `/run` snapshot,
+verifies
+the state hash against that snapshot, and uses only the snapshot for guard,
+apply, and status. Missing, pending, malformed, insecure, or mismatched state
+removes the snapshot and returns nonzero without changing firewall rules. If
+apply or status fails after successful binding, reconcile reinstalls and
+confirms the guard before returning nonzero; a later timer attempt retries after
+containers and networks become ready.
+
+The deployment script continues to use the separate `reconcile` action after
+it has independently validated and pinned its approved config snapshot. That
+action preserves the explicit `pending` to `active` first-migration workflow;
+only the unattended timer path requires an already-active state.
 
 ### iptables/systemd installation approval
 

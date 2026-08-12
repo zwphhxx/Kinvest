@@ -5,4 +5,4 @@ After=docker.service
 
 [Service]
 Type=oneshot
-ExecStart=/usr/local/sbin/kinvest-metadata-firewall reconcile
+ExecStart=/usr/local/sbin/kinvest-metadata-firewall reconcile-active

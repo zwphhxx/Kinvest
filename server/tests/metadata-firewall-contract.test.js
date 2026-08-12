@@ -1,4 +1,5 @@
 const assert = require('node:assert/strict')
+const crypto = require('node:crypto')
 const fs = require('node:fs')
 const os = require('node:os')
 const path = require('node:path')
@@ -194,6 +195,116 @@ function runWrapperPermissionFixture(wrapperText, fixture) {
   const wrapper = path.join(wrapperFixture, 'kinvest-metadata-firewall')
   writeExecutable(wrapper, instrumentedWrapper.trimEnd().split('\n'))
   return runHarness(wrapper, ['status'], { KINVEST_TEST_CONFIG: config })
+}
+
+function runWrapperActivationFixture(wrapperText, fixture, name, options = {}) {
+  const wrapperFixture = path.join(fixture, `wrapper-activation-${name}`)
+  const fakeBin = path.join(wrapperFixture, 'bin')
+  const library = path.join(wrapperFixture, 'firewall-lib.sh')
+  const config = path.join(wrapperFixture, 'metadata-network.conf')
+  const activationState = path.join(wrapperFixture, 'metadata-network.state')
+  const activationTarget = path.join(wrapperFixture, 'metadata-network.state.target')
+  const operations = path.join(wrapperFixture, 'operations')
+  const events = path.join(wrapperFixture, 'events')
+  const lock = path.join(wrapperFixture, 'firewall.lock')
+  const fakeFlock = path.join(fakeBin, 'flock')
+  const fakeIptables = path.join(fakeBin, 'iptables')
+  const fakeIptablesRestore = path.join(fakeBin, 'iptables-restore')
+  const fakeDocker = path.join(fakeBin, 'docker')
+  const fakeMktemp = path.join(fakeBin, 'mktemp')
+  const fakeSha256sum = path.join(fakeBin, 'sha256sum')
+  const configSource = 'fixture=non-secret\n'
+  const configHash = crypto.createHash('sha256').update(configSource).digest('hex')
+  const action = options.action || 'reconcile-active'
+  const stateSource = (options.stateSource || `version=1\nmode=active\nconfig_sha256=${configHash}\n`)
+    .replaceAll('__CONFIG_SHA256__', configHash)
+
+  fs.mkdirSync(fakeBin, { recursive: true })
+  fs.writeFileSync(library, [
+    'kinvest_metadata_reconcile() {',
+    `  printf '%s\\n' "reconcile:$4" >> "${operations}"`,
+    `  printf '%s\\n' "reconcile:$4" >> "${events}"`,
+    '  "$KINVEST_TEST_NODE" -e \'const fs=require("node:fs"); const [target, original, expected, snapshot]=process.argv.slice(1); if (snapshot === "1") { if (target === original) process.exit(10); if ((fs.statSync(target).mode & 0o777) !== 0o600) process.exit(11); } else if (target !== original) process.exit(12); if (fs.readFileSync(target, "utf8") !== expected) process.exit(13);\' "$4" "$KINVEST_TEST_ORIGINAL_CONFIG" "$KINVEST_TEST_CONFIG_SOURCE" "$KINVEST_TEST_EXPECT_SNAPSHOT"',
+    '}',
+    ''
+  ].join('\n'))
+  fs.writeFileSync(config, configSource)
+  fs.writeFileSync(operations, '')
+  fs.writeFileSync(events, '')
+  if (!options.missingState) {
+    if (options.activationSymlink) {
+      fs.writeFileSync(activationTarget, stateSource)
+      fs.symlinkSync(activationTarget, activationState)
+    } else {
+      fs.writeFileSync(activationState, stateSource)
+    }
+  }
+  writeExecutable(path.join(fakeBin, 'stat'), [
+    '#!/bin/sh',
+    'format=$2',
+    'target=$3',
+    'if [ "$format" = "%d:%i" ]; then',
+    '  if [ "$target" = "$KINVEST_TEST_ACTIVATION_STATE" ]; then',
+    '    printf "%s\\n" "$KINVEST_TEST_ACTIVATION_IDENTITY"',
+    '  elif [ "$target" = /dev/fd/8 ]; then',
+    '    printf "%s\\n" "$KINVEST_TEST_ACTIVATION_FD_IDENTITY"',
+    '  else',
+    '    printf "%s\\n" "9:9"',
+    '  fi',
+    'elif [ "$target" = "$KINVEST_TEST_ACTIVATION_STATE" ] || [ "$target" = /dev/fd/8 ]; then',
+    '  printf "%s\\n" "$KINVEST_TEST_ACTIVATION_STAT"',
+    'else',
+    '  printf "%s\\n" "0:0:600"',
+    'fi'
+  ])
+  writeExecutable(fakeSha256sum, [
+    '#!/bin/sh',
+    'printf "%s\\n" "sha256:$1" >> "$KINVEST_TEST_EVENTS"',
+    '"$KINVEST_TEST_NODE" -e \'const fs=require("node:fs"),crypto=require("node:crypto"); const file=process.argv[1]; process.stdout.write(crypto.createHash("sha256").update(fs.readFileSync(file)).digest("hex")+"  "+file+"\\n");\' "$1"'
+  ])
+  writeExecutable(fakeFlock, ['#!/bin/sh', 'printf "%s\\n" flock >> "$KINVEST_TEST_EVENTS"'])
+  writeExecutable(fakeMktemp, [
+    '#!/bin/sh',
+    'printf "%s\\n" mktemp >> "$KINVEST_TEST_EVENTS"',
+    'exec /usr/bin/mktemp "$@"'
+  ])
+  writeExecutable(fakeIptables, ['#!/bin/sh', 'printf "%s\\n" iptables >> "$KINVEST_TEST_EVENTS"'])
+  writeExecutable(fakeIptablesRestore, ['#!/bin/sh', 'printf "%s\\n" iptables-restore >> "$KINVEST_TEST_EVENTS"'])
+  writeExecutable(fakeDocker, ['#!/bin/sh', 'printf "%s\\n" docker >> "$KINVEST_TEST_EVENTS"'])
+
+  const instrumentedWrapper = wrapperText
+    .replace('PATH=/usr/sbin:/usr/bin:/sbin:/bin', `PATH=${fakeBin}:/usr/sbin:/usr/bin:/sbin:/bin`)
+    .replace('KMF_LIBRARY=/usr/local/libexec/kinvest-metadata-firewall-lib.sh', `KMF_LIBRARY=${library}`)
+    .replace(/^KMF_CONFIG=.*$/m, `KMF_CONFIG=\${KMF_CONFIG:-${config}}`)
+    .replace(/^KMF_ACTIVATION_STATE=.*$/m, `KMF_ACTIVATION_STATE=\${KMF_ACTIVATION_STATE:-${activationState}}`)
+    .replace(/^KMF_RUNTIME_DIR=.*$/m, `KMF_RUNTIME_DIR=\${KMF_RUNTIME_DIR:-${wrapperFixture}}`)
+    .replace('KMF_LOCK=/run/lock/kinvest-metadata-firewall.lock', `KMF_LOCK=${lock}`)
+    .replace('KMF_IPTABLES=/usr/sbin/iptables', `KMF_IPTABLES=${fakeIptables}`)
+    .replace('KMF_IPTABLES_RESTORE=/usr/sbin/iptables-restore', `KMF_IPTABLES_RESTORE=${fakeIptablesRestore}`)
+    .replace('KMF_DOCKER=/usr/bin/docker', `KMF_DOCKER=${fakeDocker}`)
+    .replace('KMF_SHA256SUM=/usr/bin/sha256sum', `KMF_SHA256SUM=${fakeSha256sum}`)
+    .replaceAll('/usr/bin/flock', fakeFlock)
+  const wrapper = path.join(wrapperFixture, 'kinvest-metadata-firewall')
+  writeExecutable(wrapper, instrumentedWrapper.trimEnd().split('\n'))
+  const result = runHarness(wrapper, [action], {
+    KINVEST_TEST_ACTIVATION_STATE: activationState,
+    KINVEST_TEST_ACTIVATION_STAT: options.activationStat || '0:0:600',
+    KINVEST_TEST_ACTIVATION_IDENTITY: options.activationIdentity || '1:2',
+    KINVEST_TEST_ACTIVATION_FD_IDENTITY: options.activationFdIdentity || '1:2',
+    KINVEST_TEST_CONFIG_SHA256: configHash,
+    KINVEST_TEST_CONFIG_SOURCE: configSource,
+    KINVEST_TEST_EVENTS: events,
+    KINVEST_TEST_EXPECT_SNAPSHOT: action === 'reconcile-active' ? '1' : '0',
+    KINVEST_TEST_NODE: process.execPath,
+    KINVEST_TEST_ORIGINAL_CONFIG: config
+  })
+  return {
+    result,
+    config,
+    events: fs.readFileSync(events, 'utf8').trim().split('\n').filter(Boolean),
+    operations: fs.readFileSync(operations, 'utf8'),
+    snapshots: fs.readdirSync(wrapperFixture).filter((entry) => entry.startsWith('kinvest-metadata-network.'))
+  }
 }
 
 function run() {
@@ -520,16 +631,66 @@ function run() {
     assert.match(wrapperText, /validate-config/)
     assert.match(wrapperText, /reconcile/)
     assert.match(wrapperText, /^KMF_CONFIG=\$\{KMF_CONFIG:-\/etc\/kinvest\/metadata-network\.conf\}$/m)
+    assert.match(wrapperText, /^KMF_ACTIVATION_STATE=\$\{KMF_ACTIVATION_STATE:-\/root\/docker\/kinvest\/state\/metadata-network\.state\}$/m)
+    assert.match(wrapperText, /kinvest_assert_active_config_binding/)
+    assert.match(wrapperText, /exec 8< "\$KMF_ACTIVATION_STATE"/)
+    assert.match(wrapperText, /done <&8/)
+    assert.ok(
+      wrapperText.indexOf('trap kinvest_cleanup_reconcile_config EXIT') <
+        wrapperText.indexOf('kmf_reconcile_config=$(mktemp'),
+      'snapshot cleanup traps must be installed before mktemp'
+    )
     const insecureConfig = runWrapperPermissionFixture(wrapperText, fixture)
     assert.notEqual(insecureConfig.status, 0, 'root:root mode 0640 metadata config must be rejected')
     assert.match(insecureConfig.stderr, /mode 0600/i)
+    const activeState = runWrapperActivationFixture(wrapperText, fixture, 'active')
+    assert.equal(activeState.result.status, 0, activeState.result.stderr)
+    assert.match(activeState.operations, /^reconcile:/)
+    assert.notEqual(activeState.operations.trim().slice('reconcile:'.length), activeState.config)
+    assert.equal(activeState.events[0], 'flock', 'the lock must be acquired before snapshot hashing and reconciliation')
+    assert.equal(activeState.events[1], 'mktemp', 'the snapshot must be created only after acquiring the lock')
+    assert.match(activeState.events[2], /^sha256:/)
+    assert.equal(activeState.events[3], activeState.operations.trim())
+    assert.equal(
+      activeState.events[2].slice('sha256:'.length),
+      activeState.events[3].slice('reconcile:'.length),
+      'hashing and reconciliation must use the same immutable snapshot'
+    )
+    assert.deepEqual(activeState.snapshots, [], 'the active config snapshot must be removed after success')
+    const pendingDeploy = runWrapperActivationFixture(wrapperText, fixture, 'pending-deploy', {
+      action: 'reconcile',
+      stateSource: 'version=1\nmode=pending\nconfig_sha256=__CONFIG_SHA256__\n'
+    })
+    assert.equal(pendingDeploy.result.status, 0, pendingDeploy.result.stderr)
+    assert.equal(pendingDeploy.operations, `reconcile:${pendingDeploy.config}\n`)
+    assert.deepEqual(pendingDeploy.snapshots, [], 'deployment reconcile must not create an active-state snapshot')
+    const rejectedActivationStates = [
+      ['pending', { stateSource: 'version=1\nmode=pending\nconfig_sha256=__CONFIG_SHA256__\n' }],
+      ['missing', { missingState: true }],
+      ['wrong-version', { stateSource: 'version=2\nmode=active\nconfig_sha256=__CONFIG_SHA256__\n' }],
+      ['wrong-order', { stateSource: 'mode=active\nversion=1\nconfig_sha256=__CONFIG_SHA256__\n' }],
+      ['extra-line', { stateSource: 'version=1\nmode=active\nconfig_sha256=__CONFIG_SHA256__\nunexpected=value\n' }],
+      ['hash-mismatch', { stateSource: `version=1\nmode=active\nconfig_sha256=${'0'.repeat(64)}\n` }],
+      ['insecure-mode', { activationStat: '0:0:640' }],
+      ['wrong-owner', { activationStat: '1000:0:600' }],
+      ['wrong-group', { activationStat: '0:1000:600' }],
+      ['replaced-state', { activationIdentity: '1:2', activationFdIdentity: '1:3' }],
+      ['symlink', { activationSymlink: true }]
+    ]
+    for (const [name, options] of rejectedActivationStates) {
+      const rejected = runWrapperActivationFixture(wrapperText, fixture, name, options)
+      assert.notEqual(rejected.result.status, 0, `${name} activation state must fail closed`)
+      assert.equal(rejected.operations, '', `${name} must fail before firewall reconciliation`)
+      assert.doesNotMatch(rejected.events.join('\n'), /^(?:iptables|iptables-restore|docker|reconcile:)/m)
+      assert.deepEqual(rejected.snapshots, [], `${name} must remove the config snapshot after failure`)
+    }
     assert.match(dropInText, /ExecStartPre=.* guard/)
     assert.doesNotMatch(dropInText, /^ExecStartPost=/m)
     assert.match(dropInText, /ExecStopPost=.* guard/)
     assert.match(serviceText, /^Requisite=docker\.service$/m)
     assert.match(serviceText, /^After=docker\.service$/m)
     assert.doesNotMatch(serviceText, /^Requires=docker\.service$/m)
-    assert.match(serviceText, /^ExecStart=\/usr\/local\/sbin\/kinvest-metadata-firewall reconcile$/m)
+    assert.match(serviceText, /^ExecStart=\/usr\/local\/sbin\/kinvest-metadata-firewall reconcile-active$/m)
     assert.doesNotMatch(serviceText, /^ExecStartPost=/m)
     const libraryText = fs.readFileSync(library, 'utf8')
     assert.doesNotMatch(libraryText, /\beth1\b/)
