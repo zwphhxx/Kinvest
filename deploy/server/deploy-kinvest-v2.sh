@@ -6,6 +6,7 @@ RUN_ROOT='/run'
 COMPOSE="$ROOT/docker-compose.yml"
 METADATA_NETWORK_CONFIG='/etc/kinvest/metadata-network.conf'
 METADATA_FIREWALL='/usr/local/sbin/kinvest-metadata-firewall'
+SECRET_VERSION_VALIDATOR='/usr/local/libexec/kinvest-secret-version-config'
 DATA_DIR="$ROOT/data"
 DATABASE="$DATA_DIR/kinvest.sqlite"
 STATE="$ROOT/state"
@@ -46,6 +47,7 @@ release_record_schema_version=''
 verification_run_id=''
 artifact_source=''
 secret_version_ids=''
+deployment_intent='forward'
 payload_end=''
 extra_input=''
 
@@ -101,12 +103,8 @@ if [[ ! "$release_record_schema_version" =~ ^[12]$ || ! "$verification_run_id" =
   exit 2
 fi
 
-# Secret VersionIds are added in the CAM/SSM phase. Until then, fail closed on
-# any value except the explicit empty object rather than accepting unvalidated
-# state metadata.
-if [[ "$secret_version_ids" != '{}' ]]; then
-  printf '%s\n' 'deployment secret version metadata is not enabled' >&2
-  exit 2
+if [[ "$secret_version_ids" == '{"rollback":"previous"}' ]]; then
+  deployment_intent='rollback'
 fi
 
 case "$registry_mode" in
@@ -238,7 +236,8 @@ for path_component in "$ROOT_TOP" "$ROOT_PARENT" "$ROOT" "$DATA_DIR" "$STATE" "$
   assert_not_symlink "$path_component"
 done
 
-if [[ ! -d "$ROOT" || ! -f "$COMPOSE" || ! -x "$ROOT/prepare-data-dir.sh" || ! -x "$METADATA_FIREWALL" ]]; then
+if [[ ! -d "$ROOT" || ! -f "$COMPOSE" || ! -x "$ROOT/prepare-data-dir.sh" ||
+  ! -x "$METADATA_FIREWALL" || ! -x "$SECRET_VERSION_VALIDATOR" ]]; then
   printf '%s\n' 'Kinvest server files are not bootstrapped' >&2
   exit 1
 fi
@@ -246,6 +245,7 @@ fi
 assert_not_symlink "$COMPOSE"
 assert_not_symlink "$ROOT/prepare-data-dir.sh"
 assert_not_symlink "$METADATA_FIREWALL"
+assert_not_symlink "$SECRET_VERSION_VALIDATOR"
 assert_metadata_network_config
 install -d -m 0700 -- "$STATE" "$BACKUP_DIR"
 assert_not_symlink "$STATE"
@@ -260,6 +260,9 @@ docker_config=''
 metadata_config_snapshot=''
 pull_stderr=''
 login_stderr=''
+preflight_stdout=''
+preflight_stderr=''
+preflight_expected=''
 
 cleanup_runtime() {
   registry_password=''
@@ -276,6 +279,11 @@ cleanup_runtime() {
   if [[ -n "$metadata_config_snapshot" && "$metadata_config_snapshot" == "$RUN_ROOT"/kinvest-metadata-network.* ]]; then
     rm -f -- "$metadata_config_snapshot"
   fi
+  for preflight_file in "$preflight_stdout" "$preflight_stderr" "$preflight_expected"; do
+    if [[ -n "$preflight_file" && "$preflight_file" == "$RUN_ROOT"/kinvest-ssm-preflight.* ]]; then
+      rm -f -- "$preflight_file"
+    fi
+  done
 }
 trap cleanup_runtime EXIT INT TERM HUP
 
@@ -338,11 +346,30 @@ run_metadata_firewall() {
     env KMF_CONFIG="$metadata_config_snapshot" "$METADATA_FIREWALL" "$@"
 }
 
+secret_provider_mode() {
+  if [[ "$1" == '{}' ]]; then printf '%s\n' 'disabled'; else printf '%s\n' 'cvm-ssm'; fi
+}
+
+validate_secret_mapping() {
+  local candidate="$1"
+  local canonical=''
+
+  canonical="$(printf '%s\n' "$candidate" | "$SECRET_VERSION_VALIDATOR" mapping 2>/dev/null)" || return 1
+  [[ "$canonical" == "$candidate" ]] || return 1
+  printf '%s\n' "$canonical"
+}
+
 run_compose() {
   local image_ref="$1"
+  local version_mapping="$2"
+  local provider_mode=''
+
+  provider_mode="$(secret_provider_mode "$version_mapping")"
 
   timeout --signal=TERM --kill-after="$DOCKER_KILL_AFTER" "$COMPOSE_TIMEOUT" \
     env KINVEST_IMAGE="$image_ref" DOCKER_CONFIG="$DOCKER_CONFIG" \
+      KINVEST_SECRET_PROVIDER_MODE="$provider_mode" \
+      KINVEST_SECRET_VERSION_IDS="$version_mapping" \
     docker compose \
       --env-file "$metadata_config_snapshot" \
       --project-name kinvest \
@@ -352,9 +379,15 @@ run_compose() {
 
 run_compose_config() {
   local image_ref="$1"
+  local version_mapping="$2"
+  local provider_mode=''
+
+  provider_mode="$(secret_provider_mode "$version_mapping")"
 
   timeout --signal=TERM --kill-after="$DOCKER_KILL_AFTER" "$COMPOSE_TIMEOUT" \
     env KINVEST_IMAGE="$image_ref" DOCKER_CONFIG="$DOCKER_CONFIG" \
+      KINVEST_SECRET_PROVIDER_MODE="$provider_mode" \
+      KINVEST_SECRET_VERSION_IDS="$version_mapping" \
     docker compose \
       --env-file "$metadata_config_snapshot" \
       --project-name kinvest \
@@ -459,6 +492,55 @@ read_image_schema_range() {
     return 1
   fi
   printf '%s %s\n' "$minimum" "$maximum"
+}
+
+run_secret_preflight() {
+  local image_ref="$1"
+  local version_mapping="$2"
+  local label=''
+  local reference_count=''
+  local status=0
+
+  [[ "$version_mapping" != '{}' ]] || return 0
+  label="$(run_inspect image inspect --format '{{index .Config.Labels "io.kinvest.secret-bootstrap"}}' "$image_ref")" || {
+    printf '%s\n' 'candidate secret bootstrap label check failed' >&2
+    return 1
+  }
+  if [[ "$label" != '1' ]]; then
+    printf '%s\n' 'candidate secret bootstrap label is missing' >&2
+    return 1
+  fi
+  reference_count="$(printf '%s\n' "$version_mapping" | "$SECRET_VERSION_VALIDATOR" count 2>/dev/null)" || {
+    printf '%s\n' 'candidate secret preflight configuration is invalid' >&2
+    return 1
+  }
+  preflight_stdout="$(mktemp "$RUN_ROOT/kinvest-ssm-preflight.stdout.XXXXXX")"
+  preflight_stderr="$(mktemp "$RUN_ROOT/kinvest-ssm-preflight.stderr.XXXXXX")"
+  preflight_expected="$(mktemp "$RUN_ROOT/kinvest-ssm-preflight.expected.XXXXXX")"
+  chmod 0600 "$preflight_stdout" "$preflight_stderr" "$preflight_expected"
+  printf 'KINVEST_SSM_PREFLIGHT_OK references=%s\n' "$reference_count" > "$preflight_expected"
+
+  run_docker run \
+    --rm \
+    --user 10001:10001 \
+    --read-only \
+    --cap-drop ALL \
+    --security-opt no-new-privileges:true \
+    --network container:kinvest \
+    --env KINVEST_SECRET_PROVIDER_MODE=cvm-ssm \
+    --env "KINVEST_SECRET_VERSION_IDS=$version_mapping" \
+    --entrypoint node \
+    "$image_ref" \
+    server/secret-preflight.js >"$preflight_stdout" 2>"$preflight_stderr" || status=$?
+
+  if ((status != 0)) || [[ -s "$preflight_stderr" ]] || ! cmp -s -- "$preflight_expected" "$preflight_stdout"; then
+    printf '%s\n' 'candidate secret preflight failed' >&2
+    return 1
+  fi
+  rm -f -- "$preflight_stdout" "$preflight_stderr" "$preflight_expected"
+  preflight_stdout=''
+  preflight_stderr=''
+  preflight_expected=''
 }
 
 read_database_schema() {
@@ -597,6 +679,7 @@ databaseBackupChecksum=$state_backup_checksum
 deployedAt=$state_deployed_at
 EOF_STATE
   chmod 0600 "$temporary"
+  chown root:root "$temporary"
   mv -f -- "$temporary" "$destination"
 }
 
@@ -623,6 +706,7 @@ databaseBackupChecksum=$database_backup_checksum
 startedAt=$started_at
 EOF_ATTEMPT
   chmod 0600 "$temporary"
+  chown root:root "$temporary"
   mv -f -- "$temporary" "$ATTEMPT_STATE"
 }
 
@@ -639,44 +723,44 @@ previous_backup_path='none'
 previous_backup_checksum='none'
 previous_deployed_at='legacy'
 previous_image_id=''
+has_previous_release='false'
 
 read_current_state() {
+  local source="${1:-$CURRENT_STATE}"
   local first_line=''
   local second_line=''
   local third_line=''
-  local key=''
-  local value=''
-  declare -A values=()
+  local state_line=''
+  local state_line_count=0
 
-  assert_not_symlink "$CURRENT_STATE"
-  IFS= read -r first_line < "$CURRENT_STATE" || return 1
+  assert_not_symlink "$source"
+  IFS= read -r first_line < "$source" || return 1
 
   if [[ "$first_line" == protocolVersion=2 ]]; then
-    while IFS='=' read -r key value; do
-      case "$key" in
-        protocolVersion|imageDigest|commit|schemaVersion|imageSchemaMin|imageSchemaMax|secretVersionIds|releaseRecordSchemaVersion|verificationRunId|artifactSource|databaseBackupPath|databaseBackupChecksum|deployedAt) ;;
+    while IFS= read -r state_line || [[ -n "$state_line" ]]; do
+      state_line_count=$((state_line_count + 1))
+      case "$state_line_count" in
+        1) [[ "$state_line" == 'protocolVersion=2' ]] || return 1 ;;
+        2) [[ "$state_line" == imageDigest=* ]] || return 1; previous_digest_ref="${state_line#imageDigest=}" ;;
+        3) [[ "$state_line" == commit=* ]] || return 1; previous_commit="${state_line#commit=}" ;;
+        4) [[ "$state_line" == schemaVersion=* ]] || return 1; previous_schema="${state_line#schemaVersion=}" ;;
+        5) [[ "$state_line" == imageSchemaMin=* ]] || return 1; previous_schema_min="${state_line#imageSchemaMin=}" ;;
+        6) [[ "$state_line" == imageSchemaMax=* ]] || return 1; previous_schema_max="${state_line#imageSchemaMax=}" ;;
+        7) [[ "$state_line" == secretVersionIds=* ]] || return 1; previous_secret_versions="${state_line#secretVersionIds=}" ;;
+        8) [[ "$state_line" == releaseRecordSchemaVersion=* ]] || return 1; previous_release_schema="${state_line#releaseRecordSchemaVersion=}" ;;
+        9) [[ "$state_line" == verificationRunId=* ]] || return 1; previous_run_id="${state_line#verificationRunId=}" ;;
+        10) [[ "$state_line" == artifactSource=* ]] || return 1; previous_artifact_source="${state_line#artifactSource=}" ;;
+        11) [[ "$state_line" == databaseBackupPath=* ]] || return 1; previous_backup_path="${state_line#databaseBackupPath=}" ;;
+        12) [[ "$state_line" == databaseBackupChecksum=* ]] || return 1; previous_backup_checksum="${state_line#databaseBackupChecksum=}" ;;
+        13) [[ "$state_line" == deployedAt=* ]] || return 1; previous_deployed_at="${state_line#deployedAt=}" ;;
         *) return 1 ;;
       esac
-      [[ -z "${values[$key]+present}" ]] || return 1
-      values[$key]="$value"
-    done < "$CURRENT_STATE"
-    [[ "${#values[@]}" -eq 13 && "${values[protocolVersion]}" == '2' ]] || return 1
-    previous_digest_ref="${values[imageDigest]}"
-    previous_commit="${values[commit]}"
-    previous_schema="${values[schemaVersion]}"
-    previous_schema_min="${values[imageSchemaMin]}"
-    previous_schema_max="${values[imageSchemaMax]}"
-    previous_secret_versions="${values[secretVersionIds]}"
-    previous_release_schema="${values[releaseRecordSchemaVersion]}"
-    previous_run_id="${values[verificationRunId]}"
-    previous_artifact_source="${values[artifactSource]}"
-    previous_backup_path="${values[databaseBackupPath]}"
-    previous_backup_checksum="${values[databaseBackupChecksum]}"
-    previous_deployed_at="${values[deployedAt]}"
+    done < "$source"
+    [[ "$state_line_count" -eq 13 ]] || return 1
   else
-    IFS= read -r first_line < "$CURRENT_STATE" || return 1
-    IFS= read -r second_line < <(sed -n '2p' "$CURRENT_STATE") || return 1
-    third_line="$(sed -n '3p' "$CURRENT_STATE")"
+    IFS= read -r first_line < "$source" || return 1
+    IFS= read -r second_line < <(sed -n '2p' "$source") || return 1
+    third_line="$(sed -n '3p' "$source")"
     [[ -z "$third_line" && "$first_line" == digest_ref=* && "$second_line" == commit=* ]] || return 1
     previous_digest_ref="${first_line#digest_ref=}"
     previous_commit="${second_line#commit=}"
@@ -685,6 +769,7 @@ read_current_state() {
   [[ "$previous_digest_ref" =~ $ALLOWED_STATE_DIGEST_PATTERN ]] || return 1
   [[ "$previous_commit" =~ ^[0-9a-f]{40}$ ]] || return 1
   schema_in_range "$previous_schema" "$previous_schema_min" "$previous_schema_max" || return 1
+  previous_secret_versions="$(validate_secret_mapping "$previous_secret_versions")" || return 1
 }
 
 capture_previous_snapshot() {
@@ -731,7 +816,11 @@ rollback() {
     exit "$original_status"
   fi
 
-  run_compose "$previous_digest_ref" >/dev/null || exit "$original_status"
+  if ! run_secret_preflight "$previous_digest_ref" "$previous_secret_versions"; then
+    printf '%s\n' 'previous release secret preflight failed; manual intervention is required' >&2
+    exit "$original_status"
+  fi
+  run_compose "$previous_digest_ref" "$previous_secret_versions" >/dev/null || exit "$original_status"
   wait_for_health || exit "$original_status"
   verify_running_image "$previous_digest_ref" || exit "$original_status"
   metadata_firewall_outcome='verified'
@@ -803,7 +892,21 @@ if [[ "$validated_metadata_config_sha256" != "$metadata_config_sha256" ]]; then
   printf '%s\n' 'validated metadata config snapshot does not match the approved hash' >&2
   exit 1
 fi
-run_compose_config "$digest_ref" >/dev/null
+if [[ "$deployment_intent" == 'rollback' ]]; then
+  if [[ ! -f "$PREVIOUS_STATE" ]] || ! read_current_state "$PREVIOUS_STATE" ||
+    [[ "$previous_digest_ref" != "$digest_ref" || "$previous_commit" != "$commit_sha" ]]; then
+    printf '%s\n' 'manual rollback target does not match verified previous state' >&2
+    exit 1
+  fi
+  secret_version_ids="$previous_secret_versions"
+else
+  secret_version_ids="$(validate_secret_mapping "$secret_version_ids")" || {
+    printf '%s\n' 'deployment secret version metadata is invalid' >&2
+    exit 2
+  }
+fi
+
+run_compose_config "$digest_ref" "$secret_version_ids" >/dev/null
 if [[ "$metadata_network_phase" == 'active' ]]; then
   if ! run_docker network inspect "$metadata_network_name" >/dev/null; then
     run_metadata_firewall guard
@@ -824,23 +927,9 @@ if [[ -e "$CURRENT_STATE" ]]; then
     printf '%s\n' 'refusing deployment because the current release cannot be verified' >&2
     exit 1
   fi
-  atomic_write_state \
-    "$PREVIOUS_STATE" \
-    "$previous_digest_ref" \
-    "$previous_commit" \
-    "$previous_schema" \
-    "$previous_schema_min" \
-    "$previous_schema_max" \
-    "$previous_secret_versions" \
-    "$previous_release_schema" \
-    "$previous_run_id" \
-    "$previous_artifact_source" \
-    "$previous_backup_path" \
-    "$previous_backup_checksum" \
-    "$previous_deployed_at"
+  has_previous_release='true'
 else
   assert_not_symlink "$CURRENT_STATE"
-  rm -f -- "$PREVIOUS_STATE"
 fi
 
 pull_with_retries "$digest_ref"
@@ -864,13 +953,33 @@ if ! schema_in_range "$schema_before" "$candidate_schema_min" "$candidate_schema
   exit 1
 fi
 
+run_secret_preflight "$digest_ref" "$secret_version_ids"
+
 create_database_backup
+if [[ "$has_previous_release" == 'true' ]]; then
+  atomic_write_state \
+    "$PREVIOUS_STATE" \
+    "$previous_digest_ref" \
+    "$previous_commit" \
+    "$previous_schema" \
+    "$previous_schema_min" \
+    "$previous_schema_max" \
+    "$previous_secret_versions" \
+    "$previous_release_schema" \
+    "$previous_run_id" \
+    "$previous_artifact_source" \
+    "$previous_backup_path" \
+    "$previous_backup_checksum" \
+    "$previous_deployed_at"
+else
+  rm -f -- "$PREVIOUS_STATE"
+fi
 attempt_started_at="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
 atomic_write_attempt_state "$schema_before" "$attempt_started_at"
 
 trap 'rollback "$?"' ERR
 run_metadata_firewall guard
-run_compose "$digest_ref" >/dev/null
+run_compose "$digest_ref" "$secret_version_ids" >/dev/null
 metadata_firewall_status=0
 run_metadata_firewall reconcile || metadata_firewall_status=$?
 if ((metadata_firewall_status != 0)); then

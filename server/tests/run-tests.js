@@ -18,7 +18,10 @@ const tests = [
   require('./data-source-contract.test'),
   require('./model-security-contract.test'),
   require('./deploy-contract.test'),
+  require('./deploy-secret-version-config.test'),
   require('./deploy-v2-contract.test'),
+  require('./deploy-v2-secret-state.test'),
+  require('./deploy-v2-workflow.test'),
   require('./data-lifecycle.test'),
   require('./workflow-contract.test')
 ]

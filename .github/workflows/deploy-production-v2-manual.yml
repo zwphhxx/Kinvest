@@ -145,6 +145,29 @@ jobs:
         env:
           DEPLOY_V2_ENABLED: ${{ vars.DEPLOY_V2_ENABLED }}
         run: test "$DEPLOY_V2_ENABLED" = 'true'
+      - name: Check out validated release
+        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683
+        with:
+          ref: ${{ needs.validate.outputs.commit_sha }}
+          persist-credentials: false
+      - name: Construct canonical secret VersionId payload
+        shell: bash
+        env:
+          INTENT: ${{ inputs.intent }}
+          SSM_BOOTSTRAP_ENABLED: ${{ vars.SSM_BOOTSTRAP_ENABLED }}
+          SSM_ADMIN_PASSWORD_VERIFIER_VERSION_ID: ${{ vars.SSM_ADMIN_PASSWORD_VERIFIER_VERSION_ID }}
+          SSM_DEVICE_TOKEN_HMAC_ACTIVE_VERSION_ID: ${{ vars.SSM_DEVICE_TOKEN_HMAC_ACTIVE_VERSION_ID }}
+          SSM_DEVICE_TOKEN_HMAC_ACCEPTED_VERSION_IDS: ${{ vars.SSM_DEVICE_TOKEN_HMAC_ACCEPTED_VERSION_IDS }}
+        run: |
+          set -euo pipefail
+          if [[ "$INTENT" == 'ROLLBACK' ]]; then
+            secret_version_ids='{"rollback":"previous"}'
+          elif [[ "$INTENT" == 'FORWARD' ]]; then
+            secret_version_ids="$(python3 deploy/server/secret-version-config.py from-env)"
+          else
+            exit 1
+          fi
+          printf 'KINVEST_SECRET_VERSION_IDS=%s\n' "$secret_version_ids" >> "$GITHUB_ENV"
       - name: Configure strict SSH trust
         shell: bash
         env:
@@ -177,6 +200,7 @@ jobs:
           IMAGE_DIGEST: ${{ needs.validate.outputs.image_digest }}
           RELEASE_SCHEMA: ${{ needs.validate.outputs.release_record_schema_version }}
           VERIFICATION_RUN_ID: ${{ needs.validate.outputs.verification_run_id }}
+          INTENT: ${{ inputs.intent }}
         run: |
           set -euo pipefail
           IMAGE_REPOSITORY='ghcr.io/zwphhxx/kinvest'
@@ -187,6 +211,15 @@ jobs:
           [[ "$DEPLOY_SHA" =~ ^[0-9a-f]{40}$ ]]
           [[ "$IMAGE_DIGEST_REF" =~ ^ghcr\.io/zwphhxx/kinvest@sha256:[0-9a-f]{64}$ ]]
           [[ "$RELEASE_SCHEMA" == '2' && "$VERIFICATION_RUN_ID" =~ ^[0-9]+$ ]]
+          if [[ "$INTENT" == 'ROLLBACK' ]]; then
+            [[ "$KINVEST_SECRET_VERSION_IDS" == '{"rollback":"previous"}' ]]
+          else
+            canonical_secret_version_ids="$(
+              printf '%s\n' "$KINVEST_SECRET_VERSION_IDS" |
+                python3 deploy/server/secret-version-config.py mapping
+            )"
+            [[ "$canonical_secret_version_ids" == "$KINVEST_SECRET_VERSION_IDS" ]]
+          fi
           printf '%s\n' \
             'KINVEST_DEPLOY_V2' \
             "$IMAGE_DIGEST_REF" \
@@ -198,7 +231,7 @@ jobs:
             "$RELEASE_SCHEMA" \
             "$VERIFICATION_RUN_ID" \
             'ghcr-public' \
-            '{}' \
+            "$KINVEST_SECRET_VERSION_IDS" \
             'EOF' |
             ssh \
               -o BatchMode=yes \
