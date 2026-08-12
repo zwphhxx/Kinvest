@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 import hashlib
 import importlib.util
+import inspect
 import io
 import json
 import os
@@ -175,6 +176,12 @@ class ArchiveFixture:
             "manifest.json": canonical_json([docker_manifest]),
             "oci-layout": canonical_json({"imageLayoutVersion": "1.0.0"}),
         })
+        if self.case == "deep_json":
+            self.members["oci-layout"] = b"[" * 1100 + b"0" + b"]" * 1100
+        if self.case == "nonfinite_nan":
+            self.members["oci-layout"] = b'{"imageLayoutVersion":NaN}'
+        if self.case == "nonfinite_infinity":
+            self.members["oci-layout"] = b'{"imageLayoutVersion":Infinity}'
 
         if self.case == "missing_blob":
             del self.members[f"blobs/sha256/{layer_digests[-1]}"]
@@ -235,14 +242,28 @@ class OfflineImageAttestationTests(unittest.TestCase):
     def fixture(self, case="valid"):
         return ArchiveFixture(self.temp.name, case)
 
-    def assert_rejected(self, case, archive_sha=None):
+    def assert_archive_error(self, callback, expected_code="OFFLINE_ARCHIVE_INVALID", forbidden=()):
+        with self.assertRaises(self.module.ArchiveVerificationError) as raised:
+            callback()
+        error = raised.exception
+        self.assertEqual(error.code, expected_code)
+        self.assertEqual(str(error), expected_code)
+        self.assertEqual(error.args, (expected_code,))
+        for value in forbidden:
+            self.assertNotIn(value, str(error))
+        return error
+
+    def assert_rejected(self, case, archive_sha=None, expected_code="OFFLINE_ARCHIVE_INVALID"):
         fixture = self.fixture(case)
-        with self.assertRaises(self.module.ArchiveVerificationError):
-            self.module.verify_archive(
+        self.assert_archive_error(
+            lambda: self.module.verify_archive(
                 fixture.archive,
                 archive_sha or fixture.archive_sha,
                 fixture.source_ref,
-            )
+            ),
+            expected_code,
+            forbidden=(str(fixture.archive), fixture.source_ref),
+        )
 
     def test_valid_archive_returns_immutable_runtime_identity(self):
         fixture = self.fixture()
@@ -251,7 +272,7 @@ class OfflineImageAttestationTests(unittest.TestCase):
             fixture.archive_sha,
             fixture.source_ref,
         )
-        self.assertEqual(result.source_digest, fixture.source_ref)
+        self.assertEqual(result.source_reference, fixture.source_ref)
         self.assertEqual(result.platform, "linux/amd64")
         self.assertEqual(result.platform_manifest_digest, fixture.platform_manifest_digest)
         self.assertEqual(result.runtime_image_id, fixture.runtime_image_id)
@@ -261,7 +282,11 @@ class OfflineImageAttestationTests(unittest.TestCase):
         self.assertEqual(result.secret_bootstrap, "1")
 
     def test_rejects_archive_checksum_mismatch(self):
-        self.assert_rejected("valid", archive_sha="0" * 64)
+        self.assert_rejected(
+            "valid",
+            archive_sha="0" * 64,
+            expected_code="OFFLINE_ARCHIVE_CHECKSUM_MISMATCH",
+        )
 
     def test_rejects_traversal_member(self):
         self.assert_rejected("traversal")
@@ -357,6 +382,132 @@ class OfflineImageAttestationTests(unittest.TestCase):
 
     def test_rejects_manifest_without_repo_tags_key(self):
         self.assert_rejected("missing_repo_tags")
+
+    def test_public_api_names_full_source_reference(self):
+        parameters = inspect.signature(self.module.verify_archive).parameters
+        self.assertIn("source_reference", parameters)
+        self.assertNotIn("source_digest", parameters)
+        fixture = self.fixture()
+        result = self.module.verify_archive(
+            archive=fixture.archive,
+            archive_sha256=fixture.archive_sha,
+            source_reference=fixture.source_ref,
+        )
+        self.assertEqual(result.source_reference, fixture.source_ref)
+        self.assertFalse(hasattr(result, "source_digest"))
+
+    def test_rejects_aggregate_captured_metadata_limit(self):
+        fixture = self.fixture()
+        with mock.patch.object(self.module, "MAX_CAPTURED_METADATA_BYTES", 1):
+            self.assert_archive_error(
+                lambda: self.module.verify_archive(
+                    fixture.archive,
+                    fixture.archive_sha,
+                    fixture.source_ref,
+                ),
+                "OFFLINE_ARCHIVE_METADATA_LIMIT",
+            )
+
+    def test_rejects_deep_json_with_stable_error(self):
+        self.assert_rejected(
+            "deep_json",
+            expected_code="OFFLINE_ARCHIVE_JSON_INVALID",
+        )
+
+    def test_rejects_nonfinite_json_constants(self):
+        for case in ("nonfinite_nan", "nonfinite_infinity"):
+            with self.subTest(case=case):
+                self.assert_rejected(
+                    case,
+                    expected_code="OFFLINE_ARCHIVE_JSON_INVALID",
+                )
+
+    def test_public_api_normalizes_value_and_overflow_errors(self):
+        fixture = self.fixture()
+        for exception_type in (ValueError, OverflowError):
+            marker = f"private-{exception_type.__name__}-payload"
+            with self.subTest(exception_type=exception_type.__name__), mock.patch.object(
+                self.module,
+                "_read_archive",
+                side_effect=exception_type(marker),
+            ):
+                self.assert_archive_error(
+                    lambda: self.module.verify_archive(
+                        fixture.archive,
+                        fixture.archive_sha,
+                        fixture.source_ref,
+                    ),
+                    "OFFLINE_ARCHIVE_INVALID",
+                    forbidden=(marker,),
+                )
+
+    def test_archive_descriptor_closes_on_success_and_rejection(self):
+        real_open = os.open
+        for checksum in (None, "0" * 64):
+            fixture = self.fixture()
+            opened = []
+
+            def tracking_open(*args, **kwargs):
+                descriptor = real_open(*args, **kwargs)
+                opened.append(descriptor)
+                return descriptor
+
+            with self.subTest(checksum=checksum), mock.patch.object(
+                self.module.os,
+                "open",
+                side_effect=tracking_open,
+            ):
+                if checksum is None:
+                    self.module.verify_archive(
+                        fixture.archive,
+                        fixture.archive_sha,
+                        fixture.source_ref,
+                    )
+                else:
+                    self.assert_archive_error(
+                        lambda: self.module.verify_archive(
+                            fixture.archive,
+                            checksum,
+                            fixture.source_ref,
+                        ),
+                        "OFFLINE_ARCHIVE_CHECKSUM_MISMATCH",
+                    )
+            self.assertEqual(len(opened), 1)
+            with self.assertRaises(OSError):
+                os.fstat(opened[0])
+
+    def test_raw_descriptor_closes_when_fdopen_fails(self):
+        fixture = self.fixture()
+        real_open = os.open
+        opened = []
+        marker = "private-fdopen-payload"
+
+        def tracking_open(*args, **kwargs):
+            descriptor = real_open(*args, **kwargs)
+            opened.append(descriptor)
+            return descriptor
+
+        with mock.patch.object(
+            self.module.os,
+            "open",
+            side_effect=tracking_open,
+        ), mock.patch.object(
+            self.module.os,
+            "fdopen",
+            side_effect=OSError(marker),
+        ):
+            self.assert_archive_error(
+                lambda: self.module.verify_archive(
+                    fixture.archive,
+                    fixture.archive_sha,
+                    fixture.source_ref,
+                ),
+                "OFFLINE_ARCHIVE_UNREADABLE",
+                forbidden=(marker,),
+            )
+        self.assertEqual(len(opened), 1)
+        with self.assertRaises(OSError):
+            os.fstat(opened[0])
 
 
 if __name__ == "__main__":

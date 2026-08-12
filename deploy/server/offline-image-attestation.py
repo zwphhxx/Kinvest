@@ -22,6 +22,7 @@ BLOB_PATH = re.compile(r"^blobs/sha256/([0-9a-f]{64})$")
 MAX_ARCHIVE_BYTES = 2 * 1024 * 1024 * 1024
 MAX_MEMBERS = 4096
 MAX_JSON_BYTES = 1024 * 1024
+MAX_CAPTURED_METADATA_BYTES = 16 * 1024 * 1024
 MAX_DESCRIPTOR_DEPTH = 8
 SOURCE_ANNOTATION = "containerd.io/distribution.source.ghcr.io"
 SOURCE_ANNOTATION_VALUE = "zwphhxx/kinvest"
@@ -40,7 +41,7 @@ class ArchiveVerificationError(RuntimeError):
 
 @dataclasses.dataclass(frozen=True)
 class VerifiedArchive:
-    source_digest: str
+    source_reference: str
     platform: str
     platform_manifest_digest: str
     runtime_image_id: str
@@ -84,15 +85,23 @@ def _unique_object(pairs: list[tuple[str, Any]]) -> dict[str, Any]:
     return result
 
 
+def _reject_json_constant(_value: str) -> None:
+    _reject("OFFLINE_ARCHIVE_JSON_INVALID")
+
+
 def _parse_json(content: bytes | None) -> Any:
     if content is None or len(content) > MAX_JSON_BYTES:
         _reject()
     try:
-        return json.loads(content.decode("utf-8"), object_pairs_hook=_unique_object)
+        return json.loads(
+            content.decode("utf-8"),
+            object_pairs_hook=_unique_object,
+            parse_constant=_reject_json_constant,
+        )
     except ArchiveVerificationError:
         raise
-    except (UnicodeDecodeError, json.JSONDecodeError):
-        _reject()
+    except (UnicodeDecodeError, json.JSONDecodeError, RecursionError, ValueError, OverflowError):
+        _reject("OFFLINE_ARCHIVE_JSON_INVALID")
 
 
 def _safe_member_name(name: str) -> bool:
@@ -102,7 +111,11 @@ def _safe_member_name(name: str) -> bool:
     return not path.is_absolute() and all(part not in ("", ".", "..") for part in path.parts)
 
 
-def _read_regular_member(archive: tarfile.TarFile, member: tarfile.TarInfo) -> tuple[str, bytes | None]:
+def _read_regular_member(
+    archive: tarfile.TarFile,
+    member: tarfile.TarInfo,
+    capture_required: bool,
+) -> tuple[str, bytes | None]:
     source = archive.extractfile(member)
     if source is None:
         _reject()
@@ -119,7 +132,12 @@ def _read_regular_member(archive: tarfile.TarFile, member: tarfile.TarInfo) -> t
             captured.extend(chunk)
     if source.read(1):
         _reject()
-    return digest.hexdigest(), bytes(captured) if captured is not None else None
+    content = bytes(captured) if captured is not None else None
+    if content is not None and not capture_required:
+        candidate = content.lstrip(b" \t\r\n")
+        if not candidate.startswith((b"{", b"[")):
+            content = None
+    return digest.hexdigest(), content
 
 
 def _read_archive(source: BinaryIO) -> tuple[dict[str, bytes], dict[str, _StoredBlob]]:
@@ -127,6 +145,7 @@ def _read_archive(source: BinaryIO) -> tuple[dict[str, bytes], dict[str, _Stored
     blobs: dict[str, _StoredBlob] = {}
     seen: set[str] = set()
     expanded_bytes = 0
+    captured_bytes = 0
     try:
         with tarfile.open(fileobj=source, mode="r:*") as archive:
             for count, member in enumerate(archive, start=1):
@@ -148,8 +167,16 @@ def _read_archive(source: BinaryIO) -> tuple[dict[str, bytes], dict[str, _Stored
                 expanded_bytes += member.size
                 if expanded_bytes > MAX_ARCHIVE_BYTES:
                     _reject()
-                actual_digest, content = _read_regular_member(archive, member)
                 blob_match = BLOB_PATH.fullmatch(member.name)
+                actual_digest, content = _read_regular_member(
+                    archive,
+                    member,
+                    capture_required=blob_match is None,
+                )
+                if content is not None:
+                    captured_bytes += len(content)
+                    if captured_bytes > MAX_CAPTURED_METADATA_BYTES:
+                        _reject("OFFLINE_ARCHIVE_METADATA_LIMIT")
                 if blob_match:
                     if actual_digest != blob_match.group(1):
                         _reject()
@@ -239,7 +266,7 @@ class _DescriptorGraph:
                 self.visit(subject, depth + 1)
 
 
-def _validate_root_index(index: Any, source_ref: str, blobs: dict[str, _StoredBlob]) -> dict[str, Any]:
+def _validate_root_index(index: Any, source_reference: str, blobs: dict[str, _StoredBlob]) -> dict[str, Any]:
     if (
         not isinstance(index, dict)
         or index.get("schemaVersion") != 2
@@ -251,7 +278,7 @@ def _validate_root_index(index: Any, source_ref: str, blobs: dict[str, _StoredBl
         _reject()
     source_descriptor = manifests[0]
     media_type, digest, size = _descriptor_fields(source_descriptor)
-    if media_type != OCI_INDEX or digest != source_ref.rsplit("@", 1)[1]:
+    if media_type != OCI_INDEX or digest != source_reference.rsplit("@", 1)[1]:
         _reject()
     annotations = source_descriptor.get("annotations")
     if not isinstance(annotations, dict) or annotations.get(SOURCE_ANNOTATION) != SOURCE_ANNOTATION_VALUE:
@@ -330,10 +357,14 @@ def _validate_docker_manifest(value: Any, config_path: str, layer_paths: list[st
         _reject()
 
 
-def verify_archive(archive: os.PathLike[str] | str, archive_sha256: str, source_digest: str) -> VerifiedArchive:
+def _verify_archive(
+    archive: os.PathLike[str] | str,
+    archive_sha256: str,
+    source_reference: str,
+) -> VerifiedArchive:
     if not isinstance(archive_sha256, str) or not SHA256.fullmatch(archive_sha256):
         _reject()
-    if not isinstance(source_digest, str) or not ALLOWED_SOURCE.fullmatch(source_digest):
+    if not isinstance(source_reference, str) or not ALLOWED_SOURCE.fullmatch(source_reference):
         _reject()
     try:
         path = Path(archive)
@@ -350,7 +381,15 @@ def verify_archive(archive: os.PathLike[str] | str, archive_sha256: str, source_
     except OSError:
         _reject("OFFLINE_ARCHIVE_UNREADABLE")
     try:
-        with os.fdopen(descriptor, "rb") as source:
+        source = os.fdopen(descriptor, "rb")
+    except OSError:
+        try:
+            os.close(descriptor)
+        except OSError:
+            pass
+        _reject("OFFLINE_ARCHIVE_UNREADABLE")
+    try:
+        with source:
             opened_metadata = os.fstat(source.fileno())
             if (
                 not stat.S_ISREG(opened_metadata.st_mode)
@@ -381,7 +420,7 @@ def verify_archive(archive: os.PathLike[str] | str, archive_sha256: str, source_
     if _parse_json(roots["oci-layout"]) != {"imageLayoutVersion": "1.0.0"}:
         _reject()
     source_descriptor = _validate_root_index(
-        _parse_json(roots["index.json"]), source_digest, blobs
+        _parse_json(roots["index.json"]), source_reference, blobs
     )
     graph = _DescriptorGraph(blobs)
     graph.visit(source_descriptor)
@@ -426,7 +465,7 @@ def verify_archive(archive: os.PathLike[str] | str, archive_sha256: str, source_
     )
 
     return VerifiedArchive(
-        source_digest=source_digest,
+        source_reference=source_reference,
         platform="linux/amd64",
         platform_manifest_digest=runtime_descriptor["digest"],
         runtime_image_id=config_digest,
@@ -435,3 +474,16 @@ def verify_archive(archive: os.PathLike[str] | str, archive_sha256: str, source_
         schema_max=schema_max,
         secret_bootstrap=secret_bootstrap,
     )
+
+
+def verify_archive(
+    archive: os.PathLike[str] | str,
+    archive_sha256: str,
+    source_reference: str,
+) -> VerifiedArchive:
+    try:
+        return _verify_archive(archive, archive_sha256, source_reference)
+    except ArchiveVerificationError:
+        raise
+    except (RecursionError, ValueError, OverflowError):
+        _reject()
