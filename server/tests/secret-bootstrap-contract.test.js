@@ -195,6 +195,22 @@ function testAdminVerifierContract() {
       digest: runtimeBytes(32, 'digest').toString('base64url'),
       format: 'kinvest-admin-scrypt-v1',
       n: 65536,
+      p: 2,
+      r: 8,
+      salt: runtimeBytes(16, 'salt').toString('base64url')
+    }),
+    JSON.stringify({
+      digest: runtimeBytes(32, 'digest').toString('base64url'),
+      format: 'kinvest-admin-scrypt-v1',
+      n: 65536,
+      p: 1,
+      r: 16,
+      salt: runtimeBytes(16, 'salt').toString('base64url')
+    }),
+    JSON.stringify({
+      digest: runtimeBytes(32, 'digest').toString('base64url'),
+      format: 'kinvest-admin-scrypt-v1',
+      n: 65536,
       p: 1,
       r: 8,
       salt: runtimeBytes(15, 'short-salt').toString('base64url')
@@ -215,10 +231,12 @@ function testAdminVerifierContract() {
 
   const password = '\u5bc6\u7801'.repeat(8)
   const salt = runtimeBytes(16, 'generated-salt')
+  const ownedSalt = Buffer.from(salt)
   const generated = generateAdminPasswordVerifier(password, (size) => {
     assert.equal(size, 16)
-    return Buffer.from(salt)
+    return ownedSalt
   })
+  assert.deepEqual(ownedSalt, Buffer.alloc(16))
   const generatedObject = JSON.parse(generated)
   assert.deepEqual(Object.keys(generatedObject), ['digest', 'format', 'n', 'p', 'r', 'salt'])
   assert.equal(generated.includes(password), false)
@@ -280,10 +298,12 @@ function testDeviceHmacContract() {
     expectSyncCode(() => parseDeviceHmacSecret(input), 'DEVICE_HMAC_INVALID')
   }
 
+  const ownedHmac = Buffer.from(bytes)
   const generated = generateDeviceHmacSecret((size) => {
     assert.equal(size, 32)
-    return Buffer.from(bytes)
+    return ownedHmac
   })
+  assert.deepEqual(ownedHmac, Buffer.alloc(32))
   assert.equal(generated, raw)
   parseDeviceHmacSecret(generated)
   expectSyncCode(

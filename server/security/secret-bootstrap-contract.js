@@ -187,7 +187,7 @@ function secureRandomBytes(size, randomBytes) {
     if (Buffer.isBuffer(value)) value.fill(0)
     fail('SECRET_RANDOM_SOURCE_INVALID')
   }
-  return Buffer.from(value)
+  return value
 }
 
 function generateAdminPasswordVerifier(password, randomBytes = crypto.randomBytes) {
