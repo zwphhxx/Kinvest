@@ -217,6 +217,12 @@ if [ "$1" = network ]; then
 fi
 if [ "$1" = pull ]; then
   if [ "$KINVEST_FAKE_MODE" = signal ]; then kill -TERM "$PPID"; sleep 1; exit 143; fi
+  pull_count=0
+  if [ -f "$KINVEST_FAKE_STATE/pull-count" ]; then pull_count="$(cat "$KINVEST_FAKE_STATE/pull-count")"; fi
+  pull_count=$((pull_count + 1))
+  printf '%s\n' "$pull_count" > "$KINVEST_FAKE_STATE/pull-count"
+  if [ "$KINVEST_FAKE_MODE" = local-digest-transient ] && [ "$pull_count" -eq 1 ]; then exit 124; fi
+  : > "$KINVEST_FAKE_STATE/pulled"
   exit 0
 fi
 if [ "$1" = login ]; then cat >/dev/null; exit 0; fi
@@ -227,6 +233,8 @@ if [ "$1" = image ] && [ "$2" = inspect ]; then
     *RepoDigests*)
       if [ "$KINVEST_FAKE_MODE" = wrong-digest ] && [ "$ref" = "$KINVEST_CANDIDATE" ]; then
         printf '["ghcr.io/zwphhxx/kinvest@sha256:%064d"]\n' 0
+      elif { [ "$KINVEST_FAKE_MODE" = local-tag-and-id-only ] || [ "$KINVEST_FAKE_MODE" = local-digest-transient ] || [ "$KINVEST_FAKE_MODE" = signal ]; } && [ ! -f "$KINVEST_FAKE_STATE/pulled" ]; then
+        printf '["ghcr.io/zwphhxx/kinvest:offline-import"]\n'
       else
         printf '["%s"]\n' "$ref"
       fi
@@ -485,6 +493,12 @@ async function run() {
     assert.equal(fs.existsSync(path.join(successfulRoot.stateDir, 'attempt.state')), false)
     assert.equal(fs.readdirSync(successfulRoot.runRoot).length, 0)
     const dockerOperations = fs.readFileSync(path.join(successfulRoot.fakeState, 'docker.log'), 'utf8').trim().split('\n')
+    assert.equal(
+      dockerOperations.some((operation) => operation.startsWith('pull ')),
+      false,
+      'an exact locally available RepoDigest must skip the registry pull'
+    )
+    assert.match(successfulRoot.result.stderr, /RepoDigest is already verified locally; registry pull skipped/)
     const composeOperations = dockerOperations.filter((operation) => operation.startsWith('compose '))
     assert.ok(composeOperations.some((operation) => /\bconfig\b/.test(operation)))
     assert.ok(composeOperations.some((operation) => /\bup\b/.test(operation)))
@@ -522,6 +536,32 @@ async function run() {
     )
   } finally {
     successfulRoot.cleanup()
+  }
+
+  const localTagAndIdOnly = runRootFixture(deploy, { mode: 'local-tag-and-id-only' })
+  try {
+    assert.equal(localTagAndIdOnly.result.status, 0, localTagAndIdOnly.result.stderr)
+    assert.deepEqual(
+      readLogLines(path.join(localTagAndIdOnly.fakeState, 'docker.log')).filter((operation) => operation.startsWith('pull ')),
+      [`pull ${localTagAndIdOnly.candidateDigest}`],
+      'a local tag and matching Image ID without the exact RepoDigest must not bypass the pull'
+    )
+  } finally {
+    localTagAndIdOnly.cleanup()
+  }
+
+  const localDigestTransient = runRootFixture(deploy, { mode: 'local-digest-transient' })
+  try {
+    assert.equal(localDigestTransient.result.status, 0, localDigestTransient.result.stderr)
+    assert.deepEqual(
+      readLogLines(path.join(localDigestTransient.fakeState, 'docker.log')).filter((operation) => operation.startsWith('pull ')),
+      [`pull ${localDigestTransient.candidateDigest}`, `pull ${localDigestTransient.candidateDigest}`],
+      'a missing local RepoDigest must retain bounded transient pull retries'
+    )
+    assert.match(localDigestTransient.result.stderr, /pull attempt 1 of 3 failed with exit code 124/)
+    assert.match(localDigestTransient.result.stderr, /pull attempt 2 of 3 succeeded/)
+  } finally {
+    localDigestTransient.cleanup()
   }
 
   const missingMetadataNetwork = runRootFixture(deploy, { mode: 'metadata-network-missing' })
@@ -694,6 +734,11 @@ async function run() {
   try {
     assert.notEqual(wrongDigest.result.status, 0)
     assert.match(wrongDigest.result.stderr, /RepoDigests/)
+    assert.deepEqual(
+      readLogLines(path.join(wrongDigest.fakeState, 'docker.log')).filter((operation) => operation.startsWith('pull ')),
+      [`pull ${wrongDigest.candidateDigest}`],
+      'a wrong local RepoDigest must still pull before the final digest guard rejects it'
+    )
     assert.equal(fs.readdirSync(wrongDigest.runRoot).length, 0)
   } finally {
     wrongDigest.cleanup()

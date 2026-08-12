@@ -932,7 +932,11 @@ else
   assert_not_symlink "$CURRENT_STATE"
 fi
 
-pull_with_retries "$digest_ref"
+if verify_repo_digest "$digest_ref"; then
+  printf '%s\n' 'Kinvest image RepoDigest is already verified locally; registry pull skipped.' >&2
+else
+  pull_with_retries "$digest_ref"
+fi
 if ! verify_repo_digest "$digest_ref"; then
   printf '%s\n' 'pulled image RepoDigests do not contain the requested digest' >&2
   exit 1
