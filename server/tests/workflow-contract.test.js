@@ -934,6 +934,8 @@ function runOfflineExportFixture({
   publishRace = false,
   mutateAfterVerify = 'none',
   simulateReusedIdentity = false,
+  anchorCleanupFault = 'none',
+  secondSignalDuringCleanup = false,
   signalAfterLink = false,
   signalAtStateTransition = false,
   outputSuffix = ''
@@ -1011,11 +1013,56 @@ if [ "$1" = '-' ]; then
     printf '%s\n' "$capture_output"
     exit 0
   fi
+  if [ "\${2:-}" = 'cleanup-anchor' ] || [ "\${2:-}" = 'cleanup-anchor-strict' ]; then
+    if [ "$FAKE_EXPORT_ANCHOR_CLEANUP_FAULT" != 'none' ] \
+      || [ "$FAKE_EXPORT_SECOND_SIGNAL_DURING_CLEANUP" = '1' ]; then
+      cleanup_script="$FAKE_EXPORT_STATE/anchor-cleanup.py"
+      cat > "$cleanup_script"
+      exec "$FAKE_EXPORT_REAL_PYTHON" - "$cleanup_script" \
+        "$FAKE_EXPORT_ANCHOR_CLEANUP_FAULT" \
+        "$FAKE_EXPORT_SECOND_SIGNAL_DURING_CLEANUP" "$@" <<'PY'
+import os
+import signal
+import sys
+import time
+
+script_path, fault, second_signal = sys.argv[1:4]
+cleanup_argv = sys.argv[4:]
+anchor_directory = cleanup_argv[2]
+anchor_path = cleanup_argv[3]
+real_unlink = os.unlink
+real_rmdir = os.rmdir
+signal_sent = False
+
+def faulting_unlink(path, *args, **kwargs):
+    global signal_sent
+    if second_signal == "1" and not signal_sent:
+        signal_sent = True
+        os.kill(os.getppid(), signal.SIGTERM)
+        time.sleep(0.05)
+    if fault == "unlink" and os.fspath(path) == anchor_path:
+        raise PermissionError("injected anchor unlink failure")
+    return real_unlink(path, *args, **kwargs)
+
+def faulting_rmdir(path, *args, **kwargs):
+    if fault == "rmdir" and os.fspath(path) == anchor_directory:
+        raise PermissionError("injected anchor rmdir failure")
+    return real_rmdir(path, *args, **kwargs)
+
+os.unlink = faulting_unlink
+os.rmdir = faulting_rmdir
+sys.argv = cleanup_argv
+with open(script_path, "rb") as source:
+    source_code = compile(source.read(), script_path, "exec")
+exec(source_code, {"__name__": "__main__"})
+PY
+    fi
+    exec "$FAKE_EXPORT_REAL_PYTHON" "$@"
+  fi
   if [ "\${2:-}" = 'cleanup-created-link' ] \
     || [ "\${2:-}" = 'create-anchor' ] \
     || [ "\${2:-}" = 'verify-anchor' ] \
-    || [ "\${2:-}" = 'verify-published-anchor' ] \
-    || [ "\${2:-}" = 'cleanup-anchor' ]; then
+    || [ "\${2:-}" = 'verify-published-anchor' ]; then
     exec "$FAKE_EXPORT_REAL_PYTHON" "$@"
   fi
   if [ "\${2:-}" = 'publish-no-replace' ]; then
@@ -1165,6 +1212,7 @@ exec "$FAKE_EXPORT_REAL_MV" "$@"
         PATH: `${fakeBin}:${process.env.PATH}`,
         FAKE_EXPORT_CHECKSUM: checksum,
         FAKE_EXPORT_ARCHIVE_BYTES: archiveBytes,
+        FAKE_EXPORT_ANCHOR_CLEANUP_FAULT: anchorCleanupFault,
         FAKE_EXPORT_ANCHOR_OBSERVED: path.join(fakeState, 'anchor-observed'),
         FAKE_EXPORT_PLATFORM_MANIFEST: platformManifest,
         FAKE_EXPORT_PUBLISH_RACE: publishRace ? '1' : '0',
@@ -1174,6 +1222,7 @@ exec "$FAKE_EXPORT_REAL_MV" "$@"
         FAKE_EXPORT_REAL_SHASUM: realShasum,
         FAKE_EXPORT_MUTATE_AFTER_VERIFY: mutateAfterVerify,
         FAKE_EXPORT_SIMULATE_REUSED_IDENTITY: simulateReusedIdentity ? '1' : '0',
+        FAKE_EXPORT_SECOND_SIGNAL_DURING_CLEANUP: secondSignalDuringCleanup ? '1' : '0',
         FAKE_EXPORT_SIGNAL_AFTER_LINK: signalAfterLink ? '1' : '0',
         FAKE_EXPORT_SIGNAL_AT_STATE_TRANSITION: signalAtStateTransition ? '1' : '0',
         FAKE_EXPORT_RUNTIME_IMAGE_ID: runtimeImageId,
@@ -1704,6 +1753,13 @@ function run() {
   assert.match(deployV2Runbook, /private same-filesystem[^\n]*0700[^\n]*hard-link anchor/i)
   assert.match(deployV2Runbook, /anchor[^\n]*prevents[^\n]*inode[^\n]*reuse/i)
   assert.match(deployV2Runbook, /anchor[^\n]*removed[^\n]*success[^\n]*failure[^\n]*signal/i)
+  assert.match(deployV2Runbook, /anchor[^\n]*cleanup[^\n]*before[^\n]*success metadata/i)
+  assert.match(deployV2Runbook, /second signal[^\n]*cannot interrupt[^\n]*cleanup/i)
+  assert.ok(
+    offlineExportScript.indexOf('cleanup-anchor-strict') < offlineExportScript.indexOf('success_metadata='),
+    'strict anchor cleanup must complete before success metadata is constructed or printed'
+  )
+  assert.match(offlineExportScript, /trap '' HUP INT TERM/)
   assert.match(deployV2Runbook, /four-asset transaction/i)
   assert.match(deployV2Runbook, /prior file or prior absence/i)
   assert.match(deployV2Runbook, /ignore handled signals during restoration/i)
@@ -1798,6 +1854,48 @@ function run() {
     )
   } finally {
     verifierFailure.cleanup()
+  }
+
+  for (const anchorCleanupFault of ['unlink', 'rmdir']) {
+    const cleanupFailure = runOfflineExportFixture({ anchorCleanupFault })
+    try {
+      assert.notEqual(cleanupFailure.result.status, 0)
+      assert.equal(cleanupFailure.result.stdout, '', `${anchorCleanupFault}: no false success metadata`)
+      assert.equal(fs.existsSync(cleanupFailure.outputPath), false, `${anchorCleanupFault}: failed export output`)
+      const anchorDirectories = fs.readdirSync(path.dirname(cleanupFailure.outputPath))
+        .filter((name) => name.includes('anchor'))
+      assert.equal(anchorDirectories.length, 1, `${anchorCleanupFault}: one private recovery directory`)
+      const anchorDirectory = path.join(path.dirname(cleanupFailure.outputPath), anchorDirectories[0])
+      assert.equal(fs.statSync(anchorDirectory).mode & 0o777, 0o700)
+      if (anchorCleanupFault === 'unlink') {
+        assert.deepEqual(fs.readdirSync(anchorDirectory), ['archive'])
+        assert.equal(fs.readFileSync(path.join(anchorDirectory, 'archive'), 'utf8'), 'verified-archive-bytes')
+      } else {
+        assert.deepEqual(fs.readdirSync(anchorDirectory), [])
+      }
+      assert.match(cleanupFailure.result.stderr, /anchor cleanup incomplete/)
+    } finally {
+      cleanupFailure.cleanup()
+    }
+  }
+
+  const secondCleanupSignal = runOfflineExportFixture({
+    verifierFails: true,
+    secondSignalDuringCleanup: true
+  })
+  try {
+    assert.notEqual(secondCleanupSignal.result.status, 0)
+    assert.equal(secondCleanupSignal.result.stdout, '')
+    assert.equal(fs.existsSync(secondCleanupSignal.outputPath), false)
+    assert.deepEqual(
+      fs.readdirSync(path.dirname(secondCleanupSignal.outputPath)).filter((name) =>
+        name.includes('temporary') || name.includes('publication') || name.includes('anchor')
+      ),
+      [],
+      'a second signal must not interrupt complete failure cleanup'
+    )
+  } finally {
+    secondCleanupSignal.cleanup()
   }
 
   const publishRace = runOfflineExportFixture({ publishRace: true })

@@ -100,6 +100,8 @@ recalculate its SHA-256 on the server before import; both checksums must match.
 A private same-filesystem `0700` directory holds a no-overwrite hard-link anchor before verification.
 The anchor prevents an unlinked temporary inode from being reused for identical replacement bytes.
 The anchor is removed after success, failure, or signal cleanup and never appears in success metadata.
+Anchor cleanup completes synchronously before success metadata is constructed or emitted.
+During EXIT or signal cleanup, handled signals are ignored so a second signal cannot interrupt cleanup.
 
 After a separate server-import approval, root imports the archive using the
 release record's exact provenance:
@@ -135,6 +137,11 @@ there is no destructive normal-state rewrite. If a signal lands after link
 creation, cleanup can therefore remove only that still-matching archive inode.
 Temporary, anchor, and output identities and checksums are compared before and
 after verification, during publication, and before success metadata is emitted.
+If normal-path anchor unlink or directory removal fails, the exporter exits nonzero
+without success stdout and removes the final path only when its armed inode still
+matches. It reports the non-secret private recovery directory: an unlink failure
+may preserve the known archive hard link there, while a directory-removal failure
+may preserve only the empty `0700` directory for deliberate administrator cleanup.
 
 ## Release record v2
 

@@ -9,6 +9,7 @@ VERIFIER="$REPOSITORY_ROOT/deploy/server/offline-image-attestation.py"
 TEMPORARY_PATH=''
 PUBLICATION_STATE=''
 ANCHOR_DIRECTORY=''
+ANCHOR_DIRECTORY_IDENTITY=''
 ANCHOR_PATH=''
 SUCCESS_METADATA_COMPLETED='false'
 
@@ -19,7 +20,9 @@ usage() {
 
 cleanup() {
   cleanup_status="$?"
-  trap - EXIT INT TERM HUP
+  trap - EXIT
+  trap '' HUP INT TERM
+  set +e
   if [[ "$SUCCESS_METADATA_COMPLETED" != 'true' && -n "$PUBLICATION_STATE" && -f "$PUBLICATION_STATE" ]]; then
     python3 - cleanup-created-link "$PUBLICATION_STATE" "$OUTPUT_PATH" <<'PY' || true
 import os
@@ -50,14 +53,20 @@ PY
     rm -f -- "$TEMPORARY_PATH"
   fi
   if [[ -n "$ANCHOR_DIRECTORY" ]]; then
-    python3 - cleanup-anchor "$ANCHOR_DIRECTORY" "$ANCHOR_PATH" <<'PY' || true
+    anchor_cleanup_status=0
+    python3 - cleanup-anchor "$ANCHOR_DIRECTORY" "$ANCHOR_PATH" \
+      "$ANCHOR_DIRECTORY_IDENTITY" "${archive_identity:-}" <<'PY' || anchor_cleanup_status="$?"
 import os
 import stat
 import sys
 
-mode, directory_path, anchor_path = sys.argv[1:]
+mode, directory_path, anchor_path, expected_directory_identity, expected_archive_identity = sys.argv[1:]
 if mode != "cleanup-anchor":
     raise SystemExit(1)
+
+def identity(value):
+    return f"{value.st_dev}:{value.st_ino}:{value.st_size}:{stat.S_IMODE(value.st_mode)}:{value.st_uid}"
+
 try:
     directory = os.lstat(directory_path)
     if (
@@ -65,18 +74,57 @@ try:
         or stat.S_ISLNK(directory.st_mode)
         or stat.S_IMODE(directory.st_mode) != 0o700
         or directory.st_uid != os.getuid()
+        or f"{directory.st_dev}:{directory.st_ino}" != expected_directory_identity
     ):
-        raise SystemExit(0)
+        raise OSError("anchor directory identity mismatch")
     try:
         anchor = os.lstat(anchor_path)
-        if stat.S_ISREG(anchor.st_mode) and not stat.S_ISLNK(anchor.st_mode):
-            os.unlink(anchor_path)
+        if (
+            not stat.S_ISREG(anchor.st_mode)
+            or stat.S_ISLNK(anchor.st_mode)
+            or identity(anchor) != expected_archive_identity
+        ):
+            raise OSError("anchor identity mismatch")
+        os.unlink(anchor_path)
     except FileNotFoundError:
         pass
+    try:
+        os.lstat(anchor_path)
+    except FileNotFoundError:
+        pass
+    else:
+        raise OSError("anchor still exists")
+    directory_after = os.lstat(directory_path)
+    if (
+        not stat.S_ISDIR(directory_after.st_mode)
+        or stat.S_ISLNK(directory_after.st_mode)
+        or stat.S_IMODE(directory_after.st_mode) != 0o700
+        or directory_after.st_uid != os.getuid()
+        or f"{directory_after.st_dev}:{directory_after.st_ino}" != expected_directory_identity
+    ):
+        raise OSError("anchor directory changed")
     os.rmdir(directory_path)
-except (FileNotFoundError, OSError):
-    pass
+    try:
+        os.lstat(directory_path)
+    except FileNotFoundError:
+        pass
+    else:
+        raise OSError("anchor directory still exists")
+except FileNotFoundError:
+    try:
+        os.lstat(anchor_path)
+    except FileNotFoundError:
+        raise SystemExit(0)
+    raise SystemExit(1)
+except (OSError, ValueError):
+    raise SystemExit(1)
 PY
+    if [[ "$anchor_cleanup_status" -ne 0 ]]; then
+      printf 'offline image anchor cleanup incomplete at %s\n' "$ANCHOR_DIRECTORY" >&2
+      if [[ "$cleanup_status" -eq 0 ]]; then
+        cleanup_status=1
+      fi
+    fi
   fi
   if [[ -n "$PUBLICATION_STATE" ]]; then
     rm -f -- "$PUBLICATION_STATE"
@@ -193,6 +241,7 @@ fi
 ANCHOR_DIRECTORY="$(mktemp -d "$(dirname -- "$OUTPUT_PATH")/.kinvest-offline-anchor.XXXXXX")"
 chmod 0700 "$ANCHOR_DIRECTORY"
 ANCHOR_PATH="$ANCHOR_DIRECTORY/archive"
+ANCHOR_DIRECTORY_IDENTITY="$(
 python3 - create-anchor "$TEMPORARY_PATH" "$ANCHOR_DIRECTORY" "$ANCHOR_PATH" "$archive_checksum" "$archive_identity" <<'PY'
 import hashlib
 import os
@@ -249,7 +298,13 @@ if (
     except OSError:
         pass
     raise SystemExit(1)
+print(f"{directory.st_dev}:{directory.st_ino}")
 PY
+)"
+if [[ ! "$ANCHOR_DIRECTORY_IDENTITY" =~ ^[0-9]+:[0-9]+$ ]]; then
+  printf '%s\n' 'offline image anchor identity is invalid' >&2
+  exit 1
+fi
 
 verification_output="$(
   python3 "$VERIFIER" verify-archive \
@@ -501,6 +556,99 @@ if [[ "$final_checksum" != "$archive_checksum" ]]; then
   printf '%s\n' 'offline image export final checksum mismatch' >&2
   exit 1
 fi
+
+trap '' HUP INT TERM
+python3 - cleanup-anchor-strict "$ANCHOR_DIRECTORY" "$ANCHOR_PATH" "$OUTPUT_PATH" \
+  "$archive_checksum" "$archive_identity" "$ANCHOR_DIRECTORY_IDENTITY" <<'PY'
+import hashlib
+import os
+import stat
+import sys
+
+(
+    mode,
+    directory_path,
+    anchor_path,
+    output_path,
+    expected_checksum,
+    expected_archive_identity,
+    expected_directory_identity,
+) = sys.argv[1:]
+if mode != "cleanup-anchor-strict":
+    raise SystemExit(1)
+
+def checksum(path):
+    digest = hashlib.sha256()
+    with open(path, "rb", buffering=0) as source:
+        for chunk in iter(lambda: source.read(1024 * 1024), b""):
+            digest.update(chunk)
+    return digest.hexdigest()
+
+def identity(value):
+    return f"{value.st_dev}:{value.st_ino}:{value.st_size}:{stat.S_IMODE(value.st_mode)}:{value.st_uid}"
+
+def valid_directory(value):
+    return (
+        stat.S_ISDIR(value.st_mode)
+        and not stat.S_ISLNK(value.st_mode)
+        and stat.S_IMODE(value.st_mode) == 0o700
+        and value.st_uid == os.getuid()
+        and f"{value.st_dev}:{value.st_ino}" == expected_directory_identity
+    )
+
+def valid_archive(value):
+    return (
+        stat.S_ISREG(value.st_mode)
+        and not stat.S_ISLNK(value.st_mode)
+        and stat.S_IMODE(value.st_mode) == 0o600
+        and value.st_uid == os.getuid()
+        and identity(value) == expected_archive_identity
+    )
+
+try:
+    directory = os.lstat(directory_path)
+    anchor = os.lstat(anchor_path)
+    output = os.lstat(output_path)
+    if (
+        not valid_directory(directory)
+        or not valid_archive(anchor)
+        or not valid_archive(output)
+        or not os.path.samestat(anchor, output)
+        or checksum(anchor_path) != expected_checksum
+        or checksum(output_path) != expected_checksum
+    ):
+        raise OSError("anchor cleanup precondition failed")
+    os.unlink(anchor_path)
+    try:
+        os.lstat(anchor_path)
+    except FileNotFoundError:
+        pass
+    else:
+        raise OSError("anchor still exists")
+    output_after = os.lstat(output_path)
+    directory_after = os.lstat(directory_path)
+    if (
+        not valid_archive(output_after)
+        or not os.path.samestat(output, output_after)
+        or checksum(output_path) != expected_checksum
+        or not valid_directory(directory_after)
+        or not os.path.samestat(directory, directory_after)
+    ):
+        raise OSError("anchor cleanup postcondition failed")
+    os.rmdir(directory_path)
+    try:
+        os.lstat(directory_path)
+    except FileNotFoundError:
+        pass
+    else:
+        raise OSError("anchor directory still exists")
+except (FileNotFoundError, OSError, ValueError):
+    print("offline image anchor cleanup failed", file=sys.stderr)
+    raise SystemExit(1)
+PY
+ANCHOR_DIRECTORY=''
+ANCHOR_DIRECTORY_IDENTITY=''
+ANCHOR_PATH=''
 
 success_metadata="$(printf 'path=%s\nchecksum=sha256:%s\nsize=%s\nsource=%s\nplatform=linux/amd64\nplatformManifest=%s\nruntimeImageId=%s' \
   "$OUTPUT_PATH" "$archive_checksum" "$archive_size" "$SOURCE_REFERENCE" \
