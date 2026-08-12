@@ -10,10 +10,18 @@ COPY server ./server
 COPY scripts ./scripts
 RUN npm run build
 
+FROM node:22-alpine AS runtime-dependencies
+
+WORKDIR /app
+
+COPY package.json package-lock.json ./
+RUN npm ci --omit=dev --ignore-scripts && npm cache clean --force
+
 FROM node:22-alpine AS runtime
 
 LABEL io.kinvest.schema.min="0" \
-      io.kinvest.schema.max="0"
+      io.kinvest.schema.max="0" \
+      io.kinvest.secret-bootstrap="1"
 
 ENV NODE_ENV=production \
     PORT=4173 \
@@ -24,7 +32,10 @@ RUN addgroup -g 10001 -S kinvest && \
 
 WORKDIR /app
 
+COPY --from=runtime-dependencies /app/node_modules ./node_modules
 COPY --from=build --chown=10001:10001 /app/dist ./
+
+RUN node -e "require('tencentcloud-sdk-nodejs-ssm'); require('tencentcloud-sdk-nodejs-common')"
 
 USER 10001:10001
 

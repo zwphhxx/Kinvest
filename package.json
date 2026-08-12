@@ -10,6 +10,8 @@
     "lint": "eslint server scripts public",
     "typecheck": "tsc -p jsconfig.json",
     "build": "node scripts/build.js",
+    "secret:generate:admin": "node scripts/generate-ssm-material.js admin-password-verifier",
+    "secret:generate:hmac": "node scripts/generate-ssm-material.js device-token-hmac",
     "check": "npm run build && npm test && npm run lint && npm run typecheck"
   },
   "engines": {

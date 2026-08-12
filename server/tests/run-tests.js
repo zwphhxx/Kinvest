@@ -7,6 +7,8 @@ const tests = [
   require('./secret-bootstrap.test'),
   require('./server-secret-bootstrap.test'),
   require('./secret-preflight.test'),
+  require('./ssm-material-generator.test'),
+  require('./docker-secret-bootstrap.test'),
   require('./metadata-firewall-contract.test'),
   require('./refresh-policy.test'),
   require('./refresh-rules.test'),

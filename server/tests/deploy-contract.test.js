@@ -373,14 +373,21 @@ async function run() {
 
   assert.deepEqual(
     dockerfile.match(/^FROM\b.*$/gm),
-    ['FROM node:22-alpine AS build', 'FROM node:22-alpine AS runtime']
+    [
+      'FROM node:22-alpine AS build',
+      'FROM node:22-alpine AS runtime-dependencies',
+      'FROM node:22-alpine AS runtime'
+    ]
   )
   assert.match(buildStage, /^RUN npm ci$/m)
   assert.match(buildStage, /^RUN npm run build$/m)
   assert.deepEqual(
     runtimeCopyCommands,
-    ['COPY --from=build --chown=10001:10001 /app/dist ./'],
-    'runtime stage must copy only the built dist directory'
+    [
+      'COPY --from=runtime-dependencies /app/node_modules ./node_modules',
+      'COPY --from=build --chown=10001:10001 /app/dist ./'
+    ],
+    'runtime stage must copy only production dependencies and the built dist directory'
   )
   assert.match(
     runtimeStage,
