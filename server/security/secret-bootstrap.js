@@ -5,6 +5,13 @@ const {
 } = require('./secret-bootstrap-contract')
 const { loadCvmSsmSecrets } = require('./cvm-ssm-secret-provider')
 
+/**
+ * @typedef {{secretName: string, versionId: string}} SecretReference
+ * @typedef {{readSecret: (reference: SecretReference) => Buffer, clear: () => void}} SecretProviderLike
+ * @typedef {{mode: string, referenceCount: number}} SecretRuntimeStatus
+ * @typedef {Readonly<{status: Readonly<SecretRuntimeStatus>, readSecret: (reference: SecretReference) => Buffer, clear: () => void}>} SecretRuntime
+ */
+
 class SecretBootstrapRuntimeError extends Error {
   constructor(code) {
     const messages = {
@@ -17,6 +24,7 @@ class SecretBootstrapRuntimeError extends Error {
   }
 }
 
+/** @param {Record<string, string | undefined>} env */
 function parseEnvironmentConfig(env) {
   const hasMode = Object.prototype.hasOwnProperty.call(env, 'KINVEST_SECRET_PROVIDER_MODE')
   const hasVersions = Object.prototype.hasOwnProperty.call(env, 'KINVEST_SECRET_VERSION_IDS')
@@ -43,6 +51,11 @@ function parseEnvironmentConfig(env) {
   return config
 }
 
+/**
+ * @param {SecretProviderLike | null} provider
+ * @param {SecretRuntimeStatus} status
+ * @returns {SecretRuntime}
+ */
 function createRuntime(provider, status) {
   let cleared = false
   return Object.freeze({
@@ -59,6 +72,13 @@ function createRuntime(provider, status) {
   })
 }
 
+/**
+ * @param {object} [options]
+ * @param {Record<string, string | undefined>} [options.env]
+ * @param {(options: {references: SecretReference[], roleName: string}) => Promise<SecretProviderLike>} [options.loadSecrets]
+ * @param {(provider: SecretProviderLike, config: any) => Promise<SecretRuntimeStatus>} [options.validateMaterial]
+ * @returns {Promise<SecretRuntime>}
+ */
 async function bootstrapSecrets({
   env = process.env,
   loadSecrets = loadCvmSsmSecrets,

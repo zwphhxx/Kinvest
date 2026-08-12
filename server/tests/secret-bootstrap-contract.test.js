@@ -21,7 +21,7 @@ const ENABLED_JSON = '{"adminPasswordVerifier":"v20260812-001","deviceTokenHmac"
 function expectCode(callback, expectedCode, forbidden = []) {
   return assert.rejects(Promise.resolve().then(callback), (error) => {
     assert.ok(error instanceof Error)
-    assert.equal(error.code, expectedCode)
+    assert.equal(/** @type {{code?: string}} */ (error).code, expectedCode)
     for (const value of forbidden) {
       if (value.length === 0) continue
       assert.equal(error.message.includes(value), false)
@@ -33,7 +33,7 @@ function expectCode(callback, expectedCode, forbidden = []) {
 function expectSyncCode(callback, expectedCode, forbidden = []) {
   assert.throws(callback, (error) => {
     assert.ok(error instanceof Error)
-    assert.equal(error.code, expectedCode)
+    assert.equal(/** @type {{code?: string}} */ (error).code, expectedCode)
     for (const value of forbidden) {
       if (value.length === 0) continue
       assert.equal(error.message.includes(value), false)

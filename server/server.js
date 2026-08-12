@@ -355,13 +355,17 @@ function applyRuntimeFileCreationMask() {
   return process.umask(RUNTIME_FILE_CREATION_MASK)
 }
 
+/** @param {unknown} error */
 function stableStartupErrorCode(error) {
-  const code = error && error.code
+  const code = error && typeof error === 'object' && 'code' in error
+    ? error.code
+    : undefined
   return typeof code === 'string' && /^[A-Z][A-Z0-9_]{2,63}$/.test(code)
     ? code
     : 'SECRET_BOOTSTRAP_FAILED'
 }
 
+/** @param {any} [options] */
 async function startServer({
   env = process.env,
   bootstrap = bootstrapSecrets,
@@ -413,6 +417,7 @@ async function startServer({
   return runtimeServer
 }
 
+/** @param {any} [options] */
 async function runServerExecutable(options = {}) {
   try {
     await startServer(options)

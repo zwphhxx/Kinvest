@@ -30,9 +30,9 @@ async function run() {
   const secretMarker = 'fixture-secret-must-not-leak'
   assert.equal(await runPreflight({
     bootstrap: async () => {
-      const error = new Error(secretMarker)
-      error.code = 'SSM_SECRET_LOAD_FAILED'
-      throw error
+      throw Object.assign(new Error(secretMarker), {
+        code: 'SSM_SECRET_LOAD_FAILED'
+      })
     },
     stdout: failedOut.stream,
     stderr: failedErr.stream

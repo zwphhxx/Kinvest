@@ -21,7 +21,7 @@ function deterministicBytes(length, label) {
 }
 
 function hasCode(code) {
-  return (error) => error instanceof Error && error.code === code
+  return (error) => error instanceof Error && 'code' in error && error.code === code
 }
 
 async function run() {
@@ -71,6 +71,7 @@ async function run() {
     [`${ADMIN_SECRET_NAME}:${VERSION}`, Buffer.from(adminMaterial)],
     [`${DEVICE_HMAC_SECRET_NAME}:${VERSION}`, Buffer.from(hmacMaterial)]
   ])
+  /** @type {{roleName: string, references: Array<{secretName: string, versionId: string}>} | undefined} */
   let receivedOptions
   const enabled = await bootstrapSecrets({
     env: {
@@ -91,6 +92,7 @@ async function run() {
       }
     }
   })
+  assert.ok(receivedOptions)
   assert.equal(receivedOptions.roleName, 'KinvestProdCvmSsmReader')
   assert.deepEqual(receivedOptions.references, [
     { secretName: ADMIN_SECRET_NAME, versionId: VERSION },

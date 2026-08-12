@@ -26,9 +26,9 @@ async function run() {
   await assert.rejects(startServer({
     runtimeServer: rejectedServer,
     bootstrap: async () => {
-      const error = new Error('fixture secret must never be logged')
-      error.code = 'SECRET_BOOTSTRAP_TEST_FAILURE'
-      throw error
+      throw Object.assign(new Error('fixture secret must never be logged'), {
+        code: 'SECRET_BOOTSTRAP_TEST_FAILURE'
+      })
     },
     processRef: new EventEmitter(),
     logger: { log() {} }

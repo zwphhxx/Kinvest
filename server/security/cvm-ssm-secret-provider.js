@@ -177,7 +177,7 @@ async function loadTemporaryCredentials({ roleName, metadataRequest, now }) {
  * @param {(input: {region: string, credentials: {secretId: string, secretKey: string, token: string, expiresAt: string}}) => {getSecretValue: (input: {SecretName: string, VersionId: string}) => Promise<{SecretName?: string, VersionId?: string, SecretString?: string}>}} [options.clientFactory]
  * @param {string} [options.region]
  * @param {() => number} [options.now]
- * @param {(event: string, metadata: {secretName: string, versionId: string, region: string}) => void} [options.audit]
+ * @param {(event: string, metadata: {loadedCount: number, region: string}) => void} [options.audit]
  */
 async function loadCvmSsmSecrets({
   references,

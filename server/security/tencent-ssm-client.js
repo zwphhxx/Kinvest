@@ -14,6 +14,7 @@ class TencentSsmClientError extends Error {
   }
 }
 
+/** @returns {any} */
 function defaultSdkLoader() {
   return require('tencentcloud-sdk-nodejs-ssm')
 }
@@ -25,6 +26,13 @@ function validCredentials(credentials) {
     typeof credentials.token === 'string' && credentials.token.length > 0)
 }
 
+/**
+ * @param {object} [options]
+ * @param {string} [options.region]
+ * @param {{secretId: string, secretKey: string, token: string}} [options.credentials]
+ * @param {() => any} [options.sdkLoader]
+ * @returns {{getSecretValue: (request: {SecretName: string, VersionId: string}) => Promise<any>}}
+ */
 function createTencentSsmClient({
   region,
   credentials,
@@ -34,6 +42,7 @@ function createTencentSsmClient({
     throw new TencentSsmClientError('SSM_CLIENT_CONFIG_INVALID')
   }
 
+  /** @type {any} */
   let Client
   try {
     const sdk = sdkLoader()
@@ -45,6 +54,7 @@ function createTencentSsmClient({
     throw new TencentSsmClientError('SSM_CLIENT_UNAVAILABLE')
   }
 
+  /** @type {any} */
   let client
   try {
     client = new Client({
