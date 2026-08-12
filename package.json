@@ -10,6 +10,8 @@
     "lint": "eslint server scripts public",
     "typecheck": "tsc -p jsconfig.json",
     "build": "node scripts/build.js",
+    "secret:generate:admin": "node scripts/generate-ssm-material.js admin-password-verifier",
+    "secret:generate:hmac": "node scripts/generate-ssm-material.js device-token-hmac",
     "check": "npm run build && npm test && npm run lint && npm run typecheck"
   },
   "engines": {
@@ -23,5 +25,9 @@
     "eslint": "10.8.0",
     "globals": "16.3.0",
     "typescript": "5.8.3"
+  },
+  "dependencies": {
+    "tencentcloud-sdk-nodejs-common": "4.1.220",
+    "tencentcloud-sdk-nodejs-ssm": "4.1.275"
   }
 }

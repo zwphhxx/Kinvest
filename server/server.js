@@ -8,11 +8,23 @@ const { createIfindClient } = require('./adapters/ifindAdapter')
 const { resolveSecurityIdentity } = require('./domain/security-identity')
 const { prepareFinanceRows } = require('../public/finance-contract')
 const { isVerifiedDataBlock } = require('../public/data-source-contract')
+const { bootstrapSecrets } = require('./security/secret-bootstrap')
 
 const PORT = Number(process.env.PORT || 4173)
 const ROOT = path.join(__dirname, '..')
 const PUBLIC_DIR = path.join(ROOT, 'public')
 const RUNTIME_FILE_CREATION_MASK = 0o077
+const SECRET_BOOTSTRAP_ERROR_CODES = new Set([
+  'SECRET_BOOTSTRAP_CONFIG_INVALID',
+  'SECRET_MATERIAL_INVALID',
+  'SECRET_MATERIAL_LOAD_FAILED',
+  'SECRET_MATERIAL_PROVIDER_INVALID',
+  'SECRET_VERSION_CONFIG_INVALID',
+  'SSM_BOOTSTRAP_INVALID',
+  'SSM_CLIENT_UNAVAILABLE',
+  'SSM_SECRET_LOAD_FAILED',
+  'TEMPORARY_CREDENTIALS_REQUIRED'
+])
 
 const MIME = {
   '.html': 'text/html; charset=utf-8',
@@ -354,16 +366,94 @@ function applyRuntimeFileCreationMask() {
   return process.umask(RUNTIME_FILE_CREATION_MASK)
 }
 
-function startServer() {
+/** @param {unknown} error */
+function stableStartupErrorCode(error) {
+  const code = error && typeof error === 'object' && 'code' in error
+    ? error.code
+    : undefined
+  return typeof code === 'string' && SECRET_BOOTSTRAP_ERROR_CODES.has(code)
+    ? code
+    : 'SECRET_BOOTSTRAP_FAILED'
+}
+
+/** @param {any} [options] */
+async function startServer({
+  env = process.env,
+  bootstrap = bootstrapSecrets,
+  runtimeServer = server,
+  port = PORT,
+  processRef = process,
+  logger = console
+} = {}) {
   applyRuntimeFileCreationMask()
-  server.listen(PORT, () => {
-    console.log(`Kinvest mock server started at http://localhost:${PORT}`)
-  })
-  return server
+  const secretRuntime = await bootstrap({ env })
+  let cleaned = false
+  const cleanup = () => {
+    if (cleaned) return
+    cleaned = true
+    processRef.removeListener('SIGTERM', handleSignal)
+    processRef.removeListener('SIGINT', handleSignal)
+    runtimeServer.removeListener('close', cleanup)
+    secretRuntime.clear()
+  }
+  const handleSignal = () => {
+    cleanup()
+    try {
+      runtimeServer.close()
+    } catch (error) {
+      if (!error || typeof error !== 'object' ||
+        !('code' in error) || error.code !== 'ERR_SERVER_NOT_RUNNING') {
+        throw Object.assign(new Error('Server close failed'), {
+          code: 'SERVER_CLOSE_FAILED'
+        })
+      }
+    }
+  }
+  processRef.once('SIGTERM', handleSignal)
+  processRef.once('SIGINT', handleSignal)
+  runtimeServer.once('close', cleanup)
+
+  try {
+    await new Promise((resolve, reject) => {
+      const handleError = (error) => {
+        runtimeServer.removeListener('error', handleError)
+        reject(error)
+      }
+      runtimeServer.once('error', handleError)
+      try {
+        runtimeServer.listen(port, () => {
+          runtimeServer.removeListener('error', handleError)
+          resolve()
+        })
+      } catch (error) {
+        runtimeServer.removeListener('error', handleError)
+        reject(error)
+      }
+    })
+  } catch (error) {
+    cleanup()
+    throw error
+  }
+  logger.log(`Kinvest mock server started at http://localhost:${port}`)
+  return runtimeServer
+}
+
+/** @param {any} [options] */
+async function runServerExecutable(options = {}) {
+  try {
+    await startServer(options)
+    return 0
+  } catch (error) {
+    const stderr = options.stderr || process.stderr
+    stderr.write(`${stableStartupErrorCode(error)}\n`)
+    return 1
+  }
 }
 
 if (require.main === module) {
-  startServer()
+  runServerExecutable().then((exitCode) => {
+    process.exitCode = exitCode
+  })
 }
 
 module.exports = {
@@ -371,6 +461,8 @@ module.exports = {
   apiRefresh,
   apiResearch,
   applyRuntimeFileCreationMask,
+  runServerExecutable,
+  stableStartupErrorCode,
   startServer,
   sanitizeCompanyData,
   toApiError,

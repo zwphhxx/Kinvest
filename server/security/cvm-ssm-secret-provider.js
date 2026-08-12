@@ -3,6 +3,7 @@ const {
   SecretProviderError,
   validateSecretReference
 } = require('./secret-provider')
+const { createTencentSsmClient } = require('./tencent-ssm-client')
 
 const REGION = 'ap-shanghai'
 const METADATA_IP = '169.254.0.23'
@@ -37,7 +38,7 @@ class LoadedSecretProvider {
     const { secretName, versionId } = validateSecretReference(reference)
     const value = this.#entries.get(secretName + ':' + versionId)
     if (!value) throw new SecretProviderError('SECRET_NOT_FOUND')
-    return value
+    return Buffer.from(value)
   }
 
   clear() {
@@ -87,9 +88,19 @@ function isValidTemporaryCredentials(credentials, now) {
     expiresAt > now + 60_000)
 }
 
-function requestCvmMetadata({ host, path, timeoutMs, maxBytes }) {
+/**
+ * @param {{host: string, path: string, timeoutMs: number, maxBytes: number}} options
+ * @param {(options: any, onResponse: (response: any) => void) => any} [requestFactory]
+ */
+function requestCvmMetadata(
+  { host, path, timeoutMs, maxBytes },
+  requestFactory = http.request
+) {
   return new Promise((resolve, reject) => {
-    const request = http.request({
+    const rejectSanitized = () => {
+      reject(new CvmSsmSecretProviderError('TEMPORARY_CREDENTIALS_REQUIRED'))
+    }
+    const request = requestFactory({
       host,
       port: 80,
       path,
@@ -102,7 +113,7 @@ function requestCvmMetadata({ host, path, timeoutMs, maxBytes }) {
     }, (response) => {
       if (response.statusCode !== 200) {
         response.resume()
-        reject(new Error('metadata request failed'))
+        rejectSanitized()
         return
       }
       const chunks = []
@@ -110,7 +121,7 @@ function requestCvmMetadata({ host, path, timeoutMs, maxBytes }) {
       response.on('data', (chunk) => {
         totalBytes += chunk.length
         if (totalBytes > maxBytes) {
-          response.destroy(new Error('metadata response too large'))
+          response.destroy(new CvmSsmSecretProviderError('TEMPORARY_CREDENTIALS_REQUIRED'))
           return
         }
         chunks.push(chunk)
@@ -118,12 +129,12 @@ function requestCvmMetadata({ host, path, timeoutMs, maxBytes }) {
       response.on('end', () => {
         resolve(Buffer.concat(chunks).toString('utf8'))
       })
-      response.on('error', reject)
+      response.on('error', rejectSanitized)
     })
     request.setTimeout(timeoutMs, () => {
-      request.destroy(new Error('metadata request timed out'))
+      request.destroy(new CvmSsmSecretProviderError('TEMPORARY_CREDENTIALS_REQUIRED'))
     })
-    request.on('error', reject)
+    request.on('error', rejectSanitized)
     request.end()
   })
 }
@@ -176,13 +187,13 @@ async function loadTemporaryCredentials({ roleName, metadataRequest, now }) {
  * @param {(input: {region: string, credentials: {secretId: string, secretKey: string, token: string, expiresAt: string}}) => {getSecretValue: (input: {SecretName: string, VersionId: string}) => Promise<{SecretName?: string, VersionId?: string, SecretString?: string}>}} [options.clientFactory]
  * @param {string} [options.region]
  * @param {() => number} [options.now]
- * @param {(event: string, metadata: {secretName: string, versionId: string, region: string}) => void} [options.audit]
+ * @param {(event: string, metadata: {loadedCount: number, region: string}) => void} [options.audit]
  */
 async function loadCvmSsmSecrets({
   references,
   roleName,
   metadataRequest = requestCvmMetadata,
-  clientFactory,
+  clientFactory = createTencentSsmClient,
   region = REGION,
   now = Date.now,
   audit = () => {}
@@ -214,7 +225,7 @@ async function loadCvmSsmSecrets({
 
   const entries = new Map()
   try {
-    for (const reference of normalizedReferences) {
+    for (const [referenceIndex, reference] of normalizedReferences.entries()) {
       if (!isValidTemporaryCredentials(credentials, now())) {
         throw new CvmSsmSecretProviderError('TEMPORARY_CREDENTIALS_REQUIRED')
       }
@@ -235,8 +246,7 @@ async function loadCvmSsmSecrets({
         Buffer.from(response.SecretString)
       )
       audit('ssm_secret_version_loaded', {
-        secretName: reference.secretName,
-        versionId: reference.versionId,
+        loadedCount: referenceIndex + 1,
         region
       })
     }
@@ -254,6 +264,8 @@ module.exports = {
   LoadedSecretProvider,
   MAX_VERSIONS_PER_SECRET,
   METADATA_IP,
+  METADATA_MAX_BYTES,
   REGION,
-  loadCvmSsmSecrets
+  loadCvmSsmSecrets,
+  requestCvmMetadata
 }
