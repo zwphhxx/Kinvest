@@ -390,6 +390,39 @@ async function testLoadedMaterialValidation() {
     'SECRET_MATERIAL_INVALID',
     ['invalid-material', DEVICE_HMAC_SECRET_NAME, HMAC_VERSION_ONE]
   )
+
+  const successfulCopies = []
+  const successfulProviderValues = new Map([
+    [`${ADMIN_SECRET_NAME}:${ADMIN_VERSION}`, Buffer.from(adminMaterial)],
+    [`${DEVICE_HMAC_SECRET_NAME}:${HMAC_VERSION_ONE}`, Buffer.from(firstHmac)],
+    [`${DEVICE_HMAC_SECRET_NAME}:${HMAC_VERSION_TWO}`, Buffer.from(secondHmac)]
+  ])
+  const successfulProvider = {
+    readSecret(reference) {
+      const copy = Buffer.from(successfulProviderValues.get(
+        `${reference.secretName}:${reference.versionId}`
+      ))
+      successfulCopies.push(copy)
+      return copy
+    }
+  }
+  await validateLoadedSecretMaterial(successfulProvider, config)
+  assert.equal(successfulCopies.every((copy) => copy.every((byte) => byte === 0)), true)
+  assert.equal(successfulProvider.readSecret({
+    secretName: DEVICE_HMAC_SECRET_NAME,
+    versionId: HMAC_VERSION_ONE
+  }).toString(), firstHmac)
+
+  const invalidCopy = Buffer.from('invalid-material')
+  await expectCode(
+    () => validateLoadedSecretMaterial({
+      readSecret: (reference) => reference.secretName === ADMIN_SECRET_NAME
+        ? Buffer.from(adminMaterial)
+        : invalidCopy
+    }, config),
+    'SECRET_MATERIAL_INVALID'
+  )
+  assert.equal(invalidCopy.every((byte) => byte === 0), true)
 }
 
 async function run() {

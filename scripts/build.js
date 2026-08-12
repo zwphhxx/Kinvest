@@ -17,7 +17,10 @@ const runtimeFiles = [
   'server/security/cvm-ssm-secret-provider.js',
   'server/security/secret-provider.js',
   'server/security/secret-bootstrap-contract.js',
+  'server/security/secret-bootstrap.js',
   'server/services/health.js',
+  'server/security/tencent-ssm-client.js',
+  'server/secret-preflight.js',
   'server/services/refresh-rules.js',
   'server/utils/refresh-policy.js',
   'public/index.html',
@@ -48,6 +51,7 @@ const distPackageJson = {
   private: packageJson.private,
   type: packageJson.type,
   engines: packageJson.engines,
+  dependencies: packageJson.dependencies,
   scripts: {
     start: packageJson.scripts.start
   }

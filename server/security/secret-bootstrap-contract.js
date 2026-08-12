@@ -286,6 +286,8 @@ async function validateLoadedSecretMaterial(provider, config) {
       }
     } catch {
       fail('SECRET_MATERIAL_INVALID')
+    } finally {
+      if (Buffer.isBuffer(raw)) raw.fill(0)
     }
   }
 

@@ -44,10 +44,13 @@ async function runBuildArtifactsExist() {
     'server/db/device-auth-repository.js',
     'server/db/refresh-db.js',
     'server/domain/security-identity.js',
+    'server/secret-preflight.js',
     'server/security/cvm-ssm-secret-provider.js',
     'server/security/device-approval.js',
     'server/security/secret-bootstrap-contract.js',
+    'server/security/secret-bootstrap.js',
     'server/security/secret-provider.js',
+    'server/security/tencent-ssm-client.js',
     'server/server.js',
     'server/services/health.js',
     'server/services/refresh-rules.js',
@@ -69,6 +72,19 @@ async function runBuildArtifactsExist() {
       listRelativeFiles(path.join(repositoryRoot, 'dist')),
       expectedArtifacts
     )
+    const sourcePackage = JSON.parse(fs.readFileSync(
+      path.join(repositoryRoot, 'package.json'),
+      'utf8'
+    ))
+    const distPackage = JSON.parse(fs.readFileSync(
+      path.join(repositoryRoot, 'dist', 'package.json'),
+      'utf8'
+    ))
+    assert.deepEqual(distPackage.dependencies, sourcePackage.dependencies)
+    assert.deepEqual(distPackage.dependencies, {
+      'tencentcloud-sdk-nodejs-common': '4.1.220',
+      'tencentcloud-sdk-nodejs-ssm': '4.1.275'
+    })
 
     for (const artifact of expectedArtifacts.filter((file) => file.endsWith('.html'))) {
       const html = fs.readFileSync(path.join(repositoryRoot, 'dist', artifact), 'utf8')

@@ -3,6 +3,7 @@ const {
   SecretProviderError,
   validateSecretReference
 } = require('./secret-provider')
+const { createTencentSsmClient } = require('./tencent-ssm-client')
 
 const REGION = 'ap-shanghai'
 const METADATA_IP = '169.254.0.23'
@@ -37,7 +38,7 @@ class LoadedSecretProvider {
     const { secretName, versionId } = validateSecretReference(reference)
     const value = this.#entries.get(secretName + ':' + versionId)
     if (!value) throw new SecretProviderError('SECRET_NOT_FOUND')
-    return value
+    return Buffer.from(value)
   }
 
   clear() {
@@ -182,7 +183,7 @@ async function loadCvmSsmSecrets({
   references,
   roleName,
   metadataRequest = requestCvmMetadata,
-  clientFactory,
+  clientFactory = createTencentSsmClient,
   region = REGION,
   now = Date.now,
   audit = () => {}
@@ -214,7 +215,7 @@ async function loadCvmSsmSecrets({
 
   const entries = new Map()
   try {
-    for (const reference of normalizedReferences) {
+    for (const [referenceIndex, reference] of normalizedReferences.entries()) {
       if (!isValidTemporaryCredentials(credentials, now())) {
         throw new CvmSsmSecretProviderError('TEMPORARY_CREDENTIALS_REQUIRED')
       }
@@ -235,8 +236,7 @@ async function loadCvmSsmSecrets({
         Buffer.from(response.SecretString)
       )
       audit('ssm_secret_version_loaded', {
-        secretName: reference.secretName,
-        versionId: reference.versionId,
+        loadedCount: referenceIndex + 1,
         region
       })
     }

@@ -92,6 +92,21 @@ async function run() {
     secretName: SECRET_NAME,
     versionId: 'v20260802-001'
   }).toString(), 'hmac-secret-one')
+  const firstRead = provider.readSecret({
+    secretName: SECRET_NAME,
+    versionId: 'v20260802-001'
+  })
+  const secondRead = provider.readSecret({
+    secretName: SECRET_NAME,
+    versionId: 'v20260802-001'
+  })
+  assert.notStrictEqual(firstRead, secondRead)
+  firstRead.fill(0)
+  assert.equal(secondRead.toString(), 'hmac-secret-one')
+  assert.equal(provider.readSecret({
+    secretName: SECRET_NAME,
+    versionId: 'v20260802-001'
+  }).toString(), 'hmac-secret-one')
   const serializedAudit = JSON.stringify(audit)
   assert.equal(serializedAudit.includes('hmac-secret-one'), false)
   assert.equal(serializedAudit.includes('temporary-key'), false)
