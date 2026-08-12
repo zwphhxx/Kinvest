@@ -30,7 +30,7 @@ if mode != "cleanup-created-link":
 try:
     with open(state_path, "r", encoding="ascii") as state:
         fields = state.read().split()
-    if len(fields) != 3 or fields[0] not in {"armed", "created"}:
+    if len(fields) != 3 or fields[0] != "armed":
         raise SystemExit(0)
     expected_device, expected_inode = map(int, fields[1:])
     target = os.lstat(output_path)
@@ -301,10 +301,6 @@ try:
         or checksum(output_path) != expected_checksum
     ):
         publication_failed(source_stat)
-    with open(state_path, "w", encoding="ascii") as state:
-        state.write(f"created {target_stat.st_dev} {target_stat.st_ino}\n")
-        state.flush()
-        os.fsync(state.fileno())
     os.unlink(temporary_path)
     final_stat = os.lstat(output_path)
     if (

@@ -934,6 +934,7 @@ function runOfflineExportFixture({
   publishRace = false,
   mutateAfterVerify = 'none',
   signalAfterLink = false,
+  signalAtStateTransition = false,
   outputSuffix = ''
 } = {}) {
   const fixtureRoot = fs.mkdtempSync(path.join(os.tmpdir(), 'kinvest-offline-export-'))
@@ -1020,6 +1021,50 @@ with open(script_path, "rb") as source:
 exec(source_code, {"__name__": "__main__"})
 PY
     fi
+    if [ "$FAKE_EXPORT_SIGNAL_AT_STATE_TRANSITION" = '1' ]; then
+      publisher_script="$FAKE_EXPORT_STATE/publisher-state-transition.py"
+      cat > "$publisher_script"
+      exec "$FAKE_EXPORT_REAL_PYTHON" - "$publisher_script" "$@" <<'PY'
+import builtins
+import os
+import signal
+import sys
+
+script_path = sys.argv[1]
+publisher_argv = sys.argv[2:]
+temporary_path = publisher_argv[2]
+state_path = publisher_argv[6]
+real_open = builtins.open
+real_unlink = os.unlink
+state_writes = 0
+
+def faulting_open(path, mode="r", *args, **kwargs):
+    global state_writes
+    if os.fspath(path) == state_path and mode == "w":
+        state_writes += 1
+        if state_writes == 2:
+            truncated = real_open(path, mode, *args, **kwargs)
+            truncated.flush()
+            os.fsync(truncated.fileno())
+            truncated.close()
+            os.kill(os.getppid(), signal.SIGTERM)
+            raise SystemExit(143)
+    return real_open(path, mode, *args, **kwargs)
+
+def faulting_unlink(path, *args, **kwargs):
+    if os.fspath(path) == temporary_path and state_writes < 2:
+        os.kill(os.getppid(), signal.SIGTERM)
+        raise SystemExit(143)
+    return real_unlink(path, *args, **kwargs)
+
+builtins.open = faulting_open
+os.unlink = faulting_unlink
+sys.argv = publisher_argv
+with open(script_path, "rb") as source:
+    source_code = compile(source.read(), script_path, "exec")
+exec(source_code, {"__name__": "__main__"})
+PY
+    fi
     exec "$FAKE_EXPORT_REAL_PYTHON" "$@"
   fi
   cat >/dev/null
@@ -1078,6 +1123,7 @@ exec "$FAKE_EXPORT_REAL_MV" "$@"
         FAKE_EXPORT_REAL_SHASUM: realShasum,
         FAKE_EXPORT_MUTATE_AFTER_VERIFY: mutateAfterVerify,
         FAKE_EXPORT_SIGNAL_AFTER_LINK: signalAfterLink ? '1' : '0',
+        FAKE_EXPORT_SIGNAL_AT_STATE_TRANSITION: signalAtStateTransition ? '1' : '0',
         FAKE_EXPORT_RUNTIME_IMAGE_ID: runtimeImageId,
         FAKE_EXPORT_SOURCE: sourceReference,
         FAKE_EXPORT_STATE: fakeState,
@@ -1601,6 +1647,8 @@ function run() {
   assert.match(deployV2Runbook, /device, inode, size, mode, owner, and SHA-256/i)
   assert.match(deployV2Runbook, /same process-created inode/i)
   assert.match(deployV2Runbook, /armed.*before.*hard link/i)
+  assert.match(deployV2Runbook, /armed record remains unchanged/i)
+  assert.doesNotMatch(deployV2Runbook, /normal `created` state/i)
   assert.match(deployV2Runbook, /four-asset transaction/i)
   assert.match(deployV2Runbook, /prior file or prior absence/i)
   assert.match(deployV2Runbook, /ignore handled signals during restoration/i)
@@ -1738,6 +1786,21 @@ function run() {
     )
   } finally {
     linkedSignal.cleanup()
+  }
+
+  const stateTransitionSignal = runOfflineExportFixture({ signalAtStateTransition: true })
+  try {
+    assert.notEqual(stateTransitionSignal.result.status, 0)
+    assert.equal(stateTransitionSignal.result.stdout, '')
+    assert.equal(fs.existsSync(stateTransitionSignal.outputPath), false)
+    assert.deepEqual(
+      fs.readdirSync(path.dirname(stateTransitionSignal.outputPath)).filter((name) =>
+        name.includes('temporary') || name.includes('publication')
+      ),
+      []
+    )
+  } finally {
+    stateTransitionSignal.cleanup()
   }
 
   for (const outputSuffix of ['\nforged=1', '\rforged=1', '\tforged=1', '\u001fforged=1', '\u007fforged=1']) {

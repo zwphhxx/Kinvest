@@ -127,8 +127,9 @@ final path only when it is still the same process-created inode recorded at link
 creation; a raced replacement is never removed. Output paths containing control
 characters are rejected so metadata remains one field per line.
 The exporter fsyncs an `armed` device/inode cleanup record before the hard link.
-If a signal lands after link creation but before normal `created` state is
-persisted, cleanup can therefore remove only that still-matching archive inode.
+The armed record remains unchanged through link validation and metadata output;
+there is no destructive normal-state rewrite. If a signal lands after link
+creation, cleanup can therefore remove only that still-matching archive inode.
 
 ## Release record v2
 
