@@ -60,6 +60,44 @@ async function run() {
     sdkLoader: () => actualSdk
   })
   assert.equal(typeof smokeClient.getSecretValue, 'function')
+
+  const secretMarker = 'fixture-secret-must-not-leak'
+  const failingClient = createTencentSsmClient({
+    region: 'ap-shanghai',
+    credentials: TEMPORARY_CREDENTIALS,
+    sdkLoader: () => ({
+      ssm: {
+        v20190923: {
+          Client: class {
+            async GetSecretValue() {
+              throw new Error(`${secretMarker} RequestId=fixture`)
+            }
+          }
+        }
+      }
+    })
+  })
+  await assert.rejects(failingClient.getSecretValue({
+    SecretName: 'fixture-name',
+    VersionId: 'v20260812-001'
+  }), (error) => {
+    assert.ok(error instanceof Error)
+    assert.equal('code' in error && error.code, 'SSM_REQUEST_FAILED')
+    assert.equal(error.message.includes(secretMarker), false)
+    assert.equal(error.message.includes('RequestId'), false)
+    return true
+  })
+
+  assert.throws(() => createTencentSsmClient({
+    region: 'ap-shanghai',
+    credentials: TEMPORARY_CREDENTIALS,
+    sdkLoader: () => { throw new Error(secretMarker) }
+  }), (error) => {
+    assert.ok(error instanceof Error)
+    assert.equal('code' in error && error.code, 'SSM_CLIENT_UNAVAILABLE')
+    assert.equal(error.message.includes(secretMarker), false)
+    return true
+  })
 }
 
 module.exports = { run }

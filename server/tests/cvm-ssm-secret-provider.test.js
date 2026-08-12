@@ -110,6 +110,8 @@ async function run() {
   const serializedAudit = JSON.stringify(audit)
   assert.equal(serializedAudit.includes('hmac-secret-one'), false)
   assert.equal(serializedAudit.includes('temporary-key'), false)
+  assert.equal(serializedAudit.includes(SECRET_NAME), false)
+  assert.equal(serializedAudit.includes('v20260802-001'), false)
   provider.clear()
   assert.throws(() => provider.readSecret({
     secretName: SECRET_NAME,

@@ -386,7 +386,14 @@ async function startServer({
   }
   const handleSignal = () => {
     cleanup()
-    runtimeServer.close()
+    try {
+      runtimeServer.close()
+    } catch (error) {
+      if (!error || typeof error !== 'object' ||
+        !('code' in error) || error.code !== 'ERR_SERVER_NOT_RUNNING') {
+        throw error
+      }
+    }
   }
   processRef.once('SIGTERM', handleSignal)
   processRef.once('SIGINT', handleSignal)
