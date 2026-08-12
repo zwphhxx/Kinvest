@@ -8,6 +8,8 @@ REPOSITORY_ROOT="$(cd -- "$SCRIPT_DIR/.." && pwd -P)"
 VERIFIER="$REPOSITORY_ROOT/deploy/server/offline-image-attestation.py"
 TEMPORARY_PATH=''
 PUBLICATION_STATE=''
+ANCHOR_DIRECTORY=''
+ANCHOR_PATH=''
 SUCCESS_METADATA_COMPLETED='false'
 
 usage() {
@@ -46,6 +48,35 @@ PY
   fi
   if [[ -n "$TEMPORARY_PATH" ]]; then
     rm -f -- "$TEMPORARY_PATH"
+  fi
+  if [[ -n "$ANCHOR_DIRECTORY" ]]; then
+    python3 - cleanup-anchor "$ANCHOR_DIRECTORY" "$ANCHOR_PATH" <<'PY' || true
+import os
+import stat
+import sys
+
+mode, directory_path, anchor_path = sys.argv[1:]
+if mode != "cleanup-anchor":
+    raise SystemExit(1)
+try:
+    directory = os.lstat(directory_path)
+    if (
+        not stat.S_ISDIR(directory.st_mode)
+        or stat.S_ISLNK(directory.st_mode)
+        or stat.S_IMODE(directory.st_mode) != 0o700
+        or directory.st_uid != os.getuid()
+    ):
+        raise SystemExit(0)
+    try:
+        anchor = os.lstat(anchor_path)
+        if stat.S_ISREG(anchor.st_mode) and not stat.S_ISLNK(anchor.st_mode):
+            os.unlink(anchor_path)
+    except FileNotFoundError:
+        pass
+    os.rmdir(directory_path)
+except (FileNotFoundError, OSError):
+    pass
+PY
   fi
   if [[ -n "$PUBLICATION_STATE" ]]; then
     rm -f -- "$PUBLICATION_STATE"
@@ -159,6 +190,67 @@ if [[ ! "$archive_identity" =~ ^[0-9]+:[0-9]+:[0-9]+:384:[0-9]+$ ]]; then
   exit 1
 fi
 
+ANCHOR_DIRECTORY="$(mktemp -d "$(dirname -- "$OUTPUT_PATH")/.kinvest-offline-anchor.XXXXXX")"
+chmod 0700 "$ANCHOR_DIRECTORY"
+ANCHOR_PATH="$ANCHOR_DIRECTORY/archive"
+python3 - create-anchor "$TEMPORARY_PATH" "$ANCHOR_DIRECTORY" "$ANCHOR_PATH" "$archive_checksum" "$archive_identity" <<'PY'
+import hashlib
+import os
+import stat
+import sys
+
+mode, temporary_path, directory_path, anchor_path, expected_checksum, expected_identity = sys.argv[1:]
+if mode != "create-anchor":
+    raise SystemExit(1)
+
+def checksum(path):
+    digest = hashlib.sha256()
+    with open(path, "rb", buffering=0) as source:
+        for chunk in iter(lambda: source.read(1024 * 1024), b""):
+            digest.update(chunk)
+    return digest.hexdigest()
+
+def identity(value):
+    return f"{value.st_dev}:{value.st_ino}:{value.st_size}:{stat.S_IMODE(value.st_mode)}:{value.st_uid}"
+
+directory = os.lstat(directory_path)
+temporary = os.lstat(temporary_path)
+if (
+    not stat.S_ISDIR(directory.st_mode)
+    or stat.S_ISLNK(directory.st_mode)
+    or stat.S_IMODE(directory.st_mode) != 0o700
+    or directory.st_uid != os.getuid()
+    or directory.st_dev != temporary.st_dev
+    or not stat.S_ISREG(temporary.st_mode)
+    or stat.S_ISLNK(temporary.st_mode)
+    or stat.S_IMODE(temporary.st_mode) != 0o600
+    or temporary.st_uid != os.getuid()
+    or identity(temporary) != expected_identity
+    or checksum(temporary_path) != expected_checksum
+):
+    raise SystemExit(1)
+try:
+    os.lstat(anchor_path)
+except FileNotFoundError:
+    pass
+else:
+    raise SystemExit(1)
+os.link(temporary_path, anchor_path, follow_symlinks=False)
+anchor = os.lstat(anchor_path)
+if (
+    not stat.S_ISREG(anchor.st_mode)
+    or stat.S_ISLNK(anchor.st_mode)
+    or not os.path.samestat(temporary, anchor)
+    or identity(anchor) != expected_identity
+    or checksum(anchor_path) != expected_checksum
+):
+    try:
+        os.unlink(anchor_path)
+    except OSError:
+        pass
+    raise SystemExit(1)
+PY
+
 verification_output="$(
   python3 "$VERIFIER" verify-archive \
     "$TEMPORARY_PATH" "$archive_checksum" "$SOURCE_REFERENCE"
@@ -236,6 +328,43 @@ if [[ "$post_verification_identity" != "$archive_identity" ]]; then
   printf '%s\n' 'offline image archive changed after verification' >&2
   exit 1
 fi
+python3 - verify-anchor "$TEMPORARY_PATH" "$ANCHOR_PATH" "$archive_checksum" "$archive_identity" <<'PY'
+import hashlib
+import os
+import stat
+import sys
+
+mode, temporary_path, anchor_path, expected_checksum, expected_identity = sys.argv[1:]
+if mode != "verify-anchor":
+    raise SystemExit(1)
+
+def checksum(path):
+    digest = hashlib.sha256()
+    with open(path, "rb", buffering=0) as source:
+        for chunk in iter(lambda: source.read(1024 * 1024), b""):
+            digest.update(chunk)
+    return digest.hexdigest()
+
+def identity(value):
+    return f"{value.st_dev}:{value.st_ino}:{value.st_size}:{stat.S_IMODE(value.st_mode)}:{value.st_uid}"
+
+temporary = os.lstat(temporary_path)
+anchor = os.lstat(anchor_path)
+if (
+    not stat.S_ISREG(temporary.st_mode)
+    or stat.S_ISLNK(temporary.st_mode)
+    or stat.S_IMODE(temporary.st_mode) != 0o600
+    or temporary.st_uid != os.getuid()
+    or not stat.S_ISREG(anchor.st_mode)
+    or stat.S_ISLNK(anchor.st_mode)
+    or not os.path.samestat(temporary, anchor)
+    or identity(temporary) != expected_identity
+    or identity(anchor) != expected_identity
+    or checksum(temporary_path) != expected_checksum
+    or checksum(anchor_path) != expected_checksum
+):
+    raise SystemExit(1)
+PY
 
 archive_size="$(wc -c < "$TEMPORARY_PATH" | tr -d '[:space:]')"
 if [[ ! "$archive_size" =~ ^[1-9][0-9]*$ ]]; then
@@ -246,13 +375,13 @@ if [[ -e "$OUTPUT_PATH" || -L "$OUTPUT_PATH" ]]; then
   printf '%s\n' 'offline image export output appeared during export' >&2
   exit 1
 fi
-python3 - publish-no-replace "$TEMPORARY_PATH" "$OUTPUT_PATH" "$archive_checksum" "$archive_identity" "$PUBLICATION_STATE" <<'PY'
+python3 - publish-no-replace "$TEMPORARY_PATH" "$OUTPUT_PATH" "$archive_checksum" "$archive_identity" "$PUBLICATION_STATE" "$ANCHOR_PATH" <<'PY'
 import hashlib
 import os
 import stat
 import sys
 
-mode, temporary_path, output_path, expected_checksum, expected_identity, state_path = sys.argv[1:]
+mode, temporary_path, output_path, expected_checksum, expected_identity, state_path, anchor_path = sys.argv[1:]
 if mode != "publish-no-replace":
     raise SystemExit(1)
 
@@ -279,7 +408,14 @@ def publication_failed(source_stat=None):
 
 try:
     source_stat = os.lstat(temporary_path)
-    if identity(source_stat) != expected_identity or checksum(temporary_path) != expected_checksum:
+    anchor_stat = os.lstat(anchor_path)
+    if (
+        identity(source_stat) != expected_identity
+        or identity(anchor_stat) != expected_identity
+        or not os.path.samestat(source_stat, anchor_stat)
+        or checksum(temporary_path) != expected_checksum
+        or checksum(anchor_path) != expected_checksum
+    ):
         publication_failed()
     with open(state_path, "w", encoding="ascii") as state:
         state.write(f"armed {source_stat.st_dev} {source_stat.st_ino}\n")
@@ -297,8 +433,10 @@ try:
         or stat.S_IMODE(target_stat.st_mode) != 0o600
         or target_stat.st_uid != os.getuid()
         or not os.path.samestat(source_stat, target_stat)
+        or not os.path.samestat(anchor_stat, target_stat)
         or identity(target_stat) != expected_identity
         or checksum(output_path) != expected_checksum
+        or checksum(anchor_path) != expected_checksum
     ):
         publication_failed(source_stat)
     os.unlink(temporary_path)
@@ -309,14 +447,54 @@ try:
         or stat.S_IMODE(final_stat.st_mode) != 0o600
         or final_stat.st_uid != os.getuid()
         or not os.path.samestat(source_stat, final_stat)
+        or not os.path.samestat(anchor_stat, final_stat)
         or identity(final_stat) != expected_identity
         or checksum(output_path) != expected_checksum
+        or checksum(anchor_path) != expected_checksum
     ):
         publication_failed(source_stat)
 except OSError:
     publication_failed(source_stat)
 PY
 TEMPORARY_PATH=''
+
+python3 - verify-published-anchor "$OUTPUT_PATH" "$ANCHOR_PATH" "$archive_checksum" "$archive_identity" <<'PY'
+import hashlib
+import os
+import stat
+import sys
+
+mode, output_path, anchor_path, expected_checksum, expected_identity = sys.argv[1:]
+if mode != "verify-published-anchor":
+    raise SystemExit(1)
+
+def checksum(path):
+    digest = hashlib.sha256()
+    with open(path, "rb", buffering=0) as source:
+        for chunk in iter(lambda: source.read(1024 * 1024), b""):
+            digest.update(chunk)
+    return digest.hexdigest()
+
+def identity(value):
+    return f"{value.st_dev}:{value.st_ino}:{value.st_size}:{stat.S_IMODE(value.st_mode)}:{value.st_uid}"
+
+output = os.lstat(output_path)
+anchor = os.lstat(anchor_path)
+if (
+    not stat.S_ISREG(output.st_mode)
+    or stat.S_ISLNK(output.st_mode)
+    or stat.S_IMODE(output.st_mode) != 0o600
+    or output.st_uid != os.getuid()
+    or not stat.S_ISREG(anchor.st_mode)
+    or stat.S_ISLNK(anchor.st_mode)
+    or not os.path.samestat(output, anchor)
+    or identity(output) != expected_identity
+    or identity(anchor) != expected_identity
+    or checksum(output_path) != expected_checksum
+    or checksum(anchor_path) != expected_checksum
+):
+    raise SystemExit(1)
+PY
 
 final_checksum="$(shasum -a 256 "$OUTPUT_PATH" | awk '{print $1}')"
 if [[ "$final_checksum" != "$archive_checksum" ]]; then

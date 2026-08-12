@@ -45,14 +45,19 @@ contain both:
 - exactly one Docker `manifest.json` entry selecting the `linux/amd64` config
   and layer blobs that `docker load` can consume.
 
-The helper writes through a private same-filesystem temporary file and records a
-durable armed-state cleanup identity before publication. After validation it
-publishes the exact destination with a no-overwrite hard link, confirms that the
-temporary and final names still identify the same verified inode, and re-hashes
-the final bytes before reporting success. Interruption before completed success
-removes only that process's linked inode. Output contains only the path, SHA-256,
-size, source digest, platform manifest digest, and runtime config digest. The
-helper never reads registry credentials directly or writes them to the archive.
+The helper writes through a private same-filesystem temporary file. Before
+verification it creates a private same-filesystem `0700` directory and a
+no-overwrite hard-link anchor to the temporary archive. Keeping that link alive
+prevents Linux from recycling the verified inode if the temporary path is
+unlinked and replaced with identical bytes. The helper records a durable armed-state
+cleanup identity before publication, compares temporary, anchor, and
+output identities and checksums at each boundary, and re-hashes the final bytes
+before the no-overwrite hard link reports success. Interruption before completed success removes only
+that process's linked inode. The anchor is removed on success, failure, and
+handled signals, and it never appears in success metadata. Output contains only
+the path, SHA-256, size, source digest, platform manifest digest, and runtime
+config digest. The helper never reads registry credentials directly or writes
+them to the archive.
 
 ## Import verification
 

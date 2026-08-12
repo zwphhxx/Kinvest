@@ -173,7 +173,12 @@ while [ "$#" -gt 0 ]; do
   case "$1" in --signal=*|--kill-after=*) shift ;; *) break ;; esac
 done
 shift
-printf '%s\n' "$*" >> "$KINVEST_FAKE_STATE/timeout.log"
+case "$1" in
+  */kinvest-offline-image-attestation)
+    printf '%s\n' "$*" > "$KINVEST_FAKE_STATE/offline-helper-timeout.log"
+    ;;
+  *) printf '%s\n' "$*" >> "$KINVEST_FAKE_STATE/timeout.log" ;;
+esac
 if [ "$KINVEST_FAKE_MODE" = offline-helper-timeout ] && [ "$1" = "$KINVEST_OFFLINE_HELPER_PATH" ]; then exit 124; fi
 exec "$@"
 `
@@ -237,7 +242,7 @@ printf '%s\n' '{"status":"ok","service":"kinvest"}'
 `
   )
   writeExecutable(
-    offlineImageAttestation,
+  offlineImageAttestation,
     `#!/bin/sh
 printf '%s\n' "$*" >> "$KINVEST_FAKE_STATE/offline-helper.log"
 [ "$1" = resolve ] || exit 2
@@ -647,7 +652,14 @@ printf '%s  %s\n' "$checksum" "$path"
     `#!/bin/sh
 set -eu
 for path do :; done
-mode="$(/usr/bin/stat -f '%Lp' "$path")"
+mode="$("$KINVEST_REAL_PYTHON" - "$path" <<'PY'
+import os
+import stat
+import sys
+
+print(format(stat.S_IMODE(os.lstat(sys.argv[1]).st_mode), "o"))
+PY
+)"
 printf '0:0:%s\n' "$mode"
 `,
     { mode: 0o755 }
@@ -867,6 +879,11 @@ async function run() {
   assert.match(deploy, /atomic_write_attempt_state/)
   assert.match(deploy, /run_docker stop kinvest/)
   assert.match(deploy, /verify_public_health/)
+  assert.match(
+    deploy,
+    /verify_running_image "\$candidate_runtime_image_id" \|\| rollback "\$\?"/,
+    'candidate runtime identity failure must invoke rollback explicitly without ERR trap inheritance'
+  )
   assert.match(deploy, /protocolVersion=3/)
   assert.match(deploy, /^METADATA_NETWORK_CONFIG='\/etc\/kinvest\/metadata-network\.conf'$/m)
   assert.match(deploy, /^METADATA_FIREWALL='\/usr\/local\/sbin\/kinvest-metadata-firewall'$/m)
@@ -1276,7 +1293,7 @@ async function run() {
       assert.equal(fs.readdirSync(helperFailure.runRoot).length, 0, `${mode} must clean helper temp files`)
       if (mode === 'offline-helper-timeout') {
         assert.ok(
-          readLogLines(path.join(helperFailure.fakeState, 'timeout.log')).some((line) => line.includes('kinvest-offline-image-attestation resolve')),
+          readLogLines(path.join(helperFailure.fakeState, 'offline-helper-timeout.log')).some((line) => line.includes('kinvest-offline-image-attestation resolve')),
           'helper resolution must use the bounded timeout wrapper'
         )
       }
@@ -1635,8 +1652,18 @@ async function run() {
   for (const mode of ['runtime-ref-mismatch', 'runtime-id-mismatch']) {
     const runtimeMismatch = runRootFixture(deploy, { mode })
     try {
-      assert.notEqual(runtimeMismatch.result.status, 0, `${mode} must fail runtime identity verification`)
-      assert.match(runtimeMismatch.result.stderr, /evaluating verified rollback/)
+      assert.equal(runtimeMismatch.result.status, 1, `${mode} must preserve the candidate verification failure status`)
+      assert.equal(
+        (runtimeMismatch.result.stderr.match(/Kinvest deployment failed; evaluating verified rollback\./g) ?? []).length,
+        1,
+        `${mode} must enter verified rollback exactly once on Bash 5`
+      )
+      assert.equal(
+        readLogLines(path.join(runtimeMismatch.fakeState, 'image-env.log'))
+          .filter((line) => line === `compose|${runtimeMismatch.previousImageId}`).length,
+        1,
+        `${mode} must restore the previous image exactly once`
+      )
     } finally {
       runtimeMismatch.cleanup()
     }

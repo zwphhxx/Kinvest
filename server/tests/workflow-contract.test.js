@@ -933,6 +933,7 @@ function runOfflineExportFixture({
   verifierFails = false,
   publishRace = false,
   mutateAfterVerify = 'none',
+  simulateReusedIdentity = false,
   signalAfterLink = false,
   signalAtStateTransition = false,
   outputSuffix = ''
@@ -993,7 +994,28 @@ esac
 set -eu
 printf '%s\n' "$*" >> "$FAKE_EXPORT_STATE/python.log"
 if [ "$1" = '-' ]; then
-  if [ "\${2:-}" = 'capture-identity' ] || [ "\${2:-}" = 'cleanup-created-link' ]; then
+  if [ "\${2:-}" = 'capture-identity' ]; then
+    count=0
+    [ ! -f "$FAKE_EXPORT_STATE/capture-identity-count" ] || count="$(cat "$FAKE_EXPORT_STATE/capture-identity-count")"
+    count=$((count + 1))
+    printf '%s\n' "$count" > "$FAKE_EXPORT_STATE/capture-identity-count"
+    if [ "$FAKE_EXPORT_SIMULATE_REUSED_IDENTITY" = '1' ] && [ "$count" -gt 1 ]; then
+      cat >/dev/null
+      cat "$FAKE_EXPORT_STATE/original-identity"
+      exit 0
+    fi
+    capture_output="$("$FAKE_EXPORT_REAL_PYTHON" "$@")"
+    if [ "$count" -eq 1 ]; then
+      printf '%s\n' "$capture_output" > "$FAKE_EXPORT_STATE/original-identity"
+    fi
+    printf '%s\n' "$capture_output"
+    exit 0
+  fi
+  if [ "\${2:-}" = 'cleanup-created-link' ] \
+    || [ "\${2:-}" = 'create-anchor' ] \
+    || [ "\${2:-}" = 'verify-anchor' ] \
+    || [ "\${2:-}" = 'verify-published-anchor' ] \
+    || [ "\${2:-}" = 'cleanup-anchor' ]; then
     exec "$FAKE_EXPORT_REAL_PYTHON" "$@"
   fi
   if [ "\${2:-}" = 'publish-no-replace' ]; then
@@ -1073,6 +1095,34 @@ PY
   exit 0
 fi
 if [ "$2" = 'verify-archive' ]; then
+  "$FAKE_EXPORT_REAL_PYTHON" - "$3" "$FAKE_EXPORT_ANCHOR_OBSERVED" <<'PY'
+import glob
+import os
+import stat
+import sys
+
+temporary_path, marker_path = sys.argv[1:]
+anchor_directories = glob.glob(
+    os.path.join(os.path.dirname(temporary_path), ".kinvest-offline-anchor.*")
+)
+if len(anchor_directories) != 1:
+    raise SystemExit(93)
+anchor_directory = anchor_directories[0]
+directory_stat = os.lstat(anchor_directory)
+anchor_path = os.path.join(anchor_directory, "archive")
+anchor_stat = os.lstat(anchor_path)
+temporary_stat = os.lstat(temporary_path)
+if (
+    not stat.S_ISDIR(directory_stat.st_mode)
+    or stat.S_IMODE(directory_stat.st_mode) != 0o700
+    or directory_stat.st_uid != os.getuid()
+    or not stat.S_ISREG(anchor_stat.st_mode)
+    or not os.path.samestat(anchor_stat, temporary_stat)
+):
+    raise SystemExit(94)
+with open(marker_path, "w", encoding="ascii") as marker:
+    marker.write("mode=700 same=1\\n")
+PY
   if [ "$FAKE_EXPORT_VERIFIER_FAILS" = '1' ]; then
     printf '%s\n' OFFLINE_ARCHIVE_INVALID >&2
     exit 1
@@ -1115,6 +1165,7 @@ exec "$FAKE_EXPORT_REAL_MV" "$@"
         PATH: `${fakeBin}:${process.env.PATH}`,
         FAKE_EXPORT_CHECKSUM: checksum,
         FAKE_EXPORT_ARCHIVE_BYTES: archiveBytes,
+        FAKE_EXPORT_ANCHOR_OBSERVED: path.join(fakeState, 'anchor-observed'),
         FAKE_EXPORT_PLATFORM_MANIFEST: platformManifest,
         FAKE_EXPORT_PUBLISH_RACE: publishRace ? '1' : '0',
         FAKE_EXPORT_RACE_OUTPUT: outputPath,
@@ -1122,6 +1173,7 @@ exec "$FAKE_EXPORT_REAL_MV" "$@"
         FAKE_EXPORT_REAL_MV: realMv,
         FAKE_EXPORT_REAL_SHASUM: realShasum,
         FAKE_EXPORT_MUTATE_AFTER_VERIFY: mutateAfterVerify,
+        FAKE_EXPORT_SIMULATE_REUSED_IDENTITY: simulateReusedIdentity ? '1' : '0',
         FAKE_EXPORT_SIGNAL_AFTER_LINK: signalAfterLink ? '1' : '0',
         FAKE_EXPORT_SIGNAL_AT_STATE_TRANSITION: signalAtStateTransition ? '1' : '0',
         FAKE_EXPORT_RUNTIME_IMAGE_ID: runtimeImageId,
@@ -1649,6 +1701,9 @@ function run() {
   assert.match(deployV2Runbook, /armed.*before.*hard link/i)
   assert.match(deployV2Runbook, /armed record remains unchanged/i)
   assert.doesNotMatch(deployV2Runbook, /normal `created` state/i)
+  assert.match(deployV2Runbook, /private same-filesystem[^\n]*0700[^\n]*hard-link anchor/i)
+  assert.match(deployV2Runbook, /anchor[^\n]*prevents[^\n]*inode[^\n]*reuse/i)
+  assert.match(deployV2Runbook, /anchor[^\n]*removed[^\n]*success[^\n]*failure[^\n]*signal/i)
   assert.match(deployV2Runbook, /four-asset transaction/i)
   assert.match(deployV2Runbook, /prior file or prior absence/i)
   assert.match(deployV2Runbook, /ignore handled signals during restoration/i)
@@ -1692,8 +1747,14 @@ function run() {
       ].join('\n')
     )
     assert.equal(offlineExport.result.stderr, '')
+    assert.equal(
+      fs.readFileSync(path.join(offlineExport.fakeState, 'anchor-observed'), 'utf8'),
+      'mode=700 same=1\n'
+    )
     assert.deepEqual(
-      fs.readdirSync(path.dirname(offlineExport.outputPath)).filter((name) => name.includes('temporary')),
+      fs.readdirSync(path.dirname(offlineExport.outputPath)).filter((name) =>
+        name.includes('temporary') || name.includes('publication') || name.includes('anchor')
+      ),
       []
     )
   } finally {
@@ -1730,7 +1791,9 @@ function run() {
     assert.notEqual(verifierFailure.result.status, 0)
     assert.equal(fs.existsSync(verifierFailure.outputPath), false)
     assert.deepEqual(
-      fs.readdirSync(path.dirname(verifierFailure.outputPath)).filter((name) => name.includes('temporary')),
+      fs.readdirSync(path.dirname(verifierFailure.outputPath)).filter((name) =>
+        name.includes('temporary') || name.includes('publication') || name.includes('anchor')
+      ),
       []
     )
   } finally {
@@ -1748,7 +1811,9 @@ function run() {
       'a raced output directory must never absorb the archive'
     )
     assert.deepEqual(
-      fs.readdirSync(path.dirname(publishRace.outputPath)).filter((name) => name.includes('temporary')),
+      fs.readdirSync(path.dirname(publishRace.outputPath)).filter((name) =>
+        name.includes('temporary') || name.includes('publication') || name.includes('anchor')
+      ),
       [],
       'publication failure must clean the private temporary archive'
     )
@@ -1764,13 +1829,36 @@ function run() {
       assert.equal(fs.existsSync(mutated.outputPath), false)
       assert.deepEqual(
         fs.readdirSync(path.dirname(mutated.outputPath)).filter((name) =>
-          name.includes('temporary') || name.includes('publication')
+          name.includes('temporary') || name.includes('publication') || name.includes('anchor')
         ),
         []
       )
     } finally {
       mutated.cleanup()
     }
+  }
+
+  const simulatedReuse = runOfflineExportFixture({
+    mutateAfterVerify: 'replace-path',
+    simulateReusedIdentity: true
+  })
+  try {
+    assert.notEqual(simulatedReuse.result.status, 0)
+    assert.equal(simulatedReuse.result.stdout, '')
+    assert.equal(fs.existsSync(simulatedReuse.outputPath), false)
+    assert.equal(
+      fs.readFileSync(path.join(simulatedReuse.fakeState, 'capture-identity-count'), 'utf8'),
+      '2\n',
+      'the fixture must simulate the old dev/inode identity check accepting replacement bytes'
+    )
+    assert.deepEqual(
+      fs.readdirSync(path.dirname(simulatedReuse.outputPath)).filter((name) =>
+        name.includes('temporary') || name.includes('publication') || name.includes('anchor')
+      ),
+      []
+    )
+  } finally {
+    simulatedReuse.cleanup()
   }
 
   const linkedSignal = runOfflineExportFixture({ signalAfterLink: true })
@@ -1780,7 +1868,7 @@ function run() {
     assert.equal(fs.existsSync(linkedSignal.outputPath), false)
     assert.deepEqual(
       fs.readdirSync(path.dirname(linkedSignal.outputPath)).filter((name) =>
-        name.includes('temporary') || name.includes('publication')
+        name.includes('temporary') || name.includes('publication') || name.includes('anchor')
       ),
       []
     )
@@ -1795,7 +1883,7 @@ function run() {
     assert.equal(fs.existsSync(stateTransitionSignal.outputPath), false)
     assert.deepEqual(
       fs.readdirSync(path.dirname(stateTransitionSignal.outputPath)).filter((name) =>
-        name.includes('temporary') || name.includes('publication')
+        name.includes('temporary') || name.includes('publication') || name.includes('anchor')
       ),
       []
     )

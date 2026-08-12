@@ -97,6 +97,9 @@ log in to Docker or read Docker credential configuration. Preserve the printed
 path, SHA-256, byte size, source digest, platform manifest digest, and runtime
 Image ID as non-secret transfer metadata. Transfer the archive separately and
 recalculate its SHA-256 on the server before import; both checksums must match.
+A private same-filesystem `0700` directory holds a no-overwrite hard-link anchor before verification.
+The anchor prevents an unlinked temporary inode from being reused for identical replacement bytes.
+The anchor is removed after success, failure, or signal cleanup and never appears in success metadata.
 
 After a separate server-import approval, root imports the archive using the
 release record's exact provenance:
@@ -130,6 +133,8 @@ The exporter fsyncs an `armed` device/inode cleanup record before the hard link.
 The armed record remains unchanged through link validation and metadata output;
 there is no destructive normal-state rewrite. If a signal lands after link
 creation, cleanup can therefore remove only that still-matching archive inode.
+Temporary, anchor, and output identities and checksums are compared before and
+after verification, during publication, and before success metadata is emitted.
 
 ## Release record v2
 

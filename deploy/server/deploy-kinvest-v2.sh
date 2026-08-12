@@ -1326,7 +1326,7 @@ if ((metadata_firewall_status != 0)); then
   rollback "$metadata_firewall_status"
 fi
 wait_for_health
-verify_running_image "$candidate_runtime_image_id"
+verify_running_image "$candidate_runtime_image_id" || rollback "$?"
 
 schema_after="$(read_database_schema)"
 if ! schema_in_range "$schema_after" "$candidate_schema_min" "$candidate_schema_max"; then
