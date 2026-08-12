@@ -579,7 +579,8 @@ function runUnsafeInstallerTargetFixture(installerSource) {
 function runTransactionalInstallerFixture(installerSource, {
   fault,
   helperInitiallyAbsent = false,
-  deploymentOwnsLock = false
+  deploymentOwnsLock = false,
+  forceInnerTimeout = false
 }) {
   const fixtureRoot = fs.mkdtempSync(path.join(os.tmpdir(), 'kinvest-installer-transaction-'))
   const fakeBin = path.join(fixtureRoot, 'bin')
@@ -790,12 +791,15 @@ exec "$KINVEST_REAL_PYTHON" "$@"
     { mode: 0o755 }
   )
 
-  const instrumentedInstaller = installerSource
+  let instrumentedInstaller = installerSource
     .replaceAll('/usr/local/sbin', localSbin)
     .replaceAll('/usr/local/libexec', localLibexec)
     .replaceAll('/run/kinvest-offline-pycache', path.join(runDir, 'kinvest-offline-pycache'))
     .replaceAll('/run/kinvest-deploy-v2-backup', path.join(runDir, 'kinvest-deploy-v2-backup'))
     .replaceAll('/root/docker/kinvest/state/deploy.lock', deployLock)
+  if (forceInnerTimeout) {
+    instrumentedInstaller = instrumentedInstaller.replace('\n', '\nsleep 1\n')
+  }
   const installerPath = path.join(fixtureRoot, 'install-deploy-v2.sh')
   fs.writeFileSync(installerPath, instrumentedInstaller, { mode: 0o755 })
   const installerEnvironment = {
@@ -819,14 +823,18 @@ import sys
 
 with open(sys.argv[3], "a+b") as lock_file:
     fcntl.flock(lock_file.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
-    completed = subprocess.run(
-        ["bash", sys.argv[1], sys.argv[2]],
-        env=os.environ,
-        stdout=subprocess.PIPE,
-        stderr=subprocess.PIPE,
-        text=True,
-        timeout=${transactionalInstallerNestedTimeoutSeconds},
-    )
+    try:
+        completed = subprocess.run(
+            ["bash", sys.argv[1], sys.argv[2]],
+            env=os.environ,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True,
+            timeout=${forceInnerTimeout ? 0.05 : transactionalInstallerNestedTimeoutSeconds},
+        )
+    except subprocess.TimeoutExpired:
+        sys.stderr.write("KINVEST_TEST_NESTED_TIMEOUT\\n")
+        raise SystemExit(124)
 sys.stdout.write(completed.stdout)
 sys.stderr.write(completed.stderr)
 raise SystemExit(completed.returncode)
@@ -861,6 +869,12 @@ function assertTransactionalFixtureCompleted(result, scenario) {
     `${scenario}: transactional installer fixture exceeded ${transactionalInstallerTimeoutMs}ms`
   )
   assert.equal(result.signal, null, `${scenario}: transactional installer fixture was terminated by ${result.signal}`)
+  assert.notEqual(result.status, 124, `${scenario}: nested transactional installer subprocess timed out`)
+  assert.doesNotMatch(
+    `${result.stdout}${result.stderr}`,
+    /KINVEST_TEST_NESTED_TIMEOUT/,
+    `${scenario}: nested transactional installer timeout marker must fail the harness guard`
+  )
 }
 
 async function run() {
@@ -1097,6 +1111,24 @@ async function run() {
     }
   } finally {
     deploymentLockedInstaller.cleanup()
+  }
+
+  const forcedInnerTimeout = runTransactionalInstallerFixture(installer, {
+    fault: 'lock-busy',
+    deploymentOwnsLock: true,
+    forceInnerTimeout: true
+  })
+  try {
+    assert.equal(forcedInnerTimeout.result.error, undefined)
+    assert.equal(forcedInnerTimeout.result.signal, null)
+    assert.throws(
+      () => assertTransactionalFixtureCompleted(forcedInnerTimeout.result, 'forced-inner-timeout'),
+      /nested transactional installer subprocess timed out/
+    )
+    assert.equal(forcedInnerTimeout.result.status, 124)
+    assert.match(forcedInnerTimeout.result.stderr, /KINVEST_TEST_NESTED_TIMEOUT/)
+  } finally {
+    forcedInnerTimeout.cleanup()
   }
 
   const directAdapterFixture = fs.mkdtempSync(path.join(os.tmpdir(), 'kinvest-attestation-adapter-'))
