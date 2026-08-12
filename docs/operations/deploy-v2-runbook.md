@@ -35,8 +35,18 @@ EOF
 The four non-secret provenance lines before `EOF` extend the original draft.
 They are required because the joint server deployment state cannot otherwise
 record the release record, workflow run, artifact source, or active SSM VersionId
-set. The current phase accepts only `{}` for secret versions; CAM/SSM activation
-will expand that validator in a separate reviewed PR.
+set. The final metadata line accepts one of three exact single-line forms:
+
+- `{}` for disabled secret bootstrap.
+- The canonical admin verifier and device HMAC VersionId mapping for a forward
+  deployment.
+- `{"rollback":"previous"}` for an explicit one-step rollback request.
+
+The shared validator rejects extra keys, alternate key order, aliases such as
+`current`, unsorted or duplicate accepted versions, and an active HMAC version
+that is not accepted. The rollback sentinel is never stored. It is resolved to
+the mapping in `previous.state` only when the requested digest and commit also
+match that state exactly.
 
 ## Registry behavior
 
@@ -88,6 +98,32 @@ stops the candidate, preserves `attempt.state`, prints
 `ROLLBACK_REQUIRES_DB_RESTORE`, and stops. A database restore remains a separate
 user-approved maintenance operation.
 
+`current.state`, `previous.state`, and `attempt.state` contain only canonical
+VersionId metadata or `{}`. They never contain a SecretString, STS credential,
+long-lived cloud credential, or rollback sentinel. Compose receives only the
+derived provider mode and the canonical VersionId JSON. Automatic rollback
+restores the previous image, commit, schema range, and VersionId mapping as one
+deployment state.
+
+## Candidate SSM preflight
+
+An enabled VersionId mapping adds a fail-closed candidate gate after immutable
+digest and schema-label verification but before database backup, Compose
+mutation, or attempt/success state writes:
+
+1. Require `io.kinvest.secret-bootstrap=1` on the candidate image.
+2. Confirm the J4-A preflight entry is a regular readable file in the image.
+3. Run it once as UID/GID `10001`, read-only, with all capabilities dropped,
+   `no-new-privileges`, and `--network container:kinvest`.
+4. Pass only `KINVEST_SECRET_PROVIDER_MODE=cvm-ssm` and the canonical VersionId
+   JSON.
+5. Accept only one exact stdout line with the expected reference count, empty
+   stderr, and exit status zero.
+
+Disabled `{}` deployments skip this preflight and retain the established Mock
+path. A rollback to an enabled previous mapping performs the same candidate
+preflight before restoring that release.
+
 Normal releases use `FORWARD` and must reference the current `origin/main`
 release record. Historical main releases require the explicit `ROLLBACK` intent
 and `ROLLBACK_V2` confirmation.
@@ -99,3 +135,8 @@ Only after explicit approval run the repository installer as root with the
 canonical server-source directory. The installer replaces the root program
 first and the forced wrapper second, validates shell syntax, prints only
 non-secret hashes, and does not restart a container.
+
+The J4-B repository changes do not install these assets or deploy production.
+Installing the validator, deployment script, and Compose file and performing a
+disabled `{}` baseline deployment belong to J4-C and require their own explicit
+approvals.
