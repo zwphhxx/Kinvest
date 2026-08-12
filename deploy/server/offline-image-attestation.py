@@ -3,6 +3,7 @@
 
 from __future__ import annotations
 
+import contextlib
 import dataclasses
 import datetime
 import hashlib
@@ -535,6 +536,256 @@ def verify_archive(
         _reject()
 
 
+def _verified_archive_from_documents(
+    roots: dict[str, bytes],
+    blobs: dict[str, _StoredBlob],
+    archive_sha256: str,
+    source_reference: str,
+) -> VerifiedArchive:
+    if _parse_json(roots["oci-layout"]) != {"imageLayoutVersion": "1.0.0"}:
+        _reject()
+    source_descriptor = _validate_root_index(
+        _parse_json(roots["index.json"]), source_reference, blobs
+    )
+    graph = _DescriptorGraph(blobs)
+    graph.visit(source_descriptor)
+    if graph.reachable != set(blobs):
+        _reject()
+    source_index = graph.blob_json(source_descriptor["digest"])
+    runtime_descriptor = _runtime_descriptor(source_index)
+    runtime_manifest = graph.blob_json(runtime_descriptor["digest"])
+    if (
+        not isinstance(runtime_manifest, dict)
+        or runtime_manifest.get("mediaType") != OCI_MANIFEST
+        or "artifactType" in runtime_manifest
+        or "subject" in runtime_manifest
+    ):
+        _reject()
+    config_descriptor = runtime_manifest.get("config")
+    layer_descriptors = runtime_manifest.get("layers")
+    if not isinstance(config_descriptor, dict) or not isinstance(layer_descriptors, list):
+        _reject()
+    config_media_type, config_digest, _ = _descriptor_fields(config_descriptor)
+    if config_media_type != OCI_CONFIG:
+        _reject()
+    config = graph.blob_json(config_digest)
+    schema_min, schema_max, secret_bootstrap = _schema_labels(config)
+    rootfs = config.get("rootfs")
+    diff_ids = (
+        rootfs.get("diff_ids")
+        if isinstance(rootfs, dict) and rootfs.get("type") == "layers"
+        else None
+    )
+    if (
+        not isinstance(diff_ids, list)
+        or len(diff_ids) != len(layer_descriptors)
+        or any(
+            not isinstance(value, str)
+            or not re.fullmatch(r"sha256:[0-9a-f]{64}", value)
+            for value in diff_ids
+        )
+    ):
+        _reject()
+    layer_paths = []
+    for layer in layer_descriptors:
+        _, layer_digest, _ = _descriptor_fields(layer)
+        layer_paths.append(f"blobs/sha256/{layer_digest.removeprefix('sha256:')}")
+    config_path = f"blobs/sha256/{config_digest.removeprefix('sha256:')}"
+    _validate_docker_manifest(
+        _parse_json(roots["manifest.json"]), config_path, layer_paths
+    )
+    return VerifiedArchive(
+        source_reference=source_reference,
+        platform="linux/amd64",
+        platform_manifest_digest=runtime_descriptor["digest"],
+        runtime_image_id=config_digest,
+        archive_sha256=archive_sha256,
+        schema_min=schema_min,
+        schema_max=schema_max,
+        secret_bootstrap=secret_bootstrap,
+    )
+
+
+@contextlib.contextmanager
+def _open_verified_archive_source(
+    archive: os.PathLike[str] | str,
+    archive_sha256: str,
+    source_reference: str,
+):
+    if not isinstance(archive_sha256, str) or not SHA256.fullmatch(archive_sha256):
+        _reject()
+    if not isinstance(source_reference, str) or not ALLOWED_SOURCE.fullmatch(source_reference):
+        _reject()
+    try:
+        path = Path(archive)
+        path_metadata = path.lstat()
+    except (OSError, TypeError, ValueError):
+        _reject("OFFLINE_ARCHIVE_UNREADABLE")
+    if not stat.S_ISREG(path_metadata.st_mode) or stat.S_ISLNK(path_metadata.st_mode):
+        _reject()
+    if path_metadata.st_size <= 0 or path_metadata.st_size > MAX_ARCHIVE_BYTES:
+        _reject()
+    flags = os.O_RDONLY | getattr(os, "O_CLOEXEC", 0) | getattr(os, "O_NOFOLLOW", 0)
+    try:
+        descriptor = os.open(path, flags)
+    except OSError:
+        _reject("OFFLINE_ARCHIVE_UNREADABLE")
+    try:
+        source = os.fdopen(descriptor, "rb")
+    except OSError:
+        try:
+            os.close(descriptor)
+        except OSError:
+            pass
+        _reject("OFFLINE_ARCHIVE_UNREADABLE")
+    try:
+        with source:
+            opened_metadata = os.fstat(source.fileno())
+            if (
+                not stat.S_ISREG(opened_metadata.st_mode)
+                or (path_metadata.st_dev, path_metadata.st_ino)
+                != (opened_metadata.st_dev, opened_metadata.st_ino)
+                or opened_metadata.st_size <= 0
+                or opened_metadata.st_size > MAX_ARCHIVE_BYTES
+            ):
+                _reject()
+            if _sha256_stream(source) != archive_sha256:
+                _reject("OFFLINE_ARCHIVE_CHECKSUM_MISMATCH")
+            roots, blobs = _read_archive(source)
+            final_checksum = _sha256_stream(source)
+            final_metadata = os.fstat(source.fileno())
+            stable_fields = ("st_dev", "st_ino", "st_mode", "st_size", "st_mtime_ns")
+            if (
+                final_checksum != archive_sha256
+                or any(
+                    getattr(opened_metadata, field) != getattr(final_metadata, field)
+                    for field in stable_fields
+                )
+            ):
+                _reject("OFFLINE_ARCHIVE_CHANGED")
+            verified = _verified_archive_from_documents(
+                roots,
+                blobs,
+                archive_sha256,
+                source_reference,
+            )
+            yield source, opened_metadata, verified
+    except ArchiveVerificationError:
+        raise
+    except OSError:
+        _reject("OFFLINE_ARCHIVE_UNREADABLE")
+
+
+def _copy_verified_source_to_snapshot(source: BinaryIO, destination: BinaryIO) -> tuple[str, int]:
+    digest = hashlib.sha256()
+    total = 0
+    try:
+        source.seek(0)
+        while True:
+            chunk = source.read(1024 * 1024)
+            if not chunk:
+                break
+            destination.write(chunk)
+            digest.update(chunk)
+            total += len(chunk)
+        destination.flush()
+        os.fsync(destination.fileno())
+        source.seek(0)
+    except OSError:
+        _reject("OFFLINE_ARCHIVE_SNAPSHOT_FAILED")
+    return digest.hexdigest(), total
+
+
+@contextlib.contextmanager
+def _verified_private_snapshot(
+    archive_path: os.PathLike[str] | str,
+    archive_sha256: str,
+    source_reference: str,
+    *,
+    owner_uid: int,
+    owner_gid: int,
+):
+    with _open_verified_archive_source(
+        archive_path,
+        archive_sha256,
+        source_reference,
+    ) as (source, opened_metadata, verified):
+        with tempfile.TemporaryDirectory(prefix="kinvest-offline-import-") as directory_name:
+            directory = Path(directory_name)
+            try:
+                directory.chmod(0o700)
+                directory_metadata = directory.lstat()
+            except OSError:
+                _reject("OFFLINE_ARCHIVE_SNAPSHOT_FAILED")
+            if (
+                not stat.S_ISDIR(directory_metadata.st_mode)
+                or stat.S_IMODE(directory_metadata.st_mode) != 0o700
+                or directory_metadata.st_uid != owner_uid
+                or directory_metadata.st_gid != owner_gid
+            ):
+                _reject("OFFLINE_ARCHIVE_SNAPSHOT_FAILED")
+            snapshot_path = directory / "verified-image.tar"
+            flags = (
+                os.O_WRONLY
+                | os.O_CREAT
+                | os.O_EXCL
+                | getattr(os, "O_CLOEXEC", 0)
+                | getattr(os, "O_NOFOLLOW", 0)
+            )
+            try:
+                descriptor = os.open(snapshot_path, flags, 0o600)
+            except OSError:
+                _reject("OFFLINE_ARCHIVE_SNAPSHOT_FAILED")
+            try:
+                destination = os.fdopen(descriptor, "wb")
+            except OSError:
+                try:
+                    os.close(descriptor)
+                except OSError:
+                    pass
+                _reject("OFFLINE_ARCHIVE_SNAPSHOT_FAILED")
+            with destination:
+                try:
+                    os.fchmod(destination.fileno(), 0o600)
+                    metadata = os.fstat(destination.fileno())
+                    if (metadata.st_uid, metadata.st_gid) != (owner_uid, owner_gid):
+                        os.fchown(destination.fileno(), owner_uid, owner_gid)
+                    copied_checksum, copied_size = _copy_verified_source_to_snapshot(
+                        source,
+                        destination,
+                    )
+                except ArchiveVerificationError:
+                    raise
+                except OSError:
+                    _reject("OFFLINE_ARCHIVE_SNAPSHOT_FAILED")
+            final_source_metadata = os.fstat(source.fileno())
+            stable_fields = ("st_dev", "st_ino", "st_mode", "st_size", "st_mtime_ns")
+            if (
+                copied_checksum != archive_sha256
+                or copied_size != opened_metadata.st_size
+                or any(
+                    getattr(opened_metadata, field)
+                    != getattr(final_source_metadata, field)
+                    for field in stable_fields
+                )
+            ):
+                _reject("OFFLINE_ARCHIVE_CHANGED")
+            try:
+                snapshot_metadata = snapshot_path.lstat()
+            except OSError:
+                _reject("OFFLINE_ARCHIVE_SNAPSHOT_FAILED")
+            if (
+                not stat.S_ISREG(snapshot_metadata.st_mode)
+                or stat.S_ISLNK(snapshot_metadata.st_mode)
+                or stat.S_IMODE(snapshot_metadata.st_mode) != 0o600
+                or snapshot_metadata.st_uid != owner_uid
+                or snapshot_metadata.st_gid != owner_gid
+                or snapshot_metadata.st_size != copied_size
+            ):
+                _reject("OFFLINE_ARCHIVE_SNAPSHOT_FAILED")
+            yield verified, snapshot_path
+
+
 def _attestation_reject(code: str = "OFFLINE_ATTESTATION_INVALID") -> None:
     raise OfflineAttestationError(code)
 
@@ -684,7 +935,15 @@ class AttestationStore:
         except OSError:
             _attestation_reject("OFFLINE_ATTESTATION_RECORD_UNSAFE")
         try:
-            with os.fdopen(descriptor, "rb") as source:
+            source = os.fdopen(descriptor, "rb")
+        except OSError:
+            try:
+                os.close(descriptor)
+            except OSError:
+                pass
+            _attestation_reject("OFFLINE_ATTESTATION_RECORD_UNSAFE")
+        try:
+            with source:
                 opened = os.fstat(source.fileno())
                 if (
                     (opened.st_dev, opened.st_ino)
@@ -871,9 +1130,10 @@ def _utc_now() -> str:
 
 
 def import_archive(
-    verified: VerifiedArchive,
     archive_path: os.PathLike[str] | str,
     *,
+    archive_sha256: str,
+    source_reference: str,
     commit: str,
     verification_run_id: str,
     state_dir: os.PathLike[str] | str = DEFAULT_STATE_DIR,
@@ -882,25 +1142,30 @@ def import_archive(
     owner_uid: int = 0,
     owner_gid: int = 0,
 ) -> AttestationRecord:
-    if not isinstance(verified, VerifiedArchive):
-        _attestation_reject()
     _validate_import_inputs(commit, verification_run_id)
-    _docker_call(
-        docker,
-        ["docker", "load", "--input", str(archive_path)],
-        DOCKER_LOAD_TIMEOUT_SECONDS,
-        "OFFLINE_ATTESTATION_LOAD_FAILED",
-    )
-    inspection = _inspect_image(
-        verified.runtime_image_id,
-        docker,
-        "OFFLINE_ATTESTATION_IMAGE_UNAVAILABLE",
-    )
-    _validate_inspection(
-        inspection,
-        verified.runtime_image_id,
-        (verified.schema_min, verified.schema_max, verified.secret_bootstrap),
-    )
+    with _verified_private_snapshot(
+        archive_path,
+        archive_sha256,
+        source_reference,
+        owner_uid=owner_uid,
+        owner_gid=owner_gid,
+    ) as (verified, snapshot_path):
+        _docker_call(
+            docker,
+            ["docker", "load", "--input", str(snapshot_path)],
+            DOCKER_LOAD_TIMEOUT_SECONDS,
+            "OFFLINE_ATTESTATION_LOAD_FAILED",
+        )
+        inspection = _inspect_image(
+            verified.runtime_image_id,
+            docker,
+            "OFFLINE_ATTESTATION_IMAGE_UNAVAILABLE",
+        )
+        _validate_inspection(
+            inspection,
+            verified.runtime_image_id,
+            (verified.schema_min, verified.schema_max, verified.secret_bootstrap),
+        )
     record = AttestationRecord(
         version=1,
         source_reference=verified.source_reference,
@@ -972,10 +1237,10 @@ def main(
         if len(arguments) == 6 and arguments[0] == "import":
             if geteuid() != 0:
                 _attestation_reject("OFFLINE_ATTESTATION_ROOT_REQUIRED")
-            verified = verify_archive(arguments[1], arguments[2], arguments[3])
             record = import_archive(
-                verified,
                 arguments[1],
+                archive_sha256=arguments[2],
+                source_reference=arguments[3],
                 commit=arguments[4],
                 verification_run_id=arguments[5],
                 state_dir=state_dir,
