@@ -926,11 +926,119 @@ chmod +x "$destination/crane"
   }
 }
 
+function runOfflineExportFixture({
+  sourceReference = `ghcr.io/zwphhxx/kinvest@sha256:${'7'.repeat(64)}`,
+  outputMode = 'new',
+  verifierFails = false
+} = {}) {
+  const fixtureRoot = fs.mkdtempSync(path.join(os.tmpdir(), 'kinvest-offline-export-'))
+  const fakeBin = path.join(fixtureRoot, 'bin')
+  const fakeState = path.join(fixtureRoot, 'state')
+  const outputPath = outputMode === 'relative' ? 'candidate.tar' : path.join(fixtureRoot, 'candidate.tar')
+  const checksum = '8'.repeat(64)
+  const platformManifest = `sha256:${'9'.repeat(64)}`
+  const runtimeImageId = `sha256:${'a'.repeat(64)}`
+
+  fs.mkdirSync(fakeBin)
+  fs.mkdirSync(fakeState)
+  if (outputMode === 'existing') {
+    fs.writeFileSync(outputPath, 'existing')
+  } else if (outputMode === 'symlink') {
+    fs.symlinkSync(path.join(fixtureRoot, 'missing-target'), outputPath)
+  }
+
+  writeExecutable(path.join(fakeBin, 'uname'), '#!/bin/sh\nprintf \'%s\\n\' Darwin\n')
+  writeExecutable(
+    path.join(fakeBin, 'docker'),
+    `#!/bin/sh
+set -eu
+printf '%s\n' "$*" >> "$FAKE_EXPORT_STATE/docker.log"
+case "$1 $2" in
+  'pull --platform')
+    [ "$3" = 'linux/amd64' ]
+    [ "$4" = "$FAKE_EXPORT_SOURCE" ]
+    ;;
+  'image inspect')
+    printf '%s\n' "$FAKE_EXPORT_SOURCE"
+    ;;
+  'image save')
+    [ "$3" = '--output' ]
+    printf 'verified-archive-bytes' > "$4"
+    chmod 0600 "$4"
+    [ "$5" = "$FAKE_EXPORT_SOURCE" ]
+    ;;
+  *) exit 91 ;;
+esac
+`
+  )
+  writeExecutable(
+    path.join(fakeBin, 'shasum'),
+    `#!/bin/sh
+printf '%s  %s\n' "$FAKE_EXPORT_CHECKSUM" "\${3:-}"
+`
+  )
+  writeExecutable(
+    path.join(fakeBin, 'python3'),
+    `#!/bin/sh
+set -eu
+printf '%s\n' "$*" >> "$FAKE_EXPORT_STATE/python.log"
+if [ "$1" = '-' ]; then
+  cat >/dev/null
+  printf 'platform_manifest_digest=%s\nruntime_image_id=%s\n' \
+    "$FAKE_EXPORT_PLATFORM_MANIFEST" "$FAKE_EXPORT_RUNTIME_IMAGE_ID"
+  exit 0
+fi
+if [ "$2" = 'verify-archive' ]; then
+  if [ "$FAKE_EXPORT_VERIFIER_FAILS" = '1' ]; then
+    printf '%s\n' OFFLINE_ARCHIVE_INVALID >&2
+    exit 1
+  fi
+  printf 'KINVEST_OFFLINE_ARCHIVE_OK runtimeImageId=%s\n' "$FAKE_EXPORT_RUNTIME_IMAGE_ID"
+  exit 0
+fi
+exit 92
+`
+  )
+
+  const result = spawnSync(
+    rootPath('scripts/export-offline-image.sh'),
+    [sourceReference, outputPath],
+    {
+      encoding: 'utf8',
+      env: {
+        ...process.env,
+        PATH: `${fakeBin}:${process.env.PATH}`,
+        FAKE_EXPORT_CHECKSUM: checksum,
+        FAKE_EXPORT_PLATFORM_MANIFEST: platformManifest,
+        FAKE_EXPORT_RUNTIME_IMAGE_ID: runtimeImageId,
+        FAKE_EXPORT_SOURCE: sourceReference,
+        FAKE_EXPORT_STATE: fakeState,
+        FAKE_EXPORT_VERIFIER_FAILS: verifierFails ? '1' : '0'
+      },
+      timeout: 5000
+    }
+  )
+
+  return {
+    checksum,
+    cleanup() {
+      fs.rmSync(fixtureRoot, { recursive: true, force: true })
+    },
+    fakeState,
+    outputPath,
+    platformManifest,
+    result,
+    runtimeImageId,
+    sourceReference
+  }
+}
+
 function run() {
   const workflow = readRootFile('.github/workflows/deploy.yml')
   const verifyWorkflow = readRootFile('.github/workflows/verify-tcr-release-manual.yml')
   const productionWorkflow = readRootFile('.github/workflows/deploy-production-manual.yml')
   const mirrorScript = readRootFile('scripts/mirror-release-to-tcr.sh')
+  const offlineExportScript = readRootFile('scripts/export-offline-image.sh')
   const deploy = readRootFile('deploy/server/deploy-kinvest.sh')
   const bootstrap = readRootFile('deploy/server/bootstrap-server.sh')
   const wrapper = readRootFile('deploy/server/kinvest-ssh-command')
@@ -1410,6 +1518,98 @@ function run() {
     'local mirror must not create release records or touch GitHub or the server'
   )
   assert.equal(fs.statSync(rootPath('scripts/mirror-release-to-tcr.sh')).mode & 0o111, 0o111)
+
+  assert.equal(fs.statSync(rootPath('scripts/export-offline-image.sh')).mode & 0o111, 0o111)
+  assert.match(offlineExportScript, /ghcr\\\.io\/zwphhxx\/kinvest@sha256:/)
+  assert.match(offlineExportScript, /docker pull --platform linux\/amd64/)
+  assert.match(offlineExportScript, /verify-archive/)
+  assert.doesNotMatch(
+    offlineExportScript,
+    /docker login|DOCKER_CONFIG|config\.json|security find|credential/i
+  )
+
+  const offlineExport = runOfflineExportFixture()
+  try {
+    const diagnostics = JSON.stringify(offlineExport.result, null, 2)
+    assert.equal(offlineExport.result.status, 0, diagnostics)
+    assert.equal(fs.readFileSync(offlineExport.outputPath, 'utf8'), 'verified-archive-bytes')
+    assert.equal(fs.statSync(offlineExport.outputPath).mode & 0o777, 0o600)
+    const dockerCalls = fs
+      .readFileSync(path.join(offlineExport.fakeState, 'docker.log'), 'utf8')
+      .trim()
+      .split('\n')
+    assert.deepEqual(dockerCalls.slice(0, 2), [
+      `pull --platform linux/amd64 ${offlineExport.sourceReference}`,
+      `image inspect --format {{range .RepoDigests}}{{println .}}{{end}} ${offlineExport.sourceReference}`
+    ])
+    assert.match(
+      dockerCalls[2],
+      new RegExp(`^image save --output ${offlineExport.outputPath.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')}\\.temporary\\.[A-Za-z0-9]+ ${offlineExport.sourceReference}$`)
+    )
+    const temporaryPath = dockerCalls[2].split(' ')[3]
+    const pythonCalls = fs.readFileSync(path.join(offlineExport.fakeState, 'python.log'), 'utf8')
+    assert.match(
+      pythonCalls,
+      new RegExp(`offline-image-attestation\\.py verify-archive ${temporaryPath.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')} ${offlineExport.checksum}`)
+    )
+    assert.equal(
+      offlineExport.result.stdout,
+      [
+        `path=${offlineExport.outputPath}`,
+        `checksum=sha256:${offlineExport.checksum}`,
+        'size=22',
+        `source=${offlineExport.sourceReference}`,
+        'platform=linux/amd64',
+        `platformManifest=${offlineExport.platformManifest}`,
+        `runtimeImageId=${offlineExport.runtimeImageId}`,
+        ''
+      ].join('\n')
+    )
+    assert.equal(offlineExport.result.stderr, '')
+    assert.deepEqual(
+      fs.readdirSync(path.dirname(offlineExport.outputPath)).filter((name) => name.includes('temporary')),
+      []
+    )
+  } finally {
+    offlineExport.cleanup()
+  }
+
+  for (const invalid of [
+    'GHCR.io/zwphhxx/kinvest@sha256:' + '7'.repeat(64),
+    'ghcr.io/zwphhxx/other@sha256:' + '7'.repeat(64),
+    'ghcr.io/zwphhxx/kinvest:latest',
+    'ghcr.io/zwphhxx/kinvest@sha256:' + 'A'.repeat(64)
+  ]) {
+    const rejected = runOfflineExportFixture({ sourceReference: invalid })
+    try {
+      assert.equal(rejected.result.status, 2)
+      assert.equal(fs.existsSync(path.join(rejected.fakeState, 'docker.log')), false)
+    } finally {
+      rejected.cleanup()
+    }
+  }
+
+  for (const outputMode of ['existing', 'symlink', 'relative']) {
+    const rejected = runOfflineExportFixture({ outputMode })
+    try {
+      assert.equal(rejected.result.status, 2)
+      assert.equal(fs.existsSync(path.join(rejected.fakeState, 'docker.log')), false)
+    } finally {
+      rejected.cleanup()
+    }
+  }
+
+  const verifierFailure = runOfflineExportFixture({ verifierFails: true })
+  try {
+    assert.notEqual(verifierFailure.result.status, 0)
+    assert.equal(fs.existsSync(verifierFailure.outputPath), false)
+    assert.deepEqual(
+      fs.readdirSync(path.dirname(verifierFailure.outputPath)).filter((name) => name.includes('temporary')),
+      []
+    )
+  } finally {
+    verifierFailure.cleanup()
+  }
 
   const mirrorSuccess = runMirrorSuccessFixture()
   try {
@@ -2454,3 +2654,12 @@ function run() {
 }
 
 module.exports = { run }
+
+if (require.main === module) {
+  try {
+    run()
+  } catch (error) {
+    console.error(error)
+    process.exitCode = 1
+  }
+}

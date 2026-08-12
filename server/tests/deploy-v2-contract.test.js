@@ -543,9 +543,26 @@ async function run() {
   assert.match(installer, /deploy-kinvest-v2\.sh/)
   assert.match(installer, /kinvest-ssh-command-v2/)
   assert.match(installer, /secret-version-config\.py/)
+  assert.match(installer, /offline-image-attestation\.py/)
+  assert.match(
+    installer,
+    /^LOCAL_OFFLINE_ATTESTATION='\/usr\/local\/libexec\/kinvest-offline-image-attestation'$/m
+  )
   assert.match(installer, /install -d -o root -g root -m 0755 -- \/usr\/local\/libexec/)
   assert.doesNotMatch(installer, /for source_file in [^\n]*secret-version-config\.py/)
   assert.match(installer, /python3 "\$SOURCE_DIR\/secret-version-config\.py" mapping/)
+  assert.match(installer, /! -f "\$SOURCE_DIR\/offline-image-attestation\.py"/)
+  assert.match(installer, /-L "\$SOURCE_DIR\/offline-image-attestation\.py"/)
+  assert.match(installer, /python3 -m py_compile "\$SOURCE_DIR\/offline-image-attestation\.py"/)
+  assert.match(installer, /python3 "\$SOURCE_DIR\/offline-image-attestation\.py" self-check/)
+  assert.match(installer, /compile_cache="\$\(mktemp -d \/run\/kinvest-offline-pycache\.XXXXXX\)"/)
+  assert.match(installer, /PYTHONPYCACHEPREFIX="\$compile_cache" python3 -m py_compile/)
+  assert.match(installer, /rm -rf -- "\$compile_cache"/)
+  assert.match(installer, /mktemp \/usr\/local\/libexec\/\.kinvest-offline-image-attestation\.XXXXXX/)
+  assert.match(installer, /install -o root -g root -m 0755 -- "\$SOURCE_DIR\/offline-image-attestation\.py"/)
+  assert.match(installer, /mv -f -- "\$attestation_temporary" "\$LOCAL_OFFLINE_ATTESTATION"/)
+  assert.doesNotMatch(installer, /offline-image-attestation\.py" (?:import|resolve)/)
+  assert.doesNotMatch(installer, /^\s*(?:docker|systemctl|service)\b/m)
   assert.match(installer, /no container was restarted/)
 
   assert.match(workflow, /DEPLOY_V2_ENABLED/)
