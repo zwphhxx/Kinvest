@@ -4,13 +4,17 @@
 from __future__ import annotations
 
 import dataclasses
+import datetime
 import hashlib
 import json
 import os
 from pathlib import Path, PurePosixPath
 import re
 import stat
+import subprocess
+import sys
 import tarfile
+import tempfile
 from typing import Any, BinaryIO
 
 
@@ -29,12 +33,41 @@ SOURCE_ANNOTATION_VALUE = "zwphhxx/kinvest"
 OCI_INDEX = "application/vnd.oci.image.index.v1+json"
 OCI_MANIFEST = "application/vnd.oci.image.manifest.v1+json"
 OCI_CONFIG = "application/vnd.oci.image.config.v1+json"
+DEFAULT_STATE_DIR = Path("/root/docker/kinvest/state/offline-images")
+IMAGE_ID = re.compile(r"^sha256:[0-9a-f]{64}$")
+COMMIT = re.compile(r"^[0-9a-f]{40}$")
+RUN_ID = re.compile(r"^[0-9]+$")
+RFC3339_UTC = re.compile(
+    r"^[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}Z$"
+)
+RECORD_FIELDS = (
+    "version",
+    "sourceDigest",
+    "platform",
+    "platformManifestDigest",
+    "runtimeImageId",
+    "archiveSha256",
+    "commit",
+    "verificationRunId",
+    "importedAt",
+)
+DOCKER_LOAD_TIMEOUT_SECONDS = 120
+DOCKER_INSPECT_TIMEOUT_SECONDS = 10
+MAX_DOCKER_OUTPUT_BYTES = 1024 * 1024
 
 
 class ArchiveVerificationError(RuntimeError):
     """Stable, payload-free archive rejection."""
 
     def __init__(self, code: str = "OFFLINE_ARCHIVE_INVALID") -> None:
+        self.code = code
+        super().__init__(code)
+
+
+class OfflineAttestationError(RuntimeError):
+    """Stable, payload-free import and resolution rejection."""
+
+    def __init__(self, code: str = "OFFLINE_ATTESTATION_INVALID") -> None:
         self.code = code
         super().__init__(code)
 
@@ -49,6 +82,19 @@ class VerifiedArchive:
     schema_min: int
     schema_max: int
     secret_bootstrap: str
+
+
+@dataclasses.dataclass(frozen=True)
+class AttestationRecord:
+    version: int
+    source_reference: str
+    platform: str
+    platform_manifest_digest: str
+    runtime_image_id: str
+    archive_sha256: str
+    commit: str
+    verification_run_id: str
+    imported_at: str
 
 
 @dataclasses.dataclass(frozen=True)
@@ -487,3 +533,480 @@ def verify_archive(
         raise
     except (RecursionError, ValueError, OverflowError):
         _reject()
+
+
+def _attestation_reject(code: str = "OFFLINE_ATTESTATION_INVALID") -> None:
+    raise OfflineAttestationError(code)
+
+
+def _validate_timestamp(value: str) -> None:
+    if not isinstance(value, str) or not RFC3339_UTC.fullmatch(value):
+        _attestation_reject()
+    try:
+        datetime.datetime.strptime(value, "%Y-%m-%dT%H:%M:%SZ")
+    except ValueError:
+        _attestation_reject()
+
+
+def _validate_record(record: AttestationRecord) -> None:
+    if (
+        record.version != 1
+        or not ALLOWED_SOURCE.fullmatch(record.source_reference)
+        or record.platform != "linux/amd64"
+        or not IMAGE_ID.fullmatch(record.platform_manifest_digest)
+        or not IMAGE_ID.fullmatch(record.runtime_image_id)
+        or not SHA256.fullmatch(record.archive_sha256)
+        or not COMMIT.fullmatch(record.commit)
+        or not RUN_ID.fullmatch(record.verification_run_id)
+    ):
+        _attestation_reject()
+    _validate_timestamp(record.imported_at)
+
+
+def _record_text(record: AttestationRecord) -> str:
+    _validate_record(record)
+    values = (
+        str(record.version),
+        record.source_reference,
+        record.platform,
+        record.platform_manifest_digest,
+        record.runtime_image_id,
+        record.archive_sha256,
+        record.commit,
+        record.verification_run_id,
+        record.imported_at,
+    )
+    return "".join(f"{key}={value}\n" for key, value in zip(RECORD_FIELDS, values))
+
+
+def _parse_record(content: bytes) -> AttestationRecord:
+    try:
+        text = content.decode("utf-8")
+    except UnicodeDecodeError:
+        _attestation_reject()
+    if not text.endswith("\n") or "\r" in text or "\x00" in text:
+        _attestation_reject()
+    lines = text[:-1].split("\n")
+    if len(lines) != len(RECORD_FIELDS):
+        _attestation_reject()
+    values: list[str] = []
+    for line, key in zip(lines, RECORD_FIELDS):
+        prefix = f"{key}="
+        if not line.startswith(prefix):
+            _attestation_reject()
+        values.append(line[len(prefix):])
+    if values[0] != "1":
+        _attestation_reject()
+    record = AttestationRecord(
+        version=1,
+        source_reference=values[1],
+        platform=values[2],
+        platform_manifest_digest=values[3],
+        runtime_image_id=values[4],
+        archive_sha256=values[5],
+        commit=values[6],
+        verification_run_id=values[7],
+        imported_at=values[8],
+    )
+    _validate_record(record)
+    if _record_text(record) != text:
+        _attestation_reject()
+    return record
+
+
+def _same_import(left: AttestationRecord, right: AttestationRecord) -> bool:
+    return dataclasses.replace(left, imported_at=right.imported_at) == right
+
+
+class AttestationStore:
+    """Strict root-owned storage for immutable offline-image attestations."""
+
+    def __init__(
+        self,
+        state_dir: os.PathLike[str] | str = DEFAULT_STATE_DIR,
+        *,
+        owner_uid: int = 0,
+        owner_gid: int = 0,
+    ) -> None:
+        self.state_dir = Path(state_dir)
+        self.owner_uid = owner_uid
+        self.owner_gid = owner_gid
+        self._prepare_directory()
+
+    def _prepare_directory(self) -> None:
+        try:
+            self.state_dir.mkdir(mode=0o700)
+        except FileExistsError:
+            pass
+        except OSError:
+            _attestation_reject("OFFLINE_ATTESTATION_STATE_UNSAFE")
+        self._check_directory()
+
+    def _check_directory(self) -> None:
+        try:
+            metadata = self.state_dir.lstat()
+        except OSError:
+            _attestation_reject("OFFLINE_ATTESTATION_STATE_UNSAFE")
+        if (
+            not stat.S_ISDIR(metadata.st_mode)
+            or stat.S_ISLNK(metadata.st_mode)
+            or stat.S_IMODE(metadata.st_mode) != 0o700
+            or metadata.st_uid != self.owner_uid
+            or metadata.st_gid != self.owner_gid
+        ):
+            _attestation_reject("OFFLINE_ATTESTATION_STATE_UNSAFE")
+
+    def _path(self, source_reference: str) -> Path:
+        if not isinstance(source_reference, str) or not ALLOWED_SOURCE.fullmatch(source_reference):
+            _attestation_reject()
+        return self.state_dir / f"{source_reference.rsplit(':', 1)[1]}.state"
+
+    def read(self, source_reference: str) -> AttestationRecord:
+        self._check_directory()
+        path = self._path(source_reference)
+        try:
+            path_metadata = path.lstat()
+        except FileNotFoundError:
+            _attestation_reject("OFFLINE_ATTESTATION_NOT_FOUND")
+        except OSError:
+            _attestation_reject("OFFLINE_ATTESTATION_RECORD_UNSAFE")
+        if (
+            not stat.S_ISREG(path_metadata.st_mode)
+            or stat.S_ISLNK(path_metadata.st_mode)
+            or stat.S_IMODE(path_metadata.st_mode) != 0o600
+            or path_metadata.st_uid != self.owner_uid
+            or path_metadata.st_gid != self.owner_gid
+        ):
+            _attestation_reject("OFFLINE_ATTESTATION_RECORD_UNSAFE")
+        flags = os.O_RDONLY | getattr(os, "O_CLOEXEC", 0) | getattr(os, "O_NOFOLLOW", 0)
+        try:
+            descriptor = os.open(path, flags)
+        except OSError:
+            _attestation_reject("OFFLINE_ATTESTATION_RECORD_UNSAFE")
+        try:
+            with os.fdopen(descriptor, "rb") as source:
+                opened = os.fstat(source.fileno())
+                if (
+                    (opened.st_dev, opened.st_ino)
+                    != (path_metadata.st_dev, path_metadata.st_ino)
+                    or stat.S_IMODE(opened.st_mode) != 0o600
+                    or opened.st_uid != self.owner_uid
+                    or opened.st_gid != self.owner_gid
+                    or opened.st_size <= 0
+                    or opened.st_size > 4096
+                ):
+                    _attestation_reject("OFFLINE_ATTESTATION_RECORD_UNSAFE")
+                content = source.read(4097)
+        except OfflineAttestationError:
+            raise
+        except OSError:
+            _attestation_reject("OFFLINE_ATTESTATION_RECORD_UNSAFE")
+        record = _parse_record(content)
+        if record.source_reference != source_reference:
+            _attestation_reject()
+        return record
+
+    def write(self, record: AttestationRecord) -> AttestationRecord:
+        self._check_directory()
+        target = self._path(record.source_reference)
+        content = _record_text(record).encode("utf-8")
+        if target.exists() or target.is_symlink():
+            existing = self.read(record.source_reference)
+            if _same_import(existing, record):
+                return existing
+            _attestation_reject("OFFLINE_ATTESTATION_CONFLICT")
+        descriptor = -1
+        temporary_name: str | None = None
+        published = False
+        try:
+            descriptor, temporary_name = tempfile.mkstemp(
+                prefix=".offline-attestation-",
+                dir=self.state_dir,
+            )
+            os.fchmod(descriptor, 0o600)
+            metadata = os.fstat(descriptor)
+            if (metadata.st_uid, metadata.st_gid) != (self.owner_uid, self.owner_gid):
+                os.fchown(descriptor, self.owner_uid, self.owner_gid)
+            with os.fdopen(descriptor, "wb") as destination:
+                descriptor = -1
+                destination.write(content)
+                destination.flush()
+                os.fsync(destination.fileno())
+            try:
+                os.link(temporary_name, target, follow_symlinks=False)
+                published = True
+            except FileExistsError:
+                existing = self.read(record.source_reference)
+                if _same_import(existing, record):
+                    return existing
+                _attestation_reject("OFFLINE_ATTESTATION_CONFLICT")
+            directory_descriptor = os.open(
+                self.state_dir,
+                os.O_RDONLY | getattr(os, "O_DIRECTORY", 0) | getattr(os, "O_CLOEXEC", 0),
+            )
+            try:
+                os.fsync(directory_descriptor)
+            finally:
+                os.close(directory_descriptor)
+        except OfflineAttestationError:
+            raise
+        except OSError:
+            if published:
+                try:
+                    target.unlink()
+                except OSError:
+                    pass
+            _attestation_reject("OFFLINE_ATTESTATION_WRITE_FAILED")
+        finally:
+            if descriptor >= 0:
+                try:
+                    os.close(descriptor)
+                except OSError:
+                    pass
+            if temporary_name is not None:
+                try:
+                    os.unlink(temporary_name)
+                except FileNotFoundError:
+                    pass
+                except OSError:
+                    pass
+        return record
+
+
+def _run_docker(arguments: list[str], timeout: int) -> subprocess.CompletedProcess[str]:
+    try:
+        return subprocess.run(
+            arguments,
+            check=False,
+            capture_output=True,
+            text=True,
+            timeout=timeout,
+        )
+    except (OSError, subprocess.TimeoutExpired):
+        _attestation_reject("OFFLINE_ATTESTATION_DOCKER_FAILED")
+
+
+def _docker_call(docker: Any, arguments: list[str], timeout: int, failure_code: str) -> str:
+    try:
+        result = docker(arguments, timeout)
+    except OfflineAttestationError:
+        raise
+    except (OSError, subprocess.TimeoutExpired):
+        _attestation_reject(failure_code)
+    stdout = result.stdout if isinstance(result.stdout, str) else ""
+    if result.returncode != 0 or len(stdout.encode("utf-8")) > MAX_DOCKER_OUTPUT_BYTES:
+        _attestation_reject(failure_code)
+    return stdout
+
+
+def _inspect_image(runtime_image_id: str, docker: Any, unavailable_code: str) -> dict[str, Any]:
+    output = _docker_call(
+        docker,
+        [
+            "docker",
+            "image",
+            "inspect",
+            runtime_image_id,
+            "--format",
+            "{{json .}}",
+        ],
+        DOCKER_INSPECT_TIMEOUT_SECONDS,
+        unavailable_code,
+    )
+    try:
+        inspection = json.loads(
+            output,
+            object_pairs_hook=_unique_object,
+            parse_constant=lambda _value: _attestation_reject(),
+        )
+    except OfflineAttestationError:
+        raise
+    except (json.JSONDecodeError, RecursionError, ValueError, OverflowError):
+        _attestation_reject("OFFLINE_ATTESTATION_IMAGE_MISMATCH")
+    if not isinstance(inspection, dict):
+        _attestation_reject("OFFLINE_ATTESTATION_IMAGE_MISMATCH")
+    return inspection
+
+
+def _inspection_labels(inspection: dict[str, Any]) -> tuple[int, int, str]:
+    normalized = {
+        "architecture": inspection.get("Architecture"),
+        "config": inspection.get("Config"),
+        "os": inspection.get("Os"),
+    }
+    try:
+        return _schema_labels(normalized)
+    except ArchiveVerificationError:
+        _attestation_reject("OFFLINE_ATTESTATION_IMAGE_MISMATCH")
+
+
+def _validate_inspection(
+    inspection: dict[str, Any],
+    runtime_image_id: str,
+    expected_labels: tuple[int, int, str] | None = None,
+) -> None:
+    if (
+        inspection.get("Id") != runtime_image_id
+        or inspection.get("Os") != "linux"
+        or inspection.get("Architecture") != "amd64"
+    ):
+        _attestation_reject("OFFLINE_ATTESTATION_IMAGE_MISMATCH")
+    labels = _inspection_labels(inspection)
+    if expected_labels is not None and labels != expected_labels:
+        _attestation_reject("OFFLINE_ATTESTATION_IMAGE_MISMATCH")
+
+
+def _validate_import_inputs(commit: str, verification_run_id: str) -> None:
+    if (
+        not isinstance(commit, str)
+        or not COMMIT.fullmatch(commit)
+        or not isinstance(verification_run_id, str)
+        or not RUN_ID.fullmatch(verification_run_id)
+    ):
+        _attestation_reject()
+
+
+def _utc_now() -> str:
+    return datetime.datetime.now(datetime.timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+
+
+def import_archive(
+    verified: VerifiedArchive,
+    archive_path: os.PathLike[str] | str,
+    *,
+    commit: str,
+    verification_run_id: str,
+    state_dir: os.PathLike[str] | str = DEFAULT_STATE_DIR,
+    docker: Any = _run_docker,
+    now: Any = _utc_now,
+    owner_uid: int = 0,
+    owner_gid: int = 0,
+) -> AttestationRecord:
+    if not isinstance(verified, VerifiedArchive):
+        _attestation_reject()
+    _validate_import_inputs(commit, verification_run_id)
+    _docker_call(
+        docker,
+        ["docker", "load", "--input", str(archive_path)],
+        DOCKER_LOAD_TIMEOUT_SECONDS,
+        "OFFLINE_ATTESTATION_LOAD_FAILED",
+    )
+    inspection = _inspect_image(
+        verified.runtime_image_id,
+        docker,
+        "OFFLINE_ATTESTATION_IMAGE_UNAVAILABLE",
+    )
+    _validate_inspection(
+        inspection,
+        verified.runtime_image_id,
+        (verified.schema_min, verified.schema_max, verified.secret_bootstrap),
+    )
+    record = AttestationRecord(
+        version=1,
+        source_reference=verified.source_reference,
+        platform=verified.platform,
+        platform_manifest_digest=verified.platform_manifest_digest,
+        runtime_image_id=verified.runtime_image_id,
+        archive_sha256=verified.archive_sha256,
+        commit=commit,
+        verification_run_id=verification_run_id,
+        imported_at=now(),
+    )
+    return AttestationStore(
+        state_dir,
+        owner_uid=owner_uid,
+        owner_gid=owner_gid,
+    ).write(record)
+
+
+def resolve_attestation(
+    source_reference: str,
+    commit: str,
+    verification_run_id: str,
+    *,
+    state_dir: os.PathLike[str] | str = DEFAULT_STATE_DIR,
+    docker: Any = _run_docker,
+    owner_uid: int = 0,
+    owner_gid: int = 0,
+) -> str:
+    _validate_import_inputs(commit, verification_run_id)
+    record = AttestationStore(
+        state_dir,
+        owner_uid=owner_uid,
+        owner_gid=owner_gid,
+    ).read(source_reference)
+    if record.commit != commit or record.verification_run_id != verification_run_id:
+        _attestation_reject("OFFLINE_ATTESTATION_PROVENANCE_MISMATCH")
+    inspection = _inspect_image(
+        record.runtime_image_id,
+        docker,
+        "OFFLINE_ATTESTATION_IMAGE_UNAVAILABLE",
+    )
+    _validate_inspection(inspection, record.runtime_image_id)
+    return record.runtime_image_id
+
+
+def main(
+    argv: list[str] | None = None,
+    *,
+    stdout: Any = sys.stdout,
+    stderr: Any = sys.stderr,
+    geteuid: Any = os.geteuid,
+    state_dir: os.PathLike[str] | str = DEFAULT_STATE_DIR,
+    docker: Any = _run_docker,
+    now: Any = _utc_now,
+    owner_uid: int = 0,
+    owner_gid: int = 0,
+) -> int:
+    arguments = list(sys.argv[1:] if argv is None else argv)
+    try:
+        if arguments == ["self-check"]:
+            stdout.write("KINVEST_OFFLINE_ATTESTATION_SELF_CHECK_OK\n")
+            return 0
+        if len(arguments) == 4 and arguments[0] == "verify-archive":
+            verified = verify_archive(arguments[1], arguments[2], arguments[3])
+            stdout.write(
+                f"KINVEST_OFFLINE_ARCHIVE_OK runtimeImageId={verified.runtime_image_id}\n"
+            )
+            return 0
+        if len(arguments) == 6 and arguments[0] == "import":
+            if geteuid() != 0:
+                _attestation_reject("OFFLINE_ATTESTATION_ROOT_REQUIRED")
+            verified = verify_archive(arguments[1], arguments[2], arguments[3])
+            record = import_archive(
+                verified,
+                arguments[1],
+                commit=arguments[4],
+                verification_run_id=arguments[5],
+                state_dir=state_dir,
+                docker=docker,
+                now=now,
+                owner_uid=owner_uid,
+                owner_gid=owner_gid,
+            )
+            stdout.write(
+                f"KINVEST_OFFLINE_IMPORT_OK runtimeImageId={record.runtime_image_id}\n"
+            )
+            return 0
+        if len(arguments) == 4 and arguments[0] == "resolve":
+            if geteuid() != 0:
+                _attestation_reject("OFFLINE_ATTESTATION_ROOT_REQUIRED")
+            runtime_image_id = resolve_attestation(
+                arguments[1],
+                arguments[2],
+                arguments[3],
+                state_dir=state_dir,
+                docker=docker,
+                owner_uid=owner_uid,
+                owner_gid=owner_gid,
+            )
+            stdout.write(runtime_image_id + "\n")
+            return 0
+        _attestation_reject("OFFLINE_ATTESTATION_USAGE")
+    except (ArchiveVerificationError, OfflineAttestationError) as error:
+        stderr.write(f"{error}\n")
+        return 1
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

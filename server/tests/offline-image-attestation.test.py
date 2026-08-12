@@ -6,6 +6,8 @@ import io
 import json
 import os
 from pathlib import Path
+import subprocess
+import stat
 import sys
 import tarfile
 import tempfile
@@ -232,6 +234,33 @@ class ArchiveFixture:
                     archive.addfile(info, io.BytesIO(content))
 
 
+class FakeDocker:
+    def __init__(self, inspected=None, load_returncode=0, inspect_returncode=0, stderr=""):
+        self.inspected = inspected
+        self.load_returncode = load_returncode
+        self.inspect_returncode = inspect_returncode
+        self.stderr = stderr
+        self.calls = []
+
+    def __call__(self, arguments, timeout):
+        self.calls.append((list(arguments), timeout))
+        if arguments[:2] == ["docker", "load"]:
+            return subprocess.CompletedProcess(
+                arguments,
+                self.load_returncode,
+                stdout="Loaded image\n" if self.load_returncode == 0 else "",
+                stderr=self.stderr,
+            )
+        if arguments[:3] == ["docker", "image", "inspect"]:
+            return subprocess.CompletedProcess(
+                arguments,
+                self.inspect_returncode,
+                stdout=json.dumps(self.inspected) if self.inspect_returncode == 0 else "",
+                stderr=self.stderr,
+            )
+        raise AssertionError(f"unexpected Docker arguments: {arguments!r}")
+
+
 class OfflineImageAttestationTests(unittest.TestCase):
     @classmethod
     def setUpClass(cls):
@@ -245,6 +274,54 @@ class OfflineImageAttestationTests(unittest.TestCase):
 
     def fixture(self, case="valid"):
         return ArchiveFixture(self.temp.name, case)
+
+    def verified_fixture(self):
+        fixture = self.fixture()
+        verified = self.module.verify_archive(
+            fixture.archive,
+            fixture.archive_sha,
+            fixture.source_ref,
+        )
+        return fixture, verified
+
+    def docker_inspection(self, verified, **overrides):
+        inspection = {
+            "Architecture": "amd64",
+            "Config": {
+                "Labels": {
+                    "io.kinvest.schema.max": str(verified.schema_max),
+                    "io.kinvest.schema.min": str(verified.schema_min),
+                    "io.kinvest.secret-bootstrap": verified.secret_bootstrap,
+                }
+            },
+            "Id": verified.runtime_image_id,
+            "Os": "linux",
+        }
+        inspection.update(overrides)
+        return inspection
+
+    def state_options(self):
+        return {
+            "owner_uid": os.geteuid(),
+            "owner_gid": os.getegid(),
+        }
+
+    def import_fixture(self, docker=None, **overrides):
+        fixture, verified = self.verified_fixture()
+        docker = docker or FakeDocker(self.docker_inspection(verified))
+        options = {
+            "verified": verified,
+            "archive_path": fixture.archive,
+            "commit": "a" * 40,
+            "verification_run_id": "31601622272",
+            "state_dir": Path(self.temp.name) / "offline-images",
+            "docker": docker,
+            "now": lambda: "2026-08-12T12:34:56Z",
+            **self.state_options(),
+        }
+        options.update(overrides)
+        record = self.module.import_archive(**options)
+        return fixture, verified, docker, record, options
 
     def assert_archive_error(self, callback, expected_code="OFFLINE_ARCHIVE_INVALID", forbidden=()):
         with self.assertRaises(self.module.ArchiveVerificationError) as raised:
@@ -550,6 +627,324 @@ class OfflineImageAttestationTests(unittest.TestCase):
         self.assertEqual(len(opened), 1)
         with self.assertRaises(OSError):
             os.fstat(opened[0])
+
+    def test_import_loads_by_argument_array_and_writes_canonical_record(self):
+        fixture, verified, docker, record, options = self.import_fixture()
+        expected_path = options["state_dir"] / (
+            verified.source_reference.rsplit(":", 1)[1] + ".state"
+        )
+        self.assertEqual(record.runtime_image_id, verified.runtime_image_id)
+        self.assertEqual(
+            docker.calls,
+            [
+                (["docker", "load", "--input", str(fixture.archive)], 120),
+                (
+                    [
+                        "docker",
+                        "image",
+                        "inspect",
+                        verified.runtime_image_id,
+                        "--format",
+                        "{{json .}}",
+                    ],
+                    10,
+                ),
+            ],
+        )
+        self.assertEqual(stat.S_IMODE(options["state_dir"].stat().st_mode), 0o700)
+        self.assertEqual(stat.S_IMODE(expected_path.stat().st_mode), 0o600)
+        self.assertEqual(
+            expected_path.read_text(encoding="utf-8"),
+            "\n".join(
+                [
+                    "version=1",
+                    f"sourceDigest={verified.source_reference}",
+                    "platform=linux/amd64",
+                    f"platformManifestDigest={verified.platform_manifest_digest}",
+                    f"runtimeImageId={verified.runtime_image_id}",
+                    f"archiveSha256={verified.archive_sha256}",
+                    f"commit={'a' * 40}",
+                    "verificationRunId=31601622272",
+                    "importedAt=2026-08-12T12:34:56Z",
+                    "",
+                ]
+            ),
+        )
+
+    def test_import_failure_never_writes_record_or_replays_docker_stderr(self):
+        fixture, verified = self.verified_fixture()
+        state_dir = Path(self.temp.name) / "offline-images"
+        for docker in (
+            FakeDocker(
+                self.docker_inspection(verified),
+                load_returncode=1,
+                stderr="private registry diagnostic",
+            ),
+            FakeDocker(
+                self.docker_inspection(verified, Id="sha256:" + "f" * 64),
+                stderr="private inspect diagnostic",
+            ),
+        ):
+            with self.subTest(load_returncode=docker.load_returncode), self.assertRaises(
+                self.module.OfflineAttestationError
+            ) as raised:
+                self.module.import_archive(
+                    verified,
+                    fixture.archive,
+                    commit="a" * 40,
+                    verification_run_id="31601622272",
+                    state_dir=state_dir,
+                    docker=docker,
+                    now=lambda: "2026-08-12T12:34:56Z",
+                    **self.state_options(),
+                )
+            self.assertRegex(str(raised.exception), r"^OFFLINE_ATTESTATION_[A-Z_]+$")
+            self.assertNotIn("private", str(raised.exception))
+            self.assertEqual(list(state_dir.glob("*.state")), [])
+
+    def test_store_rejects_insecure_directory_symlink_mode_and_owner(self):
+        target = Path(self.temp.name) / "target"
+        target.mkdir(mode=0o700)
+        symlink = Path(self.temp.name) / "linked-state"
+        symlink.symlink_to(target, target_is_directory=True)
+        with self.assertRaises(self.module.OfflineAttestationError) as linked:
+            self.module.AttestationStore(symlink, **self.state_options())
+        self.assertEqual(str(linked.exception), "OFFLINE_ATTESTATION_STATE_UNSAFE")
+
+        insecure = Path(self.temp.name) / "insecure-state"
+        insecure.mkdir(mode=0o755)
+        insecure.chmod(0o755)
+        with self.assertRaises(self.module.OfflineAttestationError):
+            self.module.AttestationStore(insecure, **self.state_options())
+
+        secure = Path(self.temp.name) / "secure-state"
+        secure.mkdir(mode=0o700)
+        with self.assertRaises(self.module.OfflineAttestationError):
+            self.module.AttestationStore(
+                secure,
+                owner_uid=os.geteuid() + 1,
+                owner_gid=os.getegid(),
+            )
+
+    def test_store_rejects_record_symlink_wrong_mode_and_noncanonical_order(self):
+        _, verified, _, _, options = self.import_fixture()
+        record_path = next(options["state_dir"].glob("*.state"))
+        canonical = record_path.read_text(encoding="utf-8")
+        store = self.module.AttestationStore(options["state_dir"], **self.state_options())
+
+        record_path.chmod(0o644)
+        with self.assertRaises(self.module.OfflineAttestationError):
+            store.read(verified.source_reference)
+        record_path.chmod(0o600)
+
+        lines = canonical.splitlines()
+        lines[1], lines[2] = lines[2], lines[1]
+        record_path.write_text("\n".join(lines) + "\n", encoding="utf-8")
+        record_path.chmod(0o600)
+        with self.assertRaises(self.module.OfflineAttestationError):
+            store.read(verified.source_reference)
+
+        record_path.unlink()
+        outside = Path(self.temp.name) / "outside.state"
+        outside.write_text(canonical, encoding="utf-8")
+        outside.chmod(0o600)
+        record_path.symlink_to(outside)
+        with self.assertRaises(self.module.OfflineAttestationError):
+            store.read(verified.source_reference)
+
+    def test_identical_import_is_idempotent_but_conflicting_metadata_is_rejected(self):
+        fixture, verified, docker, first, options = self.import_fixture()
+        record_path = next(options["state_dir"].glob("*.state"))
+        original = record_path.read_bytes()
+        original_mtime = record_path.stat().st_mtime_ns
+        second = self.module.import_archive(
+            verified,
+            fixture.archive,
+            commit="a" * 40,
+            verification_run_id="31601622272",
+            state_dir=options["state_dir"],
+            docker=docker,
+            now=lambda: "2030-01-01T00:00:00Z",
+            **self.state_options(),
+        )
+        self.assertEqual(second, first)
+        self.assertEqual(record_path.read_bytes(), original)
+        self.assertEqual(record_path.stat().st_mtime_ns, original_mtime)
+
+        with self.assertRaises(self.module.OfflineAttestationError) as conflict:
+            self.module.import_archive(
+                verified,
+                fixture.archive,
+                commit="b" * 40,
+                verification_run_id="31601622272",
+                state_dir=options["state_dir"],
+                docker=docker,
+                now=lambda: "2030-01-01T00:00:00Z",
+                **self.state_options(),
+            )
+        self.assertEqual(str(conflict.exception), "OFFLINE_ATTESTATION_CONFLICT")
+        self.assertEqual(record_path.read_bytes(), original)
+
+    def test_resolve_requires_exact_commit_run_and_live_image(self):
+        _, verified, docker, _, options = self.import_fixture()
+        for commit, run_id in (("b" * 40, "31601622272"), ("a" * 40, "9")):
+            before = len(docker.calls)
+            with self.subTest(commit=commit, run_id=run_id), self.assertRaises(
+                self.module.OfflineAttestationError
+            ) as raised:
+                self.module.resolve_attestation(
+                    verified.source_reference,
+                    commit,
+                    run_id,
+                    state_dir=options["state_dir"],
+                    docker=docker,
+                    **self.state_options(),
+                )
+            self.assertEqual(str(raised.exception), "OFFLINE_ATTESTATION_PROVENANCE_MISMATCH")
+            self.assertEqual(len(docker.calls), before)
+
+        stale = FakeDocker(inspect_returncode=1, stderr="private missing image")
+        with self.assertRaises(self.module.OfflineAttestationError) as raised:
+            self.module.resolve_attestation(
+                verified.source_reference,
+                "a" * 40,
+                "31601622272",
+                state_dir=options["state_dir"],
+                docker=stale,
+                **self.state_options(),
+            )
+        self.assertEqual(str(raised.exception), "OFFLINE_ATTESTATION_IMAGE_UNAVAILABLE")
+        self.assertNotIn("private", str(raised.exception))
+
+    def test_resolve_rejects_runtime_platform_label_or_id_mismatch(self):
+        _, verified, _, _, options = self.import_fixture()
+        cases = [
+            self.docker_inspection(verified, Architecture="arm64"),
+            self.docker_inspection(verified, Id="sha256:" + "e" * 64),
+            self.docker_inspection(
+                verified,
+                Config={"Labels": {"io.kinvest.schema.min": "99"}},
+            ),
+        ]
+        for inspection in cases:
+            with self.subTest(inspection=inspection), self.assertRaises(
+                self.module.OfflineAttestationError
+            ) as raised:
+                self.module.resolve_attestation(
+                    verified.source_reference,
+                    "a" * 40,
+                    "31601622272",
+                    state_dir=options["state_dir"],
+                    docker=FakeDocker(inspection),
+                    **self.state_options(),
+                )
+            self.assertEqual(str(raised.exception), "OFFLINE_ATTESTATION_IMAGE_MISMATCH")
+
+    def test_atomic_record_write_failure_cleans_temporary_file(self):
+        fixture, verified = self.verified_fixture()
+        state_dir = Path(self.temp.name) / "offline-images"
+        docker = FakeDocker(self.docker_inspection(verified))
+        with mock.patch.object(
+            self.module.os,
+            "link",
+            side_effect=OSError("private atomic failure"),
+        ), self.assertRaises(self.module.OfflineAttestationError) as raised:
+            self.module.import_archive(
+                verified,
+                fixture.archive,
+                commit="a" * 40,
+                verification_run_id="31601622272",
+                state_dir=state_dir,
+                docker=docker,
+                now=lambda: "2026-08-12T12:34:56Z",
+                **self.state_options(),
+            )
+        self.assertEqual(str(raised.exception), "OFFLINE_ATTESTATION_WRITE_FAILED")
+        self.assertEqual(list(state_dir.iterdir()), [])
+
+    def test_cli_forms_root_gate_and_exact_output(self):
+        fixture, verified = self.verified_fixture()
+        state_dir = Path(self.temp.name) / "offline-images"
+        docker = FakeDocker(self.docker_inspection(verified))
+
+        output = io.StringIO()
+        errors = io.StringIO()
+        self.assertEqual(
+            self.module.main(
+                ["verify-archive", str(fixture.archive), fixture.archive_sha, fixture.source_ref],
+                stdout=output,
+                stderr=errors,
+            ),
+            0,
+        )
+        self.assertEqual(
+            output.getvalue(),
+            f"KINVEST_OFFLINE_ARCHIVE_OK runtimeImageId={verified.runtime_image_id}\n",
+        )
+        self.assertEqual(errors.getvalue(), "")
+
+        for command in ("import", "resolve"):
+            output = io.StringIO()
+            errors = io.StringIO()
+            arguments = (
+                [command, str(fixture.archive), fixture.archive_sha, fixture.source_ref, "a" * 40, "31601622272"]
+                if command == "import"
+                else [command, fixture.source_ref, "a" * 40, "31601622272"]
+            )
+            self.assertEqual(
+                self.module.main(
+                    arguments,
+                    stdout=output,
+                    stderr=errors,
+                    geteuid=lambda: 501,
+                    state_dir=state_dir,
+                    docker=docker,
+                    **self.state_options(),
+                ),
+                1,
+            )
+            self.assertEqual(output.getvalue(), "")
+            self.assertEqual(errors.getvalue(), "OFFLINE_ATTESTATION_ROOT_REQUIRED\n")
+
+        output = io.StringIO()
+        self.assertEqual(
+            self.module.main(
+                ["import", str(fixture.archive), fixture.archive_sha, fixture.source_ref, "a" * 40, "31601622272"],
+                stdout=output,
+                stderr=io.StringIO(),
+                geteuid=lambda: 0,
+                state_dir=state_dir,
+                docker=docker,
+                **self.state_options(),
+            ),
+            0,
+        )
+        self.assertEqual(
+            output.getvalue(),
+            f"KINVEST_OFFLINE_IMPORT_OK runtimeImageId={verified.runtime_image_id}\n",
+        )
+
+        output = io.StringIO()
+        self.assertEqual(
+            self.module.main(
+                ["resolve", fixture.source_ref, "a" * 40, "31601622272"],
+                stdout=output,
+                stderr=io.StringIO(),
+                geteuid=lambda: 0,
+                state_dir=state_dir,
+                docker=docker,
+                **self.state_options(),
+            ),
+            0,
+        )
+        self.assertEqual(output.getvalue(), verified.runtime_image_id + "\n")
+
+        output = io.StringIO()
+        self.assertEqual(
+            self.module.main(["self-check"], stdout=output, stderr=io.StringIO()),
+            0,
+        )
+        self.assertEqual(output.getvalue(), "KINVEST_OFFLINE_ATTESTATION_SELF_CHECK_OK\n")
 
 
 if __name__ == "__main__":
