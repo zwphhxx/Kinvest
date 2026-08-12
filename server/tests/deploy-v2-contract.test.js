@@ -173,6 +173,8 @@ while [ "$#" -gt 0 ]; do
   case "$1" in --signal=*|--kill-after=*) shift ;; *) break ;; esac
 done
 shift
+printf '%s\n' "$*" >> "$KINVEST_FAKE_STATE/timeout.log"
+if [ "$KINVEST_FAKE_MODE" = offline-helper-timeout ] && [ "$1" = "$KINVEST_OFFLINE_HELPER_PATH" ]; then exit 124; fi
 exec "$@"
 `
   )
@@ -255,6 +257,15 @@ case "$KINVEST_FAKE_MODE" in
     printf '%s\n%s\n' 'OFFLINE_ATTESTATION_NOT_FOUND' 'secret-like-payload-must-never-escape' >&2
     exit 1
     ;;
+  offline-helper-abnormal)
+    printf '%s\n' 'secret-like-payload-must-never-escape' >&2
+    exit 137
+    ;;
+  offline-helper-parent-signal)
+    kill -TERM "$KINVEST_TEST_DEPLOY_PID"
+    sleep 1
+    exit 143
+    ;;
   offline-malformed|offline-pull-failure)
     printf '%s\n' 'sha256:not-an-image-id'
     ;;
@@ -291,6 +302,7 @@ if [ "$1" = pull ]; then
   pull_count=$((pull_count + 1))
   printf '%s\n' "$pull_count" > "$KINVEST_FAKE_STATE/pull-count"
   if [ "$KINVEST_FAKE_MODE" = local-digest-transient ] && [ "$pull_count" -eq 1 ]; then exit 124; fi
+  if [ "$KINVEST_FAKE_MODE" = pull-failure-with-digest ]; then : > "$KINVEST_FAKE_STATE/pulled"; printf 'access denied\n' >&2; exit 1; fi
   if [ "$KINVEST_FAKE_MODE" = offline-pull-failure ] || [ "$KINVEST_FAKE_MODE" = tcr-helper-valid-pull-failure ]; then printf 'access denied\n' >&2; exit 1; fi
   : > "$KINVEST_FAKE_STATE/pulled"
   exit 0
@@ -305,7 +317,7 @@ if [ "$1" = image ] && [ "$2" = inspect ]; then
         printf '["ghcr.io/zwphhxx/kinvest@sha256:%064d"]\n' 0
       else
         case "$KINVEST_FAKE_MODE" in
-          local-tag-and-id-only|local-digest-transient|signal|offline-*|tcr-helper-valid|tcr-helper-valid-pull-failure)
+          local-tag-and-id-only|local-digest-transient|signal|offline-*|pull-failure-with-digest|tcr-helper-valid|tcr-helper-valid-pull-failure)
             if [ ! -f "$KINVEST_FAKE_STATE/pulled" ]; then
               printf '["ghcr.io/zwphhxx/kinvest:offline-import"]\n'
             else
@@ -402,6 +414,7 @@ esac
   )
 
   const instrumented = deploySource
+    .replace('set -euo pipefail', () => 'set -euo pipefail\nexport KINVEST_TEST_DEPLOY_PID=$$')
     .replace("ROOT='/root/docker/kinvest'", `ROOT='${root}'`)
     .replace("RUN_ROOT='/run'", `RUN_ROOT='${runRoot}'`)
     .replace("METADATA_NETWORK_CONFIG='/etc/kinvest/metadata-network.conf'", `METADATA_NETWORK_CONFIG='${metadataNetworkConfig}'`)
@@ -443,6 +456,7 @@ esac
       KINVEST_METADATA_ACTIVATION_PATH: metadataActivationState,
       KINVEST_METADATA_ACTIVATION_STAT: activationStat,
       KINVEST_TCR_POLICY_PATH: tcrPolicyFile,
+      KINVEST_OFFLINE_HELPER_PATH: offlineImageAttestation,
       KINVEST_METADATA_SNAPSHOT_PREFIX: path.join(runRoot, 'kinvest-metadata-network.'),
       KINVEST_FAKE_CONFIG_VALID: metadataConfigVariant === 'valid' ? '1' : '0'
     }
@@ -665,6 +679,7 @@ async function run() {
       `resolve ${offlineValid.candidateDigest} ${offlineValid.candidateCommit} 987654`
     ])
     assert.ok(readLogLines(path.join(offlineValid.fakeState, 'image-env.log')).some((line) => line === `compose|${offlineValid.candidateImageId}`))
+    assert.equal(fs.readdirSync(offlineValid.runRoot).length, 0, 'successful helper resolution must clean parent-owned temp files')
   } finally {
     offlineValid.cleanup()
   }
@@ -714,6 +729,40 @@ async function run() {
     } finally {
       suppressedHelperError.cleanup()
     }
+  }
+
+  for (const mode of ['offline-helper-timeout', 'offline-helper-abnormal']) {
+    const helperFailure = runRootFixture(deploy, { mode })
+    try {
+      assert.equal(helperFailure.result.status, 0, helperFailure.result.stderr)
+      assert.deepEqual(
+        readLogLines(path.join(helperFailure.fakeState, 'docker.log')).filter((line) => line.startsWith('pull ')),
+        [`pull ${helperFailure.candidateDigest}`],
+        `${mode} must preserve registry pull fallback`
+      )
+      assert.doesNotMatch(helperFailure.result.stderr, /secret-like-payload/)
+      assert.equal(fs.readdirSync(helperFailure.runRoot).length, 0, `${mode} must clean helper temp files`)
+      if (mode === 'offline-helper-timeout') {
+        assert.ok(
+          readLogLines(path.join(helperFailure.fakeState, 'timeout.log')).some((line) => line.includes('kinvest-offline-image-attestation resolve')),
+          'helper resolution must use the bounded timeout wrapper'
+        )
+      }
+    } finally {
+      helperFailure.cleanup()
+    }
+  }
+
+  const helperParentSignal = runRootFixture(deploy, { mode: 'offline-helper-parent-signal' })
+  try {
+    assert.equal(helperParentSignal.result.status, 143)
+    assert.equal(fs.readdirSync(helperParentSignal.runRoot).length, 0, 'parent signal trap must clean helper temp files')
+    assert.equal(
+      readLogLines(path.join(helperParentSignal.fakeState, 'docker.log')).some((line) => line.startsWith('pull ')),
+      false
+    )
+  } finally {
+    helperParentSignal.cleanup()
   }
 
   const tcrExactDigest = runRootFixture(deploy, {
@@ -802,6 +851,28 @@ async function run() {
     assert.match(localDigestTransient.result.stderr, /pull attempt 2 of 3 succeeded/)
   } finally {
     localDigestTransient.cleanup()
+  }
+
+  const failedPullExposesDigest = runRootFixture(deploy, { mode: 'pull-failure-with-digest' })
+  try {
+    assert.notEqual(failedPullExposesDigest.result.status, 0)
+    assert.deepEqual(
+      readLogLines(path.join(failedPullExposesDigest.fakeState, 'docker.log')).filter((line) => line.startsWith('pull ')),
+      [`pull ${failedPullExposesDigest.candidateDigest}`]
+    )
+    assert.equal(
+      readLogLines(path.join(failedPullExposesDigest.fakeState, 'docker.log')).some((line) => /^compose .*\bup\b/.test(line)),
+      false,
+      'a failed pull must stop before Compose even if the exact RepoDigest becomes visible'
+    )
+    assert.equal(
+      fs.readFileSync(path.join(failedPullExposesDigest.stateDir, 'current.state'), 'utf8'),
+      failedPullExposesDigest.initialCurrentState
+    )
+    assert.equal(fs.existsSync(path.join(failedPullExposesDigest.stateDir, 'attempt.state')), false)
+    assert.equal(fs.readdirSync(path.join(failedPullExposesDigest.root, 'backups')).length, 0)
+  } finally {
+    failedPullExposesDigest.cleanup()
   }
 
   const missingMetadataNetwork = runRootFixture(deploy, { mode: 'metadata-network-missing' })

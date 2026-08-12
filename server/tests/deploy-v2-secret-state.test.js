@@ -210,6 +210,21 @@ async function run() {
     }
   }
 
+  const validLegacy = 'digest_ref=__DIGEST__\ncommit=__COMMIT__\n'
+  for (const currentStateSource of [
+    validLegacy + 'unexpected=value\n',
+    validLegacy + '\nunexpected=value\n',
+    validLegacy + validLegacy
+  ]) {
+    const invalidLegacy = runRootFixture(deploy, { currentStateSource })
+    try {
+      assert.notEqual(invalidLegacy.result.status, 0)
+      assertNoMutation(invalidLegacy)
+    } finally {
+      invalidLegacy.cleanup()
+    }
+  }
+
   for (const [protocol, validSource] of [
     ['v2', stateSourceV2('{}')],
     ['v3', validV3]

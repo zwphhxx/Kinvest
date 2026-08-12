@@ -261,6 +261,7 @@ docker_config=''
 metadata_config_snapshot=''
 pull_stderr=''
 login_stderr=''
+offline_attestation_stdout=''
 offline_attestation_stderr=''
 preflight_stdout=''
 preflight_stderr=''
@@ -275,10 +276,12 @@ cleanup_runtime() {
   if [[ -n "$login_stderr" ]]; then
     rm -f -- "$login_stderr"
   fi
-  if [[ -n "$offline_attestation_stderr" &&
-    "$offline_attestation_stderr" == "$RUN_ROOT"/kinvest-offline-attestation.stderr.* ]]; then
-    rm -f -- "$offline_attestation_stderr"
-  fi
+  for offline_attestation_file in "$offline_attestation_stdout" "$offline_attestation_stderr"; do
+    if [[ -n "$offline_attestation_file" &&
+      "$offline_attestation_file" == "$RUN_ROOT"/kinvest-offline-attestation.* ]]; then
+      rm -f -- "$offline_attestation_file"
+    fi
+  done
   if [[ -n "$docker_config" && "$docker_config" == "$RUN_ROOT"/kinvest-docker-config.* ]]; then
     rm -rf -- "$docker_config"
   fi
@@ -488,46 +491,59 @@ inspect_image_id() {
   printf '%s\n' "$image_id"
 }
 
+resolved_offline_image_id=''
+
 resolve_offline_image_id() {
   local value=''
   local available_image_id=''
   local helper_status=0
+  local stdout_byte_count=''
 
+  resolved_offline_image_id=''
   if [[ "$registry_mode" != 'ghcr-public' ||
     "$artifact_source" != 'ghcr-public' ||
     "${digest_ref%@*}" != "$GHCR_REPOSITORY" ]]; then
     return 1
   fi
   [[ -x "$OFFLINE_IMAGE_ATTESTATION" && ! -L "$OFFLINE_IMAGE_ATTESTATION" ]] || return 1
+  offline_attestation_stdout="$(mktemp "$RUN_ROOT/kinvest-offline-attestation.stdout.XXXXXX")"
   offline_attestation_stderr="$(mktemp "$RUN_ROOT/kinvest-offline-attestation.stderr.XXXXXX")"
-  chmod 0600 "$offline_attestation_stderr"
+  chmod 0600 "$offline_attestation_stdout" "$offline_attestation_stderr"
   helper_status=0
-  value="$(
-    (
-      ulimit -f 1
-      exec "$OFFLINE_IMAGE_ATTESTATION" resolve \
-        "$digest_ref" \
-        "$commit_sha" \
-        "$verification_run_id"
-    ) 2>"$offline_attestation_stderr"
-  )" || helper_status=$?
+  (
+    ulimit -f 1
+    timeout --signal=TERM --kill-after="$INSPECT_KILL_AFTER" "$INSPECT_TIMEOUT" \
+      "$OFFLINE_IMAGE_ATTESTATION" resolve \
+      "$digest_ref" \
+      "$commit_sha" \
+      "$verification_run_id"
+  ) >"$offline_attestation_stdout" 2>"$offline_attestation_stderr" || helper_status=$?
   if ((helper_status != 0)); then
     surface_offline_attestation_error "$offline_attestation_stderr"
-    rm -f -- "$offline_attestation_stderr"
-    offline_attestation_stderr=''
+    clear_offline_attestation_files
     return 1
   fi
   if [[ -s "$offline_attestation_stderr" ]]; then
-    rm -f -- "$offline_attestation_stderr"
-    offline_attestation_stderr=''
+    clear_offline_attestation_files
     return 1
   fi
-  rm -f -- "$offline_attestation_stderr"
-  offline_attestation_stderr=''
-  [[ "$value" =~ ^sha256:[0-9a-f]{64}$ ]] || return 1
+  value="$(cat -- "$offline_attestation_stdout" 2>/dev/null)" || {
+    clear_offline_attestation_files
+    return 1
+  }
+  stdout_byte_count="$(wc -c < "$offline_attestation_stdout" | tr -d '[:space:]')" || {
+    clear_offline_attestation_files
+    return 1
+  }
+  if [[ ! "$value" =~ ^sha256:[0-9a-f]{64}$ ||
+    ( "$stdout_byte_count" != "${#value}" && "$stdout_byte_count" != "$(( ${#value} + 1 ))" ) ]]; then
+    clear_offline_attestation_files
+    return 1
+  fi
+  clear_offline_attestation_files
   available_image_id="$(inspect_image_id "$value")" || return 1
   [[ "$available_image_id" == "$value" ]] || return 1
-  printf '%s\n' "$value"
+  resolved_offline_image_id="$value"
 }
 
 surface_offline_attestation_error() {
@@ -560,6 +576,18 @@ surface_offline_attestation_error() {
   esac
 }
 
+clear_offline_attestation_files() {
+  local helper_file=''
+
+  for helper_file in "$offline_attestation_stdout" "$offline_attestation_stderr"; do
+    if [[ -n "$helper_file" && "$helper_file" == "$RUN_ROOT"/kinvest-offline-attestation.* ]]; then
+      rm -f -- "$helper_file"
+    fi
+  done
+  offline_attestation_stdout=''
+  offline_attestation_stderr=''
+}
+
 resolve_candidate_runtime_image_id() {
   local resolved_image_id=''
 
@@ -571,13 +599,16 @@ resolve_candidate_runtime_image_id() {
     return 0
   fi
 
-  if resolved_image_id="$(resolve_offline_image_id)"; then
+  if resolve_offline_image_id; then
+    resolved_image_id="$resolved_offline_image_id"
     printf '%s\n' 'Kinvest offline image attestation resolved a verified local Image ID; registry pull skipped.' >&2
     candidate_runtime_image_id="$resolved_image_id"
     return 0
   fi
 
-  pull_with_retries "$digest_ref"
+  if ! pull_with_retries "$digest_ref"; then
+    return 1
+  fi
   if ! verify_repo_digest "$digest_ref"; then
     printf '%s\n' 'pulled image RepoDigests do not contain the requested digest' >&2
     return 1
@@ -951,8 +982,6 @@ has_previous_release='false'
 read_current_state() {
   local source="${1:-$CURRENT_STATE}"
   local first_line=''
-  local second_line=''
-  local third_line=''
   local state_line=''
   local state_line_count=0
 
@@ -1020,12 +1049,16 @@ read_current_state() {
     done < "$source"
     [[ "$state_line_count" -eq 13 ]] || return 1
   else
-    IFS= read -r first_line < "$source" || return 1
-    IFS= read -r second_line < <(sed -n '2p' "$source") || return 1
-    third_line="$(sed -n '3p' "$source")"
-    [[ -z "$third_line" && "$first_line" == digest_ref=* && "$second_line" == commit=* ]] || return 1
-    previous_digest_ref="${first_line#digest_ref=}"
-    previous_commit="${second_line#commit=}"
+    state_line_count=0
+    while IFS= read -r state_line || [[ -n "$state_line" ]]; do
+      state_line_count=$((state_line_count + 1))
+      case "$state_line_count" in
+        1) [[ "$state_line" == digest_ref=* ]] || return 1; previous_digest_ref="${state_line#digest_ref=}" ;;
+        2) [[ "$state_line" == commit=* ]] || return 1; previous_commit="${state_line#commit=}" ;;
+        *) return 1 ;;
+      esac
+    done < "$source"
+    [[ "$state_line_count" -eq 2 ]] || return 1
   fi
 
   if [[ "$previous_state_protocol" == 'legacy' ]]; then
