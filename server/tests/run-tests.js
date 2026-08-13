@@ -2,6 +2,7 @@ const tests = [
   require('./security-identity.test'),
   require('./device-approval.test'),
   require('./cvm-ssm-secret-provider.test'),
+  require('./github-tmpfs-secret-provider.test'),
   require('./secret-bootstrap-contract.test'),
   require('./tencent-ssm-client.test'),
   require('./secret-bootstrap.test'),

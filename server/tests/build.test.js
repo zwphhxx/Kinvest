@@ -47,6 +47,7 @@ async function runBuildArtifactsExist() {
     'server/secret-preflight.js',
     'server/security/cvm-ssm-secret-provider.js',
     'server/security/device-approval.js',
+    'server/security/github-tmpfs-secret-provider.js',
     'server/security/secret-bootstrap-contract.js',
     'server/security/secret-bootstrap.js',
     'server/security/secret-provider.js',

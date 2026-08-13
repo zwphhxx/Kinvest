@@ -15,6 +15,7 @@ const runtimeFiles = [
   'server/domain/security-identity.js',
   'server/security/device-approval.js',
   'server/security/cvm-ssm-secret-provider.js',
+  'server/security/github-tmpfs-secret-provider.js',
   'server/security/secret-provider.js',
   'server/security/secret-bootstrap-contract.js',
   'server/security/secret-bootstrap.js',

@@ -8,7 +8,9 @@ const {
 
 const MODES = new Set([
   'admin-password-verifier',
-  'device-token-hmac'
+  'device-token-hmac',
+  'github-admin-password-verifier',
+  'github-device-token-hmac'
 ])
 const GENERATOR_ERROR_CODES = new Set([
   'ADMIN_PASSWORD_INVALID',
@@ -20,6 +22,8 @@ const GENERATOR_ERROR_CODES = new Set([
 ])
 const CLIPBOARD_TIMEOUT_MS = 5000
 const CLIPBOARD_KILL_GRACE_MS = 250
+const CLEANUP_SIGNALS = Object.freeze(['SIGHUP', 'SIGINT', 'SIGTERM'])
+const SIGNAL_CLEANUP_NOTICE = 'Clipboard cleanup handles SIGHUP, SIGINT, and SIGTERM; SIGKILL cannot be intercepted.'
 
 class SsmMaterialGeneratorError extends Error {
   constructor(code) {
@@ -63,10 +67,10 @@ async function readHiddenLine(input, output, promptText) {
 }
 
 /** @param {any} input @param {any} output */
-async function waitForClipboardClear(input, output) {
+async function waitForClipboardClear(input, output, destination = 'Tencent Cloud SSM') {
   const prompt = readline.createInterface({ input, output, terminal: true })
   try {
-    await prompt.question('Paste the value into Tencent Cloud SSM, then press Enter here to clear the clipboard. ')
+    await prompt.question(`Paste the value into ${destination}, then press Enter here to clear the clipboard. `)
   } finally {
     prompt.close()
   }
@@ -179,9 +183,10 @@ async function runGenerator({
   input = process.stdin,
   output = process.stdout,
   promptHidden = (promptText) => readHiddenLine(input, output, promptText),
-  waitForClear = () => waitForClipboardClear(input, output),
+  waitForClear = (destination) => waitForClipboardClear(input, output, destination),
   writeClipboard = writeMacClipboard,
-  randomBytes
+  randomBytes,
+  processRef = process
 } = {}) {
   if (!MODES.has(mode)) {
     throw new SsmMaterialGeneratorError('SSM_MATERIAL_CLI_USAGE_INVALID')
@@ -189,41 +194,96 @@ async function runGenerator({
   if (!input || input.isTTY !== true || !output || output.isTTY !== true) {
     throw new SsmMaterialGeneratorError('SSM_MATERIAL_TTY_REQUIRED')
   }
+  if (!processRef ||
+    typeof processRef.on !== 'function' ||
+    typeof processRef.removeListener !== 'function' ||
+    typeof processRef.kill !== 'function' ||
+    !Number.isSafeInteger(processRef.pid)) {
+    throw new SsmMaterialGeneratorError('SSM_MATERIAL_CLI_USAGE_INVALID')
+  }
 
   /** @type {Buffer | undefined} */
   let material
   let clipboardWriteAttempted = false
+  let clipboardCleared = false
   let primaryError
   let result
+  let signalCleanupPromise
+  const signalHandlers = new Map()
+  const removeSignalHandlers = () => {
+    for (const [signal, handler] of signalHandlers) {
+      processRef.removeListener(signal, handler)
+    }
+    signalHandlers.clear()
+  }
+  const clearGeneratedClipboard = async () => {
+    if (!clipboardWriteAttempted || clipboardCleared) return
+    clipboardCleared = true
+    await writeClipboard(Buffer.alloc(0))
+    output.write('Clipboard cleared.\n')
+  }
+  const beginSignalCleanup = (signal) => {
+    if (signalCleanupPromise) return
+    signalCleanupPromise = (async () => {
+      try {
+        await clearGeneratedClipboard()
+      } catch {
+        // Signal exit still proceeds after a best-effort clipboard clear.
+      } finally {
+        removeSignalHandlers()
+        processRef.kill(processRef.pid, signal)
+      }
+    })()
+  }
+  for (const signal of CLEANUP_SIGNALS) {
+    const handler = () => beginSignalCleanup(signal)
+    signalHandlers.set(signal, handler)
+    processRef.on(signal, handler)
+  }
+  output.write(`${SIGNAL_CLEANUP_NOTICE}\n`)
   try {
-    if (mode === 'admin-password-verifier') {
+    const isAdmin = mode === 'admin-password-verifier' ||
+      mode === 'github-admin-password-verifier'
+    const isGithub = mode === 'github-admin-password-verifier' ||
+      mode === 'github-device-token-hmac'
+    if (isAdmin) {
       const password = await promptHidden('Administrator password: ')
       const confirmation = await promptHidden('Administrator password again: ')
       if (password !== confirmation) {
         throw new SsmMaterialGeneratorError('ADMIN_PASSWORD_MISMATCH')
       }
-      material = Buffer.from(generateAdminPasswordVerifier(password, randomBytes))
+      const verifier = Buffer.from(generateAdminPasswordVerifier(password, randomBytes))
+      try {
+        material = isGithub
+          ? Buffer.from(verifier.toString('base64url'), 'ascii')
+          : Buffer.from(verifier)
+      } finally {
+        verifier.fill(0)
+      }
     } else {
       material = Buffer.from(generateDeviceHmacSecret(randomBytes))
     }
 
     clipboardWriteAttempted = true
     await writeClipboard(material)
-    output.write('SSM material copied to the macOS clipboard.\n')
-    await waitForClear()
+    const destination = isGithub
+      ? 'the GitHub Production Environment Secret'
+      : 'Tencent Cloud SSM'
+    output.write(`${isGithub ? 'GitHub' : 'SSM'} material copied to the macOS clipboard.\n`)
+    await waitForClear(destination)
     result = Object.freeze({ kind: mode })
   } catch (error) {
     primaryError = error
   } finally {
     if (material) material.fill(0)
-    if (clipboardWriteAttempted) {
+    if (clipboardWriteAttempted && !clipboardCleared) {
       try {
-        await writeClipboard(Buffer.alloc(0))
-        output.write('Clipboard cleared.\n')
+        await clearGeneratedClipboard()
       } catch (cleanupError) {
         if (!primaryError) primaryError = cleanupError
       }
     }
+    removeSignalHandlers()
   }
   if (primaryError) throw primaryError
   return result
@@ -248,6 +308,7 @@ if (require.main === module) {
 }
 
 module.exports = {
+  SIGNAL_CLEANUP_NOTICE,
   SsmMaterialGeneratorError,
   readHiddenLine,
   runGenerator,
