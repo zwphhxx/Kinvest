@@ -1,0 +1,283 @@
+name: Deploy production v3 (manual)
+
+on:
+  workflow_dispatch:
+    inputs:
+      release_run_id:
+        description: 'Successful main Deploy Kinvest run ID containing release-record v2'
+        required: true
+        type: string
+      intent:
+        description: 'FORWARD deploys a release, ROLLBACK selects previous state, RESTORE rebuilds lost tmpfs for current state'
+        required: true
+        type: choice
+        options:
+          - FORWARD
+          - ROLLBACK
+          - RESTORE
+      confirm:
+        description: 'Type DEPLOY_V3, ROLLBACK_V3, or RESTORE_V3 to match intent'
+        required: true
+        type: string
+
+permissions:
+  contents: read
+
+concurrency:
+  group: kinvest-production-v3
+  cancel-in-progress: false
+
+jobs:
+  validate:
+    name: validate-v3-release
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    permissions:
+      contents: read
+      actions: read
+    outputs:
+      artifact_source: ${{ steps.record.outputs.artifact_source }}
+      commit_sha: ${{ steps.record.outputs.commit_sha }}
+      image_digest: ${{ steps.record.outputs.image_digest }}
+      release_record_schema_version: ${{ steps.record.outputs.release_record_schema_version }}
+      verification_run_id: ${{ steps.record.outputs.verification_run_id }}
+    steps:
+      - name: Check out main history
+        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+      - name: Validate deployment gate
+        shell: bash
+        env:
+          RELEASE_RUN_ID: ${{ inputs.release_run_id }}
+          CONFIRM: ${{ inputs.confirm }}
+          INTENT: ${{ inputs.intent }}
+          WORKFLOW_REF: ${{ github.ref }}
+        run: |
+          set -euo pipefail
+          [[ "$WORKFLOW_REF" == 'refs/heads/main' ]]
+          [[ "$RELEASE_RUN_ID" =~ ^[0-9]+$ ]]
+          case "$INTENT:$CONFIRM" in
+            FORWARD:DEPLOY_V3|ROLLBACK:ROLLBACK_V3|RESTORE:RESTORE_V3) ;;
+            *) exit 1 ;;
+          esac
+      - name: Verify release run provenance
+        id: provenance
+        shell: bash
+        env:
+          RELEASE_RUN_ID: ${{ inputs.release_run_id }}
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          run_json="$(gh api "repos/${GITHUB_REPOSITORY}/actions/runs/${RELEASE_RUN_ID}")"
+          [[ "$(jq -r '.path' <<<"$run_json")" == '.github/workflows/deploy.yml' ]]
+          [[ "$(jq -r '.event' <<<"$run_json")" == 'push' ]]
+          [[ "$(jq -r '.head_branch' <<<"$run_json")" == 'main' ]]
+          [[ "$(jq -r '.conclusion' <<<"$run_json")" == 'success' ]]
+          run_attempt="$(jq -r '.run_attempt' <<<"$run_json")"
+          head_sha="$(jq -r '.head_sha' <<<"$run_json")"
+          [[ "$run_attempt" =~ ^[0-9]+$ ]]
+          [[ "$head_sha" =~ ^[0-9a-f]{40}$ ]]
+          artifacts="$(gh api "repos/${GITHUB_REPOSITORY}/actions/runs/${RELEASE_RUN_ID}/artifacts")"
+          expected_name="kinvest-release-record-v2-${RELEASE_RUN_ID}-${run_attempt}"
+          matches="$(jq --arg name "$expected_name" '[.artifacts[] | select(.expired == false and .name == $name)]' <<<"$artifacts")"
+          [[ "$(jq 'length' <<<"$matches")" == '1' ]]
+          printf 'run_attempt=%s\n' "$run_attempt" >> "$GITHUB_OUTPUT"
+          printf 'head_sha=%s\n' "$head_sha" >> "$GITHUB_OUTPUT"
+      - name: Download and validate offline release attestation
+        id: record
+        shell: bash
+        env:
+          RELEASE_RUN_ID: ${{ inputs.release_run_id }}
+          RUN_ATTEMPT: ${{ steps.provenance.outputs.run_attempt }}
+          RUN_HEAD_SHA: ${{ steps.provenance.outputs.head_sha }}
+          INTENT: ${{ inputs.intent }}
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          record_dir="$(mktemp -d)"
+          trap 'rm -rf "$record_dir"' EXIT
+          gh run download "$RELEASE_RUN_ID" \
+            --name "kinvest-release-record-v2-${RELEASE_RUN_ID}-${RUN_ATTEMPT}" \
+            --dir "$record_dir"
+          record="$record_dir/release-record.json"
+          expected_keys='artifact_source commit_sha created_at ghcr_digest schema_version source_digest source_repository tcr_digest verification_run_attempt verification_run_id'
+          [[ "$(jq -r 'keys | join(" ")' "$record")" == "$expected_keys" ]]
+          [[ "$(jq -r '.schema_version' "$record")" == '2' ]]
+          [[ "$(jq -r '.verification_run_id' "$record")" == "$RELEASE_RUN_ID" ]]
+          [[ "$(jq -r '.verification_run_attempt' "$record")" == "$RUN_ATTEMPT" ]]
+          commit_sha="$(jq -r '.commit_sha' "$record")"
+          artifact_source="$(jq -r '.artifact_source' "$record")"
+          source_repository="$(jq -r '.source_repository' "$record")"
+          source_digest="$(jq -r '.source_digest' "$record")"
+          ghcr_digest="$(jq -r '.ghcr_digest' "$record")"
+          [[ "$commit_sha" == "$RUN_HEAD_SHA" && "$commit_sha" =~ ^[0-9a-f]{40}$ ]]
+          [[ "$artifact_source" == 'ghcr-public' ]]
+          [[ "$source_repository" == 'ghcr.io/zwphhxx/kinvest' ]]
+          [[ "$source_digest" =~ ^sha256:[0-9a-f]{64}$ && "$source_digest" == "$ghcr_digest" ]]
+          [[ "$(jq -r '.tcr_digest == null' "$record")" == 'true' ]]
+          git merge-base --is-ancestor "$commit_sha" origin/main
+          if [[ "$INTENT" == 'FORWARD' ]]; then
+            [[ "$commit_sha" == "$(git rev-parse origin/main)" ]]
+          fi
+          printf 'artifact_source=%s\n' "$artifact_source" >> "$GITHUB_OUTPUT"
+          printf 'commit_sha=%s\n' "$commit_sha" >> "$GITHUB_OUTPUT"
+          printf 'image_digest=%s\n' "$source_digest" >> "$GITHUB_OUTPUT"
+          printf 'release_record_schema_version=2\n' >> "$GITHUB_OUTPUT"
+          printf 'verification_run_id=%s\n' "$RELEASE_RUN_ID" >> "$GITHUB_OUTPUT"
+
+  deploy:
+    name: deploy-v3
+    needs: validate
+    runs-on: ubuntu-latest
+    timeout-minutes: 40
+    environment: Production
+    permissions:
+      contents: read
+    steps:
+      - name: Check Production v3 gate after approval
+        shell: bash
+        env:
+          DEPLOY_V3_ENABLED: ${{ vars.DEPLOY_V3_ENABLED }}
+        run: test "$DEPLOY_V3_ENABLED" = 'true'
+      - name: Revalidate trusted control plane after approval
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+          INTENT: ${{ inputs.intent }}
+          TARGET_SHA: ${{ needs.validate.outputs.commit_sha }}
+          WORKFLOW_SHA: ${{ github.sha }}
+        run: |
+          set -euo pipefail
+          main_sha="$(gh api "repos/${GITHUB_REPOSITORY}/git/ref/heads/main" --jq '.object.sha')"
+          [[ "$main_sha" =~ ^[0-9a-f]{40}$ ]]
+          [[ "$WORKFLOW_SHA" == "$main_sha" ]]
+          if [[ "$INTENT" == 'FORWARD' ]]; then
+            [[ "$TARGET_SHA" == "$main_sha" ]]
+          fi
+      - name: Check out trusted deployment control plane
+        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683
+        with:
+          ref: ${{ github.sha }}
+          persist-credentials: false
+      - name: Configure strict SSH trust
+        shell: bash
+        env:
+          DEPLOY_HOST: ${{ vars.DEPLOY_HOST }}
+          DEPLOY_PORT: ${{ vars.DEPLOY_PORT }}
+          DEPLOY_KEY: ${{ secrets.DEPLOY_SSH_KEY }}
+          DEPLOY_KNOWN_HOSTS: ${{ secrets.DEPLOY_KNOWN_HOSTS }}
+        run: |
+          set -euo pipefail
+          [[ "$DEPLOY_HOST" =~ ^[A-Za-z0-9.-]+$ ]]
+          [[ "$DEPLOY_PORT" =~ ^[0-9]{1,5}$ ]]
+          ((DEPLOY_PORT >= 1 && DEPLOY_PORT <= 65535))
+          test -n "$DEPLOY_KEY"
+          test -n "$DEPLOY_KNOWN_HOSTS"
+          umask 077
+          install -d -m 700 "$HOME/.ssh"
+          printf '%s\n' "$DEPLOY_KEY" > "$HOME/.ssh/id_ed25519"
+          printf '%s\n' "$DEPLOY_KNOWN_HOSTS" > "$HOME/.ssh/known_hosts"
+          chmod 600 "$HOME/.ssh/id_ed25519" "$HOME/.ssh/known_hosts"
+          known_host="$DEPLOY_HOST"
+          if [[ "$DEPLOY_PORT" != '22' ]]; then known_host="[$DEPLOY_HOST]:$DEPLOY_PORT"; fi
+          ssh-keygen -F "$known_host" -f "$HOME/.ssh/known_hosts" >/dev/null
+      - name: Deploy canonical payload with deploy-v3 stdin
+        shell: bash
+        env:
+          DEPLOY_HOST: ${{ vars.DEPLOY_HOST }}
+          DEPLOY_PORT: ${{ vars.DEPLOY_PORT }}
+          DEPLOY_USER: ${{ vars.DEPLOY_USER }}
+          DEPLOY_SHA: ${{ needs.validate.outputs.commit_sha }}
+          IMAGE_DIGEST: ${{ needs.validate.outputs.image_digest }}
+          RELEASE_SCHEMA: ${{ needs.validate.outputs.release_record_schema_version }}
+          VERIFICATION_RUN_ID: ${{ needs.validate.outputs.verification_run_id }}
+          INTENT: ${{ inputs.intent }}
+          TMPFS_BOOTSTRAP_ENABLED: ${{ vars.TMPFS_BOOTSTRAP_ENABLED }}
+          TMPFS_ADMIN_PASSWORD_VERIFIER_VERSION_ID: ${{ vars.TMPFS_ADMIN_PASSWORD_VERIFIER_VERSION_ID }}
+          TMPFS_DEVICE_TOKEN_HMAC_VERSION_ID: ${{ vars.TMPFS_DEVICE_TOKEN_HMAC_VERSION_ID }}
+          ADMIN_MATERIAL: ${{ vars.TMPFS_BOOTSTRAP_ENABLED == 'true' && secrets.KINVEST_ADMIN_PASSWORD_VERIFIER_B64URL || '' }}
+          HMAC_MATERIAL: ${{ vars.TMPFS_BOOTSTRAP_ENABLED == 'true' && secrets.KINVEST_DEVICE_TOKEN_HMAC_KEY || '' }}
+        run: |
+          set -euo pipefail
+          secret_admin_material="${ADMIN_MATERIAL-}"
+          secret_hmac_material="${HMAC_MATERIAL-}"
+          unset ADMIN_MATERIAL HMAC_MATERIAL
+          trap 'unset payload secret_admin_material secret_hmac_material admin_material hmac_material' EXIT
+          [[ "$DEPLOY_HOST" =~ ^[A-Za-z0-9.-]+$ ]]
+          [[ "$DEPLOY_PORT" =~ ^[0-9]{1,5}$ ]]
+          ((DEPLOY_PORT >= 1 && DEPLOY_PORT <= 65535))
+          [[ "$DEPLOY_USER" =~ ^[a-z_][a-z0-9_-]*$ ]]
+          [[ "$DEPLOY_SHA" =~ ^[0-9a-f]{40}$ ]]
+          [[ "$IMAGE_DIGEST" =~ ^sha256:[0-9a-f]{64}$ ]]
+          [[ "$RELEASE_SCHEMA" == '2' ]]
+          [[ "$VERIFICATION_RUN_ID" =~ ^[0-9]{1,20}$ ]]
+          [[ "$INTENT" =~ ^(FORWARD|ROLLBACK|RESTORE)$ ]]
+
+          case "$TMPFS_BOOTSTRAP_ENABLED" in
+            false)
+              provider='disabled'
+              admin_version=''
+              hmac_version=''
+              admin_material=''
+              hmac_material=''
+              ;;
+            true)
+              provider='github-tmpfs-v1'
+              admin_version="$TMPFS_ADMIN_PASSWORD_VERIFIER_VERSION_ID"
+              hmac_version="$TMPFS_DEVICE_TOKEN_HMAC_VERSION_ID"
+              admin_material="$secret_admin_material"
+              hmac_material="$secret_hmac_material"
+              [[ "$admin_version" =~ ^v[0-9]{8}-[0-9]{3}$ ]]
+              [[ "$hmac_version" =~ ^v[0-9]{8}-[0-9]{3}$ ]]
+              test -n "$admin_material"
+              test -n "$hmac_material"
+              ;;
+            *) exit 1 ;;
+          esac
+
+          image_ref="ghcr.io/zwphhxx/kinvest@${IMAGE_DIGEST}"
+          provenance="{\"artifactSource\":\"ghcr-public\",\"releaseRecordSchemaVersion\":2,\"verificationRunId\":\"${VERIFICATION_RUN_ID}\"}"
+          registry='{"host":"ghcr.io","mode":"ghcr-public","repository":"ghcr.io/zwphhxx/kinvest"}'
+          payload="$(
+            printf '%s\n' \
+              'KINVEST_DEPLOY_V3' \
+              "$INTENT" \
+              "$image_ref" \
+              "$DEPLOY_SHA" \
+              "$provenance" \
+              "$registry" \
+              "$provider" \
+              "$admin_version" \
+              "$hmac_version" \
+              "$admin_material" \
+              "$hmac_material" \
+              'EOF'
+          )"
+          printf '%s\n' "$payload" |
+            python3 deploy/server/deploy-v3-contract.py validate-payload >/dev/null
+          printf '%s\n' "$payload" |
+            ssh \
+              -o BatchMode=yes \
+              -o IdentitiesOnly=yes \
+              -o StrictHostKeyChecking=yes \
+              -o UserKnownHostsFile="$HOME/.ssh/known_hosts" \
+              -o ConnectTimeout=10 \
+              -o ServerAliveInterval=15 \
+              -o ServerAliveCountMax=2 \
+              -o LogLevel=ERROR \
+              -i "$HOME/.ssh/id_ed25519" \
+              -p "$DEPLOY_PORT" \
+              "$DEPLOY_USER@$DEPLOY_HOST" \
+              'deploy-v3'
+      - name: Verify public HTTPS health
+        shell: bash
+        run: |
+          set -euo pipefail
+          response="$(curl -fsS --retry 3 --retry-all-errors --max-time 15 https://dearmina.cn/api/health)"
+          jq -e '.status == "ok" and .service == "kinvest"' <<<"$response" >/dev/null
+      - name: Remove ephemeral SSH material
+        if: ${{ always() }}
+        shell: bash
+        run: rm -f "$HOME/.ssh/id_ed25519" "$HOME/.ssh/known_hosts"

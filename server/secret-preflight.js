@@ -1,6 +1,8 @@
 const { bootstrapSecrets } = require('./security/secret-bootstrap')
 
 const SSM_PREFLIGHT_ERROR_CODES = new Set([
+  'GITHUB_TMPFS_BUNDLE_INVALID',
+  'GITHUB_TMPFS_CONFIG_INVALID',
   'SECRET_BOOTSTRAP_CONFIG_INVALID',
   'SECRET_MATERIAL_INVALID',
   'SECRET_MATERIAL_LOAD_FAILED',
@@ -23,6 +25,30 @@ function stableErrorCode(error, fallback = 'SSM_PREFLIGHT_FAILED') {
     : fallback
 }
 
+function preflightSuccessLine(status) {
+  if (!status || typeof status !== 'object' ||
+    !Number.isSafeInteger(status.referenceCount)) {
+    throw Object.assign(new Error('Invalid secret preflight status'), {
+      code: 'SSM_PREFLIGHT_REQUIRES_CVM_SSM'
+    })
+  }
+
+  if (status.mode === 'disabled' && status.referenceCount === 0) {
+    return 'KINVEST_SECRET_PREFLIGHT_OK mode=disabled references=0\n'
+  }
+  if (status.mode === 'github-tmpfs-v1' && status.referenceCount === 2) {
+    return 'KINVEST_SECRET_PREFLIGHT_OK mode=github-tmpfs-v1 references=2\n'
+  }
+  if (status.mode === 'cvm-ssm' &&
+    status.referenceCount >= 2 && status.referenceCount <= 11) {
+    return `KINVEST_SSM_PREFLIGHT_OK references=${status.referenceCount}\n`
+  }
+
+  throw Object.assign(new Error('Invalid secret preflight mode or reference count'), {
+    code: 'SSM_PREFLIGHT_REQUIRES_CVM_SSM'
+  })
+}
+
 /** @param {any} [options] */
 async function runPreflight({
   env = process.env,
@@ -33,13 +59,7 @@ async function runPreflight({
   let runtime
   try {
     runtime = await bootstrap({ env })
-    if (!runtime || !runtime.status || runtime.status.mode !== 'cvm-ssm') {
-      const error = Object.assign(new Error('SSM preflight requires CVM SSM mode'), {
-        code: 'SSM_PREFLIGHT_REQUIRES_CVM_SSM'
-      })
-      throw error
-    }
-    stdout.write(`KINVEST_SSM_PREFLIGHT_OK references=${runtime.status.referenceCount}\n`)
+    stdout.write(preflightSuccessLine(runtime && runtime.status))
     return 0
   } catch (error) {
     stderr.write(`${stableErrorCode(error)}\n`)
@@ -56,6 +76,7 @@ if (require.main === module) {
 }
 
 module.exports = {
+  preflightSuccessLine,
   runPreflight,
   stableErrorCode
 }
