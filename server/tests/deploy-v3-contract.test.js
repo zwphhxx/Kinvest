@@ -251,7 +251,7 @@ function runExecutor(deployer, options = {}) {
   writeExecutable(path.join(fakeBin, 'findmnt'), `#!/bin/sh\nprintf '%s\\n' findmnt >> '${log}'\nprintf '%s\\n' '${options.runFs ?? 'tmpfs'}'\n`)
   writeExecutable(path.join(fakeBin, 'kinvest-offline-image-attestation'), `#!/bin/sh\nprintf 'attestation:%s\\n' "$*" >> '${log}'\n${options.attestationFailure ? "printf '%s\\n' OFFLINE_ATTESTATION_NOT_FOUND >&2; exit 4" : `printf '%s\\n' '${candidateId}'`}\n`)
   writeExecutable(path.join(fakeBin, 'curl'), `#!/bin/sh\nprintf '%s\\n' curl >> '${log}'\nprintf '%s\\n' '{"status":"ok","service":"kinvest"}'\n`)
-  writeExecutable(path.join(fakeBin, 'docker'), `#!/bin/sh
+  writeExecutable(path.join(fakeBin, 'docker'), `#!/usr/bin/env bash
 set -eu
 printf 'docker:%s\\n' "$*" >> '${log}'
 case "$*" in
@@ -411,6 +411,7 @@ async function run() {
   const preflightFailure = runExecutor(deployer, { preflightFailure: true })
   try {
     assert.notEqual(preflightFailure.result.status, 0)
+    assert.match(preflightFailure.result.stderr, /DEPLOY_V3_PREFLIGHT_FAILED/)
     const operations = fs.readFileSync(preflightFailure.log, 'utf8')
     assert.match(operations, /^flock\nfindmnt\n/)
     assert.match(operations, /docker:run --rm/)
