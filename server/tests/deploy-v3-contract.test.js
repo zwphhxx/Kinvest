@@ -146,6 +146,7 @@ function runExecutor(deployer, options = {}) {
   const backupDir = path.join(root, 'backups')
   const fakeBin = path.join(fixture, 'bin')
   const log = path.join(fixture, 'operations.log')
+  const preflightLog = path.join(fixture, 'preflight.log')
   const activeImage = path.join(fixture, 'active-image')
   const healthMarker = path.join(fixture, 'health-marker')
   const atomicFailureMarker = path.join(fixture, 'atomic-failure.marker')
@@ -253,8 +254,11 @@ function runExecutor(deployer, options = {}) {
   writeExecutable(path.join(fakeBin, 'curl'), `#!/bin/sh\nprintf '%s\\n' curl >> '${log}'\nprintf '%s\\n' '{"status":"ok","service":"kinvest"}'\n`)
   writeExecutable(path.join(fakeBin, 'docker'), `#!/usr/bin/env bash
 set -eu
-ulimit -f unlimited 2>/dev/null || true
-printf 'docker:%s\\n' "$*" >> '${log}'
+if [[ "$*" == *"run --rm"* ]]; then
+  printf '%s\\n' preflight >> '${preflightLog}'
+else
+  printf 'docker:%s\\n' "$*" >> '${log}'
+fi
 case "$*" in
   *"image inspect ${candidateDigest} --format {{.Id}}"*) ${options.digestMissing ? 'exit 1' : `printf '%s\\n' '${candidateId}'`} ;;
   *"image inspect ${candidateId} --format {{.Id}}"*) printf '%s\\n' '${candidateId}' ;;
@@ -326,6 +330,7 @@ esac
     },
     input,
     log,
+    preflightLog,
     result,
     runRoot,
     stateDir,
@@ -415,7 +420,7 @@ async function run() {
     assert.match(preflightFailure.result.stderr, /DEPLOY_V3_PREFLIGHT_FAILED/)
     const operations = fs.readFileSync(preflightFailure.log, 'utf8')
     assert.match(operations, /^flock\nfindmnt\n/)
-    assert.match(operations, /docker:run --rm/)
+    assert.equal(fs.readFileSync(preflightFailure.preflightLog, 'utf8'), 'preflight\n')
     assert.doesNotMatch(operations, /compose/)
     assert.equal(fs.readdirSync(preflightFailure.backupDir).length, 0)
     assert.equal(fs.existsSync(path.join(preflightFailure.stateDir, 'attempt.state')), false)
@@ -431,7 +436,7 @@ async function run() {
   })
   try {
     assert.equal(disabledExecutor.result.status, 0, disabledExecutor.result.stderr)
-    assert.match(fs.readFileSync(disabledExecutor.log, 'utf8'), /docker:run --rm/)
+    assert.equal(fs.readFileSync(disabledExecutor.preflightLog, 'utf8'), 'preflight\npreflight\n')
   } finally {
     disabledExecutor.cleanup()
   }
@@ -484,7 +489,8 @@ async function run() {
   try {
     assert.equal(forward.result.status, 0, forward.result.stderr)
     const operations = fs.readFileSync(forward.log, 'utf8')
-    assert.ok(operations.indexOf('docker:run --rm') < operations.indexOf('compose'))
+    assert.equal(fs.readFileSync(forward.preflightLog, 'utf8'), 'preflight\npreflight\n')
+    assert.match(operations, /compose/)
     assert.equal(fs.readdirSync(forward.backupDir).length, 1)
     assert.doesNotMatch(`${forward.result.stdout}${forward.result.stderr}${operations}`, new RegExp(fakeMaterials().admin))
     const current = fs.readFileSync(path.join(forward.stateDir, 'current.state'), 'utf8')
@@ -584,7 +590,8 @@ async function run() {
   try {
     assert.notEqual(reuseConflict.result.status, 0)
     assert.match(reuseConflict.result.stderr, /SECRET_VERSION_REUSE_CONFLICT/)
-    assert.doesNotMatch(fs.readFileSync(reuseConflict.log, 'utf8'), /docker:run --rm|compose/)
+    assert.equal(fs.existsSync(reuseConflict.preflightLog), false)
+    assert.doesNotMatch(fs.readFileSync(reuseConflict.log, 'utf8'), /compose/)
     assert.equal(fs.readdirSync(reuseConflict.runRoot).length, 0)
   } finally {
     reuseConflict.cleanup()
@@ -599,7 +606,8 @@ async function run() {
   try {
     assert.notEqual(historicalConflict.result.status, 0)
     assert.match(historicalConflict.result.stderr, /SECRET_VERSION_REUSE_CONFLICT/)
-    assert.doesNotMatch(fs.readFileSync(historicalConflict.log, 'utf8'), /docker:run --rm|compose/)
+    assert.equal(fs.existsSync(historicalConflict.preflightLog), false)
+    assert.doesNotMatch(fs.readFileSync(historicalConflict.log, 'utf8'), /compose/)
   } finally {
     historicalConflict.cleanup()
   }
@@ -608,7 +616,8 @@ async function run() {
   try {
     assert.notEqual(pendingForward.result.status, 0)
     assert.match(pendingForward.result.stderr, /DEPLOY_V3_ATTEMPT_PENDING/)
-    assert.doesNotMatch(fs.readFileSync(pendingForward.log, 'utf8'), /docker:run --rm|compose/)
+    assert.equal(fs.existsSync(pendingForward.preflightLog), false)
+    assert.doesNotMatch(fs.readFileSync(pendingForward.log, 'utf8'), /compose/)
     assert.equal(fs.existsSync(path.join(pendingForward.stateDir, 'attempt.state')), true)
   } finally {
     pendingForward.cleanup()
@@ -643,7 +652,8 @@ async function run() {
   try {
     assert.notEqual(incompatibleRecovery.result.status, 0)
     assert.match(incompatibleRecovery.result.stderr, /ROLLBACK_REQUIRES_DB_RESTORE/)
-    assert.doesNotMatch(fs.readFileSync(incompatibleRecovery.log, 'utf8'), /docker:run --rm|compose/)
+    assert.equal(fs.existsSync(incompatibleRecovery.preflightLog), false)
+    assert.doesNotMatch(fs.readFileSync(incompatibleRecovery.log, 'utf8'), /compose/)
     assert.equal(fs.existsSync(path.join(incompatibleRecovery.stateDir, 'attempt.state')), false)
   } finally {
     incompatibleRecovery.cleanup()
