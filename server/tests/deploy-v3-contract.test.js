@@ -345,7 +345,7 @@ async function run() {
 
   assert.match(wrapper, /deploy-v2\)/)
   assert.match(wrapper, /deploy-v3\)/)
-  assert.match(wrapper, /exec sudo -n \/usr\/local\/sbin\/deploy-kinvest-v2/)
+  assert.match(wrapper, /exec sudo -n \/usr\/local\/sbin\/deploy-kinvest/)
   assert.match(wrapper, /exec sudo -n \/usr\/local\/sbin\/deploy-kinvest-v3/)
   assert.doesNotMatch(wrapper, /digest|material|docker|eval/)
 
@@ -811,7 +811,7 @@ async function run() {
       wrapperPath,
       wrapper
         .replace('/usr/local/sbin/deploy-kinvest-v3', capture)
-        .replace('/usr/local/sbin/deploy-kinvest-v2', capture)
+        .replace('/usr/local/sbin/deploy-kinvest', capture)
     )
     const forwarded = spawnSync(wrapperPath, [], {
       encoding: 'utf8',
