@@ -11,7 +11,7 @@ fi
 # makes the legacy deployer fail closed until its explicit retirement.
 case "${SSH_ORIGINAL_COMMAND:-}" in
   deploy-v2)
-    exec sudo -n /usr/local/sbin/deploy-kinvest-v2
+    exec sudo -n /usr/local/sbin/deploy-kinvest
     ;;
   deploy-v3)
     exec sudo -n /usr/local/sbin/deploy-kinvest-v3

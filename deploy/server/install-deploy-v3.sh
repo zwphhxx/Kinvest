@@ -25,10 +25,10 @@ TARGET_NAMES=('deployer' 'wrapper' 'helper' 'compose' 'sudoers')
 ASSET_MODES=('0755' '0755' '0755' '0644' '0440')
 EXPECTED_ASSET_HASHES=(
   '8bb3a2e0e31649440a8a920d2fc4afdecf2a11abf31817074d737d8356a45306'
-  'c9bcc3ef8a3e462425423a6f6f5e4b9aa8a84b9cd242d06f04ab592be667f606'
+  '9850a2613ab15ad81c217ff54c2eef86394c2d9fb33c6ce8639411cd8021dac6'
   '52605d387571f05a5df52e5f6484ec1962c5aa4b758ab0fe0a45521ae51df008'
   'a422a8ce78ab16bf589a66508d4a7dfdd3ba05238a80784992ed62e959767eff'
-  '4293e524d7aa95bde30cb4b2152df8e6c93571200d757ec9697f58448c5612b8'
+  'a04ece63c6a4c34b28976128b9445c9bd3db37cadc5480eb1b5cb92d95d64f8e'
 )
 
 fail() {
@@ -306,7 +306,7 @@ bash -n "$WRAPPER_TARGET"
 PYTHONPYCACHEPREFIX="$compile_cache" python3 -m py_compile "$HELPER_TARGET"
 visudo -cf "$SUDOERS_TARGET" >/dev/null
 sudo -n -U "$DEPLOY_USER" -l "$DEPLOY_TARGET" >/dev/null
-sudo -n -U "$DEPLOY_USER" -l "$LOCAL_SBIN/deploy-kinvest-v2" >/dev/null
+sudo -n -U "$DEPLOY_USER" -l "$LOCAL_SBIN/deploy-kinvest" >/dev/null
 transaction_committed='true'
 
 sha256sum "$DEPLOY_TARGET" "$WRAPPER_TARGET" "$HELPER_TARGET" "$COMPOSE_TARGET" "$SUDOERS_TARGET"
