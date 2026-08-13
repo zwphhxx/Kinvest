@@ -4,6 +4,10 @@ const {
   validateLoadedSecretMaterial
 } = require('./secret-bootstrap-contract')
 const { loadCvmSsmSecrets } = require('./cvm-ssm-secret-provider')
+const {
+  BUNDLE_PATH,
+  loadGithubTmpfsSecrets
+} = require('./github-tmpfs-secret-provider')
 
 /**
  * @typedef {{secretName: string, versionId: string}} SecretReference
@@ -28,8 +32,15 @@ class SecretBootstrapRuntimeError extends Error {
 function parseEnvironmentConfig(env) {
   const hasMode = Object.prototype.hasOwnProperty.call(env, 'KINVEST_SECRET_PROVIDER_MODE')
   const hasVersions = Object.prototype.hasOwnProperty.call(env, 'KINVEST_SECRET_VERSION_IDS')
+  const hasBundlePath = Object.prototype.hasOwnProperty.call(env, 'KINVEST_SECRET_BUNDLE_PATH')
   if (!hasMode && !hasVersions) {
-    return parseSecretVersionConfig('{}')
+    if (hasBundlePath) {
+      throw new SecretBootstrapRuntimeError('SECRET_BOOTSTRAP_CONFIG_INVALID')
+    }
+    return Object.freeze({
+      ...parseSecretVersionConfig('{}'),
+      providerMode: 'disabled'
+    })
   }
   if (!hasMode || !hasVersions) {
     throw new SecretBootstrapRuntimeError('SECRET_BOOTSTRAP_CONFIG_INVALID')
@@ -43,12 +54,22 @@ function parseEnvironmentConfig(env) {
   } catch {
     throw new SecretBootstrapRuntimeError('SECRET_BOOTSTRAP_CONFIG_INVALID')
   }
-  if ((mode === 'disabled' && config.mode !== 'disabled') ||
-    (mode === 'cvm-ssm' && config.mode !== 'cvm-ssm') ||
-    (mode !== 'disabled' && mode !== 'cvm-ssm')) {
+  const githubModeValid = mode === 'github-tmpfs-v1' &&
+    config.mode === 'cvm-ssm' &&
+    hasBundlePath &&
+    env.KINVEST_SECRET_BUNDLE_PATH === BUNDLE_PATH &&
+    config.references.length === 2
+  if ((mode === 'disabled' && (config.mode !== 'disabled' || hasBundlePath)) ||
+    (mode === 'cvm-ssm' && (config.mode !== 'cvm-ssm' || hasBundlePath)) ||
+    (mode === 'github-tmpfs-v1' && !githubModeValid) ||
+    (mode !== 'disabled' && mode !== 'cvm-ssm' && mode !== 'github-tmpfs-v1')) {
     throw new SecretBootstrapRuntimeError('SECRET_BOOTSTRAP_CONFIG_INVALID')
   }
-  return config
+  return Object.freeze({
+    ...config,
+    providerMode: mode,
+    ...(mode === 'github-tmpfs-v1' ? { bundlePath: BUNDLE_PATH } : {})
+  })
 }
 
 /**
@@ -75,33 +96,41 @@ function createRuntime(provider, status) {
 /**
  * @param {object} [options]
  * @param {Record<string, string | undefined>} [options.env]
- * @param {(options: {references: SecretReference[], roleName: string}) => Promise<SecretProviderLike>} [options.loadSecrets]
+ * @param {(options: {references: SecretReference[], roleName?: string, bundlePath?: string}) => Promise<SecretProviderLike>} [options.loadSecrets]
  * @param {(provider: SecretProviderLike, config: any) => Promise<SecretRuntimeStatus>} [options.validateMaterial]
  * @returns {Promise<SecretRuntime>}
  */
 async function bootstrapSecrets({
   env = process.env,
-  loadSecrets = loadCvmSsmSecrets,
+  loadSecrets,
   validateMaterial = validateLoadedSecretMaterial
 } = {}) {
   if (!env || typeof env !== 'object' ||
-    typeof loadSecrets !== 'function' ||
+    (loadSecrets !== undefined && typeof loadSecrets !== 'function') ||
     typeof validateMaterial !== 'function') {
     throw new SecretBootstrapRuntimeError('SECRET_BOOTSTRAP_CONFIG_INVALID')
   }
   const config = parseEnvironmentConfig(env)
-  if (config.mode === 'disabled') {
+  if (config.providerMode === 'disabled') {
     return createRuntime(null, { mode: 'disabled', referenceCount: 0 })
   }
 
   let provider
   try {
-    provider = await loadSecrets({
-      references: config.references,
-      roleName: ROLE_NAME
+    const loader = loadSecrets || (config.providerMode === 'cvm-ssm'
+      ? loadCvmSsmSecrets
+      : loadGithubTmpfsSecrets)
+    const loaderOptions = config.providerMode === 'cvm-ssm'
+      ? { references: config.references, roleName: ROLE_NAME }
+      : loadSecrets
+          ? { references: config.references, bundlePath: config.bundlePath }
+          : { references: config.references }
+    provider = await loader(loaderOptions)
+    const validatedStatus = await validateMaterial(provider, config)
+    return createRuntime(provider, {
+      ...validatedStatus,
+      mode: config.providerMode
     })
-    const status = await validateMaterial(provider, config)
-    return createRuntime(provider, status)
   } catch (error) {
     if (provider && typeof provider.clear === 'function') provider.clear()
     throw error

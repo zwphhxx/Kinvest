@@ -12,6 +12,8 @@
     "build": "node scripts/build.js",
     "secret:generate:admin": "node scripts/generate-ssm-material.js admin-password-verifier",
     "secret:generate:hmac": "node scripts/generate-ssm-material.js device-token-hmac",
+    "secret:generate:github-admin": "node scripts/generate-ssm-material.js github-admin-password-verifier",
+    "secret:generate:github-hmac": "node scripts/generate-ssm-material.js github-device-token-hmac",
     "check": "npm run build && npm test && npm run lint && npm run typecheck"
   },
   "engines": {

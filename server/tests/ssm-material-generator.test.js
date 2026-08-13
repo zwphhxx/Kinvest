@@ -1,5 +1,9 @@
 const assert = require('node:assert/strict')
+const crypto = require('node:crypto')
 const { EventEmitter } = require('node:events')
+const fs = require('node:fs')
+const path = require('node:path')
+const { PassThrough, Writable } = require('node:stream')
 const {
   parseAdminPasswordVerifier,
   parseDeviceHmacSecret
@@ -14,12 +18,68 @@ function hasCode(code) {
 }
 
 async function run() {
+  const generatorTestSource = fs.readFileSync(__filename, 'utf8')
+  assert.equal(
+    /assert\.equal\(\s*decodedGithubAdmin\.toString\('base64url'\)/.test(generatorTestSource),
+    false
+  )
   const {
+    SIGNAL_CLEANUP_NOTICE,
     runGenerator,
     runGeneratorCli,
     stableErrorCode,
     writeMacClipboard
   } = require('../../scripts/generate-ssm-material')
+
+  assert.equal(
+    typeof SIGNAL_CLEANUP_NOTICE === 'string' &&
+      SIGNAL_CLEANUP_NOTICE.includes('SIGKILL') &&
+      SIGNAL_CLEANUP_NOTICE.includes('cannot be intercepted'),
+    true
+  )
+
+  /** @type {any} */
+  const signalProcess = new EventEmitter()
+  signalProcess.pid = 12345
+  signalProcess.killCalls = []
+  signalProcess.kill = (pid, signal) => signalProcess.killCalls.push({ pid, signal })
+  let releaseSignalWait = () => {}
+  let firstSignalClipboardWrite
+  const firstSignalClipboardWritePromise = new Promise((resolve) => {
+    firstSignalClipboardWrite = resolve
+  })
+  const signalClipboard = []
+  const signalRun = runGenerator({
+    mode: 'github-device-token-hmac',
+    input: { isTTY: true },
+    output: { isTTY: true, write() {} },
+    waitForClear: () => new Promise((resolve) => {
+      releaseSignalWait = () => resolve()
+    }),
+    writeClipboard: async (value) => {
+      signalClipboard.push(Buffer.from(value))
+      if (signalClipboard.length === 1) firstSignalClipboardWrite()
+    },
+    randomBytes: (length) => deterministicBytes(length, 'signal-hmac'),
+    processRef: signalProcess
+  })
+  await firstSignalClipboardWritePromise
+  assert.equal(signalProcess.listenerCount('SIGHUP'), 1)
+  assert.equal(signalProcess.listenerCount('SIGINT'), 1)
+  assert.equal(signalProcess.listenerCount('SIGTERM'), 1)
+  signalProcess.emit('SIGTERM')
+  await new Promise((resolve) => setImmediate(resolve))
+  assert.equal(signalClipboard.length >= 2 && signalClipboard[1].length === 0, true)
+  assert.equal(
+    JSON.stringify(signalProcess.killCalls) ===
+      JSON.stringify([{ pid: 12345, signal: 'SIGTERM' }]),
+    true
+  )
+  releaseSignalWait()
+  await signalRun
+  assert.equal(signalProcess.listenerCount('SIGHUP'), 0)
+  assert.equal(signalProcess.listenerCount('SIGINT'), 0)
+  assert.equal(signalProcess.listenerCount('SIGTERM'), 0)
 
   const adminClipboard = []
   const adminWriteBuffers = []
@@ -64,6 +124,118 @@ async function run() {
   assert.equal(hmacClipboard.length, 2)
   parseDeviceHmacSecret(hmacClipboard[0]).fill(0)
   assert.equal(hmacClipboard[1].length, 0)
+
+  const githubAdminClipboard = []
+  const githubAdminOutput = []
+  const githubAdminResult = await runGenerator({
+    mode: 'github-admin-password-verifier',
+    input: { isTTY: true },
+    output: { isTTY: true, write: (value) => githubAdminOutput.push(String(value)) },
+    promptHidden: async () => 'correct horse battery staple',
+    waitForClear: async () => {},
+    writeClipboard: async (value) => githubAdminClipboard.push(Buffer.from(value)),
+    randomBytes: (length) => deterministicBytes(length, 'github-admin-salt')
+  })
+  assert.deepEqual(githubAdminResult, { kind: 'github-admin-password-verifier' })
+  assert.equal(githubAdminClipboard.length, 2)
+  const decodedGithubAdmin = Buffer.from(
+    githubAdminClipboard[0].toString('ascii'),
+    'base64url'
+  )
+  const reencodedGithubAdmin = Buffer.from(
+    decodedGithubAdmin.toString('base64url'),
+    'ascii'
+  )
+  try {
+    assert.equal(reencodedGithubAdmin.equals(githubAdminClipboard[0]), true)
+  } finally {
+    reencodedGithubAdmin.fill(0)
+  }
+  const parsedGithubAdmin = parseAdminPasswordVerifier(decodedGithubAdmin)
+  parsedGithubAdmin.digest.fill(0)
+  parsedGithubAdmin.salt.fill(0)
+  decodedGithubAdmin.fill(0)
+  assert.equal(githubAdminClipboard[1].length, 0)
+
+  const githubHmacClipboard = []
+  const githubHmacOutput = []
+  const githubHmacResult = await runGenerator({
+    mode: 'github-device-token-hmac',
+    input: { isTTY: true },
+    output: { isTTY: true, write: (value) => githubHmacOutput.push(String(value)) },
+    waitForClear: async () => {},
+    writeClipboard: async (value) => githubHmacClipboard.push(Buffer.from(value)),
+    randomBytes: (length) => deterministicBytes(length, 'github-device-hmac')
+  })
+  assert.deepEqual(githubHmacResult, { kind: 'github-device-token-hmac' })
+  assert.equal(githubHmacClipboard[0].length, 43)
+  parseDeviceHmacSecret(githubHmacClipboard[0]).fill(0)
+  assert.equal(githubHmacClipboard[1].length, 0)
+
+  const generatorSensitiveValues = [
+    githubAdminClipboard[0].toString('ascii'),
+    githubHmacClipboard[0].toString('ascii')
+  ]
+  generatorSensitiveValues.push(...generatorSensitiveValues.map((value) =>
+    crypto.createHash('sha256').update(value).digest('hex')
+  ))
+  const generatorStdout = [
+    ...adminOutput,
+    ...githubAdminOutput,
+    ...githubHmacOutput
+  ].join('')
+  const generatorStderr = generatorSensitiveValues.map((value) =>
+    stableErrorCode(Object.assign(new Error(value), { code: value }))
+  ).join('\n')
+  assert.equal(
+    generatorSensitiveValues.some((value) =>
+      generatorStdout.includes(value) || generatorStderr.includes(value)),
+    false
+  )
+  githubAdminClipboard[0].fill(0)
+  githubHmacClipboard[0].fill(0)
+
+  for (const mode of [
+    'github-admin-password-verifier',
+    'github-device-token-hmac'
+  ]) {
+    const input = Object.assign(new PassThrough(), { isTTY: true })
+    input.end('\n')
+    const outputChunks = []
+    const output = Object.assign(new Writable({
+      write(chunk, _encoding, callback) {
+        outputChunks.push(String(chunk))
+        callback()
+      }
+    }), { isTTY: true })
+    await runGenerator({
+      mode,
+      input,
+      output,
+      promptHidden: async () => 'correct horse battery staple',
+      writeClipboard: async () => {},
+      randomBytes: (length) => deterministicBytes(length, `${mode}-bytes`)
+    })
+    const visibleOutput = outputChunks.join('')
+    assert.equal(
+      visibleOutput.includes('GitHub Production Environment Secret'),
+      true
+    )
+    assert.equal(visibleOutput.includes('Tencent Cloud SSM'), false)
+  }
+
+  const packageJson = JSON.parse(fs.readFileSync(
+    path.resolve(__dirname, '..', '..', 'package.json'),
+    'utf8'
+  ))
+  assert.equal(
+    packageJson.scripts['secret:generate:github-admin'],
+    'node scripts/generate-ssm-material.js github-admin-password-verifier'
+  )
+  assert.equal(
+    packageJson.scripts['secret:generate:github-hmac'],
+    'node scripts/generate-ssm-material.js github-device-token-hmac'
+  )
 
   const failedWaitClipboard = []
   await assert.rejects(runGenerator({

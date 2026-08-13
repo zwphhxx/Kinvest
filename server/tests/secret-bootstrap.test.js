@@ -7,6 +7,7 @@ const {
 } = require('../security/secret-bootstrap-contract')
 
 const VERSION = 'v20260812-001'
+const BUNDLE_PATH = '/run/secrets/kinvest'
 const ENABLED_JSON = JSON.stringify({
   adminPasswordVerifier: VERSION,
   deviceTokenHmac: {
@@ -54,6 +55,31 @@ async function run() {
     {
       KINVEST_SECRET_PROVIDER_MODE: 'unknown',
       KINVEST_SECRET_VERSION_IDS: '{}'
+    },
+    {
+      KINVEST_SECRET_PROVIDER_MODE: 'github-tmpfs-v1',
+      KINVEST_SECRET_VERSION_IDS: ENABLED_JSON
+    },
+    {
+      KINVEST_SECRET_PROVIDER_MODE: 'github-tmpfs-v1',
+      KINVEST_SECRET_VERSION_IDS: ENABLED_JSON,
+      KINVEST_SECRET_BUNDLE_PATH: '/tmp/not-production-bundle'
+    },
+    {
+      KINVEST_SECRET_PROVIDER_MODE: 'disabled',
+      KINVEST_SECRET_VERSION_IDS: '{}',
+      KINVEST_SECRET_BUNDLE_PATH: BUNDLE_PATH
+    },
+    {
+      KINVEST_SECRET_PROVIDER_MODE: 'github-tmpfs-v1',
+      KINVEST_SECRET_VERSION_IDS: JSON.stringify({
+        adminPasswordVerifier: VERSION,
+        deviceTokenHmac: {
+          accepted: [VERSION, 'v20260812-002'],
+          active: VERSION
+        }
+      }),
+      KINVEST_SECRET_BUNDLE_PATH: BUNDLE_PATH
     }
   ]) {
     await assert.rejects(bootstrapSecrets({ env }), hasCode('SECRET_BOOTSTRAP_CONFIG_INVALID'))
@@ -71,7 +97,7 @@ async function run() {
     [`${ADMIN_SECRET_NAME}:${VERSION}`, Buffer.from(adminMaterial)],
     [`${DEVICE_HMAC_SECRET_NAME}:${VERSION}`, Buffer.from(hmacMaterial)]
   ])
-  /** @type {{roleName: string, references: Array<{secretName: string, versionId: string}>} | undefined} */
+  /** @type {{roleName?: string, bundlePath?: string, references: Array<{secretName: string, versionId: string}>} | undefined} */
   let receivedOptions
   const enabled = await bootstrapSecrets({
     env: {
@@ -106,6 +132,40 @@ async function run() {
   enabled.clear()
   enabled.clear()
   assert.equal(clearCount, 1)
+
+  let githubOptions
+  let githubClearCount = 0
+  const github = await bootstrapSecrets({
+    env: {
+      KINVEST_SECRET_PROVIDER_MODE: 'github-tmpfs-v1',
+      KINVEST_SECRET_VERSION_IDS: ENABLED_JSON,
+      KINVEST_SECRET_BUNDLE_PATH: BUNDLE_PATH
+    },
+    loadSecrets: async (options) => {
+      githubOptions = options
+      return {
+        readSecret(reference) {
+          return Buffer.from(providerValues.get(
+            `${reference.secretName}:${reference.versionId}`
+          ))
+        },
+        clear() { githubClearCount += 1 }
+      }
+    }
+  })
+  assert.deepEqual(githubOptions, {
+    references: [
+      { secretName: ADMIN_SECRET_NAME, versionId: VERSION },
+      { secretName: DEVICE_HMAC_SECRET_NAME, versionId: VERSION }
+    ],
+    bundlePath: BUNDLE_PATH
+  })
+  assert.deepEqual(github.status, {
+    mode: 'github-tmpfs-v1',
+    referenceCount: 2
+  })
+  github.clear()
+  assert.equal(githubClearCount, 1)
 
   let failedProviderClears = 0
   await assert.rejects(bootstrapSecrets({
