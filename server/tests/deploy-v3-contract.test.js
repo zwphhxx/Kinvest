@@ -152,6 +152,7 @@ function runExecutor(deployer, options = {}) {
   const atomicFailureMarker = path.join(fixture, 'atomic-failure.marker')
   const contract = path.join(fixture, 'deploy-v3-contract.py')
   const compose = path.join(root, 'docker-compose-v3.yml')
+  const metadataNetworkConfig = path.join(fixture, 'metadata-network.conf')
   const candidateId = `sha256:${'a'.repeat(64)}`
   const previousId = options.currentState?.runtimeImageId ?? `sha256:${'2'.repeat(64)}`
   const candidateDigest = `ghcr.io/zwphhxx/kinvest@sha256:${'a'.repeat(64)}`
@@ -171,6 +172,10 @@ function runExecutor(deployer, options = {}) {
   fs.writeFileSync(contract, contractSource)
   fs.chmodSync(contract, 0o755)
   fs.writeFileSync(compose, read('deploy/server/docker-compose-v3.yml'))
+  fs.writeFileSync(
+    metadataNetworkConfig,
+    options.metadataBundlePath ? 'KINVEST_SECRET_BUNDLE_PATH=/run/secrets/poisoned\n' : 'KINVEST_METADATA_NETWORK=fixture\n'
+  )
   const createDatabase = spawnSync('python3', ['-c', 'import sqlite3,sys; c=sqlite3.connect(sys.argv[1]); c.execute("PRAGMA user_version=0"); c.close()', path.join(dataDir, 'kinvest.sqlite')], { encoding: 'utf8' })
   assert.equal(createDatabase.status, 0, createDatabase.stderr)
   const normalizedCurrentState = { ...(options.currentState ?? {}) }
@@ -231,6 +236,7 @@ function runExecutor(deployer, options = {}) {
     .replace("BUNDLE_GID='10001'", `BUNDLE_GID='${process.getgid()}'`)
     .replace("CONTRACT='/usr/local/libexec/kinvest-deploy-v3-contract'", `CONTRACT='${contract}'`)
     .replace("OFFLINE_IMAGE_ATTESTATION='/usr/local/libexec/kinvest-offline-image-attestation'", `OFFLINE_IMAGE_ATTESTATION='${path.join(fakeBin, 'kinvest-offline-image-attestation')}'`)
+    .replace("METADATA_NETWORK_CONFIG='/etc/kinvest/metadata-network.conf'", `METADATA_NETWORK_CONFIG='${metadataNetworkConfig}'`)
     .replace("PUBLIC_HEALTH_URL='https://dearmina.cn/api/health'", "PUBLIC_HEALTH_URL='https://fixture.invalid/api/health'")
   if (options.backupFailure) {
     source = source.replace(
@@ -270,8 +276,18 @@ case "$*" in
   *"io.kinvest.secret-bootstrap"*) printf '%s\\n' '${options.missingCapability ? '' : '1'}' ;;
   *"image inspect sha256:"*" --format {{.Id}}"*) printf '%s\\n' "$3" ;;
   *"run --rm"*)
+    case "$*" in
+      *KINVEST_SECRET_PROVIDER_MODE=github-tmpfs-v1*)
+        case "$*" in
+          *KINVEST_SECRET_BUNDLE_PATH=/run/secrets/kinvest*":/run/secrets/kinvest:ro"*) ;;
+          *) exit 19 ;;
+        esac ;;
+    esac
     ${options.preflightFailure ? 'exit 17' : options.realDisabledPreflight
-      ? `KINVEST_SECRET_PROVIDER_MODE=disabled KINVEST_SECRET_VERSION_IDS='{}' node '${path.join(rootDir, 'server/secret-preflight.js')}'`
+      ? `case "$*" in
+          *KINVEST_SECRET_BUNDLE_PATH*) exit 18 ;;
+        esac
+        KINVEST_SECRET_PROVIDER_MODE=disabled KINVEST_SECRET_VERSION_IDS='{}' node '${path.join(rootDir, 'server/secret-preflight.js')}'`
       : options.preflightOversized
         ? "printf '%0130d' 0"
         : options.preflightStderr
@@ -282,6 +298,7 @@ case "$*" in
     ${options.composeFailure ? `if [ "\${KINVEST_IMAGE:-}" = '${candidateId}' ]; then exit 18; fi` : ':'}
     ${options.recoveryFailure ? `if [ "\${KINVEST_IMAGE:-}" = '${previousId}' ]; then exit 20; fi` : ':'}
     printf 'compose-env:%s|%s|%s\n' "\${KINVEST_IMAGE:-}" "\${KINVEST_SECRET_VERSION_IDS:-}" "\${KINVEST_SECRET_BUNDLE_HOST_PATH:-}" >> '${log}'
+    printf 'compose-bundle-env:%s\n' "\${KINVEST_SECRET_BUNDLE_PATH-unset}" >> '${log}'
     printf '%s' "\${KINVEST_IMAGE:-}" > '${activeImage}' ;;
   *"inspect --format {{.State.Health.Status}} kinvest"*)
     ${options.healthFailure ? `if [ ! -e '${healthMarker}' ] && [ "$(cat '${activeImage}')" = '${candidateId}' ]; then touch '${healthMarker}'; printf '%s\\n' unhealthy; exit 0; fi` : ':'}
@@ -395,6 +412,7 @@ async function run() {
   assert.match(deployer, /--cap-drop ALL/)
   assert.match(deployer, /--network none/)
   assert.match(deployer, /\/run\/secrets\/kinvest:ro/)
+  assert.match(deployer, /if \[\[ "\$provider" == github-tmpfs-v1 \]\]/)
   assert.ok(deployer.indexOf('run_secret_preflight') < deployer.indexOf('create_database_backup'))
   assert.doesNotMatch(deployer, /set -x|KINVEST_ADMIN_PASSWORD_VERIFIER_B64URL|KINVEST_DEVICE_TOKEN_HMAC_KEY/)
   const helperSource = read('deploy/server/deploy-v3-contract.py')
@@ -405,7 +423,7 @@ async function run() {
 
   assert.match(compose, /KINVEST_SECRET_PROVIDER_MODE/)
   assert.match(compose, /KINVEST_SECRET_VERSION_IDS/)
-  assert.match(compose, /KINVEST_SECRET_BUNDLE_PATH: \/run\/secrets\/kinvest/)
+  assert.match(compose, /^ {6}- KINVEST_SECRET_BUNDLE_PATH$/m)
   assert.match(compose, /source: \$\{KINVEST_SECRET_BUNDLE_HOST_PATH:\?[^}]+\}/)
   assert.match(compose, /target: \/run\/secrets\/kinvest/)
   assert.match(compose, /read_only: true/)
@@ -437,8 +455,29 @@ async function run() {
   try {
     assert.equal(disabledExecutor.result.status, 0, disabledExecutor.result.stderr)
     assert.equal(fs.readFileSync(disabledExecutor.preflightLog, 'utf8'), 'preflight\npreflight\n')
+    assert.match(fs.readFileSync(disabledExecutor.log, 'utf8'), /^compose-bundle-env:unset$/m)
   } finally {
     disabledExecutor.cleanup()
+  }
+
+  const poisonedDisabledExecutor = runExecutor(deployer, {
+    metadataBundlePath: true,
+    provider: 'disabled',
+    realDisabledPreflight: true
+  })
+  try {
+    assert.notEqual(poisonedDisabledExecutor.result.status, 0)
+    assert.equal(poisonedDisabledExecutor.result.stderr, 'DEPLOY_V3_METADATA_CONFIG_FORBIDDEN\n')
+    assert.equal(fs.existsSync(poisonedDisabledExecutor.preflightLog), false)
+    assert.equal(fs.readFileSync(poisonedDisabledExecutor.log, 'utf8'), 'flock\n')
+    assert.equal(
+      fs.readFileSync(path.join(poisonedDisabledExecutor.stateDir, 'current.state'), 'utf8'),
+      stateText()
+    )
+    assert.equal(fs.existsSync(path.join(poisonedDisabledExecutor.stateDir, 'attempt.state')), false)
+    assert.deepEqual(fs.readdirSync(poisonedDisabledExecutor.backupDir), [])
+  } finally {
+    poisonedDisabledExecutor.cleanup()
   }
 
   const disabledFailure = runExecutor(deployer, {

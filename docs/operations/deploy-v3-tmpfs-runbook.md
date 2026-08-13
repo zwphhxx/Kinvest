@@ -74,6 +74,8 @@ After approval, the deploy job re-reads the current `main` SHA. The workflow con
 7. Restore `DEPLOY_V3_ENABLED=false` immediately after acceptance.
 
 Disabled mode sends `disabled` plus four empty VersionId/material lines. It does not expose the two bootstrap Secrets to the step environment through the conditional expressions.
+The deployer must also omit `KINVEST_SECRET_BUNDLE_PATH` from both candidate preflight and the application container in disabled mode. The read-only disabled directory may remain mounted for a stable Compose shape, but the application must not be told to read it. `github-tmpfs-v1` mode must set the fixed container path and mount the selected candidate bundle.
+The fixed metadata-network env file must not define `KINVEST_SECRET_BUNDLE_PATH`; deploy-v3 rejects such a definition before preflight or any Docker/state transition so `--env-file` cannot reintroduce the variable in disabled mode.
 
 ## Gate 3: tmpfs bootstrap deployment
 
