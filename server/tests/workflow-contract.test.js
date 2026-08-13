@@ -1,5 +1,6 @@
 const assert = require('node:assert/strict')
 const { spawnSync } = require('node:child_process')
+const crypto = require('node:crypto')
 const fs = require('node:fs')
 const os = require('node:os')
 const path = require('node:path')
@@ -926,11 +927,334 @@ chmod +x "$destination/crane"
   }
 }
 
+function runOfflineExportFixture({
+  sourceReference = `ghcr.io/zwphhxx/kinvest@sha256:${'7'.repeat(64)}`,
+  outputMode = 'new',
+  verifierFails = false,
+  publishRace = false,
+  mutateAfterVerify = 'none',
+  simulateReusedIdentity = false,
+  anchorCleanupFault = 'none',
+  secondSignalDuringCleanup = false,
+  signalAfterLink = false,
+  signalAtStateTransition = false,
+  outputSuffix = ''
+} = {}) {
+  const fixtureRoot = fs.mkdtempSync(path.join(os.tmpdir(), 'kinvest-offline-export-'))
+  const fakeBin = path.join(fixtureRoot, 'bin')
+  const fakeState = path.join(fixtureRoot, 'state')
+  const outputPath = outputMode === 'relative' ? 'candidate.tar' : path.join(fixtureRoot, `candidate${outputSuffix}.tar`)
+  const archiveBytes = 'verified-archive-bytes'
+  const checksum = crypto.createHash('sha256').update(archiveBytes).digest('hex')
+  const platformManifest = `sha256:${'9'.repeat(64)}`
+  const runtimeImageId = `sha256:${'a'.repeat(64)}`
+  const realPython = spawnSync('python3', ['-c', 'import sys; print(sys.executable)'], {
+    encoding: 'utf8'
+  }).stdout.trim()
+  const realMv = spawnSync('sh', ['-c', 'command -v mv'], { encoding: 'utf8' }).stdout.trim()
+  const realShasum = spawnSync('sh', ['-c', 'command -v shasum'], { encoding: 'utf8' }).stdout.trim()
+
+  fs.mkdirSync(fakeBin)
+  fs.mkdirSync(fakeState)
+  if (outputMode === 'existing') {
+    fs.writeFileSync(outputPath, 'existing')
+  } else if (outputMode === 'symlink') {
+    fs.symlinkSync(path.join(fixtureRoot, 'missing-target'), outputPath)
+  }
+
+  writeExecutable(path.join(fakeBin, 'uname'), '#!/bin/sh\nprintf \'%s\\n\' Darwin\n')
+  writeExecutable(
+    path.join(fakeBin, 'docker'),
+    `#!/bin/sh
+set -eu
+printf '%s\n' "$*" >> "$FAKE_EXPORT_STATE/docker.log"
+case "$1 $2" in
+  'pull --platform')
+    [ "$3" = 'linux/amd64' ]
+    [ "$4" = "$FAKE_EXPORT_SOURCE" ]
+    ;;
+  'image inspect')
+    printf '%s\n' "$FAKE_EXPORT_SOURCE"
+    ;;
+  'image save')
+    [ "$3" = '--output' ]
+    printf '%s' "$FAKE_EXPORT_ARCHIVE_BYTES" > "$4"
+    chmod 0600 "$4"
+    [ "$5" = "$FAKE_EXPORT_SOURCE" ]
+    ;;
+  *) exit 91 ;;
+esac
+`
+  )
+  writeExecutable(
+    path.join(fakeBin, 'shasum'),
+    '#!/bin/sh\nexec "$FAKE_EXPORT_REAL_SHASUM" "$@"\n'
+  )
+  writeExecutable(
+    path.join(fakeBin, 'python3'),
+    `#!/bin/sh
+set -eu
+printf '%s\n' "$*" >> "$FAKE_EXPORT_STATE/python.log"
+if [ "$1" = '-' ]; then
+  if [ "\${2:-}" = 'capture-identity' ]; then
+    count=0
+    [ ! -f "$FAKE_EXPORT_STATE/capture-identity-count" ] || count="$(cat "$FAKE_EXPORT_STATE/capture-identity-count")"
+    count=$((count + 1))
+    printf '%s\n' "$count" > "$FAKE_EXPORT_STATE/capture-identity-count"
+    if [ "$FAKE_EXPORT_SIMULATE_REUSED_IDENTITY" = '1' ] && [ "$count" -gt 1 ]; then
+      cat >/dev/null
+      cat "$FAKE_EXPORT_STATE/original-identity"
+      exit 0
+    fi
+    capture_output="$("$FAKE_EXPORT_REAL_PYTHON" "$@")"
+    if [ "$count" -eq 1 ]; then
+      printf '%s\n' "$capture_output" > "$FAKE_EXPORT_STATE/original-identity"
+    fi
+    printf '%s\n' "$capture_output"
+    exit 0
+  fi
+  if [ "\${2:-}" = 'cleanup-anchor' ] || [ "\${2:-}" = 'cleanup-anchor-strict' ]; then
+    if [ "$FAKE_EXPORT_ANCHOR_CLEANUP_FAULT" != 'none' ] \
+      || [ "$FAKE_EXPORT_SECOND_SIGNAL_DURING_CLEANUP" = '1' ]; then
+      cleanup_script="$FAKE_EXPORT_STATE/anchor-cleanup.py"
+      cat > "$cleanup_script"
+      exec "$FAKE_EXPORT_REAL_PYTHON" - "$cleanup_script" \
+        "$FAKE_EXPORT_ANCHOR_CLEANUP_FAULT" \
+        "$FAKE_EXPORT_SECOND_SIGNAL_DURING_CLEANUP" "$@" <<'PY'
+import os
+import signal
+import sys
+import time
+
+script_path, fault, second_signal = sys.argv[1:4]
+cleanup_argv = sys.argv[4:]
+anchor_directory = cleanup_argv[2]
+anchor_path = cleanup_argv[3]
+real_unlink = os.unlink
+real_rmdir = os.rmdir
+signal_sent = False
+
+def faulting_unlink(path, *args, **kwargs):
+    global signal_sent
+    if second_signal == "1" and not signal_sent:
+        signal_sent = True
+        os.kill(os.getppid(), signal.SIGTERM)
+        time.sleep(0.05)
+    if fault == "unlink" and os.fspath(path) == anchor_path:
+        raise PermissionError("injected anchor unlink failure")
+    return real_unlink(path, *args, **kwargs)
+
+def faulting_rmdir(path, *args, **kwargs):
+    if fault == "rmdir" and os.fspath(path) == anchor_directory:
+        raise PermissionError("injected anchor rmdir failure")
+    return real_rmdir(path, *args, **kwargs)
+
+os.unlink = faulting_unlink
+os.rmdir = faulting_rmdir
+sys.argv = cleanup_argv
+with open(script_path, "rb") as source:
+    source_code = compile(source.read(), script_path, "exec")
+exec(source_code, {"__name__": "__main__"})
+PY
+    fi
+    exec "$FAKE_EXPORT_REAL_PYTHON" "$@"
+  fi
+  if [ "\${2:-}" = 'cleanup-created-link' ] \
+    || [ "\${2:-}" = 'create-anchor' ] \
+    || [ "\${2:-}" = 'verify-anchor' ] \
+    || [ "\${2:-}" = 'verify-published-anchor' ]; then
+    exec "$FAKE_EXPORT_REAL_PYTHON" "$@"
+  fi
+  if [ "\${2:-}" = 'publish-no-replace' ]; then
+    if [ "$FAKE_EXPORT_PUBLISH_RACE" = '1' ]; then
+      mkdir "$FAKE_EXPORT_RACE_OUTPUT"
+    fi
+    if [ "$FAKE_EXPORT_SIGNAL_AFTER_LINK" = '1' ]; then
+      publisher_script="$FAKE_EXPORT_STATE/publisher.py"
+      cat > "$publisher_script"
+      exec "$FAKE_EXPORT_REAL_PYTHON" - "$publisher_script" "$@" <<'PY'
+import os
+import signal
+import sys
+script_path = sys.argv[1]
+publisher_argv = sys.argv[2:]
+real_link = os.link
+def link_then_signal(*args, **kwargs):
+    result = real_link(*args, **kwargs)
+    os.kill(os.getppid(), signal.SIGTERM)
+    raise SystemExit(143)
+os.link = link_then_signal
+sys.argv = publisher_argv
+with open(script_path, "rb") as source:
+    source_code = compile(source.read(), script_path, "exec")
+exec(source_code, {"__name__": "__main__"})
+PY
+    fi
+    if [ "$FAKE_EXPORT_SIGNAL_AT_STATE_TRANSITION" = '1' ]; then
+      publisher_script="$FAKE_EXPORT_STATE/publisher-state-transition.py"
+      cat > "$publisher_script"
+      exec "$FAKE_EXPORT_REAL_PYTHON" - "$publisher_script" "$@" <<'PY'
+import builtins
+import os
+import signal
+import sys
+
+script_path = sys.argv[1]
+publisher_argv = sys.argv[2:]
+temporary_path = publisher_argv[2]
+state_path = publisher_argv[6]
+real_open = builtins.open
+real_unlink = os.unlink
+state_writes = 0
+
+def faulting_open(path, mode="r", *args, **kwargs):
+    global state_writes
+    if os.fspath(path) == state_path and mode == "w":
+        state_writes += 1
+        if state_writes == 2:
+            truncated = real_open(path, mode, *args, **kwargs)
+            truncated.flush()
+            os.fsync(truncated.fileno())
+            truncated.close()
+            os.kill(os.getppid(), signal.SIGTERM)
+            raise SystemExit(143)
+    return real_open(path, mode, *args, **kwargs)
+
+def faulting_unlink(path, *args, **kwargs):
+    if os.fspath(path) == temporary_path and state_writes < 2:
+        os.kill(os.getppid(), signal.SIGTERM)
+        raise SystemExit(143)
+    return real_unlink(path, *args, **kwargs)
+
+builtins.open = faulting_open
+os.unlink = faulting_unlink
+sys.argv = publisher_argv
+with open(script_path, "rb") as source:
+    source_code = compile(source.read(), script_path, "exec")
+exec(source_code, {"__name__": "__main__"})
+PY
+    fi
+    exec "$FAKE_EXPORT_REAL_PYTHON" "$@"
+  fi
+  cat >/dev/null
+  printf 'platform_manifest_digest=%s\nruntime_image_id=%s\n' \
+    "$FAKE_EXPORT_PLATFORM_MANIFEST" "$FAKE_EXPORT_RUNTIME_IMAGE_ID"
+  exit 0
+fi
+if [ "$2" = 'verify-archive' ]; then
+  "$FAKE_EXPORT_REAL_PYTHON" - "$3" "$FAKE_EXPORT_ANCHOR_OBSERVED" <<'PY'
+import glob
+import os
+import stat
+import sys
+
+temporary_path, marker_path = sys.argv[1:]
+anchor_directories = glob.glob(
+    os.path.join(os.path.dirname(temporary_path), ".kinvest-offline-anchor.*")
+)
+if len(anchor_directories) != 1:
+    raise SystemExit(93)
+anchor_directory = anchor_directories[0]
+directory_stat = os.lstat(anchor_directory)
+anchor_path = os.path.join(anchor_directory, "archive")
+anchor_stat = os.lstat(anchor_path)
+temporary_stat = os.lstat(temporary_path)
+if (
+    not stat.S_ISDIR(directory_stat.st_mode)
+    or stat.S_IMODE(directory_stat.st_mode) != 0o700
+    or directory_stat.st_uid != os.getuid()
+    or not stat.S_ISREG(anchor_stat.st_mode)
+    or not os.path.samestat(anchor_stat, temporary_stat)
+):
+    raise SystemExit(94)
+with open(marker_path, "w", encoding="ascii") as marker:
+    marker.write("mode=700 same=1\\n")
+PY
+  if [ "$FAKE_EXPORT_VERIFIER_FAILS" = '1' ]; then
+    printf '%s\n' OFFLINE_ARCHIVE_INVALID >&2
+    exit 1
+  fi
+  printf 'KINVEST_OFFLINE_ARCHIVE_OK runtimeImageId=%s\n' "$FAKE_EXPORT_RUNTIME_IMAGE_ID"
+  case "$FAKE_EXPORT_MUTATE_AFTER_VERIFY" in
+    in-place)
+      printf '%s' 'tampered-archive-bytes' > "$3"
+      chmod 0600 "$3"
+      ;;
+    replace-path)
+      rm -f -- "$3"
+      printf '%s' "$FAKE_EXPORT_ARCHIVE_BYTES" > "$3"
+      chmod 0600 "$3"
+      ;;
+  esac
+  exit 0
+fi
+exit 92
+`
+  )
+  writeExecutable(
+    path.join(fakeBin, 'mv'),
+    `#!/bin/sh
+set -eu
+if [ "$FAKE_EXPORT_PUBLISH_RACE" = '1' ]; then
+  mkdir "$FAKE_EXPORT_RACE_OUTPUT"
+fi
+exec "$FAKE_EXPORT_REAL_MV" "$@"
+`
+  )
+
+  const result = spawnSync(
+    rootPath('scripts/export-offline-image.sh'),
+    [sourceReference, outputPath],
+    {
+      encoding: 'utf8',
+      env: {
+        ...process.env,
+        PATH: `${fakeBin}:${process.env.PATH}`,
+        FAKE_EXPORT_CHECKSUM: checksum,
+        FAKE_EXPORT_ARCHIVE_BYTES: archiveBytes,
+        FAKE_EXPORT_ANCHOR_CLEANUP_FAULT: anchorCleanupFault,
+        FAKE_EXPORT_ANCHOR_OBSERVED: path.join(fakeState, 'anchor-observed'),
+        FAKE_EXPORT_PLATFORM_MANIFEST: platformManifest,
+        FAKE_EXPORT_PUBLISH_RACE: publishRace ? '1' : '0',
+        FAKE_EXPORT_RACE_OUTPUT: outputPath,
+        FAKE_EXPORT_REAL_PYTHON: realPython,
+        FAKE_EXPORT_REAL_MV: realMv,
+        FAKE_EXPORT_REAL_SHASUM: realShasum,
+        FAKE_EXPORT_MUTATE_AFTER_VERIFY: mutateAfterVerify,
+        FAKE_EXPORT_SIMULATE_REUSED_IDENTITY: simulateReusedIdentity ? '1' : '0',
+        FAKE_EXPORT_SECOND_SIGNAL_DURING_CLEANUP: secondSignalDuringCleanup ? '1' : '0',
+        FAKE_EXPORT_SIGNAL_AFTER_LINK: signalAfterLink ? '1' : '0',
+        FAKE_EXPORT_SIGNAL_AT_STATE_TRANSITION: signalAtStateTransition ? '1' : '0',
+        FAKE_EXPORT_RUNTIME_IMAGE_ID: runtimeImageId,
+        FAKE_EXPORT_SOURCE: sourceReference,
+        FAKE_EXPORT_STATE: fakeState,
+        FAKE_EXPORT_VERIFIER_FAILS: verifierFails ? '1' : '0'
+      },
+      timeout: 5000
+    }
+  )
+
+  return {
+    checksum,
+    cleanup() {
+      fs.rmSync(fixtureRoot, { recursive: true, force: true })
+    },
+    fakeState,
+    outputPath,
+    platformManifest,
+    result,
+    runtimeImageId,
+    sourceReference
+  }
+}
+
 function run() {
   const workflow = readRootFile('.github/workflows/deploy.yml')
   const verifyWorkflow = readRootFile('.github/workflows/verify-tcr-release-manual.yml')
   const productionWorkflow = readRootFile('.github/workflows/deploy-production-manual.yml')
   const mirrorScript = readRootFile('scripts/mirror-release-to-tcr.sh')
+  const offlineExportScript = readRootFile('scripts/export-offline-image.sh')
+  const deployV2Runbook = readRootFile('docs/operations/deploy-v2-runbook.md')
   const deploy = readRootFile('deploy/server/deploy-kinvest.sh')
   const bootstrap = readRootFile('deploy/server/bootstrap-server.sh')
   const wrapper = readRootFile('deploy/server/kinvest-ssh-command')
@@ -1410,6 +1734,271 @@ function run() {
     'local mirror must not create release records or touch GitHub or the server'
   )
   assert.equal(fs.statSync(rootPath('scripts/mirror-release-to-tcr.sh')).mode & 0o111, 0o111)
+
+  assert.equal(fs.statSync(rootPath('scripts/export-offline-image.sh')).mode & 0o111, 0o111)
+  assert.match(offlineExportScript, /ghcr\\\.io\/zwphhxx\/kinvest@sha256:/)
+  assert.match(offlineExportScript, /docker pull --platform linux\/amd64/)
+  assert.match(offlineExportScript, /verify-archive/)
+  assert.doesNotMatch(
+    offlineExportScript,
+    /docker login|DOCKER_CONFIG|config\.json|security find|credential/i
+  )
+  assert.match(deployV2Runbook, /atomic no-overwrite hard link/i)
+  assert.doesNotMatch(deployV2Runbook, /atomic rename/i)
+  assert.match(deployV2Runbook, /device, inode, size, mode, owner, and SHA-256/i)
+  assert.match(deployV2Runbook, /same process-created inode/i)
+  assert.match(deployV2Runbook, /armed.*before.*hard link/i)
+  assert.match(deployV2Runbook, /armed record remains unchanged/i)
+  assert.doesNotMatch(deployV2Runbook, /normal `created` state/i)
+  assert.match(deployV2Runbook, /private same-filesystem[^\n]*0700[^\n]*hard-link anchor/i)
+  assert.match(deployV2Runbook, /anchor[^\n]*prevents[^\n]*inode[^\n]*reuse/i)
+  assert.match(deployV2Runbook, /anchor[^\n]*removed[^\n]*success[^\n]*failure[^\n]*signal/i)
+  assert.match(deployV2Runbook, /anchor[^\n]*cleanup[^\n]*before[^\n]*success metadata/i)
+  assert.match(deployV2Runbook, /second signal[^\n]*cannot interrupt[^\n]*cleanup/i)
+  assert.ok(
+    offlineExportScript.indexOf('cleanup-anchor-strict') < offlineExportScript.indexOf('success_metadata='),
+    'strict anchor cleanup must complete before success metadata is constructed or printed'
+  )
+  assert.match(offlineExportScript, /trap '' HUP INT TERM/)
+  assert.match(deployV2Runbook, /four-asset transaction/i)
+  assert.match(deployV2Runbook, /prior file or prior absence/i)
+  assert.match(deployV2Runbook, /ignore handled signals during restoration/i)
+  assert.match(deployV2Runbook, /backup[\s\S]{0,80}preserved[\s\S]{0,80}restoration\s+verification fails/i)
+
+  const offlineExport = runOfflineExportFixture()
+  try {
+    const diagnostics = JSON.stringify(offlineExport.result, null, 2)
+    assert.equal(offlineExport.result.status, 0, diagnostics)
+    assert.equal(fs.readFileSync(offlineExport.outputPath, 'utf8'), 'verified-archive-bytes')
+    assert.equal(fs.statSync(offlineExport.outputPath).mode & 0o777, 0o600)
+    const dockerCalls = fs
+      .readFileSync(path.join(offlineExport.fakeState, 'docker.log'), 'utf8')
+      .trim()
+      .split('\n')
+    assert.deepEqual(dockerCalls.slice(0, 2), [
+      `pull --platform linux/amd64 ${offlineExport.sourceReference}`,
+      `image inspect --format {{range .RepoDigests}}{{println .}}{{end}} ${offlineExport.sourceReference}`
+    ])
+    assert.match(
+      dockerCalls[2],
+      new RegExp(`^image save --output ${offlineExport.outputPath.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')}\\.temporary\\.[A-Za-z0-9]+ ${offlineExport.sourceReference}$`)
+    )
+    const temporaryPath = dockerCalls[2].split(' ')[3]
+    const pythonCalls = fs.readFileSync(path.join(offlineExport.fakeState, 'python.log'), 'utf8')
+    assert.match(
+      pythonCalls,
+      new RegExp(`offline-image-attestation\\.py verify-archive ${temporaryPath.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')} ${offlineExport.checksum}`)
+    )
+    assert.equal(
+      offlineExport.result.stdout,
+      [
+        `path=${offlineExport.outputPath}`,
+        `checksum=sha256:${offlineExport.checksum}`,
+        'size=22',
+        `source=${offlineExport.sourceReference}`,
+        'platform=linux/amd64',
+        `platformManifest=${offlineExport.platformManifest}`,
+        `runtimeImageId=${offlineExport.runtimeImageId}`,
+        ''
+      ].join('\n')
+    )
+    assert.equal(offlineExport.result.stderr, '')
+    assert.equal(
+      fs.readFileSync(path.join(offlineExport.fakeState, 'anchor-observed'), 'utf8'),
+      'mode=700 same=1\n'
+    )
+    assert.deepEqual(
+      fs.readdirSync(path.dirname(offlineExport.outputPath)).filter((name) =>
+        name.includes('temporary') || name.includes('publication') || name.includes('anchor')
+      ),
+      []
+    )
+  } finally {
+    offlineExport.cleanup()
+  }
+
+  for (const invalid of [
+    'GHCR.io/zwphhxx/kinvest@sha256:' + '7'.repeat(64),
+    'ghcr.io/zwphhxx/other@sha256:' + '7'.repeat(64),
+    'ghcr.io/zwphhxx/kinvest:latest',
+    'ghcr.io/zwphhxx/kinvest@sha256:' + 'A'.repeat(64)
+  ]) {
+    const rejected = runOfflineExportFixture({ sourceReference: invalid })
+    try {
+      assert.equal(rejected.result.status, 2)
+      assert.equal(fs.existsSync(path.join(rejected.fakeState, 'docker.log')), false)
+    } finally {
+      rejected.cleanup()
+    }
+  }
+
+  for (const outputMode of ['existing', 'symlink', 'relative']) {
+    const rejected = runOfflineExportFixture({ outputMode })
+    try {
+      assert.equal(rejected.result.status, 2)
+      assert.equal(fs.existsSync(path.join(rejected.fakeState, 'docker.log')), false)
+    } finally {
+      rejected.cleanup()
+    }
+  }
+
+  const verifierFailure = runOfflineExportFixture({ verifierFails: true })
+  try {
+    assert.notEqual(verifierFailure.result.status, 0)
+    assert.equal(fs.existsSync(verifierFailure.outputPath), false)
+    assert.deepEqual(
+      fs.readdirSync(path.dirname(verifierFailure.outputPath)).filter((name) =>
+        name.includes('temporary') || name.includes('publication') || name.includes('anchor')
+      ),
+      []
+    )
+  } finally {
+    verifierFailure.cleanup()
+  }
+
+  for (const anchorCleanupFault of ['unlink', 'rmdir']) {
+    const cleanupFailure = runOfflineExportFixture({ anchorCleanupFault })
+    try {
+      assert.notEqual(cleanupFailure.result.status, 0)
+      assert.equal(cleanupFailure.result.stdout, '', `${anchorCleanupFault}: no false success metadata`)
+      assert.equal(fs.existsSync(cleanupFailure.outputPath), false, `${anchorCleanupFault}: failed export output`)
+      const anchorDirectories = fs.readdirSync(path.dirname(cleanupFailure.outputPath))
+        .filter((name) => name.includes('anchor'))
+      assert.equal(anchorDirectories.length, 1, `${anchorCleanupFault}: one private recovery directory`)
+      const anchorDirectory = path.join(path.dirname(cleanupFailure.outputPath), anchorDirectories[0])
+      assert.equal(fs.statSync(anchorDirectory).mode & 0o777, 0o700)
+      if (anchorCleanupFault === 'unlink') {
+        assert.deepEqual(fs.readdirSync(anchorDirectory), ['archive'])
+        assert.equal(fs.readFileSync(path.join(anchorDirectory, 'archive'), 'utf8'), 'verified-archive-bytes')
+      } else {
+        assert.deepEqual(fs.readdirSync(anchorDirectory), [])
+      }
+      assert.match(cleanupFailure.result.stderr, /anchor cleanup incomplete/)
+    } finally {
+      cleanupFailure.cleanup()
+    }
+  }
+
+  const secondCleanupSignal = runOfflineExportFixture({
+    verifierFails: true,
+    secondSignalDuringCleanup: true
+  })
+  try {
+    assert.notEqual(secondCleanupSignal.result.status, 0)
+    assert.equal(secondCleanupSignal.result.stdout, '')
+    assert.equal(fs.existsSync(secondCleanupSignal.outputPath), false)
+    assert.deepEqual(
+      fs.readdirSync(path.dirname(secondCleanupSignal.outputPath)).filter((name) =>
+        name.includes('temporary') || name.includes('publication') || name.includes('anchor')
+      ),
+      [],
+      'a second signal must not interrupt complete failure cleanup'
+    )
+  } finally {
+    secondCleanupSignal.cleanup()
+  }
+
+  const publishRace = runOfflineExportFixture({ publishRace: true })
+  try {
+    assert.notEqual(publishRace.result.status, 0)
+    assert.equal(publishRace.result.stdout, '')
+    assert.equal(fs.lstatSync(publishRace.outputPath).isDirectory(), true)
+    assert.deepEqual(
+      fs.readdirSync(publishRace.outputPath),
+      [],
+      'a raced output directory must never absorb the archive'
+    )
+    assert.deepEqual(
+      fs.readdirSync(path.dirname(publishRace.outputPath)).filter((name) =>
+        name.includes('temporary') || name.includes('publication') || name.includes('anchor')
+      ),
+      [],
+      'publication failure must clean the private temporary archive'
+    )
+  } finally {
+    publishRace.cleanup()
+  }
+
+  for (const mutateAfterVerify of ['in-place', 'replace-path']) {
+    const mutated = runOfflineExportFixture({ mutateAfterVerify })
+    try {
+      assert.notEqual(mutated.result.status, 0)
+      assert.equal(mutated.result.stdout, '')
+      assert.equal(fs.existsSync(mutated.outputPath), false)
+      assert.deepEqual(
+        fs.readdirSync(path.dirname(mutated.outputPath)).filter((name) =>
+          name.includes('temporary') || name.includes('publication') || name.includes('anchor')
+        ),
+        []
+      )
+    } finally {
+      mutated.cleanup()
+    }
+  }
+
+  const simulatedReuse = runOfflineExportFixture({
+    mutateAfterVerify: 'replace-path',
+    simulateReusedIdentity: true
+  })
+  try {
+    assert.notEqual(simulatedReuse.result.status, 0)
+    assert.equal(simulatedReuse.result.stdout, '')
+    assert.equal(fs.existsSync(simulatedReuse.outputPath), false)
+    assert.equal(
+      fs.readFileSync(path.join(simulatedReuse.fakeState, 'capture-identity-count'), 'utf8'),
+      '2\n',
+      'the fixture must simulate the old dev/inode identity check accepting replacement bytes'
+    )
+    assert.deepEqual(
+      fs.readdirSync(path.dirname(simulatedReuse.outputPath)).filter((name) =>
+        name.includes('temporary') || name.includes('publication') || name.includes('anchor')
+      ),
+      []
+    )
+  } finally {
+    simulatedReuse.cleanup()
+  }
+
+  const linkedSignal = runOfflineExportFixture({ signalAfterLink: true })
+  try {
+    assert.notEqual(linkedSignal.result.status, 0)
+    assert.equal(linkedSignal.result.stdout, '')
+    assert.equal(fs.existsSync(linkedSignal.outputPath), false)
+    assert.deepEqual(
+      fs.readdirSync(path.dirname(linkedSignal.outputPath)).filter((name) =>
+        name.includes('temporary') || name.includes('publication') || name.includes('anchor')
+      ),
+      []
+    )
+  } finally {
+    linkedSignal.cleanup()
+  }
+
+  const stateTransitionSignal = runOfflineExportFixture({ signalAtStateTransition: true })
+  try {
+    assert.notEqual(stateTransitionSignal.result.status, 0)
+    assert.equal(stateTransitionSignal.result.stdout, '')
+    assert.equal(fs.existsSync(stateTransitionSignal.outputPath), false)
+    assert.deepEqual(
+      fs.readdirSync(path.dirname(stateTransitionSignal.outputPath)).filter((name) =>
+        name.includes('temporary') || name.includes('publication') || name.includes('anchor')
+      ),
+      []
+    )
+  } finally {
+    stateTransitionSignal.cleanup()
+  }
+
+  for (const outputSuffix of ['\nforged=1', '\rforged=1', '\tforged=1', '\u001fforged=1', '\u007fforged=1']) {
+    const injected = runOfflineExportFixture({ outputSuffix })
+    try {
+      assert.equal(injected.result.status, 2)
+      assert.equal(injected.result.stdout, '')
+      assert.equal(fs.existsSync(path.join(injected.fakeState, 'docker.log')), false)
+    } finally {
+      injected.cleanup()
+    }
+  }
 
   const mirrorSuccess = runMirrorSuccessFixture()
   try {
@@ -2454,3 +3043,12 @@ function run() {
 }
 
 module.exports = { run }
+
+if (require.main === module) {
+  try {
+    run()
+  } catch (error) {
+    console.error(error)
+    process.exitCode = 1
+  }
+}
