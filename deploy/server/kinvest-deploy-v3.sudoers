@@ -1,0 +1,2 @@
+lighthouse ALL=(root) NOPASSWD: /usr/local/sbin/deploy-kinvest-v2 ""
+lighthouse ALL=(root) NOPASSWD: /usr/local/sbin/deploy-kinvest-v3 ""

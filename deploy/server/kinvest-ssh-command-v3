@@ -1,0 +1,23 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+if [[ "$#" -ne 0 ]]; then
+  printf '%s\n' 'DEPLOY_V3_WRAPPER_ARGUMENTS_REJECTED' >&2
+  exit 2
+fi
+
+# This dispatcher deliberately does not parse, buffer, or log stdin. It keeps
+# deploy-v2 reachable during the disabled v3 baseline; protocol-v4 state then
+# makes the legacy deployer fail closed until its explicit retirement.
+case "${SSH_ORIGINAL_COMMAND:-}" in
+  deploy-v2)
+    exec sudo -n /usr/local/sbin/deploy-kinvest-v2
+    ;;
+  deploy-v3)
+    exec sudo -n /usr/local/sbin/deploy-kinvest-v3
+    ;;
+  *)
+    printf '%s\n' 'KINVEST_DEPLOY_WRAPPER_COMMAND_REJECTED' >&2
+    exit 2
+    ;;
+esac

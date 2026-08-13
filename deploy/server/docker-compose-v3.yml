@@ -1,0 +1,55 @@
+services:
+  kinvest:
+    image: ${KINVEST_IMAGE:-kinvest:local}
+    container_name: kinvest
+    restart: unless-stopped
+    user: "10001:10001"
+    environment:
+      TZ: ${TZ:-Asia/Shanghai}
+      PORT: 4173
+      KINVEST_DB_PATH: /data/kinvest.sqlite
+      KINVEST_SECRET_PROVIDER_MODE: ${KINVEST_SECRET_PROVIDER_MODE:?set provider mode}
+      KINVEST_SECRET_VERSION_IDS: ${KINVEST_SECRET_VERSION_IDS:?set canonical VersionId JSON}
+      KINVEST_SECRET_BUNDLE_PATH: /run/secrets/kinvest
+    volumes:
+      - type: bind
+        source: /root/docker/kinvest/data
+        target: /data
+        bind:
+          create_host_path: false
+      - type: bind
+        source: ${KINVEST_SECRET_BUNDLE_HOST_PATH:?set tmpfs bundle host path}
+        target: /run/secrets/kinvest
+        read_only: true
+        bind:
+          create_host_path: false
+    expose:
+      - "4173"
+    networks:
+      web: {}
+      metadata-egress:
+        ipv4_address: ${KINVEST_CONTAINER_IP:?use --env-file /etc/kinvest/metadata-network.conf}
+        gw_priority: 1
+    healthcheck:
+      test: ["CMD", "wget", "--no-verbose", "--tries=1", "--spider", "http://127.0.0.1:4173/api/health"]
+      interval: 30s
+      timeout: 3s
+      start_period: 5s
+      retries: 3
+    security_opt:
+      - no-new-privileges:true
+    cap_drop:
+      - ALL
+
+networks:
+  web:
+    external: true
+  metadata-egress:
+    name: ${KINVEST_METADATA_NETWORK:?use --env-file /etc/kinvest/metadata-network.conf}
+    driver: bridge
+    driver_opts:
+      com.docker.network.bridge.name: ${KINVEST_BRIDGE_INTERFACE:?use --env-file /etc/kinvest/metadata-network.conf}
+    ipam:
+      config:
+        - subnet: ${KINVEST_METADATA_SUBNET:?use --env-file /etc/kinvest/metadata-network.conf}
+          gateway: ${KINVEST_METADATA_GATEWAY:?use --env-file /etc/kinvest/metadata-network.conf}
