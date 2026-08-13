@@ -9,7 +9,7 @@ RUN_ROOT='/run'
 SUDOERS_DIR='/etc/sudoers.d'
 INSTALL_OWNER='root'
 INSTALL_GROUP='root'
-DEPLOY_USER='lighthouse'
+DEPLOY_USER='kinvest-deploy'
 
 DEPLOY_TARGET="$LOCAL_SBIN/deploy-kinvest-v3"
 WRAPPER_TARGET="$LOCAL_SBIN/kinvest-ssh-command"
@@ -28,7 +28,7 @@ EXPECTED_ASSET_HASHES=(
   '9850a2613ab15ad81c217ff54c2eef86394c2d9fb33c6ce8639411cd8021dac6'
   '52605d387571f05a5df52e5f6484ec1962c5aa4b758ab0fe0a45521ae51df008'
   'a422a8ce78ab16bf589a66508d4a7dfdd3ba05238a80784992ed62e959767eff'
-  'a04ece63c6a4c34b28976128b9445c9bd3db37cadc5480eb1b5cb92d95d64f8e'
+  'fec028143a1827aaea04ed9c75c3bbfc22f5cd0a37e9f54a72719b66b48eec62'
 )
 
 fail() {

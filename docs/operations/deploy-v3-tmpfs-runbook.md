@@ -28,13 +28,14 @@ KINVEST_DEVICE_TOKEN_HMAC_KEY
 Configure these `Production` Environment Variables:
 
 ```text
+DEPLOY_USER=kinvest-deploy
 DEPLOY_V3_ENABLED=false
 TMPFS_BOOTSTRAP_ENABLED=false
 TMPFS_ADMIN_PASSWORD_VERIFIER_VERSION_ID=vYYYYMMDD-NNN
 TMPFS_DEVICE_TOKEN_HMAC_VERSION_ID=vYYYYMMDD-NNN
 ```
 
-`DEPLOY_HOST`, `DEPLOY_PORT`, and `DEPLOY_USER` remain non-secret Production variables. `DEPLOY_SSH_KEY` and `DEPLOY_KNOWN_HOSTS` remain Production Environment Secrets.
+`DEPLOY_HOST`, `DEPLOY_PORT`, and `DEPLOY_USER` remain non-secret Production variables. The production forced-command account is fixed as `kinvest-deploy`; do not substitute the maintenance account. `DEPLOY_SSH_KEY` and `DEPLOY_KNOWN_HOSTS` remain Production Environment Secrets.
 
 Generate bootstrap materials only with the local interactive generator. It writes the result to the macOS clipboard, not standard output or disk. Paste directly into the GitHub Environment Secret field and clear the clipboard immediately. `SIGKILL` cannot be intercepted, so confirm the clipboard is empty before leaving the workstation.
 
@@ -47,12 +48,12 @@ The root-owned `0600` VersionId fingerprint ledger is append-only for the lifeti
 Do not install deploy-v3 server assets merely because the code PR merged.
 
 1. Record the exact merged commit and expected SHA-256 hashes for the dispatcher, root deployer, contract helper, Compose file, sudoers policy, and installer. Verify the installer hash manually before running it.
-2. Confirm the current v2 deployment state, J3 timer, internal health, public HTTPS health, and rollback backup.
+2. Confirm `Production/DEPLOY_USER=kinvest-deploy`, the current v2 deployment state, J3 timer, internal health, public HTTPS health, and rollback backup.
 3. Obtain explicit approval to install server assets.
 4. Run the reviewed installer only after its own hash matches. The installer compares every asset with its embedded merged-commit hash, copies it into a root-private `/run` staging directory, writes the old assets and a hash manifest to the persistent root-only `/root/docker/kinvest/install-backups/deploy-v3` tree, then atomically installs the staged copy.
 5. Keep `DEPLOY_V3_ENABLED=false` and `TMPFS_BOOTSTRAP_ENABLED=false`.
 6. Confirm the forced-command dispatcher accepts only the exact literals `deploy-v2` and `deploy-v3`. It must reject arguments, prefixes, suffixes, shell operators, and every other command.
-7. Confirm `visudo -cf /etc/sudoers.d/kinvest-deploy-v3` succeeds. Both entries include the sudoers empty-argument constraint `""`, so the dedicated rule permits only no-argument execution of the two fixed deployer paths. Review `sudo -n -U lighthouse -l` in full and record any broader inherited administrator rule as a residual trusted-admin boundary; do not add a wildcard deploy command.
+7. Confirm `visudo -cf /etc/sudoers.d/kinvest-deploy-v3` succeeds. Both entries are granted only to the production forced-command account `kinvest-deploy` and include the sudoers empty-argument constraint `""`, so the dedicated rule permits only no-argument execution of the two fixed deployer paths. Review `sudo -n -U kinvest-deploy -l` and the maintenance account's permissions separately; record any broader inherited administrator rule as a residual trusted-admin boundary and do not add a wildcard deploy command.
 
 The dispatcher preserves the currently installed v2 path, `/usr/local/sbin/deploy-kinvest`, during the disabled v3 baseline. If the first v3 switch fails, the deployer restores the exact protocol-v3 state bytes, so the migration boundary is not crossed. Only the first successful v3 deployment writes protocol-v4 state; after that, v2 is no longer a deployment rollback mechanism because its older state parser must fail closed. All later forward, rollback, and reboot recovery operations use deploy-v3 until a separately reviewed v2 retirement change removes the legacy branch.
 
