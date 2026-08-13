@@ -255,6 +255,7 @@ function runExecutor(deployer, options = {}) {
     .replace("OFFLINE_IMAGE_ATTESTATION='/usr/local/libexec/kinvest-offline-image-attestation'", `OFFLINE_IMAGE_ATTESTATION='${path.join(fakeBin, 'kinvest-offline-image-attestation')}'`)
     .replace("METADATA_NETWORK_CONFIG='/etc/kinvest/metadata-network.conf'", `METADATA_NETWORK_CONFIG='${metadataNetworkConfig}'`)
     .replace("PUBLIC_HEALTH_URL='https://dearmina.cn/api/health'", "PUBLIC_HEALTH_URL='https://fixture.invalid/api/health'")
+    .replaceAll('ulimit -f 1', 'ulimit -S -f 1')
   if (options.backupFailure) {
     source = source.replace(
       'if ! python3 - "$DATABASE" "$temporary" <<\'PY\'',
@@ -294,12 +295,29 @@ function runExecutor(deployer, options = {}) {
   writeExecutable(path.join(fakeBin, 'docker'), `#!/usr/bin/env bash
 set -eu
 if [[ "$*" == *"run --rm"* ]]; then
+  harness_file_limit="$(ulimit -S -f)"
+  ${options.requirePreflightFileLimit ? `[[ "$harness_file_limit" == 1 ]] || exit 151` : ':'}
+  ${options.disableHarnessLogLimitLift ? ':' : 'ulimit -S -f unlimited'}
+  ${options.enforceLinuxDiagnosticFileLimit ? `diagnostic_write_limit="$(ulimit -S -f)"
+  if [[ "$diagnostic_write_limit" != unlimited ]]; then
+    if [[ -f '${dockerRunLog}' ]]; then
+      diagnostic_existing="$(wc -c < '${dockerRunLog}')"
+    else
+      diagnostic_existing=0
+    fi
+    diagnostic_append="$(printf '%s\\n' "$*" | wc -c)"
+    if ((diagnostic_existing + diagnostic_append > harness_file_limit * 1024)); then
+      exit 153
+    fi
+  fi` : ':'}
   printf '%s\\n' "$*" >> '${dockerRunLog}'
   if [[ "$*" == *"bootstrapSecrets"* ]]; then
     printf '%s\\n' legacy-fallback >> '${preflightLog}'
   else
     printf '%s\\n' preflight >> '${preflightLog}'
   fi
+  ${options.disableHarnessLogLimitLift ? ':' : 'ulimit -S -f "$harness_file_limit"'}
+  ${options.requirePreflightFileLimit ? `[[ "$(ulimit -S -f)" == 1 ]] || exit 152` : ':'}
 else
   printf 'docker:%s\\n' "$*" >> '${log}'
 fi
@@ -578,6 +596,55 @@ async function run() {
     } finally {
       backupFailure.cleanup()
     }
+  }
+
+  const linuxBoundedPreFixFailure = runExecutor(deployer, {
+    backupFailure: true,
+    disableHarnessLogLimitLift: true,
+    enforceLinuxDiagnosticFileLimit: true,
+    requirePreflightFileLimit: true
+  })
+  try {
+    assert.notEqual(linuxBoundedPreFixFailure.result.status, 0)
+    assert.equal(
+      linuxBoundedPreFixFailure.result.stderr,
+      'DEPLOY_V3_RECOVERY_PREFLIGHT_FAILED\n'
+    )
+    assert.equal(
+      fs.readFileSync(linuxBoundedPreFixFailure.preflightLog, 'utf8'),
+      'preflight\n'
+    )
+    assert.equal(
+      fs.readFileSync(linuxBoundedPreFixFailure.dockerRunLog, 'utf8').trim().split('\n').length,
+      1
+    )
+    assert.deepEqual(fs.readdirSync(linuxBoundedPreFixFailure.backupDir), [])
+    assert.doesNotMatch(fs.readFileSync(linuxBoundedPreFixFailure.log, 'utf8'), /compose/)
+  } finally {
+    linuxBoundedPreFixFailure.cleanup()
+  }
+
+  const linuxBoundedBackupFailure = runExecutor(deployer, {
+    backupFailure: true,
+    enforceLinuxDiagnosticFileLimit: true,
+    requirePreflightFileLimit: true
+  })
+  try {
+    assert.notEqual(linuxBoundedBackupFailure.result.status, 0)
+    assert.match(
+      linuxBoundedBackupFailure.result.stderr,
+      /DEPLOY_V3_DATABASE_BACKUP_FAILED/
+    )
+    assert.equal(
+      fs.readFileSync(linuxBoundedBackupFailure.preflightLog, 'utf8'),
+      'preflight\npreflight\n'
+    )
+    assert.equal(
+      fs.readFileSync(linuxBoundedBackupFailure.dockerRunLog, 'utf8').trim().split('\n').length,
+      2
+    )
+  } finally {
+    linuxBoundedBackupFailure.cleanup()
   }
 
   for (const invalidPreflight of [
