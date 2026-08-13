@@ -253,6 +253,7 @@ function runExecutor(deployer, options = {}) {
   writeExecutable(path.join(fakeBin, 'curl'), `#!/bin/sh\nprintf '%s\\n' curl >> '${log}'\nprintf '%s\\n' '{"status":"ok","service":"kinvest"}'\n`)
   writeExecutable(path.join(fakeBin, 'docker'), `#!/usr/bin/env bash
 set -eu
+ulimit -f unlimited 2>/dev/null || true
 printf 'docker:%s\\n' "$*" >> '${log}'
 case "$*" in
   *"image inspect ${candidateDigest} --format {{.Id}}"*) ${options.digestMissing ? 'exit 1' : `printf '%s\\n' '${candidateId}'`} ;;
