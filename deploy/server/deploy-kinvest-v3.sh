@@ -23,6 +23,10 @@ METADATA_NETWORK_CONFIG='/etc/kinvest/metadata-network.conf'
 DOCKER_TIMEOUT='120s'
 INSPECT_TIMEOUT='15s'
 PULL_TIMEOUT='300s'
+LEGACY_RECOVERY_IMAGE_DIGEST='ghcr.io/zwphhxx/kinvest@sha256:25bc6f76846f1ad429aeb8c4bf1185f8db43bb71b7e5d293197ca48f4d74ad26'
+LEGACY_RECOVERY_RUNTIME_IMAGE_ID='sha256:46fce58a9fac1c765a5f5beeafe53a9f63fb3f4e93d4628640a2583da68000b0'
+LEGACY_RECOVERY_COMMIT='a0d511f0818a2dd0cc00f619af24942802f3af0d'
+LEGACY_RECOVERY_PREFLIGHT_ERROR='SSM_PREFLIGHT_REQUIRES_CVM_SSM'
 
 fail() { printf '%s\n' "$1" >&2; exit "${2:-1}"; }
 
@@ -72,6 +76,7 @@ recovery_error=''
 current_schema_version=''
 restore_backup_path='none'
 restore_backup_checksum='none'
+last_preflight_legacy_failure='false'
 
 safe_runtime_file() {
   [[ -n "$1" && "$1" == "$RUN_ROOT"/kinvest-v3.* ]]
@@ -151,10 +156,11 @@ PY
 }
 
 run_secret_preflight() {
-  local image_id="$1" provider="$2" versions="$3" bundle_path="$4" expected references bytes status output error valid
+  local image_id="$1" provider="$2" versions="$3" bundle_path="$4" expected expected_error references bytes error_bytes status output error valid
   output="$(mktemp "$RUN_ROOT/kinvest-v3.preflight-out.XXXXXX")"
   error="$(mktemp "$RUN_ROOT/kinvest-v3.preflight-err.XXXXXX")"
   chmod 0600 "$output" "$error"
+  last_preflight_legacy_failure='false'
   status=0
   (
     ulimit -f 1
@@ -177,6 +183,42 @@ run_secret_preflight() {
   references=2
   [[ "$provider" == disabled ]] && references=0
   expected="KINVEST_SECRET_PREFLIGHT_OK mode=$provider references=$references"
+  bytes=$((${#expected} + 1))
+  expected_error="$LEGACY_RECOVERY_PREFLIGHT_ERROR"
+  error_bytes=$((${#expected_error} + 1))
+  valid=false
+  if ((status == 1)) && \
+    [[ ! -s "$output" ]] && \
+    [[ "$(wc -c <"$error" | tr -d '[:space:]')" -eq "$error_bytes" ]] && \
+    [[ "$(cat "$error")" == "$expected_error" ]]; then
+    last_preflight_legacy_failure='true'
+  fi
+  if ((status == 0)) && \
+    [[ "$(wc -c <"$output" | tr -d '[:space:]')" -le 128 ]] && \
+    [[ "$(wc -c <"$error" | tr -d '[:space:]')" -eq 0 ]] && \
+    [[ "$(wc -c <"$output" | tr -d '[:space:]')" -eq "$bytes" ]] && \
+    [[ "$(cat "$output")" == "$expected" ]]; then
+    valid=true
+  fi
+  rm -f -- "$output" "$error"
+  [[ "$valid" == true ]]
+}
+
+run_legacy_disabled_recovery_preflight() {
+  local image_id="$1" expected bytes status output error valid
+  output="$(mktemp "$RUN_ROOT/kinvest-v3.legacy-preflight-out.XXXXXX")"
+  error="$(mktemp "$RUN_ROOT/kinvest-v3.legacy-preflight-err.XXXXXX")"
+  chmod 0600 "$output" "$error"
+  status=0
+  (
+    ulimit -f 1
+    run_docker run --rm --user 10001:10001 --read-only --cap-drop ALL \
+      --security-opt no-new-privileges:true --network none \
+      --env KINVEST_SECRET_PROVIDER_MODE=disabled \
+      --env 'KINVEST_SECRET_VERSION_IDS={}' \
+      --entrypoint node "$image_id" -e 'const { bootstrapSecrets } = require("./server/security/secret-bootstrap"); (async () => { let runtime; try { runtime = await bootstrapSecrets({ env: { KINVEST_SECRET_PROVIDER_MODE: "disabled", KINVEST_SECRET_VERSION_IDS: "{}" } }); const status = runtime && runtime.status; if (!status || status.mode !== "disabled" || status.referenceCount !== 0 || typeof runtime.clear !== "function") throw new Error("invalid status"); runtime.clear(); runtime = undefined; process.stdout.write("KINVEST_SECRET_PREFLIGHT_OK mode=disabled references=0\n"); } catch { if (runtime && typeof runtime.clear === "function") { try { runtime.clear(); } catch {} } process.exitCode = 1; } })();'
+  ) >"$output" 2>"$error" || status=$?
+  expected='KINVEST_SECRET_PREFLIGHT_OK mode=disabled references=0'
   bytes=$((${#expected} + 1))
   valid=false
   if ((status == 0)) && \
@@ -349,7 +391,9 @@ json_field() { "$CONTRACT" json-field "$2" <"$1"; }
 intent="$(json_field "$prepared_file" intent)"
 request_provider="$(json_field "$prepared_file" secretProviderMode)"
 request_versions="$(json_field "$prepared_file" secretVersionIds)"
-candidate_bundle_id="$(json_field "$prepared_file" secretBundleId)"
+request_fingerprints="$(json_field "$prepared_file" secretMaterialFingerprints)"
+request_bundle_id="$(json_field "$prepared_file" secretBundleId)"
+candidate_bundle_id="$request_bundle_id"
 candidate_bundle_path="$(json_field "$prepared_file" secretBundlePath)"
 verification_run_id="$(json_field "$prepared_file" verificationRunId)"
 
@@ -370,6 +414,12 @@ if [[ "$(head -n 1 "$current_original_file")" == protocolVersion=3 ]]; then
 fi
 "$CONTRACT" parse-state <"$CURRENT_STATE" >"$current_json"
 current_schema_version="$(json_field "$current_json" schemaVersion)"
+current_digest="$(json_field "$current_json" imageDigest)"
+current_commit="$(json_field "$current_json" commit)"
+current_provider="$(json_field "$current_json" secretProviderMode)"
+current_versions="$(json_field "$current_json" secretVersionIds)"
+current_fingerprints="$(json_field "$current_json" secretMaterialFingerprints)"
+current_bundle_id="$(json_field "$current_json" secretBundleId)"
 if [[ "$current_was_legacy" == true && "$request_provider" != disabled ]]; then
   fail DEPLOY_V3_LEGACY_BASELINE_REQUIRED
 fi
@@ -491,8 +541,30 @@ recovery_bootstrap="$(read_image_label "$recovery_image_id" io.kinvest.secret-bo
 [[ "$recovery_schema_min" =~ ^[0-9]+$ && "$recovery_schema_max" =~ ^[0-9]+$ && "$recovery_schema_min" -le "$recovery_schema_max" && "$recovery_bootstrap" == 1 ]] || fail ROLLBACK_REQUIRES_DB_RESTORE
 [[ "$schema_before" -ge "$recovery_schema_min" && "$schema_before" -le "$recovery_schema_max" ]] || fail ROLLBACK_REQUIRES_DB_RESTORE
 
+legacy_disabled_recovery_preflight_allowed() {
+  [[ "$intent" == FORWARD && \
+    "$current_was_legacy" == true && \
+    "$current_provider" == disabled && \
+    "$current_versions" == '{}' && \
+    "$current_fingerprints" == '{}' && \
+    "$current_bundle_id" == none && \
+    "$request_provider" == disabled && \
+    "$request_versions" == '{}' && \
+    "$request_fingerprints" == '{}' && \
+    "$request_bundle_id" == none && \
+    "$current_digest" == "$LEGACY_RECOVERY_IMAGE_DIGEST" && \
+    "$recovery_image_id" == "$LEGACY_RECOVERY_RUNTIME_IMAGE_ID" && \
+    "$current_commit" == "$LEGACY_RECOVERY_COMMIT" ]]
+}
+
 run_secret_preflight "$runtime_image_id" "$target_provider" "$target_versions" "$candidate_bundle_path" || fail DEPLOY_V3_PREFLIGHT_FAILED
-run_secret_preflight "$recovery_image_id" "$request_provider" "$request_versions" "$candidate_bundle_path" || fail DEPLOY_V3_RECOVERY_PREFLIGHT_FAILED
+if ! run_secret_preflight "$recovery_image_id" "$request_provider" "$request_versions" "$candidate_bundle_path"; then
+  if [[ "$last_preflight_legacy_failure" != true ]] || \
+    ! legacy_disabled_recovery_preflight_allowed || \
+    ! run_legacy_disabled_recovery_preflight "$recovery_image_id"; then
+    fail DEPLOY_V3_RECOVERY_PREFLIGHT_FAILED
+  fi
+fi
 "$CONTRACT" ledger-commit "$VERSION_LEDGER" <"$prepared_file"
 
 database_backup_path='none'
