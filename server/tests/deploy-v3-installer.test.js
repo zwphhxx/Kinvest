@@ -41,7 +41,7 @@ function createFixture(installer, { existingTargets = true } = {}) {
   write(path.join(source, assetNames[1]), '#!/usr/bin/env bash\nexit 0\n')
   write(path.join(source, assetNames[2]), '#!/usr/bin/env python3\nprint("ok")\n')
   write(path.join(source, assetNames[3]), 'services: {}\n', 0o644)
-  write(path.join(source, assetNames[4]), 'lighthouse ALL=(root) NOPASSWD: /usr/local/sbin/deploy-kinvest ""\nlighthouse ALL=(root) NOPASSWD: /usr/local/sbin/deploy-kinvest-v3 ""\n', 0o440)
+  write(path.join(source, assetNames[4]), 'kinvest-deploy ALL=(root) NOPASSWD: /usr/local/sbin/deploy-kinvest ""\nkinvest-deploy ALL=(root) NOPASSWD: /usr/local/sbin/deploy-kinvest-v3 ""\n', 0o440)
   if (existingTargets) {
     for (const name of targetNames) write(path.join(target, name), `old-${name}\n`, 0o700)
   }
@@ -107,6 +107,7 @@ async function run() {
   assert.match(installer, /INSTALL_OWNER='root'/)
   assert.match(installer, /INSTALL_GROUP='root'/)
   assert.match(installer, /ASSET_MODES=\('0755' '0755' '0755' '0644' '0440'\)/)
+  assert.match(installer, /^DEPLOY_USER='kinvest-deploy'$/m)
   assert.match(installer, /visudo -cf/)
   assert.match(installer, /^DEPLOY_TARGET="\$LOCAL_SBIN\/deploy-kinvest-v3"$/m)
   assert.match(installer, /^sudo -n -U "\$DEPLOY_USER" -l "\$DEPLOY_TARGET" >\/dev\/null$/m)
@@ -114,8 +115,13 @@ async function run() {
   assert.doesNotMatch(installer, /\/usr\/local\/sbin\/deploy-kinvest-v2|\$LOCAL_SBIN\/deploy-kinvest-v2/)
   assert.match(installer, /INSTALL_BACKUP_ROOT="\$SERVER_ROOT\/install-backups\/deploy-v3"/)
   const sudoers = fs.readFileSync(path.join(rootDir, 'deploy/server/kinvest-deploy-v3.sudoers'), 'utf8')
-  assert.match(sudoers, /deploy-kinvest ""/)
-  assert.match(sudoers, /deploy-kinvest-v3 ""/)
+  assert.equal(
+    sudoers,
+    'kinvest-deploy ALL=(root) NOPASSWD: /usr/local/sbin/deploy-kinvest ""\n' +
+      'kinvest-deploy ALL=(root) NOPASSWD: /usr/local/sbin/deploy-kinvest-v3 ""\n'
+  )
+  assert.doesNotMatch(sudoers, /^lighthouse /m)
+  assert.doesNotMatch(sudoers, /\*/)
   assert.match(installer, /WRAPPER_TARGET="\$LOCAL_SBIN\/kinvest-ssh-command"/)
   assert.match(installer, /kinvest-deploy-v3-stage/)
   assert.match(installer, /DEPLOY_LOCK="\$SERVER_ROOT\/state\/deploy.lock"/)
