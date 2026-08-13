@@ -34,6 +34,11 @@ install -d -m 0700 -- "$STATE" "$BACKUP_DIR"
 exec 9>"$STATE/deploy.lock"
 flock -n 9 || fail DEPLOY_V3_LOCKED
 
+[[ -f "$METADATA_NETWORK_CONFIG" && ! -L "$METADATA_NETWORK_CONFIG" ]] || fail DEPLOY_V3_METADATA_CONFIG_INVALID
+if grep -Eq '^[[:space:]]*(export[[:space:]]+)?KINVEST_SECRET_BUNDLE_PATH[[:space:]]*=' "$METADATA_NETWORK_CONFIG"; then
+  fail DEPLOY_V3_METADATA_CONFIG_FORBIDDEN
+fi
+
 run_fstype="$(findmnt -n -o FSTYPE --target "$RUN_ROOT" 2>/dev/null)" || fail DEPLOY_V3_RUN_MOUNT_INVALID
 [[ "$run_fstype" == tmpfs ]] || fail DEPLOY_V3_RUN_NOT_TMPFS
 
@@ -153,13 +158,21 @@ run_secret_preflight() {
   status=0
   (
     ulimit -f 1
-    run_docker run --rm --user 10001:10001 --read-only --cap-drop ALL \
-      --security-opt no-new-privileges:true --network none \
-      --env "KINVEST_SECRET_PROVIDER_MODE=$provider" \
-      --env "KINVEST_SECRET_VERSION_IDS=$versions" \
-      --env KINVEST_SECRET_BUNDLE_PATH=/run/secrets/kinvest \
-      --volume "$bundle_path:/run/secrets/kinvest:ro" \
-      --entrypoint node "$image_id" server/secret-preflight.js
+    if [[ "$provider" == github-tmpfs-v1 ]]; then
+      run_docker run --rm --user 10001:10001 --read-only --cap-drop ALL \
+        --security-opt no-new-privileges:true --network none \
+        --env "KINVEST_SECRET_PROVIDER_MODE=$provider" \
+        --env "KINVEST_SECRET_VERSION_IDS=$versions" \
+        --env KINVEST_SECRET_BUNDLE_PATH=/run/secrets/kinvest \
+        --volume "$bundle_path:/run/secrets/kinvest:ro" \
+        --entrypoint node "$image_id" server/secret-preflight.js
+    else
+      run_docker run --rm --user 10001:10001 --read-only --cap-drop ALL \
+        --security-opt no-new-privileges:true --network none \
+        --env "KINVEST_SECRET_PROVIDER_MODE=$provider" \
+        --env "KINVEST_SECRET_VERSION_IDS=$versions" \
+        --entrypoint node "$image_id" server/secret-preflight.js
+    fi
   ) >"$output" 2>"$error" || status=$?
   references=2
   [[ "$provider" == disabled ]] && references=0
@@ -179,20 +192,34 @@ run_secret_preflight() {
 
 compose_up() {
   local image_id="$1" provider="$2" versions="$3" bundle_path="$4"
-  KINVEST_IMAGE="$image_id" \
-  KINVEST_SECRET_PROVIDER_MODE="$provider" \
-  KINVEST_SECRET_VERSION_IDS="$versions" \
-  KINVEST_SECRET_BUNDLE_HOST_PATH="$bundle_path" \
+  (
+    export KINVEST_IMAGE="$image_id"
+    export KINVEST_SECRET_PROVIDER_MODE="$provider"
+    export KINVEST_SECRET_VERSION_IDS="$versions"
+    export KINVEST_SECRET_BUNDLE_HOST_PATH="$bundle_path"
+    if [[ "$provider" == github-tmpfs-v1 ]]; then
+      export KINVEST_SECRET_BUNDLE_PATH=/run/secrets/kinvest
+    else
+      unset KINVEST_SECRET_BUNDLE_PATH
+    fi
     run_docker compose -f "$COMPOSE" --env-file "$METADATA_NETWORK_CONFIG" up -d
+  )
 }
 
 compose_down() {
   local image_id="$1" provider="$2" versions="$3" bundle_path="$4"
-  KINVEST_IMAGE="$image_id" \
-  KINVEST_SECRET_PROVIDER_MODE="$provider" \
-  KINVEST_SECRET_VERSION_IDS="$versions" \
-  KINVEST_SECRET_BUNDLE_HOST_PATH="$bundle_path" \
+  (
+    export KINVEST_IMAGE="$image_id"
+    export KINVEST_SECRET_PROVIDER_MODE="$provider"
+    export KINVEST_SECRET_VERSION_IDS="$versions"
+    export KINVEST_SECRET_BUNDLE_HOST_PATH="$bundle_path"
+    if [[ "$provider" == github-tmpfs-v1 ]]; then
+      export KINVEST_SECRET_BUNDLE_PATH=/run/secrets/kinvest
+    else
+      unset KINVEST_SECRET_BUNDLE_PATH
+    fi
     run_docker compose -f "$COMPOSE" --env-file "$METADATA_NETWORK_CONFIG" down
+  )
 }
 
 make_approved_envelope() {
