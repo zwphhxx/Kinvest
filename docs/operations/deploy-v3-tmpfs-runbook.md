@@ -57,6 +57,10 @@ Do not install deploy-v3 server assets merely because the code PR merged.
 
 The dispatcher preserves the currently installed v2 path, `/usr/local/sbin/deploy-kinvest`, during the disabled v3 baseline. If the first v3 switch fails, the deployer restores the exact protocol-v3 state bytes, so the migration boundary is not crossed. Only the first successful v3 deployment writes protocol-v4 state; after that, v2 is no longer a deployment rollback mechanism because its older state parser must fail closed. All later forward, rollback, and reboot recovery operations use deploy-v3 until a separately reviewed v2 retirement change removes the legacy branch.
 
+The first successful v3 deployment has one narrowly allowlisted recovery-preflight compatibility path. The exact protocol-v3 production recovery image supports `disabled` mode with empty VersionIds in `server/security/secret-bootstrap`, but its older `server/secret-preflight.js` rejects that valid disabled status with `SSM_PREFLIGHT_REQUIRES_CVM_SSM`. The deployer therefore runs the normal recovery preflight first and permits a second isolated bootstrap probe only for `FORWARD`, exact disabled/empty current and requested secret state, the exact reviewed legacy digest, runtime Image ID, and commit, and the exact historical status/stdout/stderr failure signature. The second probe uses the same non-root, read-only, capability-free, no-network container boundary and must return the exact disabled status and success line. Any mismatch fails before the ledger commit, database backup, Compose, or state mutation.
+
+Remove the legacy identity constants, fallback probe, contract cases, and this compatibility note once production `current.state` is confirmed at protocol v4. Protocol v4 state cannot enter the compatibility path, so the fallback is unreachable after the one-time baseline migration and must not be generalized to another image or error.
+
 Any hash, owner, permission, syntax, or health mismatch stops the installation. Restore the backups and leave v3 disabled.
 
 ## Gate 2: disabled baseline deployment

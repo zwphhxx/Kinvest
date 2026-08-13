@@ -6,6 +6,12 @@ const path = require('node:path')
 
 const rootDir = path.resolve(__dirname, '../..')
 const helperPath = path.join(rootDir, 'deploy/server/deploy-v3-contract.py')
+const legacyRecoveryIdentity = Object.freeze({
+  imageDigest: 'ghcr.io/zwphhxx/kinvest@sha256:25bc6f76846f1ad429aeb8c4bf1185f8db43bb71b7e5d293197ca48f4d74ad26',
+  runtimeImageId: 'sha256:46fce58a9fac1c765a5f5beeafe53a9f63fb3f4e93d4628640a2583da68000b0',
+  commit: 'a0d511f0818a2dd0cc00f619af24942802f3af0d'
+})
+const disabledPreflightSuccess = 'KINVEST_SECRET_PREFLIGHT_OK mode=disabled references=0'
 
 function read(relativePath) {
   return fs.readFileSync(path.join(rootDir, relativePath), 'utf8')
@@ -81,6 +87,10 @@ function writeExecutable(file, source) {
   fs.writeFileSync(file, source, { mode: 0o755 })
 }
 
+function shellQuote(value) {
+  return `'${String(value).replaceAll("'", `'"'"'`)}'`
+}
+
 function stateText(overrides = {}) {
   const values = {
     protocolVersion: 4,
@@ -147,6 +157,7 @@ function runExecutor(deployer, options = {}) {
   const fakeBin = path.join(fixture, 'bin')
   const log = path.join(fixture, 'operations.log')
   const preflightLog = path.join(fixture, 'preflight.log')
+  const dockerRunLog = path.join(fixture, 'docker-run.log')
   const activeImage = path.join(fixture, 'active-image')
   const healthMarker = path.join(fixture, 'health-marker')
   const atomicFailureMarker = path.join(fixture, 'atomic-failure.marker')
@@ -156,6 +167,12 @@ function runExecutor(deployer, options = {}) {
   const candidateId = `sha256:${'a'.repeat(64)}`
   const previousId = options.currentState?.runtimeImageId ?? `sha256:${'2'.repeat(64)}`
   const candidateDigest = `ghcr.io/zwphhxx/kinvest@sha256:${'a'.repeat(64)}`
+  const legacyFallbackOutput = options.legacyFallbackOutput ?? `${disabledPreflightSuccess}\n`
+  const legacyFallbackStderr = options.legacyFallbackStderr ?? ''
+  const legacyFallbackStatus = options.legacyFallbackStatus ?? 0
+  const legacyNormalOutput = options.legacyNormalOutput ?? ''
+  const legacyNormalStderr = options.legacyNormalStderr ?? 'SSM_PREFLIGHT_REQUIRES_CVM_SSM\n'
+  const legacyNormalStatus = options.legacyNormalStatus ?? 1
   fs.mkdirSync(stateDir, { recursive: true })
   fs.mkdirSync(dataDir, { recursive: true })
   fs.mkdirSync(backupDir, { recursive: true })
@@ -250,6 +267,22 @@ function runExecutor(deployer, options = {}) {
       'if ! false <<\'PY\''
     )
   }
+  for (const [assignment, value] of [
+    ['request_versions', options.requestVersionsOverride],
+    ['request_fingerprints', options.requestFingerprintsOverride],
+    ['request_bundle_id', options.requestBundleOverride],
+    ['current_provider', options.currentProviderOverride],
+    ['current_versions', options.currentVersionsOverride],
+    ['current_fingerprints', options.currentFingerprintsOverride],
+    ['current_bundle_id', options.currentBundleOverride]
+  ]) {
+    if (value !== undefined) {
+      source = source.replace(
+        new RegExp(`^${assignment}=.*$`, 'm'),
+        `${assignment}=${shellQuote(value)}`
+      )
+    }
+  }
   const script = path.join(fixture, 'deployer')
   writeExecutable(script, source)
 
@@ -261,7 +294,12 @@ function runExecutor(deployer, options = {}) {
   writeExecutable(path.join(fakeBin, 'docker'), `#!/usr/bin/env bash
 set -eu
 if [[ "$*" == *"run --rm"* ]]; then
-  printf '%s\\n' preflight >> '${preflightLog}'
+  printf '%s\\n' "$*" >> '${dockerRunLog}'
+  if [[ "$*" == *"bootstrapSecrets"* ]]; then
+    printf '%s\\n' legacy-fallback >> '${preflightLog}'
+  else
+    printf '%s\\n' preflight >> '${preflightLog}'
+  fi
 else
   printf 'docker:%s\\n' "$*" >> '${log}'
 fi
@@ -276,6 +314,11 @@ case "$*" in
   *"io.kinvest.secret-bootstrap"*) printf '%s\\n' '${options.missingCapability ? '' : '1'}' ;;
   *"image inspect sha256:"*" --format {{.Id}}"*) printf '%s\\n' "$3" ;;
   *"run --rm"*)
+    if [[ "$*" == *"bootstrapSecrets"* ]]; then
+      printf '%s' ${shellQuote(legacyFallbackOutput)}
+      printf '%s' ${shellQuote(legacyFallbackStderr)} >&2
+      exit ${legacyFallbackStatus}
+    fi
     case "$*" in
       *KINVEST_SECRET_PROVIDER_MODE=github-tmpfs-v1*)
         case "$*" in
@@ -283,6 +326,11 @@ case "$*" in
           *) exit 19 ;;
         esac ;;
     esac
+    ${options.legacyRecoveryPreflight ? `if [[ "$*" == *"${previousId}"*"server/secret-preflight.js"* ]]; then
+      printf '%s' ${shellQuote(legacyNormalOutput)}
+      printf '%s' ${shellQuote(legacyNormalStderr)} >&2
+      exit ${legacyNormalStatus}
+    fi` : ':'}
     ${options.preflightFailure ? 'exit 17' : options.realDisabledPreflight
       ? `case "$*" in
           *KINVEST_SECRET_BUNDLE_PATH*) exit 18 ;;
@@ -346,12 +394,24 @@ esac
       fs.rmSync(fixture, { recursive: true, force: true })
     },
     input,
+    dockerRunLog,
     log,
     preflightLog,
     result,
     runRoot,
     stateDir,
     fixture
+  }
+}
+
+function legacyRecoveryOptions(overrides = {}) {
+  return {
+    currentState: { runtimeImageId: legacyRecoveryIdentity.runtimeImageId },
+    currentStateText: legacyStateText(legacyRecoveryIdentity),
+    legacyRecoveryPreflight: true,
+    preflightOutput: disabledPreflightSuccess,
+    provider: 'disabled',
+    ...overrides
   }
 }
 
@@ -431,6 +491,19 @@ async function run() {
 
   const syntax = spawnSync('bash', ['-n'], { encoding: 'utf8', input: deployer })
   assert.equal(syntax.status, 0, syntax.stderr)
+
+  const inlineLegacyProbeMatch = deployer.match(
+    /--entrypoint node "\$image_id" -e '([^'\n]*bootstrapSecrets[^'\n]*)'/
+  )
+  assert.ok(inlineLegacyProbeMatch, 'legacy fallback must expose one inline bootstrap probe')
+  const inlineLegacyProbe = spawnSync(process.execPath, ['-e', inlineLegacyProbeMatch[1]], {
+    cwd: rootDir,
+    encoding: 'utf8',
+    env: process.env
+  })
+  assert.equal(inlineLegacyProbe.status, 0, inlineLegacyProbe.stderr)
+  assert.equal(inlineLegacyProbe.stdout, `${disabledPreflightSuccess}\n`)
+  assert.equal(inlineLegacyProbe.stderr, '')
 
   const preflightFailure = runExecutor(deployer, { preflightFailure: true })
   try {
@@ -753,6 +826,202 @@ async function run() {
     assert.equal(fs.existsSync(path.join(compatibleAfterMigration.stateDir, 'attempt.state')), false)
   } finally {
     compatibleAfterMigration.cleanup()
+  }
+
+  const legacyRecoveryCompatibility = runExecutor(deployer, legacyRecoveryOptions())
+  try {
+    assert.equal(
+      legacyRecoveryCompatibility.result.status,
+      0,
+      legacyRecoveryCompatibility.result.stderr
+    )
+    assert.equal(
+      fs.readFileSync(legacyRecoveryCompatibility.preflightLog, 'utf8'),
+      'preflight\npreflight\nlegacy-fallback\n'
+    )
+    const dockerRuns = fs.readFileSync(legacyRecoveryCompatibility.dockerRunLog, 'utf8').trim().split('\n')
+    assert.equal(dockerRuns.length, 3)
+    assert.match(dockerRuns[0], new RegExp(`${legacyRecoveryCompatibility.candidateId}.*server/secret-preflight\\.js`))
+    assert.match(dockerRuns[1], new RegExp(`${legacyRecoveryIdentity.runtimeImageId}.*server/secret-preflight\\.js`))
+    assert.match(dockerRuns[2], new RegExp(`${legacyRecoveryIdentity.runtimeImageId}.*bootstrapSecrets`))
+    for (const hardening of [
+      '--user 10001:10001',
+      '--read-only',
+      '--cap-drop ALL',
+      '--security-opt no-new-privileges:true',
+      '--network none',
+      'KINVEST_SECRET_PROVIDER_MODE=disabled',
+      'KINVEST_SECRET_VERSION_IDS={}'
+    ]) assert.match(dockerRuns[2], new RegExp(hardening.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')))
+    assert.doesNotMatch(dockerRuns[2], /KINVEST_SECRET_BUNDLE_PATH|--volume/)
+  } finally {
+    legacyRecoveryCompatibility.cleanup()
+  }
+
+  for (const failureMode of [
+    { name: 'candidate Compose failure', composeFailure: true },
+    { name: 'candidate health failure', healthFailure: true }
+  ]) {
+    const legacyRecoveredSwitch = runExecutor(deployer, legacyRecoveryOptions(failureMode))
+    try {
+      assert.notEqual(legacyRecoveredSwitch.result.status, 0, failureMode.name)
+      assert.equal(
+        fs.readFileSync(path.join(legacyRecoveredSwitch.stateDir, 'current.state'), 'utf8'),
+        legacyStateText(legacyRecoveryIdentity),
+        failureMode.name
+      )
+      assert.equal(
+        fs.readFileSync(legacyRecoveredSwitch.activeImage, 'utf8'),
+        legacyRecoveryIdentity.runtimeImageId,
+        failureMode.name
+      )
+      assert.equal(
+        fs.existsSync(path.join(legacyRecoveredSwitch.stateDir, 'attempt.state')),
+        false,
+        failureMode.name
+      )
+      assert.equal(
+        fs.existsSync(path.join(legacyRecoveredSwitch.stateDir, 'previous.state')),
+        false,
+        failureMode.name
+      )
+      const operations = fs.readFileSync(legacyRecoveredSwitch.log, 'utf8').trim().split('\n')
+      const recoveryCompose = operations.filter((line) => line.startsWith('compose-env:')).at(-1)
+      assert.equal(
+        recoveryCompose,
+        `compose-env:${legacyRecoveryIdentity.runtimeImageId}|{}|${path.join(legacyRecoveredSwitch.runRoot, 'kinvest-secrets', 'disabled')}`,
+        failureMode.name
+      )
+      assert.equal(
+        operations.filter((line) => line.startsWith('compose-bundle-env:')).at(-1),
+        'compose-bundle-env:unset',
+        failureMode.name
+      )
+      const fallbackRun = fs.readFileSync(legacyRecoveredSwitch.dockerRunLog, 'utf8')
+        .trim().split('\n').find((line) => line.includes('bootstrapSecrets'))
+      assert.ok(fallbackRun, failureMode.name)
+      assert.doesNotMatch(fallbackRun, /KINVEST_SECRET_BUNDLE_PATH|--volume|\/run\/secrets\/kinvest/, failureMode.name)
+    } finally {
+      legacyRecoveredSwitch.cleanup()
+    }
+  }
+
+  /** @type {Array<[string, Record<string, any>]>} */
+  const legacyGuardCases = [
+    ['protocol v4', {
+      currentStateText: stateText(legacyRecoveryIdentity)
+    }],
+    ['wrong intent', {
+      intent: 'ROLLBACK',
+      previousState: {
+        imageDigest: `ghcr.io/zwphhxx/kinvest@sha256:${'a'.repeat(64)}`,
+        runtimeImageId: `sha256:${'a'.repeat(64)}`,
+        commit: 'b'.repeat(40)
+      }
+    }],
+    ['wrong request provider', {
+      provider: 'github-tmpfs-v1',
+      preflightOutput: 'KINVEST_SECRET_PREFLIGHT_OK mode=github-tmpfs-v1 references=2'
+    }],
+    ['wrong request versions', { requestVersionsOverride: '{"unexpected":"v1"}' }],
+    ['wrong request fingerprints', { requestFingerprintsOverride: '{"unexpected":"hash"}' }],
+    ['wrong request bundle', { requestBundleOverride: 'f'.repeat(32) }],
+    ['wrong current provider', { currentProviderOverride: 'github-tmpfs-v1' }],
+    ['wrong current versions', { currentVersionsOverride: '{"unexpected":"v1"}' }],
+    ['wrong current fingerprints', { currentFingerprintsOverride: '{"unexpected":"hash"}' }],
+    ['wrong current bundle', { currentBundleOverride: 'e'.repeat(32) }],
+    ['wrong recovery digest', {
+      currentStateText: legacyStateText({
+        ...legacyRecoveryIdentity,
+        imageDigest: `ghcr.io/zwphhxx/kinvest@sha256:${'9'.repeat(64)}`
+      })
+    }],
+    ['wrong recovery image ID', {
+      currentState: { runtimeImageId: `sha256:${'8'.repeat(64)}` },
+      currentStateText: legacyStateText({
+        ...legacyRecoveryIdentity,
+        runtimeImageId: `sha256:${'8'.repeat(64)}`
+      })
+    }],
+    ['wrong recovery commit', {
+      currentStateText: legacyStateText({
+        ...legacyRecoveryIdentity,
+        commit: '7'.repeat(40)
+      })
+    }],
+    ['normal stdout is nonempty', { legacyNormalOutput: 'unexpected\n' }],
+    ['normal stderr differs', { legacyNormalStderr: 'SSM_PREFLIGHT_FAILED\n' }],
+    ['normal status differs', { legacyNormalStatus: 2 }]
+  ]
+  for (const [name, overrides] of legacyGuardCases) {
+    const guarded = runExecutor(deployer, legacyRecoveryOptions(overrides))
+    try {
+      assert.notEqual(guarded.result.status, 0, name)
+      assert.equal(
+        fs.existsSync(guarded.preflightLog) && fs.readFileSync(guarded.preflightLog, 'utf8').includes('legacy-fallback'),
+        false,
+        name
+      )
+    } finally {
+      guarded.cleanup()
+    }
+  }
+
+  /** @type {Array<[string, Record<string, any>]>} */
+  const malformedLegacyProbes = [
+    ['unexpected output', { legacyFallbackOutput: 'unexpected\n' }],
+    ['unexpected stderr', { legacyFallbackStderr: 'unexpected\n' }],
+    ['unexpected status', { legacyFallbackStatus: 17 }],
+    ['timeout status', { legacyFallbackStatus: 124 }]
+  ]
+  for (const [name, overrides] of malformedLegacyProbes) {
+    const malformedProbe = runExecutor(deployer, legacyRecoveryOptions(overrides))
+    try {
+      assert.notEqual(malformedProbe.result.status, 0, name)
+      assert.match(malformedProbe.result.stderr, /DEPLOY_V3_RECOVERY_PREFLIGHT_FAILED/, name)
+      assert.equal(
+        fs.readFileSync(malformedProbe.preflightLog, 'utf8'),
+        'preflight\npreflight\nlegacy-fallback\n',
+        name
+      )
+    } finally {
+      malformedProbe.cleanup()
+    }
+  }
+
+  const originalPrevious = stateText({ commit: '6'.repeat(40) })
+  const originalLedger = {
+    adminPasswordVerifier: {},
+    deviceTokenHmac: {}
+  }
+  const legacyPretransactionFailure = runExecutor(deployer, legacyRecoveryOptions({
+    legacyFallbackOutput: 'malformed\n',
+    ledger: originalLedger,
+    previousState: { commit: '6'.repeat(40) }
+  }))
+  try {
+    assert.notEqual(legacyPretransactionFailure.result.status, 0)
+    assert.equal(
+      fs.readFileSync(path.join(legacyPretransactionFailure.stateDir, 'current.state'), 'utf8'),
+      legacyStateText(legacyRecoveryIdentity)
+    )
+    assert.equal(
+      fs.readFileSync(path.join(legacyPretransactionFailure.stateDir, 'previous.state'), 'utf8'),
+      originalPrevious
+    )
+    assert.equal(
+      fs.readFileSync(path.join(legacyPretransactionFailure.stateDir, 'secret-version-ledger.json'), 'utf8'),
+      `${JSON.stringify(originalLedger)}\n`
+    )
+    assert.equal(fs.existsSync(path.join(legacyPretransactionFailure.stateDir, 'attempt.state')), false)
+    assert.deepEqual(fs.readdirSync(legacyPretransactionFailure.backupDir), [])
+    assert.doesNotMatch(fs.readFileSync(legacyPretransactionFailure.log, 'utf8'), /compose/)
+    assert.equal(
+      fs.readFileSync(legacyPretransactionFailure.activeImage, 'utf8'),
+      legacyRecoveryIdentity.runtimeImageId
+    )
+  } finally {
+    legacyPretransactionFailure.cleanup()
   }
 
   const legacy = legacyStateText()
