@@ -186,9 +186,9 @@ kinvest_activate_deny_all() {
   [ "$KMF_ACTIVATION_MODE" = deny-all ]
 }
 
-kmf_usage='Usage: kinvest-metadata-firewall validate-config|verify-bridge-netfilter|guard|apply|status|reconcile|reconcile-active|activate-deny-all --confirm-deny-all|rollback|rollback-pre-bind --assert-role-unbound'
+kmf_usage='Usage: kinvest-metadata-firewall validate-config|verify-bridge-netfilter|boot-guard|guard|apply|status|reconcile|reconcile-active|activate-deny-all --confirm-deny-all|rollback|rollback-pre-bind --assert-role-unbound'
 case "$#:$1" in
-  1:validate-config|1:verify-bridge-netfilter|1:guard|1:apply|1:status|1:reconcile|1:reconcile-active|1:rollback) ;;
+  1:validate-config|1:verify-bridge-netfilter|1:boot-guard|1:guard|1:apply|1:status|1:reconcile|1:reconcile-active|1:rollback) ;;
   2:activate-deny-all)
     [ "$2" = '--confirm-deny-all' ] || {
       printf '%s\n' "$kmf_usage" >&2
@@ -215,7 +215,7 @@ case "$kmf_action" in
     kinvest_metadata_verify_bridge_netfilter
     exit 0
     ;;
-  guard|apply|status|reconcile|reconcile-active)
+  boot-guard|guard|apply|status|reconcile|reconcile-active)
     kinvest_metadata_verify_bridge_netfilter || exit 1
     ;;
 esac
@@ -255,6 +255,7 @@ fi
 
 case "$kmf_action" in
   validate-config) kinvest_metadata_validate_config "$KMF_CONFIG" ;;
+  boot-guard) kinvest_metadata_boot_guard "$KMF_IPTABLES" ;;
   guard) kinvest_metadata_guard "$KMF_IPTABLES" ;;
   apply) kinvest_metadata_apply "$KMF_IPTABLES" "$KMF_IPTABLES_RESTORE" "$KMF_DOCKER" "$KMF_CONFIG" ;;
   status) kinvest_metadata_status "$KMF_IPTABLES" "$KMF_DOCKER" "$KMF_CONFIG" ;;
@@ -265,6 +266,7 @@ case "$kmf_action" in
       deny-all) kinvest_metadata_reconcile_deny_all "$KMF_IPTABLES" "$KMF_IPTABLES_RESTORE" "$kmf_reconcile_config" ;;
       *) exit 1 ;;
     esac
+    kinvest_metadata_remove_boot_guard "$KMF_IPTABLES"
     ;;
   activate-deny-all) kinvest_activate_deny_all "$kmf_reconcile_config" ;;
   rollback) kinvest_metadata_rollback "$KMF_IPTABLES" ;;

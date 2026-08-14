@@ -2,6 +2,7 @@
 
 KMF_METADATA_FIXED_IP=169.254.0.23
 KMF_CHAIN=KINVEST-METADATA
+KMF_BOOT_GUARD_COMMENT=kinvest-metadata-docker-boot-guard
 KMF_GUARD_COMMENT=kinvest-metadata-docker-start-guard
 KMF_NORMALIZATION_GUARD_COMMENT=kinvest-metadata-normalization-guard
 
@@ -200,6 +201,37 @@ kinvest_metadata_remove_all() {
         printf '%s\n' "Metadata firewall could not check a managed rule in $kmf_remove_chain" >&2
         return 1
       fi
+      return 0
+    fi
+  done
+}
+
+kinvest_metadata_boot_guard_present() {
+  kinvest_metadata_iptables -t mangle -C PREROUTING -d "$KMF_METADATA_FIXED_IP/32" -p tcp --dport 80 -m comment --comment "$KMF_BOOT_GUARD_COMMENT" -j DROP >/dev/null 2>&1
+}
+
+kinvest_metadata_boot_guard() {
+  KMF_IPTABLES=$1
+  kmf_boot_guard_rules=$(kinvest_metadata_iptables -t mangle -S PREROUTING) || return 1
+  kmf_boot_guard_first=$(printf '%s\n' "$kmf_boot_guard_rules" | awk '$1 == "-A" { print; exit }')
+  kmf_boot_guard_expected="-A PREROUTING -d $KMF_METADATA_FIXED_IP/32 -p tcp -m tcp --dport 80 -m comment --comment $KMF_BOOT_GUARD_COMMENT -j DROP"
+  if [ "$kmf_boot_guard_first" = "$kmf_boot_guard_expected" ] && kinvest_metadata_boot_guard_present; then
+    return 0
+  fi
+  kinvest_metadata_iptables -t mangle -I PREROUTING 1 -d "$KMF_METADATA_FIXED_IP/32" -p tcp --dport 80 -m comment --comment "$KMF_BOOT_GUARD_COMMENT" -j DROP || return 1
+  kmf_boot_guard_rules=$(kinvest_metadata_iptables -t mangle -S PREROUTING) || return 1
+  kmf_boot_guard_first=$(printf '%s\n' "$kmf_boot_guard_rules" | awk '$1 == "-A" { print; exit }')
+  [ "$kmf_boot_guard_first" = "$kmf_boot_guard_expected" ] && kinvest_metadata_boot_guard_present
+}
+
+kinvest_metadata_remove_boot_guard() {
+  KMF_IPTABLES=$1
+  while :; do
+    if kinvest_metadata_boot_guard_present; then
+      kinvest_metadata_iptables -t mangle -D PREROUTING -d "$KMF_METADATA_FIXED_IP/32" -p tcp --dport 80 -m comment --comment "$KMF_BOOT_GUARD_COMMENT" -j DROP || return 1
+    else
+      kmf_boot_guard_check_status=$?
+      [ "$kmf_boot_guard_check_status" -eq 1 ] || return 1
       return 0
     fi
   done
