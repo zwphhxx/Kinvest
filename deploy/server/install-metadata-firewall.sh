@@ -18,6 +18,7 @@ RUNTIME_FD_ROOT='/proc/self/fd'
 RUNTIME_FD_IDENTITY_MODE='device-inode'
 BACKUP_ROOT="$TARGET_ROOT/var/backups/kinvest-metadata-firewall"
 LOCK_FILE="$LOCK_ROOT/kinvest-metadata-firewall-install.lock"
+INTERLOCK_TARGET="$TARGET_ROOT/etc/systemd/system/docker.service.d/00-kinvest-metadata-recovery-interlock.conf"
 MANIFEST_RELATIVE='deploy/server/metadata-firewall-assets.sha256'
 ASSET_IDS='library wrapper service timer drop-in modules-load sysctl'
 INSTALL_IDS='drop-in library wrapper service timer modules-load sysctl'
@@ -35,6 +36,8 @@ state_record=''
 parents_record=''
 transaction_started='0'
 transaction_committed='0'
+operator_transactions=''
+safe_commit_recovered='0'
 stage_library=''
 stage_wrapper=''
 stage_service=''
@@ -179,6 +182,15 @@ file_gid() { stat_value '%g' '%g' "$1"; }
 file_links() { stat_value '%h' '%l' "$1"; }
 file_identity() { stat_value '%d:%i' '%d:%i' "$1"; }
 file_inode() { stat_value '%i' '%i' "$1"; }
+
+dereferenced_file_identity() {
+  path_value=$1
+  if stat -Lc '%d:%i' "$path_value" >/dev/null 2>&1; then
+    stat -Lc '%d:%i' "$path_value"
+  else
+    stat -f '%d:%i' "$path_value"
+  fi
+}
 
 mode_is_not_writable_by_group_or_other() {
   mode_value=$1
@@ -345,6 +357,85 @@ verify_bound_parent() {
   fi
 }
 
+interlock_content() {
+  printf '%s\n' '[Service]' 'ExecStartPre=/bin/false'
+}
+
+interlock_is_safe() {
+  transaction=$1
+  verify_bound_parent "$transaction" drop-in || return 1
+  secure_regular_file "$INTERLOCK_TARGET" || return 1
+  [ "$(file_mode "$INTERLOCK_TARGET")" = '644' ] || return 1
+  [ "$(cat "$INTERLOCK_TARGET" 2>/dev/null || printf '%s' invalid)" = "$(interlock_content)" ]
+}
+
+install_interlock() {
+  transaction=$1
+  verify_bound_parent "$transaction" drop-in || return 1
+  if [ -e "$INTERLOCK_TARGET" ] || [ -L "$INTERLOCK_TARGET" ]; then
+    interlock_is_safe "$transaction" || {
+      RECOVERY_CODE='INTERLOCK_PATH_UNSAFE'
+      return 1
+    }
+    sync -f "$INTERLOCK_TARGET" >/dev/null 2>&1 || return 1
+    sync -f "${INTERLOCK_TARGET%/*}" >/dev/null 2>&1 || return 1
+    return 0
+  fi
+  interlock_temp=$(mktemp "${INTERLOCK_TARGET%/*}/.kinvest-metadata-interlock.XXXXXX") || return 1
+  if ! interlock_content > "$interlock_temp" ||
+    ! chown "$INSTALL_OWNER:$INSTALL_GROUP" "$interlock_temp" ||
+    ! chmod '0644' "$interlock_temp" ||
+    ! sync -f "$interlock_temp" ||
+    ! verify_bound_parent "$transaction" drop-in; then
+    rm -f -- "$interlock_temp"
+    return 1
+  fi
+  if ! mv -fT -- "$interlock_temp" "$INTERLOCK_TARGET" ||
+    ! sync -f "$INTERLOCK_TARGET" ||
+    ! sync -f "${INTERLOCK_TARGET%/*}" ||
+    ! interlock_is_safe "$transaction"; then
+    rm -f -- "$interlock_temp"
+    return 1
+  fi
+}
+
+remove_interlock() {
+  transaction=$1
+  verify_bound_parent "$transaction" drop-in || return 1
+  if [ ! -e "$INTERLOCK_TARGET" ] && [ ! -L "$INTERLOCK_TARGET" ]; then
+    return 0
+  fi
+  interlock_is_safe "$transaction" || {
+    RECOVERY_CODE='INTERLOCK_PATH_UNSAFE'
+    return 1
+  }
+  rm -f -- "$INTERLOCK_TARGET" || return 1
+  sync -f "${INTERLOCK_TARGET%/*}" || return 1
+}
+
+append_operator_transaction() {
+  transaction=$1
+  case "$operator_transactions" in
+    '') operator_transactions=$transaction ;;
+    *) operator_transactions="$operator_transactions
+$transaction" ;;
+  esac
+}
+
+supersede_operator_transactions() {
+  except_transaction=${1:-none}
+  [ -n "$operator_transactions" ] || return 0
+  if ! printf '%s\n' "$operator_transactions" |
+    while IFS= read -r operator_transaction; do
+      [ "$operator_transaction" = "$except_transaction" ] && continue
+      validate_transaction "$operator_transaction" || exit 1
+      write_phase "$operator_transaction" superseded || exit 1
+    done; then
+    RECOVERY_CODE='OPERATOR_TRANSACTION_SUPERSEDE_FAILED'
+    return 1
+  fi
+}
+
 state_record_line() {
   transaction=$1
   asset_id=$2
@@ -360,6 +451,11 @@ validate_transaction() {
   [ "$(wc -l < "$transaction/asset-state.tsv" | tr -d ' ')" = '8' ] || return 1
   [ "$(wc -l < "$transaction/parents.tsv" | tr -d ' ')" = '8' ] || return 1
   for asset_id in $ASSET_IDS; do
+    secure_regular_file "$transaction/snapshot/$asset_id.asset" || return 1
+    captured_hash=$(awk -v wanted="$(asset_source "$asset_id")" \
+      '$2 == wanted { print $1; found++ } END { if (found != 1) exit 1 }' \
+      "$transaction/captured-manifest.sha256") || return 1
+    [ "$(file_hash "$transaction/snapshot/$asset_id.asset")" = "$captured_hash" ] || return 1
     line=$(state_record_line "$transaction" "$asset_id") || return 1
     tab=$(printf '\t')
     old_ifs=$IFS
@@ -457,7 +553,7 @@ verify_bridge_prerequisites() {
   exec 8< "$RUNTIME_SYSCTL_PATH" || return 1
   verification_failed='0'
   if [ "$RUNTIME_FD_IDENTITY_MODE" = 'device-inode' ]; then
-    fd_identity=$(file_identity "$RUNTIME_FD_ROOT/8" 2>/dev/null) || verification_failed='1'
+    fd_identity=$(dereferenced_file_identity "$RUNTIME_FD_ROOT/8" 2>/dev/null) || verification_failed='1'
     [ "$verification_failed" = '0' ] && [ "$fd_identity" = "$path_identity_before" ] || verification_failed='1'
   else
     [ "$RUNTIME_FD_IDENTITY_MODE" = 'inode-only' ] || verification_failed='1'
@@ -514,6 +610,7 @@ rollback_runtime() {
   fi
   if [ -n "$partial_code" ]; then
     printf 'KINVEST_METADATA_FIREWALL_RUNTIME_ROLLBACK_PARTIAL code=%s preserved=1\n' "$partial_code" >&2
+    return 2
   fi
 }
 
@@ -530,10 +627,34 @@ recover_transaction() {
   restore_files_from_transaction "$transaction" || files_status='failed'
   if [ -f "$transaction/runtime-sysctl-attempted" ]; then
     runtime_status='ok'
-    rollback_runtime "$transaction" || runtime_status='failed'
+    if rollback_runtime "$transaction"; then
+      :
+    else
+      runtime_result=$?
+      case "$runtime_result" in
+        2) runtime_status='operator-required' ;;
+        *) runtime_status='failed' ;;
+      esac
+    fi
+  fi
+  interlock_status='not-required'
+  case "$runtime_status" in
+    operator-required|failed)
+      interlock_status='ok'
+      install_interlock "$transaction" || interlock_status='failed'
+      ;;
+  esac
+  if [ "$interlock_status" = 'ok' ]; then
+    if write_phase "$transaction" operator-required; then
+      phase_status='operator-required'
+    else
+      phase_status='write-failed'
+    fi
   fi
   systemctl daemon-reload >/dev/null 2>&1 || daemon_reload_status='failed'
-  if [ "$files_status" = 'ok' ] && [ "$runtime_status" != 'failed' ] && [ "$daemon_reload_status" = 'ok' ]; then
+  if [ "$files_status" = 'ok' ] &&
+    { [ "$runtime_status" = 'ok' ] || [ "$runtime_status" = 'not-required' ]; } &&
+    [ "$daemon_reload_status" = 'ok' ]; then
     if write_phase "$transaction" recovered; then
       phase_status='recovered'
     else
@@ -542,6 +663,11 @@ recover_transaction() {
   fi
   printf 'KINVEST_METADATA_FIREWALL_RECOVERY_STATUS files=%s runtime=%s daemon_reload=%s phase=%s\n' \
     "$files_status" "$runtime_status" "$daemon_reload_status" "$phase_status" >&2
+  if [ "$runtime_status" = 'operator-required' ] && [ "$files_status" = 'ok' ] &&
+    [ "$interlock_status" = 'ok' ] && [ "$phase_status" = 'operator-required' ]; then
+    RECOVERY_CODE='RECOVERY_OPERATOR_REQUIRED'
+    return 1
+  fi
   if [ "$files_status" != 'ok' ] || [ "$runtime_status" = 'failed' ] ||
     [ "$daemon_reload_status" != 'ok' ] || [ "$phase_status" != 'recovered' ]; then
     RECOVERY_CODE='RECOVERY_INCOMPLETE'
@@ -549,9 +675,67 @@ recover_transaction() {
   fi
 }
 
+verify_installed_transaction() {
+  transaction=$1
+  validate_transaction "$transaction" || return 1
+  for asset_id in $ASSET_IDS; do
+    verify_bound_parent "$transaction" "$asset_id" || return 1
+    target=$(asset_target "$asset_id")
+    mode=$(asset_mode "$asset_id")
+    secure_regular_file "$target" || return 1
+    [ "$(file_mode "$target")" = "${mode#0}" ] || return 1
+    [ "$(file_hash "$target")" = "$(file_hash "$transaction/snapshot/$asset_id.asset")" ] || return 1
+  done
+  /bin/sh -n "$(asset_target library)" || return 1
+  /bin/sh -n "$(asset_target wrapper)" || return 1
+}
+
+complete_safe_commit() {
+  transaction=$1
+  verify_installed_transaction "$transaction" || {
+    RECOVERY_CODE='SAFE_COMMIT_ASSET_VERIFY_FAILED'
+    return 1
+  }
+  modprobe br_netfilter >/dev/null 2>&1 || {
+    RECOVERY_CODE='SAFE_COMMIT_MODULE_LOAD_FAILED'
+    return 1
+  }
+  sysctl --load "$(asset_target sysctl)" >/dev/null 2>&1 || {
+    RECOVERY_CODE='SAFE_COMMIT_SYSCTL_LOAD_FAILED'
+    return 1
+  }
+  "$(asset_target wrapper)" verify-bridge-netfilter >/dev/null 2>&1 || {
+    RECOVERY_CODE='SAFE_COMMIT_WRAPPER_VERIFY_FAILED'
+    return 1
+  }
+  verify_bridge_prerequisites || {
+    RECOVERY_CODE='SAFE_COMMIT_RUNTIME_VERIFY_FAILED'
+    return 1
+  }
+  systemctl daemon-reload >/dev/null 2>&1 || {
+    RECOVERY_CODE='SAFE_COMMIT_DAEMON_RELOAD_FAILED'
+    return 1
+  }
+  if [ -e "$INTERLOCK_TARGET" ] || [ -L "$INTERLOCK_TARGET" ]; then
+    remove_interlock "$transaction" || return 1
+    systemctl daemon-reload >/dev/null 2>&1 || {
+      RECOVERY_CODE='INTERLOCK_RELEASE_DAEMON_RELOAD_FAILED'
+      return 1
+    }
+  fi
+  supersede_operator_transactions "$transaction" || return 1
+  write_phase "$transaction" committed || {
+    RECOVERY_CODE='TRANSACTION_SYNC_FAILED'
+    return 1
+  }
+  printf '%s\n' 'KINVEST_METADATA_FIREWALL_SAFE_COMMIT_RECOVERED' >&2
+}
+
 recover_incomplete_transaction() {
   incomplete=''
   incomplete_count=0
+  safe_commit=''
+  safe_commit_count=0
   set +f
   set -- "$BACKUP_ROOT"/install-*
   set -f
@@ -567,10 +751,21 @@ recover_incomplete_transaction() {
     fi
     phase_value=$(cat "$candidate/phase" 2>/dev/null || printf '%s' invalid)
     case "$phase_value" in
-      committed|recovered) ;;
+      committed|recovered|superseded) ;;
+      operator-required)
+        validate_transaction "$candidate" || {
+          RECOVERY_CODE='TRANSACTION_INVENTORY_INVALID'
+          return 1
+        }
+        append_operator_transaction "$candidate"
+        ;;
       prepared|installing)
         incomplete=$candidate
         incomplete_count=$((incomplete_count + 1))
+        ;;
+      safe-committed)
+        safe_commit=$candidate
+        safe_commit_count=$((safe_commit_count + 1))
         ;;
       *) RECOVERY_CODE='TRANSACTION_INVENTORY_INVALID'; return 1 ;;
     esac
@@ -579,7 +774,39 @@ recover_incomplete_transaction() {
     RECOVERY_CODE='MULTIPLE_INCOMPLETE_TRANSACTIONS'
     return 1
   }
-  [ "$incomplete_count" -eq 0 ] || recover_transaction "$incomplete"
+  [ "$safe_commit_count" -le 1 ] || {
+    RECOVERY_CODE='MULTIPLE_INCOMPLETE_TRANSACTIONS'
+    return 1
+  }
+  [ "$incomplete_count" -eq 0 ] || [ "$safe_commit_count" -eq 0 ] || {
+    RECOVERY_CODE='MULTIPLE_INCOMPLETE_TRANSACTIONS'
+    return 1
+  }
+  if [ "$safe_commit_count" -eq 1 ]; then
+    complete_safe_commit "$safe_commit" || return 1
+    backup_dir=$safe_commit
+    safe_commit_recovered='1'
+    return 0
+  fi
+  if [ "$incomplete_count" -eq 1 ]; then
+    if recover_transaction "$incomplete"; then
+      return 0
+    fi
+    if [ "$RECOVERY_CODE" = 'RECOVERY_OPERATOR_REQUIRED' ]; then
+      append_operator_transaction "$incomplete"
+      return 0
+    fi
+    return 1
+  fi
+  if [ -n "$operator_transactions" ]; then
+    if ! printf '%s\n' "$operator_transactions" |
+      while IFS= read -r operator_transaction; do
+        interlock_is_safe "$operator_transaction" || exit 1
+      done; then
+      RECOVERY_CODE='RECOVERY_INTERLOCK_MISSING'
+      return 1
+    fi
+  fi
 }
 
 cleanup() {
@@ -635,6 +862,10 @@ ensure_directory "$LOCK_ROOT" '0755'
 exec 9>"$LOCK_FILE"
 flock -n 9 || fail 'INSTALL_LOCKED'
 recover_incomplete_transaction || fail "$RECOVERY_CODE"
+if [ "$safe_commit_recovered" = '1' ]; then
+  printf 'KINVEST_METADATA_FIREWALL_INSTALL_OK backup=%s recovered=safe-commit\n' "$backup_dir"
+  exit 0
+fi
 
 if [ ! -d "$SOURCE_ROOT" ] || [ -L "$SOURCE_ROOT" ]; then
   fail 'SOURCE_ROOT_INVALID'
@@ -838,6 +1069,15 @@ if ! "$(asset_target wrapper)" verify-bridge-netfilter; then
 fi
 if ! systemctl daemon-reload; then
   fail 'DAEMON_RELOAD_FAILED'
+fi
+if [ -n "$operator_transactions" ] || [ -e "$INTERLOCK_TARGET" ] || [ -L "$INTERLOCK_TARGET" ]; then
+  write_phase "$backup_dir" safe-committed || fail 'TRANSACTION_SYNC_FAILED'
+  # TEST_FAULT_POINT_AFTER_SAFE_COMMIT_BEFORE_INTERLOCK_REMOVE
+  remove_interlock "$backup_dir" || fail "$RECOVERY_CODE"
+  if ! systemctl daemon-reload; then
+    fail 'INTERLOCK_RELEASE_DAEMON_RELOAD_FAILED'
+  fi
+  supersede_operator_transactions "$backup_dir" || fail "$RECOVERY_CODE"
 fi
 write_phase "$backup_dir" committed || fail 'TRANSACTION_SYNC_FAILED'
 transaction_committed='1'
