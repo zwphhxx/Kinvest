@@ -209,11 +209,16 @@ esac
 kmf_action=$1
 
 kinvest_assert_secure_file "$KMF_LIBRARY"
-if [ "$kmf_action" = verify-bridge-netfilter ]; then
-  . "$KMF_LIBRARY"
-  kinvest_metadata_verify_bridge_netfilter
-  exit 0
-fi
+. "$KMF_LIBRARY"
+case "$kmf_action" in
+  verify-bridge-netfilter)
+    kinvest_metadata_verify_bridge_netfilter
+    exit 0
+    ;;
+  guard|apply|status|reconcile|reconcile-active)
+    kinvest_metadata_verify_bridge_netfilter || exit 1
+    ;;
+esac
 if [ "$kmf_action" = validate-config ] || [ "$kmf_action" = apply ] || [ "$kmf_action" = status ] || [ "$kmf_action" = reconcile ] || [ "$kmf_action" = reconcile-active ] || [ "$kmf_action" = activate-deny-all ]; then
   kinvest_assert_secure_file "$KMF_CONFIG" 600
 fi
@@ -247,7 +252,6 @@ if [ "$kmf_action" = reconcile-active ] || [ "$kmf_action" = activate-deny-all ]
     kinvest_assert_active_config_binding "$kmf_reconcile_config"
   fi
 fi
-. "$KMF_LIBRARY"
 
 case "$kmf_action" in
   validate-config) kinvest_metadata_validate_config "$KMF_CONFIG" ;;
