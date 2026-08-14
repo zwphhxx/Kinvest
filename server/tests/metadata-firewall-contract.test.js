@@ -469,7 +469,10 @@ function runWrapperBridgeNetfilterFixture(wrapperText, library, fixture, name, o
     .replaceAll('/usr/bin/flock', fakeFlock)
   const wrapper = path.join(wrapperFixture, 'kinvest-metadata-firewall')
   writeExecutable(wrapper, instrumentedWrapper.trimEnd().split('\n'))
-  const result = runHarness(wrapper, options.args || ['verify-bridge-netfilter'], {
+  const wrapperArguments = options.args || ['verify-bridge-netfilter']
+  const harnessFile = options.shell || wrapper
+  const harnessArguments = options.shell ? [wrapper, ...wrapperArguments] : wrapperArguments
+  const result = runHarness(harnessFile, harnessArguments, {
     KMF_BR_NETFILTER_MODULE_PATH: bridgeNetfilterModule,
     KMF_BRIDGE_NF_CALL_IPTABLES_PATH: bridgeNfCallIptables,
     KINVEST_TEST_REPLACE_SYSCTL_ON_FD_STAT: options.sysctlSymlinkReplacement ? '1' : '0',
@@ -1012,6 +1015,13 @@ function run() {
       ['sysctl-identity-mismatch', { sysctlIdentityMismatch: true }, 'METADATA_BR_NETFILTER_SYSCTL_INVALID'],
       ['sysctl-symlink-replacement', { sysctlSymlinkReplacement: true }, 'METADATA_BR_NETFILTER_SYSCTL_INVALID']
     ]
+    if (fs.existsSync('/bin/dash')) {
+      verifierCases.push([
+        'sysctl-open-failure-dash',
+        { shell: '/bin/dash', sysctlMode: 0o000 },
+        'METADATA_BR_NETFILTER_SYSCTL_INVALID'
+      ])
+    }
     for (const [name, options, expectedCode] of verifierCases) {
       const verification = runWrapperBridgeNetfilterFixture(wrapperText, library, fixture, name, options)
       assert.notEqual(verification.result.status, 0, `${name} must fail closed`)

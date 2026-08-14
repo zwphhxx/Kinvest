@@ -25,10 +25,11 @@ kinvest_metadata_read_bridge_nf_call_iptables() {
     [ "$kmf_bridge_nf_path_identity_after" = "$kmf_bridge_nf_fd_identity_after" ] || return 1
 
   case "$kmf_bridge_nf_call_iptables" in
-    1) return 0 ;;
-    0) return 2 ;;
+    1) kmf_bridge_nf_result=enabled ;;
+    0) kmf_bridge_nf_result=disabled ;;
     *) return 1 ;;
   esac
+  return 0
 }
 
 kinvest_metadata_verify_bridge_netfilter() {
@@ -41,13 +42,14 @@ kinvest_metadata_verify_bridge_netfilter() {
     return 1
   }
 
-  if kinvest_metadata_read_bridge_nf_call_iptables 2>/dev/null 7< "$KMF_BRIDGE_NF_CALL_IPTABLES_PATH"; then
-    return 0
-  else
-    kmf_bridge_nf_status=$?
+  kmf_bridge_nf_result=invalid
+  if ! kinvest_metadata_read_bridge_nf_call_iptables 2>/dev/null 7< "$KMF_BRIDGE_NF_CALL_IPTABLES_PATH"; then
+    printf '%s\n' 'METADATA_BR_NETFILTER_SYSCTL_INVALID' >&2
+    return 1
   fi
-  case "$kmf_bridge_nf_status" in
-    2)
+  case "$kmf_bridge_nf_result" in
+    enabled) return 0 ;;
+    disabled)
       printf '%s\n' 'METADATA_BR_NETFILTER_SYSCTL_DISABLED' >&2
       return 1
       ;;
