@@ -73,7 +73,7 @@ This change does not add an `OUTPUT` rule and does not block host processes. It 
 
 ## Installation and rollback
 
-The existing metadata-firewall installer is extended to manage the two new configuration assets and the Docker drop-in as one versioned installation set.
+A dedicated metadata-firewall installer is added to manage the existing runtime assets, the two new configuration assets, and the Docker drop-in as one versioned installation set. The repository currently has no standalone installer for this subsystem; prior installations used audited manual commands.
 
 Installation rules:
 
