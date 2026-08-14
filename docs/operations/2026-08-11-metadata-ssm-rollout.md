@@ -114,16 +114,18 @@ running containers. The Docker drop-in installs only the startup/stop deny guard
 it does not run network-dependent apply or status actions that could fail
 `docker.service`. The independent oneshot service uses `Requisite` and `After`,
 so a timer attempt never starts inactive Docker. It invokes one locked
-`reconcile-active` operation. Before any firewall or Docker call, the wrapper requires
-the activation state to be a regular, non-symlink, root-owned mode `0600` file
-with exactly `version=1`, `mode=active`, and the installed config SHA-256. Under
-the same lock it opens the state once, verifies that the path and descriptor
-still identify the same inode, and parses only that descriptor. It installs
-cleanup traps before creating a process-unique mode `0600` `/run` snapshot,
-verifies
-the state hash against that snapshot, and uses only the snapshot for guard,
-apply, and status. Missing, pending, malformed, insecure, or mismatched state
-removes the snapshot and returns nonzero without changing firewall rules. If
+`reconcile-active` operation. Before any firewall or Docker call, the wrapper
+requires the activation state to be a regular, non-symlink, root-owned mode
+`0600` file with exactly `version=1`, either `mode=active` or `mode=deny-all`,
+and the installed config SHA-256. Under the same lock it opens the state once,
+verifies that the path and descriptor still identify the same inode, and parses
+only that descriptor. It installs cleanup traps before creating a process-unique
+mode `0600` `/run` snapshot, verifies the state hash against that snapshot, and
+uses only the snapshot for reconciliation. After successful binding,
+`reconcile-active` dispatches `mode=active` to the existing allow-mode reconcile
+path and `mode=deny-all` to the exact deny-all reconcile path. Missing, pending,
+malformed, unknown, insecure, replaced, or hash-mismatched state fails closed,
+removes the snapshot, and returns nonzero without changing firewall rules. If
 apply or status fails after successful binding, reconcile reinstalls and
 confirms the guard before returning nonzero; a later timer attempt retries after
 containers and networks become ready.
@@ -168,6 +170,106 @@ The intended root-owned destinations are:
 Installation commands are an operator checklist and are not authorization to
 run them. Install executable files mode `0755`, library and unit files mode
 `0644`, and the config mode `0600`, all owned by root.
+
+## T6 metadata deny-all procedure
+
+T6 is a separately approved firewall-only change. It performs no CAM or SSM
+operation. In `mode=deny-all`, Kinvest, Nginx, and temporary bridge containers
+are all denied access to `169.254.0.23/32` TCP port `80`. Host access remains
+unchanged. Docker restart persistence is deferred to T7; separate approval is
+required, and Docker must not be restarted as part of T6.
+
+### T6 installation
+
+After the iptables/systemd installation approval, install only the reviewed T6
+artifacts from the repository checkout. These commands do not grant approval:
+
+    install -o root -g root -m 0755 deploy/server/kinvest-metadata-firewall.sh /usr/local/sbin/kinvest-metadata-firewall
+    install -o root -g root -m 0644 deploy/server/kinvest-metadata-firewall-lib.sh /usr/local/libexec/kinvest-metadata-firewall-lib.sh
+    install -o root -g root -m 0644 deploy/server/kinvest-metadata-firewall.service /etc/systemd/system/kinvest-metadata-firewall.service
+    install -o root -g root -m 0644 deploy/server/kinvest-metadata-firewall.timer /etc/systemd/system/kinvest-metadata-firewall.timer
+    systemctl daemon-reload
+
+Confirm `/etc/kinvest/metadata-network.conf` is a regular, non-symlink,
+root-owned mode `0600` file. Do not enable the timer, change activation state,
+or mutate iptables during installation.
+
+### T6 activation
+
+After a separate explicit production activation approval, retain fail-closed
+coverage first, then write the confirmed hash-bound deny-all state and invoke
+the same entry point used by the service:
+
+    /usr/local/sbin/kinvest-metadata-firewall guard
+    /usr/local/sbin/kinvest-metadata-firewall activate-deny-all --confirm-deny-all
+    /usr/local/sbin/kinvest-metadata-firewall reconcile-active
+    systemctl enable --now kinvest-metadata-firewall.timer
+
+The activation action is explicit and confirmation-gated; no deployment or
+timer action silently converts `mode=active` to `mode=deny-all`. Deployment-time
+`reconcile` retains the existing allow-mode behavior and does not read or change
+the deny-all activation mode.
+
+### T6 verification
+
+Verify the state is exact and bound to the installed config:
+
+    config_hash="$(sha256sum /etc/kinvest/metadata-network.conf | awk '{print $1}')"
+    test "$(sed -n '1p' /root/docker/kinvest/state/metadata-network.state)" = 'version=1'
+    test "$(sed -n '2p' /root/docker/kinvest/state/metadata-network.state)" = 'mode=deny-all'
+    test "$(sed -n '3p' /root/docker/kinvest/state/metadata-network.state)" = "config_sha256=$config_hash"
+    test "$(wc -l < /root/docker/kinvest/state/metadata-network.state)" -eq 3
+
+Verify the permanent chain has exactly the deny and return rules, no ACCEPT,
+and no broad link-local CIDR:
+
+    expected_chain="$(printf '%s\n' '-A KINVEST-METADATA -d 169.254.0.23/32 -p tcp -m tcp --dport 80 -m comment --comment kinvest-metadata-default-deny -j REJECT --reject-with tcp-reset' '-A KINVEST-METADATA -j RETURN')"
+    test "$(iptables -S KINVEST-METADATA)" = "$expected_chain"
+    ! iptables -S KINVEST-METADATA | grep -Eq 'ACCEPT|169[.]254[.]0[.]0/16'
+    test "$(iptables -S FORWARD | grep -c '^-A FORWARD -j KINVEST-METADATA$')" -eq 1
+    test "$(iptables -S DOCKER-USER | grep -c '^-A DOCKER-USER -j KINVEST-METADATA$')" -eq 1
+    test "$(iptables -S FORWARD | sed -n '1p')" = '-A FORWARD -j KINVEST-METADATA'
+    test "$(iptables -S DOCKER-USER | sed -n '1p')" = '-A DOCKER-USER -j KINVEST-METADATA'
+    systemctl is-active --quiet kinvest-metadata-firewall.timer
+
+Use non-credential probes from Kinvest, Nginx, and an approved temporary
+container on Docker's default bridge and confirm each connection is rejected.
+Do not record metadata responses. The exact chain and first-position jumps are
+the authoritative proof that every forwarded container source is denied.
+
+### T6 rollback
+
+The fail-closed rollback removes the permanent chain and jumps while retaining
+the top-level deny guard:
+
+    systemctl disable --now kinvest-metadata-firewall.timer
+    /usr/local/sbin/kinvest-metadata-firewall rollback
+
+Restoring the prior allow mode is a separate explicit rollback approval. It
+must reuse the exact installed config hash; it must never be inferred from the
+current deny-all state. Run the publication and reconciliation as one strict
+`set -eu` operator sequence. Any failed write, ownership change, mode change,
+durability barrier, rename, or reconciliation stops the sequence immediately:
+
+    (
+      set -eu
+      state_directory=/root/docker/kinvest/state
+      approved_hash="$(sha256sum /etc/kinvest/metadata-network.conf | awk '{print $1}')"
+      state_tmp="$(mktemp "$state_directory/.metadata-network.state.XXXXXX")"
+      trap 'rm -f -- "$state_tmp"' EXIT
+      trap 'exit 1' HUP INT TERM
+      printf 'version=1\nmode=active\nconfig_sha256=%s\n' "$approved_hash" > "$state_tmp"
+      chown root:root "$state_tmp"
+      chmod 0600 "$state_tmp"
+      /usr/bin/sync "$state_tmp"
+      mv -f -- "$state_tmp" "$state_directory/metadata-network.state"
+      /usr/bin/sync "$state_directory"
+      /usr/local/sbin/kinvest-metadata-firewall reconcile-active
+    )
+
+If allow-mode validation or reconciliation fails, the top-level deny guard
+remains and the rollback is not complete. Re-enabling the timer requires its
+own approval after exact allow-chain and runtime verification.
 
 ## Apply and status
 

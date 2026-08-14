@@ -314,9 +314,32 @@ kinvest_metadata_verify_managed_chain() {
   [ "$kmf_chain_signature" = "$(printf '%s\n' 'kinvest-metadata-app-allow|ACCEPT' 'kinvest-metadata-default-deny|REJECT' '|RETURN')" ]
 }
 
+kinvest_metadata_verify_deny_all_managed_chain() {
+  kinvest_metadata_iptables -C "$KMF_CHAIN" -d "$KMF_METADATA_IP/32" -p tcp --dport 80 -m comment --comment kinvest-metadata-default-deny -j REJECT --reject-with tcp-reset || return 1
+  kinvest_metadata_iptables -C "$KMF_CHAIN" -j RETURN || return 1
+  kmf_chain_rules=$(kinvest_metadata_iptables -S "$KMF_CHAIN") || return 1
+  kmf_chain_signature=$(printf '%s\n' "$kmf_chain_rules" | awk '
+    $1 == "-A" {
+      comment=""
+      target=""
+      for (i = 1; i <= NF; i++) {
+        if ($i == "--comment") comment=$(i + 1)
+        if ($i == "-j") target=$(i + 1)
+      }
+      print comment "|" target
+    }
+  ')
+  [ "$kmf_chain_signature" = "$(printf '%s\n' 'kinvest-metadata-default-deny|REJECT' '|RETURN')" ]
+}
+
 kinvest_metadata_verify_rules() {
   kmf_mode=$1
-  kinvest_metadata_verify_managed_chain || return 1
+  kmf_chain_mode=${2:-allow}
+  case "$kmf_chain_mode" in
+    allow) kinvest_metadata_verify_managed_chain || return 1 ;;
+    deny-all) kinvest_metadata_verify_deny_all_managed_chain || return 1 ;;
+    *) return 1 ;;
+  esac
 
   kmf_forward_rules=$(kinvest_metadata_iptables -S FORWARD) || return 1
   kmf_docker_rules=$(kinvest_metadata_iptables -S DOCKER-USER) || return 1
@@ -411,6 +434,56 @@ kinvest_metadata_reconcile() {
     return 1
   fi
   if ! kinvest_metadata_status "$iptables_command" "$docker_command" "$config_path"; then
+    kinvest_metadata_guard "$iptables_command" || return 1
+    return 1
+  fi
+}
+
+kinvest_metadata_apply_deny_all() {
+  KMF_IPTABLES=$1
+  KMF_IPTABLES_RESTORE=$2
+  kmf_config_path=$3
+
+  kinvest_metadata_guard "$KMF_IPTABLES" || return 1
+  kinvest_metadata_load_config "$kmf_config_path" || return 1
+  kinvest_metadata_iptables -S DOCKER-USER >/dev/null || return 1
+  if ! kinvest_metadata_iptables -S "$KMF_CHAIN" >/dev/null 2>&1; then
+    kinvest_metadata_iptables -N "$KMF_CHAIN" || return 1
+  fi
+  kinvest_metadata_iptables -F "$KMF_CHAIN" || return 1
+  kinvest_metadata_iptables -A "$KMF_CHAIN" -d "$KMF_METADATA_IP/32" -p tcp --dport 80 -m comment --comment kinvest-metadata-default-deny -j REJECT --reject-with tcp-reset || return 1
+  kinvest_metadata_iptables -A "$KMF_CHAIN" -j RETURN || return 1
+  kinvest_metadata_verify_deny_all_managed_chain || return 1
+
+  kinvest_metadata_remove_all FORWARD -j "$KMF_CHAIN" || return 1
+  kinvest_metadata_remove_all DOCKER-USER -j "$KMF_CHAIN" || return 1
+  kinvest_metadata_restore_jumps || return 1
+  kinvest_metadata_verify_rules staging deny-all || return 1
+  kinvest_metadata_remove_all FORWARD -d "$KMF_METADATA_FIXED_IP/32" -p tcp --dport 80 -m comment --comment "$KMF_GUARD_COMMENT" -j REJECT --reject-with tcp-reset || return 1
+  if ! kinvest_metadata_verify_rules final deny-all; then
+    kinvest_metadata_guard "$KMF_IPTABLES"
+    return 1
+  fi
+}
+
+kinvest_metadata_status_deny_all() {
+  KMF_IPTABLES=$1
+  kmf_config_path=$2
+  kinvest_metadata_load_config "$kmf_config_path" || return 1
+  kinvest_metadata_verify_rules final deny-all
+}
+
+kinvest_metadata_reconcile_deny_all() {
+  local iptables_command="$1"
+  local iptables_restore_command="$2"
+  local config_path="$3"
+
+  kinvest_metadata_guard "$iptables_command" || return 1
+  if ! kinvest_metadata_apply_deny_all "$iptables_command" "$iptables_restore_command" "$config_path"; then
+    kinvest_metadata_guard "$iptables_command" || return 1
+    return 1
+  fi
+  if ! kinvest_metadata_status_deny_all "$iptables_command" "$config_path"; then
     kinvest_metadata_guard "$iptables_command" || return 1
     return 1
   fi
