@@ -5,6 +5,47 @@ KMF_CHAIN=KINVEST-METADATA
 KMF_GUARD_COMMENT=kinvest-metadata-docker-start-guard
 KMF_NORMALIZATION_GUARD_COMMENT=kinvest-metadata-normalization-guard
 
+kinvest_metadata_verify_bridge_netfilter() {
+  [ -d "$KMF_BR_NETFILTER_MODULE_PATH" ] || {
+    printf '%s\n' 'METADATA_BR_NETFILTER_MODULE_MISSING' >&2
+    return 1
+  }
+  [ -f "$KMF_BRIDGE_NF_CALL_IPTABLES_PATH" ] && [ ! -L "$KMF_BRIDGE_NF_CALL_IPTABLES_PATH" ] || {
+    printf '%s\n' 'METADATA_BR_NETFILTER_SYSCTL_MISSING' >&2
+    return 1
+  }
+
+  kmf_bridge_nf_call_iptables=
+  kmf_bridge_nf_call_iptables_extra=
+  exec 7< "$KMF_BRIDGE_NF_CALL_IPTABLES_PATH" || {
+    printf '%s\n' 'METADATA_BR_NETFILTER_SYSCTL_MISSING' >&2
+    return 1
+  }
+  if ! IFS= read -r kmf_bridge_nf_call_iptables <&7; then
+    exec 7<&-
+    printf '%s\n' 'METADATA_BR_NETFILTER_SYSCTL_INVALID' >&2
+    return 1
+  fi
+  if IFS= read -r kmf_bridge_nf_call_iptables_extra <&7 || [ -n "$kmf_bridge_nf_call_iptables_extra" ]; then
+    exec 7<&-
+    printf '%s\n' 'METADATA_BR_NETFILTER_SYSCTL_INVALID' >&2
+    return 1
+  fi
+  exec 7<&-
+
+  case "$kmf_bridge_nf_call_iptables" in
+    1) return 0 ;;
+    0)
+      printf '%s\n' 'METADATA_BR_NETFILTER_SYSCTL_DISABLED' >&2
+      return 1
+      ;;
+    *)
+      printf '%s\n' 'METADATA_BR_NETFILTER_SYSCTL_INVALID' >&2
+      return 1
+      ;;
+  esac
+}
+
 kinvest_metadata_validate_ipv4() {
   kmf_value=$1
   kmf_old_ifs=$IFS
@@ -174,6 +215,7 @@ kinvest_metadata_guard_failure() {
 
 kinvest_metadata_guard() {
   KMF_IPTABLES=$1
+  kinvest_metadata_verify_bridge_netfilter || return 1
   kmf_guard_rules=$(kinvest_metadata_iptables -S FORWARD) || return 1
   kmf_guard_first_comment=$(printf '%s\n' "$kmf_guard_rules" | awk '$1 == "-A" { for (i = 1; i <= NF; i++) if ($i == "--comment") print $(i + 1); exit }')
   kmf_primary_count=$(printf '%s\n' "$kmf_guard_rules" | awk -v expected="$KMF_GUARD_COMMENT" '{ for (i = 1; i <= NF; i++) if ($i == "--comment" && $(i + 1) == expected) count++ } END { print count + 0 }')

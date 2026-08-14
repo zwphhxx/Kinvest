@@ -4,6 +4,8 @@ set -eu
 PATH=/usr/sbin:/usr/bin:/sbin:/bin
 KMF_LIBRARY=/usr/local/libexec/kinvest-metadata-firewall-lib.sh
 KMF_CONFIG=${KMF_CONFIG:-/etc/kinvest/metadata-network.conf}
+KMF_BR_NETFILTER_MODULE_PATH=${KMF_BR_NETFILTER_MODULE_PATH:-/sys/module/br_netfilter}
+KMF_BRIDGE_NF_CALL_IPTABLES_PATH=${KMF_BRIDGE_NF_CALL_IPTABLES_PATH:-/proc/sys/net/bridge/bridge-nf-call-iptables}
 KMF_ACTIVATION_STATE=${KMF_ACTIVATION_STATE:-/root/docker/kinvest/state/metadata-network.state}
 KMF_RUNTIME_DIR=${KMF_RUNTIME_DIR:-/run}
 KMF_LOCK=/run/lock/kinvest-metadata-firewall.lock
@@ -184,9 +186,9 @@ kinvest_activate_deny_all() {
   [ "$KMF_ACTIVATION_MODE" = deny-all ]
 }
 
-kmf_usage='Usage: kinvest-metadata-firewall validate-config|guard|apply|status|reconcile|reconcile-active|activate-deny-all --confirm-deny-all|rollback|rollback-pre-bind --assert-role-unbound'
+kmf_usage='Usage: kinvest-metadata-firewall validate-config|verify-bridge-netfilter|guard|apply|status|reconcile|reconcile-active|activate-deny-all --confirm-deny-all|rollback|rollback-pre-bind --assert-role-unbound'
 case "$#:$1" in
-  1:validate-config|1:guard|1:apply|1:status|1:reconcile|1:reconcile-active|1:rollback) ;;
+  1:validate-config|1:verify-bridge-netfilter|1:guard|1:apply|1:status|1:reconcile|1:reconcile-active|1:rollback) ;;
   2:activate-deny-all)
     [ "$2" = '--confirm-deny-all' ] || {
       printf '%s\n' "$kmf_usage" >&2
@@ -207,6 +209,11 @@ esac
 kmf_action=$1
 
 kinvest_assert_secure_file "$KMF_LIBRARY"
+if [ "$kmf_action" = verify-bridge-netfilter ]; then
+  . "$KMF_LIBRARY"
+  kinvest_metadata_verify_bridge_netfilter
+  exit 0
+fi
 if [ "$kmf_action" = validate-config ] || [ "$kmf_action" = apply ] || [ "$kmf_action" = status ] || [ "$kmf_action" = reconcile ] || [ "$kmf_action" = reconcile-active ] || [ "$kmf_action" = activate-deny-all ]; then
   kinvest_assert_secure_file "$KMF_CONFIG" 600
 fi
