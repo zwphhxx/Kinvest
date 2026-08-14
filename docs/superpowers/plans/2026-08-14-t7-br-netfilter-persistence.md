@@ -293,7 +293,7 @@ assert.match(operations, /^systemctl:daemon-reload$/m)
 assert.doesNotMatch(operations, /systemctl:(?:start|restart):?docker/)
 ```
 
-Add failure cases for a manifest mismatch, module-load failure, sysctl failure, and prerequisite-verification failure. Assert previous assets are restored and absent assets are removed only when the backup manifest marks them absent.
+Add failure cases for a manifest mismatch, module-load failure, sysctl failure, and prerequisite-verification failure. Assert previous assets are restored and absent assets are removed only when the backup manifest marks them absent. Add production-mode Linux fd identity coverage proving `stat -L` compares device and inode for the opened sysctl target. Model absent, unsafe, reload-failed, and unsafe-runtime prior states as operator-required failures with runtime value `1`, retained transaction state, and an independent Docker-start interlock. Cover recovery `daemon-reload` failure, later safe supersession, and crashes before every asset replacement and before interlock release.
 
 - [ ] **Step 2: Register the test and observe RED**
 
@@ -347,7 +347,16 @@ kinvest-br-netfilter.modules-load.conf -> /etc/modules-load.d/kinvest-br-netfilt
 kinvest-br-netfilter.sysctl.conf -> /etc/sysctl.d/90-kinvest-br-netfilter.conf (0644)
 ```
 
-The error trap restores the recorded present files, removes only recorded-absent targets, runs `systemctl daemon-reload`, prints one stable failure code plus backup path, and never starts Docker.
+The error trap restores the recorded present files, removes only recorded-absent targets, always attempts `systemctl daemon-reload`, prints stable non-secret recovery and failure status plus backup path, and never starts Docker.
+
+If the old persistent sysctl is absent or unsafe, reloading it fails, or the prior runtime value was not `1`, rollback must keep the live value at `1` but return nonzero. It durably records phase `operator-required`, retains the backup and transaction, and atomically installs this root-owned mode `0644` systemd drop-in in the already identity-bound Docker drop-in parent:
+
+```ini
+[Service]
+ExecStartPre=/bin/false
+```
+
+The fixed path is `/etc/systemd/system/docker.service.d/00-kinvest-metadata-recovery-interlock.conf`. It is deliberately independent of the restored wrapper and blocks Docker after reboot even when `daemon-reload` fails during recovery. A later invocation keeps the interlock until the replacement assets are durable, the installed wrapper and direct module/sysctl verification pass, and the first `daemon-reload` succeeds. It then records `safe-committed`, removes the exact validated interlock, performs a second `daemon-reload`, marks older operator transactions `superseded`, and records `committed`. An interrupted `safe-committed` transaction is completed before any new transaction begins; a partial rollback is never marked `recovered`.
 
 - [ ] **Step 4: Generate the exact asset manifest**
 

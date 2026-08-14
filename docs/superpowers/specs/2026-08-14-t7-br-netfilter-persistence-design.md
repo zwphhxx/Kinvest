@@ -85,6 +85,7 @@ Installation rules:
 - Back up existing files and record whether each new file was previously absent.
 - Install with same-filesystem temporary files and atomic rename.
 - Load `br_netfilter`, apply only the Kinvest sysctl file, and verify the exact runtime values.
+- On Linux, compare the opened sysctl file descriptor with the validated path by device and inode using explicitly dereferenced `stat -L`; keep the original path's non-symlink and before/after identity checks.
 - Do not start Docker or reconstruct the secret bundle during installation.
 
 Rollback rules:
@@ -94,6 +95,10 @@ Rollback rules:
 - Reload the previous module/sysctl configuration where possible.
 - Keep Docker stopped if the previous configuration cannot prove bridge traffic is filtered.
 - Never use a successful command exit as a substitute for a real metadata-denial probe.
+
+An absent or unsafe prior persistent sysctl, a failed prior-config reload, or an unsafe prior runtime value is not an automatically recovered state. Rollback preserves the live value `1`, retains the timestamped backup and transaction, records phase `operator-required`, and exits nonzero with a stable diagnostic. Before attempting `daemon-reload`, it atomically installs and durably syncs `/etc/systemd/system/docker.service.d/00-kinvest-metadata-recovery-interlock.conf` as root-owned mode `0644`; its self-contained `ExecStartPre=/bin/false` blocks Docker without invoking repository code, including after reboot if systemd has not reloaded successfully.
+
+A later installer invocation may safely supersede an `operator-required` transaction. The interlock remains in place until all new persistent assets are durable, the trusted wrapper and direct bridge prerequisites pass, and `daemon-reload` succeeds. The installer then durably records `safe-committed`, removes only the exact validated interlock, reloads systemd again, marks retained operator transactions `superseded`, and finally records `committed`. Crash recovery resumes from `safe-committed`; it never marks a partial rollback `recovered` and never unblocks Docker before a durable safe state exists.
 
 ## Automated test design
 
