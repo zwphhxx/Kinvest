@@ -58,18 +58,22 @@ The firewall `guard`, `reconcile`, and `reconcile-active` paths also verify thes
 
 ### Docker lifecycle ordering
 
-The Docker drop-in keeps the existing pre-start and stop guards and adds an immediate post-start reconciliation:
+Docker owns and may rebuild the filter-layer `FORWARD` and `DOCKER-USER` chains during daemon startup, so the filter pre-start guard is not the startup continuity boundary. Before Docker starts, the wrapper installs a first-position `mangle/PREROUTING` rule that drops TCP traffic to `169.254.0.23:80`. Docker does not own that layer, so the boot guard remains effective while Docker resets its filter chains.
+
+The exact startup order is:
 
 ```text
 ExecStartPre=verify bridge netfilter prerequisites
-ExecStartPre=install deny guard
-ExecStartPost=reconcile-active
-ExecStopPost=install deny guard
+ExecStartPre=install first-position mangle/PREROUTING boot DROP
+ExecStartPre=install filter deny guard
+Docker daemon start and filter-chain rebuild
+ExecStartPost=reconcile-active and verify the permanent deny
+remove the boot DROP only after reconciliation succeeds
 ```
 
-The pre-start guard protects the interval while Docker rebuilds its chains. The post-start reconciliation normalizes the final `FORWARD`, `DOCKER-USER`, and `KINVEST-METADATA` rules as soon as Docker initialization completes. The five-minute timer remains a drift-repair fallback, not the first protection after boot.
+The `reconcile-active` command normalizes and verifies the final `FORWARD`, `DOCKER-USER`, and `KINVEST-METADATA` rules before removing the boot guard. Its `ExecStartPost` entry is not failure-ignored. If reconciliation fails, Docker startup fails and stops rather than remaining in service, the boot guard is not removed, and `ExecStopPost` reinstalls the boot guard and filter guard. There is no lifecycle state in which Docker is allowed to keep serving without either the temporary boot DROP or the verified permanent metadata deny.
 
-This change does not add an `OUTPUT` rule and does not block host processes. It protects the current Kinvest, Nginx, and temporary Docker bridge networks without changing Tencent Cloud host-agent behavior.
+The boot guard deliberately overblocks all prerouted TCP traffic to `169.254.0.23:80`, including the approved Kinvest application path, during the short Docker startup and recovery interval. This is acceptable because fail-closed startup takes precedence over application availability, and the rule is temporary: it is removed only after the permanent policy is verified. The change does not add an `OUTPUT` rule or block host-generated traffic, so Tencent Cloud host-agent behavior is unchanged.
 
 ## Installation and rollback
 
@@ -101,7 +105,10 @@ Tests are written before implementation and must first fail for the missing beha
 - Valid prerequisites allow guard and reconciliation to proceed.
 - Docker cannot start when prerequisite verification fails.
 - Docker post-start invokes `reconcile-active` before the unit is considered successful.
-- A modeled Docker chain rebuild retains a pre-start deny guard and ends with the exact deny-all chain after post-start reconciliation.
+- A modeled Docker start begins from guards installed by the real wrapper, records each filter-chain rebuild transition, and proves that the independent `mangle/PREROUTING` boot DROP remains while Docker removes the filter guard.
+- A negative continuity fixture models Docker removing the boot guard as well as rebuilding its filter chains; the contract must fail before the containers-ready boundary.
+- A failed non-ignored `ExecStartPost` reconciliation stops the modeled Docker service and leaves or reinstalls the boot guard instead of serving unprotected.
+- Successful post-start reconciliation ends with the exact deny-all chain and removes the boot guard only after the permanent policy is verified.
 - The installer manages module, sysctl, drop-in, hashes, modes, backup, and rollback without starting Docker.
 - PR `verify`, `security`, and `container-build` checks remain secret-free.
 

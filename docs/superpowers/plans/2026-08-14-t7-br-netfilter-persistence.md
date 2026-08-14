@@ -161,6 +161,8 @@ git commit -m "fix: fail closed without bridge netfilter"
 - Create: `deploy/server/kinvest-br-netfilter.modules-load.conf`
 - Create: `deploy/server/kinvest-br-netfilter.sysctl.conf`
 - Modify: `deploy/server/docker-kinvest-metadata-firewall.conf`
+- Modify: `deploy/server/kinvest-metadata-firewall.sh`
+- Modify: `deploy/server/kinvest-metadata-firewall-lib.sh`
 - Modify: `server/tests/metadata-firewall-contract.test.js`
 
 - [ ] **Step 1: Write failing exact-asset and ordering tests**
@@ -174,14 +176,21 @@ assert.equal(
   'net.bridge.bridge-nf-call-iptables = 1\n'
 )
 assert.match(dropInText, /^ExecStartPre=\+\/usr\/local\/sbin\/kinvest-metadata-firewall verify-bridge-netfilter$/m)
+assert.match(dropInText, /^ExecStartPre=\+\/usr\/local\/sbin\/kinvest-metadata-firewall boot-guard$/m)
 assert.match(dropInText, /^ExecStartPre=\+\/usr\/local\/sbin\/kinvest-metadata-firewall guard$/m)
 assert.match(dropInText, /^ExecStartPost=\+\/usr\/local\/sbin\/kinvest-metadata-firewall reconcile-active$/m)
+assert.match(dropInText, /^ExecStopPost=\+\/usr\/local\/sbin\/kinvest-metadata-firewall boot-guard$/m)
 assert.match(dropInText, /^ExecStopPost=\+\/usr\/local\/sbin\/kinvest-metadata-firewall guard$/m)
-assert.ok(dropInText.indexOf('verify-bridge-netfilter') < dropInText.indexOf(' guard'))
-assert.ok(dropInText.indexOf(' guard') < dropInText.indexOf('reconcile-active'))
+const orderedLifecycle = [
+  'verify-bridge-netfilter',
+  'boot-guard',
+  ' guard',
+  'reconcile-active'
+].map((entry) => dropInText.indexOf(entry))
+assert.deepEqual([...orderedLifecycle].sort((a, b) => a - b), orderedLifecycle)
 ```
 
-Remove the obsolete assertion that forbids every `ExecStartPost` entry.
+Remove the obsolete assertion that forbids every `ExecStartPost` entry. Add a transition recorder that recognizes an equivalent metadata deny only when a first-position `mangle/PREROUTING` boot DROP, a filter guard, or the complete permanent managed policy is present. Add a negative fixture that removes the boot guard during Docker's filter rebuild and assert that continuity validation rejects it.
 
 - [ ] **Step 2: Run the focused test and observe RED**
 
@@ -193,7 +202,7 @@ node -e "require('./server/tests/metadata-firewall-contract.test').run()"
 
 Expected: FAIL because both assets and Docker lifecycle lines are absent.
 
-- [ ] **Step 3: Create exact assets and update the drop-in**
+- [ ] **Step 3: Create exact assets and implement the boot-guard lifecycle**
 
 Create `deploy/server/kinvest-br-netfilter.modules-load.conf`:
 
@@ -215,14 +224,28 @@ After=systemd-modules-load.service systemd-sysctl.service
 
 [Service]
 ExecStartPre=+/usr/local/sbin/kinvest-metadata-firewall verify-bridge-netfilter
+ExecStartPre=+/usr/local/sbin/kinvest-metadata-firewall boot-guard
 ExecStartPre=+/usr/local/sbin/kinvest-metadata-firewall guard
 ExecStartPost=+/usr/local/sbin/kinvest-metadata-firewall reconcile-active
+ExecStopPost=+/usr/local/sbin/kinvest-metadata-firewall boot-guard
 ExecStopPost=+/usr/local/sbin/kinvest-metadata-firewall guard
 ```
 
+Add `boot-guard` to the wrapper's exact action grammar and dispatch it to a library operation that installs this rule at position 1:
+
+```sh
+iptables -w 5 -t mangle -I PREROUTING 1 \
+  -d 169.254.0.23/32 -p tcp --dport 80 \
+  -m comment --comment kinvest-metadata-docker-boot-guard -j DROP
+```
+
+The operation must be idempotent and verify that the rule is first. After either the active or deny-all permanent policy has reconciled and passed its final status verification, `reconcile-active` removes every matching boot guard. A reconciliation failure must return before removal, leaving the boot guard in place for the non-ignored `ExecStartPost` failure and the stop-post reinstall.
+
 - [ ] **Step 4: Model the clean-boot sequence**
 
-Add one test that first runs the pre-start verifier with no module and expects failure, then creates the module/sysctl fixtures, runs verifier and guard, simulates Docker recreating `DOCKER-USER`, and runs `reconcile-active`. Assert the final chain contains exactly the deny rule plus `RETURN`, and no app allow rule.
+Add one test that first runs the pre-start verifier with no module and expects failure, then creates the module/sysctl fixtures and runs verifier, `boot-guard`, and filter `guard` through the real wrapper/library behavior. Starting from that actual pre-start state, simulate Docker removing the filter guard and rebuilding `FORWARD` and `DOCKER-USER` step by step. Record every observable transition and assert that the independent first-position `mangle/PREROUTING` DROP remains through the containers-ready boundary.
+
+Run `reconcile-active` with deny-all activation and assert the final managed chain contains exactly the metadata REJECT plus `RETURN`, contains no app allow, has the reviewed final jumps, and no longer contains the boot guard. Add a negative fixture in which Docker also removes the boot guard and assert that the continuity contract fails. Add a lifecycle fixture in which `reconcile-active` fails and assert that the non-ignored `ExecStartPost` marks Docker failed/stopped, executes stop-post guards, and never leaves the modeled service serving unprotected.
 
 - [ ] **Step 5: Run the focused test and observe GREEN**
 
@@ -230,15 +253,17 @@ Run:
 
 ```bash
 node -e "require('./server/tests/metadata-firewall-contract.test').run()"
+/bin/sh -n deploy/server/kinvest-metadata-firewall-lib.sh
+/bin/sh -n deploy/server/kinvest-metadata-firewall.sh
 ```
 
-Expected: exit `0`.
+Expected: all commands exit `0`.
 
 - [ ] **Step 6: Commit boot assets and lifecycle ordering**
 
 ```bash
-git add deploy/server/kinvest-br-netfilter.modules-load.conf deploy/server/kinvest-br-netfilter.sysctl.conf deploy/server/docker-kinvest-metadata-firewall.conf server/tests/metadata-firewall-contract.test.js
-git commit -m "fix: persist bridge netfilter before Docker"
+git add deploy/server/kinvest-br-netfilter.modules-load.conf deploy/server/kinvest-br-netfilter.sysctl.conf deploy/server/docker-kinvest-metadata-firewall.conf deploy/server/kinvest-metadata-firewall.sh deploy/server/kinvest-metadata-firewall-lib.sh server/tests/metadata-firewall-contract.test.js
+git commit -m "fix: guard metadata across Docker startup"
 ```
 
 ### Task 3: Add an atomic metadata-firewall installer
