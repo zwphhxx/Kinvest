@@ -13,6 +13,9 @@ INSTALL_OWNER='root'
 INSTALL_GROUP='root'
 LOCK_ROOT='/run/lock'
 RUNTIME_SYSCTL_PATH='/proc/sys/net/bridge/bridge-nf-call-iptables'
+RUNTIME_MODULE_PATH='/sys/module/br_netfilter'
+RUNTIME_FD_ROOT='/proc/self/fd'
+RUNTIME_FD_IDENTITY_MODE='device-inode'
 BACKUP_ROOT="$TARGET_ROOT/var/backups/kinvest-metadata-firewall"
 LOCK_FILE="$LOCK_ROOT/kinvest-metadata-firewall-install.lock"
 MANIFEST_RELATIVE='deploy/server/metadata-firewall-assets.sha256'
@@ -175,6 +178,7 @@ file_uid() { stat_value '%u' '%u' "$1"; }
 file_gid() { stat_value '%g' '%g' "$1"; }
 file_links() { stat_value '%h' '%l' "$1"; }
 file_identity() { stat_value '%d:%i' '%d:%i' "$1"; }
+file_inode() { stat_value '%i' '%i' "$1"; }
 
 mode_is_not_writable_by_group_or_other() {
   mode_value=$1
@@ -446,19 +450,51 @@ write_runtime_one() {
   [ "$(runtime_value)" = '1' ]
 }
 
+verify_bridge_prerequisites() {
+  [ -d "$RUNTIME_MODULE_PATH" ] && [ ! -L "$RUNTIME_MODULE_PATH" ] || return 1
+  [ -f "$RUNTIME_SYSCTL_PATH" ] && [ ! -L "$RUNTIME_SYSCTL_PATH" ] || return 1
+  path_identity_before=$(file_identity "$RUNTIME_SYSCTL_PATH" 2>/dev/null) || return 1
+  exec 8< "$RUNTIME_SYSCTL_PATH" || return 1
+  verification_failed='0'
+  if [ "$RUNTIME_FD_IDENTITY_MODE" = 'device-inode' ]; then
+    fd_identity=$(file_identity "$RUNTIME_FD_ROOT/8" 2>/dev/null) || verification_failed='1'
+    [ "$verification_failed" = '0' ] && [ "$fd_identity" = "$path_identity_before" ] || verification_failed='1'
+  else
+    [ "$RUNTIME_FD_IDENTITY_MODE" = 'inode-only' ] || verification_failed='1'
+    fd_inode=$(file_inode "$RUNTIME_FD_ROOT/8" 2>/dev/null) || verification_failed='1'
+    path_inode=$(file_inode "$RUNTIME_SYSCTL_PATH" 2>/dev/null) || verification_failed='1'
+    [ "$verification_failed" = '0' ] && [ "$fd_inode" = "$path_inode" ] || verification_failed='1'
+  fi
+  first_line=''
+  if ! IFS= read -r first_line <&8; then
+    verification_failed='1'
+  fi
+  extra_line=''
+  if IFS= read -r extra_line <&8 || [ -n "$extra_line" ]; then
+    verification_failed='1'
+  fi
+  exec 8<&-
+  [ "$first_line" = '1' ] || verification_failed='1'
+  path_identity_after=$(file_identity "$RUNTIME_SYSCTL_PATH" 2>/dev/null) || verification_failed='1'
+  [ "$path_identity_after" = "$path_identity_before" ] || verification_failed='1'
+  [ "$verification_failed" = '0' ]
+}
+
 rollback_runtime() {
   transaction=$1
   [ -f "$transaction/runtime-sysctl-attempted" ] || return 0
   prior_runtime=$(cat "$transaction/runtime-before" 2>/dev/null || printf '%s' other)
   partial_code=''
   restored_sysctl=$(asset_target sysctl)
-  if [ -f "$restored_sysctl" ] && [ ! -L "$restored_sysctl" ] &&
+  if [ ! -e "$restored_sysctl" ] && [ ! -L "$restored_sysctl" ]; then
+    partial_code='PRIOR_CONFIG_ABSENT'
+  elif [ -f "$restored_sysctl" ] && [ ! -L "$restored_sysctl" ] &&
     [ "$(cat "$restored_sysctl" 2>/dev/null || printf '%s' invalid)" = 'net.bridge.bridge-nf-call-iptables = 1' ]; then
     if ! sysctl --load "$restored_sysctl" >/dev/null 2>&1; then
       partial_code='PRIOR_CONFIG_RELOAD_FAILED'
     fi
   else
-    partial_code='PRIOR_CONFIG_NOT_FAIL_CLOSED'
+    partial_code='PRIOR_CONFIG_UNSAFE'
   fi
   if [ "$prior_runtime" != '1' ]; then
     partial_code='PRIOR_RUNTIME_UNSAFE'
@@ -469,8 +505,10 @@ rollback_runtime() {
       return 1
     }
   fi
-  restored_wrapper=$(asset_target wrapper)
-  if [ ! -x "$restored_wrapper" ] || ! "$restored_wrapper" verify-bridge-netfilter; then
+  if [ ! -d "$RUNTIME_MODULE_PATH" ] || [ -L "$RUNTIME_MODULE_PATH" ]; then
+    modprobe br_netfilter >/dev/null 2>&1 || :
+  fi
+  if ! verify_bridge_prerequisites; then
     printf '%s\n' 'KINVEST_METADATA_FIREWALL_RUNTIME_ROLLBACK_PARTIAL code=RUNTIME_VERIFY_FAILED preserved=1' >&2
     return 1
   fi
@@ -485,16 +523,30 @@ recover_transaction() {
     [ "$RECOVERY_CODE" = 'RECOVERY_FAILED' ] && RECOVERY_CODE='TRANSACTION_INVENTORY_INVALID'
     return 1
   }
-  restore_files_from_transaction "$transaction" || return 1
-  rollback_runtime "$transaction" || return 1
-  systemctl daemon-reload >/dev/null 2>&1 || {
-    RECOVERY_CODE='DAEMON_RELOAD_FAILED'
+  files_status='ok'
+  runtime_status='not-required'
+  daemon_reload_status='ok'
+  phase_status=$(cat "$transaction/phase" 2>/dev/null || printf '%s' invalid)
+  restore_files_from_transaction "$transaction" || files_status='failed'
+  if [ -f "$transaction/runtime-sysctl-attempted" ]; then
+    runtime_status='ok'
+    rollback_runtime "$transaction" || runtime_status='failed'
+  fi
+  systemctl daemon-reload >/dev/null 2>&1 || daemon_reload_status='failed'
+  if [ "$files_status" = 'ok' ] && [ "$runtime_status" != 'failed' ] && [ "$daemon_reload_status" = 'ok' ]; then
+    if write_phase "$transaction" recovered; then
+      phase_status='recovered'
+    else
+      phase_status='write-failed'
+    fi
+  fi
+  printf 'KINVEST_METADATA_FIREWALL_RECOVERY_STATUS files=%s runtime=%s daemon_reload=%s phase=%s\n' \
+    "$files_status" "$runtime_status" "$daemon_reload_status" "$phase_status" >&2
+  if [ "$files_status" != 'ok' ] || [ "$runtime_status" = 'failed' ] ||
+    [ "$daemon_reload_status" != 'ok' ] || [ "$phase_status" != 'recovered' ]; then
+    RECOVERY_CODE='RECOVERY_INCOMPLETE'
     return 1
-  }
-  write_phase "$transaction" recovered || {
-    RECOVERY_CODE='TRANSACTION_SYNC_FAILED'
-    return 1
-  }
+  fi
 }
 
 recover_incomplete_transaction() {

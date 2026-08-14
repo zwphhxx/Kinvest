@@ -112,8 +112,16 @@ printf 'modprobe:%s\\n' "$*" >> "$KINVEST_TEST_OPERATIONS"
     path.join(bin, 'sysctl'),
     `#!/bin/sh
 printf 'sysctl:%s\\n' "$*" >> "$KINVEST_TEST_OPERATIONS"
+counter_file="$KINVEST_TEST_OPERATIONS.sysctl-count"
+count=0
+[ ! -f "$counter_file" ] || count=$(cat "$counter_file")
+count=$((count + 1))
+printf '%s\\n' "$count" > "$counter_file"
 if [ -n "\${KINVEST_TEST_RUNTIME_SYSCTL:-}" ]; then
   printf '1\\n' > "$KINVEST_TEST_RUNTIME_SYSCTL"
+fi
+if [ "\${KINVEST_TEST_REMOVE_MODULE_ON_SYSCTL_CALL:-0}" = "$count" ] && [ -n "\${KINVEST_TEST_RUNTIME_MODULE_PATH:-}" ]; then
+  /bin/rm -rf "$KINVEST_TEST_RUNTIME_MODULE_PATH"
 fi
 [ "\${KINVEST_TEST_FAIL_SYSCTL:-0}" != '1' ]
 `
@@ -122,7 +130,13 @@ fi
     path.join(bin, 'systemctl'),
     `#!/bin/sh
 printf 'systemctl:%s\\n' "$*" >> "$KINVEST_TEST_OPERATIONS"
-[ "\${KINVEST_TEST_FAIL_DAEMON_RELOAD:-0}" != '1' ]
+counter_file="$KINVEST_TEST_OPERATIONS.systemctl-count"
+count=0
+[ ! -f "$counter_file" ] || count=$(cat "$counter_file")
+count=$((count + 1))
+printf '%s\\n' "$count" > "$counter_file"
+[ "\${KINVEST_TEST_FAIL_DAEMON_RELOAD:-0}" != '1' ] || exit 1
+[ "$count" -gt "\${KINVEST_TEST_FAIL_DAEMON_RELOAD_COUNT:-0}" ]
 `
   )
   write(
@@ -175,6 +189,7 @@ function createFixture(installer, { present = assets.map((asset) => asset.id) } 
   const lockRoot = path.join(fixture, 'run-lock')
   const operations = path.join(fixture, 'operations.log')
   const runtimeSysctl = path.join(targetRoot, 'proc/sys/net/bridge/bridge-nf-call-iptables')
+  const runtimeModule = path.join(targetRoot, 'sys/module/br_netfilter')
   fs.mkdirSync(sourceRoot)
   fs.mkdirSync(targetRoot)
   fs.mkdirSync(bin)
@@ -192,6 +207,7 @@ function createFixture(installer, { present = assets.map((asset) => asset.id) } 
     }
   }
   write(runtimeSysctl, '1\n', 0o644)
+  fs.mkdirSync(runtimeModule, { recursive: true })
   const manifest = assets
     .map((asset) => {
       const contents = fs.readFileSync(path.join(sourceRoot, asset.source))
@@ -211,6 +227,9 @@ function createFixture(installer, { present = assets.map((asset) => asset.id) } 
       "RUNTIME_SYSCTL_PATH='/proc/sys/net/bridge/bridge-nf-call-iptables'",
       `RUNTIME_SYSCTL_PATH='${runtimeSysctl}'`
     )
+    .replace("RUNTIME_MODULE_PATH='/sys/module/br_netfilter'", `RUNTIME_MODULE_PATH='${runtimeModule}'`)
+    .replace("RUNTIME_FD_ROOT='/proc/self/fd'", "RUNTIME_FD_ROOT='/dev/fd'")
+    .replace("RUNTIME_FD_IDENTITY_MODE='device-inode'", "RUNTIME_FD_IDENTITY_MODE='inode-only'")
     .replace("REQUIRED_UID='0'", `REQUIRED_UID='${process.getuid()}'`)
     .replace(
       "SECURE_PATH='/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin'",
@@ -221,7 +240,7 @@ function createFixture(installer, { present = assets.map((asset) => asset.id) } 
   assert.notEqual(instrumented, installer, 'test copy must redirect production targets')
   const script = path.join(fixture, 'install-metadata-firewall.sh')
   write(script, instrumented)
-  return { fixture, sourceRoot, targetRoot, bin, lockRoot, operations, runtimeSysctl, script }
+  return { fixture, sourceRoot, targetRoot, bin, lockRoot, operations, runtimeSysctl, runtimeModule, script }
 }
 
 function runInstaller(context, extraEnv = {}, sourceRoot = context.sourceRoot) {
@@ -231,7 +250,8 @@ function runInstaller(context, extraEnv = {}, sourceRoot = context.sourceRoot) {
       ...process.env,
       ...extraEnv,
       KINVEST_TEST_OPERATIONS: context.operations,
-      KINVEST_TEST_RUNTIME_SYSCTL: context.runtimeSysctl
+      KINVEST_TEST_RUNTIME_SYSCTL: context.runtimeSysctl,
+      KINVEST_TEST_RUNTIME_MODULE_PATH: context.runtimeModule
     }
   })
 }
@@ -338,7 +358,8 @@ async function run() {
       assert.equal(backupDirectories(context).length, 1)
       assert.match(operations(context), /^systemctl:daemon-reload$/m)
       if (failure.code !== 'MODULE_LOAD_FAILED') {
-        assert.match(operations(context), /^original-wrapper:verify-bridge-netfilter$/m)
+        assert.doesNotMatch(operations(context), /^original-wrapper:verify-bridge-netfilter$/m)
+        assert.match(result.stderr, /KINVEST_METADATA_FIREWALL_RECOVERY_STATUS files=ok runtime=ok daemon_reload=ok phase=recovered/)
         assert.equal(fs.readFileSync(context.runtimeSysctl, 'utf8'), '1\n')
       }
       assert.doesNotMatch(operations(context), /systemctl:(?:start|restart|stop|enable)|docker|compose/)
@@ -355,8 +376,83 @@ async function run() {
       /KINVEST_METADATA_FIREWALL_RUNTIME_ROLLBACK_PARTIAL code=PRIOR_RUNTIME_UNSAFE preserved=1/
     )
     assert.equal(fs.readFileSync(unsafePriorRuntime.runtimeSysctl, 'utf8'), '1\n')
-    assert.match(operations(unsafePriorRuntime), /^original-wrapper:verify-bridge-netfilter$/m)
+    assert.doesNotMatch(operations(unsafePriorRuntime), /^original-wrapper:verify-bridge-netfilter$/m)
     assertOriginalState(unsafePriorRuntime, assets.map((asset) => asset.id))
+  })
+
+  const initialDaemonReloadFailure = createFixture(installer)
+  withFixture(initialDaemonReloadFailure, () => {
+    const result = runInstaller(initialDaemonReloadFailure, {
+      KINVEST_TEST_FAIL_DAEMON_RELOAD_COUNT: '1'
+    })
+    assert.notEqual(result.status, 0)
+    assert.match(result.stderr, /code=DAEMON_RELOAD_FAILED/)
+    assert.match(
+      result.stderr,
+      /KINVEST_METADATA_FIREWALL_RECOVERY_STATUS files=ok runtime=ok daemon_reload=ok phase=recovered/
+    )
+    assertOriginalState(initialDaemonReloadFailure, assets.map((asset) => asset.id))
+    assert.equal(fs.readFileSync(initialDaemonReloadFailure.runtimeSysctl, 'utf8'), '1\n')
+    assert.equal((operations(initialDaemonReloadFailure).match(/^systemctl:daemon-reload$/gm) || []).length, 2)
+  })
+
+  const absentPriorSysctl = createFixture(installer, {
+    present: assets.filter((asset) => !['wrapper', 'sysctl'].includes(asset.id)).map((asset) => asset.id)
+  })
+  withFixture(absentPriorSysctl, () => {
+    const result = runInstaller(absentPriorSysctl, { KINVEST_TEST_FAIL_VERIFIER: '1' })
+    assert.notEqual(result.status, 0)
+    assert.match(
+      result.stderr,
+      /KINVEST_METADATA_FIREWALL_RUNTIME_ROLLBACK_PARTIAL code=PRIOR_CONFIG_ABSENT preserved=1/
+    )
+    assert.match(
+      result.stderr,
+      /KINVEST_METADATA_FIREWALL_RECOVERY_STATUS files=ok runtime=ok daemon_reload=ok phase=recovered/
+    )
+    assert.equal(fs.readFileSync(absentPriorSysctl.runtimeSysctl, 'utf8'), '1\n')
+    assert.equal(fs.existsSync(targetPath(absentPriorSysctl, assets.find((asset) => asset.id === 'sysctl'))), false)
+    assert.equal(fs.existsSync(targetPath(absentPriorSysctl, assets.find((asset) => asset.id === 'wrapper'))), false)
+    assert.equal((operations(absentPriorSysctl).match(/^systemctl:daemon-reload$/gm) || []).length, 1)
+  })
+
+  const unsafePriorSysctl = createFixture(installer)
+  withFixture(unsafePriorSysctl, () => {
+    const sysctlTarget = targetPath(unsafePriorSysctl, assets.find((asset) => asset.id === 'sysctl'))
+    const wrapperTarget = targetPath(unsafePriorSysctl, assets.find((asset) => asset.id === 'wrapper'))
+    fs.writeFileSync(sysctlTarget, 'net.bridge.bridge-nf-call-iptables = 0\n')
+    write(wrapperTarget, '#!/bin/sh\nexit 99\n', 0o755)
+    const result = runInstaller(unsafePriorSysctl, { KINVEST_TEST_FAIL_VERIFIER: '1' })
+    assert.notEqual(result.status, 0)
+    assert.match(
+      result.stderr,
+      /KINVEST_METADATA_FIREWALL_RUNTIME_ROLLBACK_PARTIAL code=PRIOR_CONFIG_UNSAFE preserved=1/
+    )
+    assert.match(
+      result.stderr,
+      /KINVEST_METADATA_FIREWALL_RECOVERY_STATUS files=ok runtime=ok daemon_reload=ok phase=recovered/
+    )
+    assert.equal(fs.readFileSync(unsafePriorSysctl.runtimeSysctl, 'utf8'), '1\n')
+    assert.equal(fs.readFileSync(sysctlTarget, 'utf8'), 'net.bridge.bridge-nf-call-iptables = 0\n')
+    assert.equal(fs.readFileSync(wrapperTarget, 'utf8'), '#!/bin/sh\nexit 99\n')
+  })
+
+  const aggregatedRecoveryFailure = createFixture(installer)
+  withFixture(aggregatedRecoveryFailure, () => {
+    const result = runInstaller(aggregatedRecoveryFailure, {
+      KINVEST_TEST_FAIL_DAEMON_RELOAD_COUNT: '2',
+      KINVEST_TEST_REMOVE_MODULE_ON_SYSCTL_CALL: '2'
+    })
+    assert.notEqual(result.status, 0)
+    assert.match(result.stderr, /code=DAEMON_RELOAD_FAILED/)
+    assert.match(
+      result.stderr,
+      /KINVEST_METADATA_FIREWALL_RECOVERY_STATUS files=ok runtime=failed daemon_reload=failed phase=installing/
+    )
+    assert.match(result.stderr, /rollback=failed:RECOVERY_INCOMPLETE/)
+    assert.equal((operations(aggregatedRecoveryFailure).match(/^systemctl:daemon-reload$/gm) || []).length, 2)
+    assertOriginalState(aggregatedRecoveryFailure, assets.map((asset) => asset.id))
+    assert.equal(fs.readFileSync(aggregatedRecoveryFailure.runtimeSysctl, 'utf8'), '1\n')
   })
 
   const sourceRace = createFixture(installer)
