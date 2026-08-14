@@ -11,6 +11,7 @@ const tests = [
   require('./ssm-material-generator.test'),
   require('./docker-secret-bootstrap.test'),
   require('./metadata-firewall-contract.test'),
+  require('./metadata-firewall-installer.test'),
   require('./refresh-policy.test'),
   require('./refresh-rules.test'),
   require('./health.test'),
