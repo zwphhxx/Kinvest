@@ -93,6 +93,9 @@ if [ "\${1:-}" = '-c' ]; then
     actual=$(/usr/bin/shasum -a 256 "$relative" | /usr/bin/awk '{print $1}')
     [ "$actual" = "$expected" ] || exit 1
   done < "$manifest"
+  if [ -n "\${KINVEST_TEST_SWAP_AFTER_MANIFEST:-}" ]; then
+    /bin/cp "$KINVEST_TEST_SWAP_CONTENT" "$KINVEST_TEST_SWAP_AFTER_MANIFEST"
+  fi
   exit 0
 fi
 exec /usr/bin/shasum -a 256 "$@"
@@ -109,6 +112,9 @@ printf 'modprobe:%s\\n' "$*" >> "$KINVEST_TEST_OPERATIONS"
     path.join(bin, 'sysctl'),
     `#!/bin/sh
 printf 'sysctl:%s\\n' "$*" >> "$KINVEST_TEST_OPERATIONS"
+if [ -n "\${KINVEST_TEST_RUNTIME_SYSCTL:-}" ]; then
+  printf '1\\n' > "$KINVEST_TEST_RUNTIME_SYSCTL"
+fi
 [ "\${KINVEST_TEST_FAIL_SYSCTL:-0}" != '1' ]
 `
   )
@@ -128,6 +134,8 @@ set -eu
 exec /bin/mv -f "$@"
 `
   )
+  write(path.join(bin, 'sync'), '#!/bin/sh\nexit 0\n')
+  write(path.join(bin, 'flock'), '#!/bin/sh\nexit 0\n')
 }
 
 function fixtureAssetContents(asset) {
@@ -146,15 +154,33 @@ printf 'wrapper:%s\\n' "$*" >> "$KINVEST_TEST_OPERATIONS"
   return 'net.bridge.bridge-nf-call-iptables = 1\n'
 }
 
+function originalAssetContents(asset) {
+  if (asset.id === 'library') return '#!/bin/sh\nkinvest_original_library=1\n'
+  if (asset.id === 'wrapper') {
+    return `#!/bin/sh
+printf 'original-wrapper:%s\\n' "$*" >> "$KINVEST_TEST_OPERATIONS"
+[ "$#" -eq 1 ] && [ "$1" = 'verify-bridge-netfilter' ] || exit 92
+[ "$(cat "$KINVEST_TEST_RUNTIME_SYSCTL")" = '1' ]
+`
+  }
+  if (asset.id === 'sysctl') return 'net.bridge.bridge-nf-call-iptables = 1\n'
+  return `old-${asset.id}\n`
+}
+
 function createFixture(installer, { present = assets.map((asset) => asset.id) } = {}) {
   const fixture = fs.realpathSync(fs.mkdtempSync(path.join(os.tmpdir(), 'kinvest-metadata-installer-')))
   const sourceRoot = path.join(fixture, 'verified-source')
   const targetRoot = path.join(fixture, 'target-root')
   const bin = path.join(fixture, 'bin')
+  const lockRoot = path.join(fixture, 'run-lock')
   const operations = path.join(fixture, 'operations.log')
+  const runtimeSysctl = path.join(targetRoot, 'proc/sys/net/bridge/bridge-nf-call-iptables')
   fs.mkdirSync(sourceRoot)
   fs.mkdirSync(targetRoot)
   fs.mkdirSync(bin)
+  fs.mkdirSync(lockRoot)
+  fs.chmodSync(sourceRoot, 0o755)
+  fs.chmodSync(targetRoot, 0o755)
   fs.writeFileSync(operations, '')
   fakeCommands(bin)
 
@@ -162,9 +188,10 @@ function createFixture(installer, { present = assets.map((asset) => asset.id) } 
     const contents = fixtureAssetContents(asset)
     write(path.join(sourceRoot, asset.source), contents, asset.mode)
     if (present.includes(asset.id)) {
-      write(targetPath({ targetRoot }, asset), `old-${asset.id}\n`, 0o600)
+      write(targetPath({ targetRoot }, asset), originalAssetContents(asset), asset.mode)
     }
   }
+  write(runtimeSysctl, '1\n', 0o644)
   const manifest = assets
     .map((asset) => {
       const contents = fs.readFileSync(path.join(sourceRoot, asset.source))
@@ -176,6 +203,14 @@ function createFixture(installer, { present = assets.map((asset) => asset.id) } 
   const securePath = `${bin}:${process.env.PATH}`
   const instrumented = installer
     .replace("TARGET_ROOT=''", `TARGET_ROOT='${targetRoot}'`)
+    .replace("SECURITY_ROOT='/'", `SECURITY_ROOT='${fixture}'`)
+    .replace("TRUSTED_UID='0'", `TRUSTED_UID='${process.getuid()}'`)
+    .replace("TRUSTED_GID='0'", `TRUSTED_GID='${process.getgid()}'`)
+    .replace("LOCK_ROOT='/run/lock'", `LOCK_ROOT='${lockRoot}'`)
+    .replace(
+      "RUNTIME_SYSCTL_PATH='/proc/sys/net/bridge/bridge-nf-call-iptables'",
+      `RUNTIME_SYSCTL_PATH='${runtimeSysctl}'`
+    )
     .replace("REQUIRED_UID='0'", `REQUIRED_UID='${process.getuid()}'`)
     .replace(
       "SECURE_PATH='/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin'",
@@ -186,7 +221,7 @@ function createFixture(installer, { present = assets.map((asset) => asset.id) } 
   assert.notEqual(instrumented, installer, 'test copy must redirect production targets')
   const script = path.join(fixture, 'install-metadata-firewall.sh')
   write(script, instrumented)
-  return { fixture, sourceRoot, targetRoot, bin, operations, script }
+  return { fixture, sourceRoot, targetRoot, bin, lockRoot, operations, runtimeSysctl, script }
 }
 
 function runInstaller(context, extraEnv = {}, sourceRoot = context.sourceRoot) {
@@ -195,7 +230,8 @@ function runInstaller(context, extraEnv = {}, sourceRoot = context.sourceRoot) {
     env: {
       ...process.env,
       ...extraEnv,
-      KINVEST_TEST_OPERATIONS: context.operations
+      KINVEST_TEST_OPERATIONS: context.operations,
+      KINVEST_TEST_RUNTIME_SYSCTL: context.runtimeSysctl
     }
   })
 }
@@ -208,8 +244,8 @@ function assertOriginalState(context, present) {
   for (const asset of assets) {
     const target = targetPath(context, asset)
     if (present.includes(asset.id)) {
-      assert.equal(fs.readFileSync(target, 'utf8'), `old-${asset.id}\n`)
-      assert.equal(fs.statSync(target).mode & 0o777, 0o600)
+      assert.equal(fs.readFileSync(target, 'utf8'), originalAssetContents(asset))
+      assert.equal(fs.statSync(target).mode & 0o777, asset.mode)
     } else {
       assert.equal(fs.existsSync(target), false, `${asset.id} should remain absent`)
     }
@@ -301,9 +337,70 @@ async function run() {
       assertOriginalState(context, assets.map((asset) => asset.id))
       assert.equal(backupDirectories(context).length, 1)
       assert.match(operations(context), /^systemctl:daemon-reload$/m)
+      if (failure.code !== 'MODULE_LOAD_FAILED') {
+        assert.match(operations(context), /^original-wrapper:verify-bridge-netfilter$/m)
+        assert.equal(fs.readFileSync(context.runtimeSysctl, 'utf8'), '1\n')
+      }
       assert.doesNotMatch(operations(context), /systemctl:(?:start|restart|stop|enable)|docker|compose/)
     })
   }
+
+  const unsafePriorRuntime = createFixture(installer)
+  withFixture(unsafePriorRuntime, () => {
+    fs.writeFileSync(unsafePriorRuntime.runtimeSysctl, '0\n')
+    const result = runInstaller(unsafePriorRuntime, { KINVEST_TEST_FAIL_VERIFIER: '1' })
+    assert.notEqual(result.status, 0)
+    assert.match(
+      result.stderr,
+      /KINVEST_METADATA_FIREWALL_RUNTIME_ROLLBACK_PARTIAL code=PRIOR_RUNTIME_UNSAFE preserved=1/
+    )
+    assert.equal(fs.readFileSync(unsafePriorRuntime.runtimeSysctl, 'utf8'), '1\n')
+    assert.match(operations(unsafePriorRuntime), /^original-wrapper:verify-bridge-netfilter$/m)
+    assertOriginalState(unsafePriorRuntime, assets.map((asset) => asset.id))
+  })
+
+  const sourceRace = createFixture(installer)
+  withFixture(sourceRace, () => {
+    const source = path.join(sourceRace.sourceRoot, assets[0].source)
+    const replacement = path.join(sourceRace.fixture, 'replacement-library')
+    write(replacement, '#!/bin/sh\nprintf changed\\n\n')
+    const result = runInstaller(sourceRace, {
+      KINVEST_TEST_SWAP_AFTER_MANIFEST: source,
+      KINVEST_TEST_SWAP_CONTENT: replacement
+    })
+    assert.notEqual(result.status, 0)
+    assert.match(result.stderr, /code=SOURCE_SNAPSHOT_HASH_MISMATCH/)
+    assertOriginalState(sourceRace, assets.map((asset) => asset.id))
+  })
+
+  const writableSource = createFixture(installer)
+  withFixture(writableSource, () => {
+    fs.chmodSync(writableSource.sourceRoot, 0o775)
+    const result = runInstaller(writableSource)
+    assert.notEqual(result.status, 0)
+    assert.match(result.stderr, /code=SOURCE_PATH_UNSAFE/)
+    assertOriginalState(writableSource, assets.map((asset) => asset.id))
+  })
+
+  const hardlinkedSource = createFixture(installer)
+  withFixture(hardlinkedSource, () => {
+    const source = path.join(hardlinkedSource.sourceRoot, assets[2].source)
+    fs.linkSync(source, `${source}.unexpected-hardlink`)
+    const result = runInstaller(hardlinkedSource)
+    assert.notEqual(result.status, 0)
+    assert.match(result.stderr, /code=SOURCE_ASSET_UNSAFE/)
+    assertOriginalState(hardlinkedSource, assets.map((asset) => asset.id))
+  })
+
+  const writableParent = createFixture(installer)
+  withFixture(writableParent, () => {
+    const unsafeParent = path.join(writableParent.targetRoot, 'etc/systemd')
+    fs.chmodSync(unsafeParent, 0o777)
+    const result = runInstaller(writableParent)
+    assert.notEqual(result.status, 0)
+    assert.match(result.stderr, /code=TARGET_PATH_UNSAFE/)
+    assertOriginalState(writableParent, assets.map((asset) => asset.id))
+  })
 
   const mixedPresent = ['library', 'service', 'drop-in', 'sysctl']
   const rollback = createFixture(installer, { present: mixedPresent })
@@ -345,6 +442,48 @@ async function run() {
     assert.notEqual(runInstaller(targetSymlink).status, 0)
     assert.equal(fs.readFileSync(victim, 'utf8'), 'do-not-touch\n')
     assert.equal(fs.lstatSync(wrapperTarget).isSymbolicLink(), true)
+  })
+
+  const replacementOrder = ['drop-in', 'library', 'wrapper', 'service', 'timer', 'modules-load', 'sysctl']
+  for (const faultAsset of replacementOrder) {
+    const crash = createFixture(installer)
+    withFixture(crash, () => {
+      const marker = `# TEST_FAULT_POINT_AFTER_REPLACE_${faultAsset}`
+      const faultScript = path.join(crash.fixture, `crash-after-${faultAsset}.sh`)
+      const baseScript = fs.readFileSync(crash.script, 'utf8')
+      assert.match(baseScript, new RegExp(marker.replaceAll('-', '[-]')))
+      write(faultScript, baseScript.replace(marker, () => 'kill -KILL $$'))
+      const crashed = runInstaller({ ...crash, script: faultScript })
+      assert.notEqual(crashed.status, 0)
+      fs.appendFileSync(path.join(crash.sourceRoot, assets[0].source), '# force next install to stop after recovery\n')
+      const recovered = runInstaller(crash)
+      assert.notEqual(recovered.status, 0)
+      assert.match(recovered.stderr, /code=SOURCE_MANIFEST_INVALID/)
+      assertOriginalState(crash, assets.map((asset) => asset.id))
+      const recoveredPhases = backupDirectories(crash)
+        .map((entry) => path.join(crash.targetRoot, 'var/backups/kinvest-metadata-firewall', entry, 'phase'))
+        .filter((entry) => fs.existsSync(entry))
+        .map((entry) => fs.readFileSync(entry, 'utf8').trim())
+      assert.ok(recoveredPhases.includes('recovered'), `missing recovered phase after ${faultAsset}`)
+    })
+  }
+
+  const replacedParent = createFixture(installer)
+  withFixture(replacedParent, () => {
+    const marker = '# TEST_FAULT_POINT_AFTER_REPLACE_drop-in'
+    const faultScript = path.join(replacedParent.fixture, 'crash-before-parent-swap.sh')
+    const baseScript = fs.readFileSync(replacedParent.script, 'utf8')
+    assert.match(baseScript, new RegExp(marker.replaceAll('-', '[-]')))
+    write(faultScript, baseScript.replace(marker, () => 'kill -KILL $$'))
+    assert.notEqual(runInstaller({ ...replacedParent, script: faultScript }).status, 0)
+    const parent = path.dirname(targetPath(replacedParent, assets.find((asset) => asset.id === 'drop-in')))
+    const displaced = `${parent}.displaced`
+    fs.renameSync(parent, displaced)
+    fs.mkdirSync(parent, { mode: 0o755 })
+    const result = runInstaller(replacedParent)
+    assert.notEqual(result.status, 0)
+    assert.match(result.stderr, /code=TARGET_PARENT_IDENTITY_CHANGED/)
+    assert.equal(fs.existsSync(path.join(parent, 'kinvest-metadata-firewall.conf')), false)
   })
 }
 

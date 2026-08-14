@@ -4,21 +4,32 @@ set -f
 umask 077
 
 TARGET_ROOT=''
+SECURITY_ROOT='/'
+TRUSTED_UID='0'
+TRUSTED_GID='0'
 REQUIRED_UID='0'
 SECURE_PATH='/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin'
 INSTALL_OWNER='root'
 INSTALL_GROUP='root'
+LOCK_ROOT='/run/lock'
+RUNTIME_SYSCTL_PATH='/proc/sys/net/bridge/bridge-nf-call-iptables'
 BACKUP_ROOT="$TARGET_ROOT/var/backups/kinvest-metadata-firewall"
+LOCK_FILE="$LOCK_ROOT/kinvest-metadata-firewall-install.lock"
 MANIFEST_RELATIVE='deploy/server/metadata-firewall-assets.sha256'
 ASSET_IDS='library wrapper service timer drop-in modules-load sysctl'
+INSTALL_IDS='drop-in library wrapper service timer modules-load sysctl'
+ROLLBACK_IDS='sysctl modules-load timer service wrapper library drop-in'
 EXPECTED_ASSET_PATHS='deploy/server/kinvest-metadata-firewall-lib.sh deploy/server/kinvest-metadata-firewall.sh deploy/server/kinvest-metadata-firewall.service deploy/server/kinvest-metadata-firewall.timer deploy/server/docker-kinvest-metadata-firewall.conf deploy/server/kinvest-br-netfilter.modules-load.conf deploy/server/kinvest-br-netfilter.sysctl.conf'
 
 PATH=$SECURE_PATH
 export PATH
 
 FAILURE_CODE='UNEXPECTED_FAILURE'
+RECOVERY_CODE='RECOVERY_FAILED'
 backup_dir='none'
+preparing_dir=''
 state_record=''
+parents_record=''
 transaction_started='0'
 transaction_committed='0'
 stage_library=''
@@ -28,6 +39,13 @@ stage_timer=''
 stage_drop_in=''
 stage_modules_load=''
 stage_sysctl=''
+expected_hash_library=''
+expected_hash_wrapper=''
+expected_hash_service=''
+expected_hash_timer=''
+expected_hash_drop_in=''
+expected_hash_modules_load=''
+expected_hash_sysctl=''
 
 fail() {
   FAILURE_CODE=$1
@@ -69,8 +87,44 @@ asset_mode() {
 }
 
 asset_is_shell() {
+  case "$1" in library|wrapper) return 0 ;; *) return 1 ;; esac
+}
+
+set_expected_hash() {
   case "$1" in
-    library|wrapper) return 0 ;;
+    library) expected_hash_library=$2 ;;
+    wrapper) expected_hash_wrapper=$2 ;;
+    service) expected_hash_service=$2 ;;
+    timer) expected_hash_timer=$2 ;;
+    drop-in) expected_hash_drop_in=$2 ;;
+    modules-load) expected_hash_modules_load=$2 ;;
+    sysctl) expected_hash_sysctl=$2 ;;
+    *) return 1 ;;
+  esac
+}
+
+expected_hash() {
+  case "$1" in
+    library) printf '%s\n' "$expected_hash_library" ;;
+    wrapper) printf '%s\n' "$expected_hash_wrapper" ;;
+    service) printf '%s\n' "$expected_hash_service" ;;
+    timer) printf '%s\n' "$expected_hash_timer" ;;
+    drop-in) printf '%s\n' "$expected_hash_drop_in" ;;
+    modules-load) printf '%s\n' "$expected_hash_modules_load" ;;
+    sysctl) printf '%s\n' "$expected_hash_sysctl" ;;
+    *) return 1 ;;
+  esac
+}
+
+id_for_source_path() {
+  case "$1" in
+    deploy/server/kinvest-metadata-firewall-lib.sh) printf '%s\n' library ;;
+    deploy/server/kinvest-metadata-firewall.sh) printf '%s\n' wrapper ;;
+    deploy/server/kinvest-metadata-firewall.service) printf '%s\n' service ;;
+    deploy/server/kinvest-metadata-firewall.timer) printf '%s\n' timer ;;
+    deploy/server/docker-kinvest-metadata-firewall.conf) printf '%s\n' drop-in ;;
+    deploy/server/kinvest-br-netfilter.modules-load.conf) printf '%s\n' modules-load ;;
+    deploy/server/kinvest-br-netfilter.sysctl.conf) printf '%s\n' sysctl ;;
     *) return 1 ;;
   esac
 }
@@ -105,64 +159,119 @@ file_hash() {
   sha256sum "$1" | awk '{print $1}'
 }
 
-file_mode() {
-  if stat -c '%a' "$1" >/dev/null 2>&1; then
-    stat -c '%a' "$1"
+stat_value() {
+  linux_format=$1
+  bsd_format=$2
+  path_value=$3
+  if stat -c "$linux_format" "$path_value" >/dev/null 2>&1; then
+    stat -c "$linux_format" "$path_value"
   else
-    stat -f '%Lp' "$1"
+    stat -f "$bsd_format" "$path_value"
   fi
 }
 
-file_uid() {
-  if stat -c '%u' "$1" >/dev/null 2>&1; then
-    stat -c '%u' "$1"
-  else
-    stat -f '%u' "$1"
-  fi
-}
+file_mode() { stat_value '%a' '%Lp' "$1"; }
+file_uid() { stat_value '%u' '%u' "$1"; }
+file_gid() { stat_value '%g' '%g' "$1"; }
+file_links() { stat_value '%h' '%l' "$1"; }
+file_identity() { stat_value '%d:%i' '%d:%i' "$1"; }
 
-file_gid() {
-  if stat -c '%g' "$1" >/dev/null 2>&1; then
-    stat -c '%g' "$1"
-  else
-    stat -f '%g' "$1"
-  fi
-}
-
-identity_id() {
-  value=$1
-  kind=$2
-  case "$value" in
-    ''|*[!0-9]*)
-      if [ "$kind" = 'user' ]; then
-        id -u "$value"
-      else
-        id -g "$value"
-      fi
-      ;;
-    *) printf '%s\n' "$value" ;;
+mode_is_not_writable_by_group_or_other() {
+  mode_value=$1
+  other_digit=${mode_value#"${mode_value%?}"}
+  without_other=${mode_value%?}
+  group_digit=${without_other#"${without_other%?}"}
+  case "$group_digit$other_digit" in
+    *2*|*3*|*6*|*7*) return 1 ;;
+    *) return 0 ;;
   esac
 }
 
-assert_safe_directory() {
-  directory=$1
-  if [ -L "$directory" ] || { [ -e "$directory" ] && [ ! -d "$directory" ]; }; then
-    fail 'TARGET_PATH_UNSAFE'
-  fi
+secure_directory() {
+  path_value=$1
+  [ -d "$path_value" ] && [ ! -L "$path_value" ] || return 1
+  [ "$(file_uid "$path_value")" = "$TRUSTED_UID" ] || return 1
+  [ "$(file_gid "$path_value")" = "$TRUSTED_GID" ] || return 1
+  mode_is_not_writable_by_group_or_other "$(file_mode "$path_value")"
+}
+
+secure_regular_file() {
+  path_value=$1
+  [ -f "$path_value" ] && [ ! -L "$path_value" ] || return 1
+  [ "$(file_uid "$path_value")" = "$TRUSTED_UID" ] || return 1
+  [ "$(file_gid "$path_value")" = "$TRUSTED_GID" ] || return 1
+  [ "$(file_links "$path_value")" = '1' ] || return 1
+  mode_is_not_writable_by_group_or_other "$(file_mode "$path_value")"
+}
+
+validate_secure_chain() {
+  requested_path=$1
+  allow_missing=${2:-0}
+  secure_directory "$SECURITY_ROOT" || return 1
+  case "$requested_path" in
+    "$SECURITY_ROOT") return 0 ;;
+    "$SECURITY_ROOT"/*) relative_path=${requested_path#"$SECURITY_ROOT"/} ;;
+    /*)
+      [ "$SECURITY_ROOT" = '/' ] || return 1
+      relative_path=${requested_path#/}
+      ;;
+    *) return 1 ;;
+  esac
+  current_path=$SECURITY_ROOT
+  old_ifs=$IFS
+  IFS='/'
+  set -- $relative_path
+  IFS=$old_ifs
+  for component in "$@"; do
+    case "$component" in ''|.|..) return 1 ;; esac
+    current_path="${current_path%/}/$component"
+    if [ ! -e "$current_path" ] && [ ! -L "$current_path" ]; then
+      [ "$allow_missing" = '1' ] && return 0
+      return 1
+    fi
+    secure_directory "$current_path" || return 1
+  done
 }
 
 ensure_directory() {
   directory=$1
   mode=$2
-  assert_safe_directory "$directory"
-  if [ ! -d "$directory" ]; then
-    mkdir "$directory" || fail 'TARGET_DIRECTORY_CREATE_FAILED'
-    chown "$INSTALL_OWNER:$INSTALL_GROUP" "$directory" || fail 'TARGET_DIRECTORY_OWNER_FAILED'
-    chmod "$mode" "$directory" || fail 'TARGET_DIRECTORY_MODE_FAILED'
+  if [ -e "$directory" ] || [ -L "$directory" ]; then
+    secure_directory "$directory" || fail 'TARGET_PATH_UNSAFE'
+    return 0
   fi
+  parent=${directory%/*}
+  secure_directory "$parent" || fail 'TARGET_PATH_UNSAFE'
+  mkdir "$directory" || fail 'TARGET_DIRECTORY_CREATE_FAILED'
+  chown "$INSTALL_OWNER:$INSTALL_GROUP" "$directory" || fail 'TARGET_DIRECTORY_OWNER_FAILED'
+  chmod "$mode" "$directory" || fail 'TARGET_DIRECTORY_MODE_FAILED'
+  secure_directory "$directory" || fail 'TARGET_PATH_UNSAFE'
+  sync -f "$parent" || fail 'TARGET_DIRECTORY_SYNC_FAILED'
 }
 
-validate_manifest_shape() (
+durable_file() {
+  path_value=$1
+  sync -f "$path_value" || fail 'TRANSACTION_SYNC_FAILED'
+}
+
+durable_directory() {
+  path_value=$1
+  sync -f "$path_value" || fail 'TRANSACTION_SYNC_FAILED'
+}
+
+write_phase() {
+  transaction=$1
+  phase_value=$2
+  phase_temp=$(mktemp "$transaction/.phase.XXXXXX") || return 1
+  printf '%s\n' "$phase_value" > "$phase_temp" || return 1
+  chown "$INSTALL_OWNER:$INSTALL_GROUP" "$phase_temp" || return 1
+  chmod '0600' "$phase_temp" || return 1
+  sync -f "$phase_temp" || return 1
+  mv -fT -- "$phase_temp" "$transaction/phase" || return 1
+  sync -f "$transaction" || return 1
+}
+
+validate_and_capture_manifest() {
   count=0
   seen=''
   while IFS= read -r line || [ -n "$line" ]; do
@@ -170,58 +279,255 @@ validate_manifest_shape() (
     IFS=' '
     set -- $line
     IFS=$old_ifs
-    [ "$#" -eq 2 ] || exit 1
+    [ "$#" -eq 2 ] || return 1
     digest=$1
     relative=$2
-    [ "${#digest}" -eq 64 ] || exit 1
-    case "$digest" in *[!0-9a-f]*) exit 1 ;; esac
-    case " $EXPECTED_ASSET_PATHS " in *" $relative "*) ;; *) exit 1 ;; esac
-    case "$seen" in *"|$relative|"*) exit 1 ;; esac
+    [ "${#digest}" -eq 64 ] || return 1
+    case "$digest" in *[!0-9a-f]*) return 1 ;; esac
+    case " $EXPECTED_ASSET_PATHS " in *" $relative "*) ;; *) return 1 ;; esac
+    case "$seen" in *"|$relative|"*) return 1 ;; esac
+    asset_id=$(id_for_source_path "$relative") || return 1
+    set_expected_hash "$asset_id" "$digest" || return 1
     seen="$seen|$relative|"
     count=$((count + 1))
   done < "$MANIFEST_RELATIVE"
-  [ "$count" -eq 7 ] || exit 1
-  for expected in $EXPECTED_ASSET_PATHS; do
-    case "$seen" in *"|$expected|"*) ;; *) exit 1 ;; esac
+  [ "$count" -eq 7 ] || return 1
+  for asset_id in $ASSET_IDS; do
+    [ -n "$(expected_hash "$asset_id")" ] || return 1
   done
-)
+}
 
-rollback_assets() {
-  rollback_failed='0'
+write_captured_manifest() {
+  destination=$1
+  : > "$destination"
+  for asset_id in $ASSET_IDS; do
+    printf '%s  %s\n' "$(expected_hash "$asset_id")" "$(asset_source "$asset_id")" >> "$destination"
+  done
+  chown "$INSTALL_OWNER:$INSTALL_GROUP" "$destination"
+  chmod '0600' "$destination"
+  durable_file "$destination"
+}
+
+parent_record_line() {
+  transaction=$1
+  asset_id=$2
+  awk -F '\t' -v wanted="$asset_id" '$1 == wanted { print; found=1 } END { if (!found) exit 1 }' "$transaction/parents.tsv"
+}
+
+verify_bound_parent() {
+  transaction=$1
+  asset_id=$2
+  record=$(parent_record_line "$transaction" "$asset_id") || {
+    RECOVERY_CODE='TRANSACTION_INVENTORY_INVALID'
+    return 1
+  }
   tab=$(printf '\t')
-  while IFS="$tab" read -r asset_id original_state target backup_name; do
-    [ "$asset_id" = 'asset-state-v1' ] && continue
+  old_ifs=$IFS
+  IFS="$tab"
+  set -- $record
+  IFS=$old_ifs
+  [ "$#" -eq 3 ] || {
+    RECOVERY_CODE='TRANSACTION_INVENTORY_INVALID'
+    return 1
+  }
+  expected_parent=$2
+  expected_identity=$3
+  target_parent=$(asset_target "$asset_id")
+  target_parent=${target_parent%/*}
+  if [ "$expected_parent" != "$target_parent" ] || ! secure_directory "$target_parent" ||
+    [ "$(file_identity "$target_parent" 2>/dev/null || printf '%s' invalid)" != "$expected_identity" ]; then
+    RECOVERY_CODE='TARGET_PARENT_IDENTITY_CHANGED'
+    return 1
+  fi
+}
+
+state_record_line() {
+  transaction=$1
+  asset_id=$2
+  awk -F '\t' -v wanted="$asset_id" '$1 == wanted { print; found=1 } END { if (!found) exit 1 }' "$transaction/asset-state.tsv"
+}
+
+validate_transaction() {
+  transaction=$1
+  secure_directory "$transaction" || return 1
+  for trusted_file in phase asset-state.tsv parents.tsv captured-manifest.sha256 runtime-before runtime-identity; do
+    secure_regular_file "$transaction/$trusted_file" || return 1
+  done
+  [ "$(wc -l < "$transaction/asset-state.tsv" | tr -d ' ')" = '8' ] || return 1
+  [ "$(wc -l < "$transaction/parents.tsv" | tr -d ' ')" = '8' ] || return 1
+  for asset_id in $ASSET_IDS; do
+    line=$(state_record_line "$transaction" "$asset_id") || return 1
+    tab=$(printf '\t')
+    old_ifs=$IFS
+    IFS="$tab"
+    set -- $line
+    IFS=$old_ifs
+    [ "$#" -eq 8 ] || return 1
+    [ "$1" = "$asset_id" ] || return 1
+    [ "$3" = "$(asset_target "$asset_id")" ] || return 1
+    case "$2" in
+      present)
+        [ "$4" = "$asset_id.asset" ] || return 1
+        secure_regular_file "$transaction/backups/$4" || return 1
+        [ "$(file_hash "$transaction/backups/$4")" = "$5" ] || return 1
+        ;;
+      absent) [ "$4" = '-' ] || return 1 ;;
+      *) return 1 ;;
+    esac
+    verify_bound_parent "$transaction" "$asset_id" || return 1
+  done
+}
+
+restore_files_from_transaction() {
+  transaction=$1
+  for asset_id in $ROLLBACK_IDS; do
+    verify_bound_parent "$transaction" "$asset_id" || return 1
+    line=$(state_record_line "$transaction" "$asset_id") || {
+      RECOVERY_CODE='TRANSACTION_INVENTORY_INVALID'
+      return 1
+    }
+    tab=$(printf '\t')
+    old_ifs=$IFS
+    IFS="$tab"
+    set -- $line
+    IFS=$old_ifs
+    original_state=$2
+    target=$3
+    backup_name=$4
+    original_hash=$5
+    original_mode=$6
+    original_uid=$7
+    original_gid=$8
     case "$original_state" in
       present)
-        restore_temp=$(mktemp "${target%/*}/.kinvest-metadata-restore-${asset_id}.XXXXXX") || {
-          rollback_failed='1'
-          continue
-        }
-        if ! cp -p "$backup_dir/$backup_name" "$restore_temp"; then
-          rollback_failed='1'
-        elif ! mv -fT -- "$restore_temp" "$target"; then
-          rollback_failed='1'
+        restore_temp=$(mktemp "${target%/*}/.kinvest-metadata-restore-${asset_id}.XXXXXX") || return 1
+        if ! cp "$transaction/backups/$backup_name" "$restore_temp" ||
+          ! chown "$original_uid:$original_gid" "$restore_temp" ||
+          ! chmod "$original_mode" "$restore_temp" ||
+          [ "$(file_hash "$restore_temp")" != "$original_hash" ]; then
+          rm -f -- "$restore_temp"
+          return 1
         fi
-        rm -f -- "$restore_temp"
-        if [ ! -f "$target" ] || [ -L "$target" ] ||
-          [ "$(file_hash "$target" 2>/dev/null || printf '%s' invalid)" != "$(file_hash "$backup_dir/$backup_name" 2>/dev/null || printf '%s' missing)" ] ||
-          [ "$(file_mode "$target" 2>/dev/null || printf '%s' invalid)" != "$(file_mode "$backup_dir/$backup_name" 2>/dev/null || printf '%s' missing)" ]; then
-          rollback_failed='1'
-        fi
+        sync -f "$restore_temp" || return 1
+        verify_bound_parent "$transaction" "$asset_id" || return 1
+        mv -fT -- "$restore_temp" "$target" || return 1
+        sync -f "$target" || return 1
+        sync -f "${target%/*}" || return 1
         ;;
       absent)
+        verify_bound_parent "$transaction" "$asset_id" || return 1
         if [ -e "$target" ] || [ -L "$target" ]; then
           if [ -f "$target" ] || [ -L "$target" ]; then
-            rm -f -- "$target" || rollback_failed='1'
+            rm -f -- "$target" || return 1
+            sync -f "${target%/*}" || return 1
           else
-            rollback_failed='1'
+            RECOVERY_CODE='TARGET_PATH_UNSAFE'
+            return 1
           fi
         fi
         ;;
-      *) rollback_failed='1' ;;
+      *) RECOVERY_CODE='TRANSACTION_INVENTORY_INVALID'; return 1 ;;
     esac
-  done < "$state_record"
-  [ "$rollback_failed" = '0' ]
+  done
+}
+
+runtime_value() {
+  if [ ! -e "$RUNTIME_SYSCTL_PATH" ] || [ -L "$RUNTIME_SYSCTL_PATH" ]; then
+    printf '%s\n' missing
+    return 0
+  fi
+  value=$(cat "$RUNTIME_SYSCTL_PATH" 2>/dev/null || printf '%s' unreadable)
+  case "$value" in 1|0) printf '%s\n' "$value" ;; *) printf '%s\n' other ;; esac
+}
+
+write_runtime_one() {
+  [ -e "$RUNTIME_SYSCTL_PATH" ] && [ ! -L "$RUNTIME_SYSCTL_PATH" ] || return 1
+  printf '1\n' > "$RUNTIME_SYSCTL_PATH" || return 1
+  [ "$(runtime_value)" = '1' ]
+}
+
+rollback_runtime() {
+  transaction=$1
+  [ -f "$transaction/runtime-sysctl-attempted" ] || return 0
+  prior_runtime=$(cat "$transaction/runtime-before" 2>/dev/null || printf '%s' other)
+  partial_code=''
+  restored_sysctl=$(asset_target sysctl)
+  if [ -f "$restored_sysctl" ] && [ ! -L "$restored_sysctl" ] &&
+    [ "$(cat "$restored_sysctl" 2>/dev/null || printf '%s' invalid)" = 'net.bridge.bridge-nf-call-iptables = 1' ]; then
+    if ! sysctl --load "$restored_sysctl" >/dev/null 2>&1; then
+      partial_code='PRIOR_CONFIG_RELOAD_FAILED'
+    fi
+  else
+    partial_code='PRIOR_CONFIG_NOT_FAIL_CLOSED'
+  fi
+  if [ "$prior_runtime" != '1' ]; then
+    partial_code='PRIOR_RUNTIME_UNSAFE'
+  fi
+  if [ "$(runtime_value)" != '1' ]; then
+    write_runtime_one || {
+      printf '%s\n' 'KINVEST_METADATA_FIREWALL_RUNTIME_ROLLBACK_PARTIAL code=SAFE_VALUE_RESTORE_FAILED preserved=unknown' >&2
+      return 1
+    }
+  fi
+  restored_wrapper=$(asset_target wrapper)
+  if [ ! -x "$restored_wrapper" ] || ! "$restored_wrapper" verify-bridge-netfilter; then
+    printf '%s\n' 'KINVEST_METADATA_FIREWALL_RUNTIME_ROLLBACK_PARTIAL code=RUNTIME_VERIFY_FAILED preserved=1' >&2
+    return 1
+  fi
+  if [ -n "$partial_code" ]; then
+    printf 'KINVEST_METADATA_FIREWALL_RUNTIME_ROLLBACK_PARTIAL code=%s preserved=1\n' "$partial_code" >&2
+  fi
+}
+
+recover_transaction() {
+  transaction=$1
+  validate_transaction "$transaction" || {
+    [ "$RECOVERY_CODE" = 'RECOVERY_FAILED' ] && RECOVERY_CODE='TRANSACTION_INVENTORY_INVALID'
+    return 1
+  }
+  restore_files_from_transaction "$transaction" || return 1
+  rollback_runtime "$transaction" || return 1
+  systemctl daemon-reload >/dev/null 2>&1 || {
+    RECOVERY_CODE='DAEMON_RELOAD_FAILED'
+    return 1
+  }
+  write_phase "$transaction" recovered || {
+    RECOVERY_CODE='TRANSACTION_SYNC_FAILED'
+    return 1
+  }
+}
+
+recover_incomplete_transaction() {
+  incomplete=''
+  incomplete_count=0
+  set +f
+  set -- "$BACKUP_ROOT"/install-*
+  set -f
+  for candidate in "$@"; do
+    [ -d "$candidate" ] || continue
+    secure_directory "$candidate" || {
+      RECOVERY_CODE='TRANSACTION_INVENTORY_INVALID'
+      return 1
+    }
+    if ! secure_regular_file "$candidate/phase"; then
+      RECOVERY_CODE='TRANSACTION_INVENTORY_INVALID'
+      return 1
+    fi
+    phase_value=$(cat "$candidate/phase" 2>/dev/null || printf '%s' invalid)
+    case "$phase_value" in
+      committed|recovered) ;;
+      prepared|installing)
+        incomplete=$candidate
+        incomplete_count=$((incomplete_count + 1))
+        ;;
+      *) RECOVERY_CODE='TRANSACTION_INVENTORY_INVALID'; return 1 ;;
+    esac
+  done
+  [ "$incomplete_count" -le 1 ] || {
+    RECOVERY_CODE='MULTIPLE_INCOMPLETE_TRANSACTIONS'
+    return 1
+  }
+  [ "$incomplete_count" -eq 0 ] || recover_transaction "$incomplete"
 }
 
 cleanup() {
@@ -231,8 +537,9 @@ cleanup() {
   rollback_status='not-required'
   if [ "$status" -ne 0 ] && [ "$transaction_started" = '1' ] && [ "$transaction_committed" != '1' ]; then
     rollback_status='ok'
-    rollback_assets || rollback_status='failed'
-    systemctl daemon-reload >/dev/null 2>&1 || rollback_status="${rollback_status}+daemon-reload-failed"
+    if ! recover_transaction "$backup_dir"; then
+      rollback_status="failed:$RECOVERY_CODE"
+    fi
   fi
   for temporary in "$stage_library" "$stage_wrapper" "$stage_service" "$stage_timer" "$stage_drop_in" "$stage_modules_load" "$stage_sysctl"; do
     [ -n "$temporary" ] && rm -f -- "$temporary"
@@ -251,7 +558,6 @@ trap 'FAILURE_CODE=INTERRUPTED; exit 143' TERM
 if [ "$#" -ne 1 ]; then
   fail 'USAGE'
 fi
-
 SOURCE_ROOT=$1
 if [ "$(id -u)" != "$REQUIRED_UID" ]; then
   fail 'ROOT_REQUIRED'
@@ -260,6 +566,24 @@ case "$SOURCE_ROOT" in /*) ;; *) fail 'SOURCE_ROOT_INVALID' ;; esac
 if printf '%s' "$SOURCE_ROOT" | LC_ALL=C grep -q '[[:cntrl:]]'; then
   fail 'SOURCE_ROOT_INVALID'
 fi
+
+secure_directory "$SECURITY_ROOT" || fail 'SECURITY_ROOT_UNSAFE'
+validate_secure_chain "$TARGET_ROOT/var" 1 || fail 'TARGET_PATH_UNSAFE'
+ensure_directory "$TARGET_ROOT/var" '0755'
+validate_secure_chain "$TARGET_ROOT/var/backups" 1 || fail 'TARGET_PATH_UNSAFE'
+ensure_directory "$TARGET_ROOT/var/backups" '0755'
+validate_secure_chain "$BACKUP_ROOT" 1 || fail 'TARGET_PATH_UNSAFE'
+ensure_directory "$BACKUP_ROOT" '0700'
+chown "$INSTALL_OWNER:$INSTALL_GROUP" "$BACKUP_ROOT" || fail 'BACKUP_ROOT_OWNER_FAILED'
+chmod '0700' "$BACKUP_ROOT" || fail 'BACKUP_ROOT_MODE_FAILED'
+secure_directory "$BACKUP_ROOT" || fail 'BACKUP_ROOT_UNSAFE'
+
+validate_secure_chain "$LOCK_ROOT" 1 || fail 'LOCK_PATH_UNSAFE'
+ensure_directory "$LOCK_ROOT" '0755'
+exec 9>"$LOCK_FILE"
+flock -n 9 || fail 'INSTALL_LOCKED'
+recover_incomplete_transaction || fail "$RECOVERY_CODE"
+
 if [ ! -d "$SOURCE_ROOT" ] || [ -L "$SOURCE_ROOT" ]; then
   fail 'SOURCE_ROOT_INVALID'
 fi
@@ -267,78 +591,74 @@ canonical_source=$(CDPATH= cd -P "$SOURCE_ROOT" 2>/dev/null && pwd -P) || fail '
 if [ "$canonical_source" != "$SOURCE_ROOT" ]; then
   fail 'SOURCE_ROOT_INVALID'
 fi
+validate_secure_chain "$SOURCE_ROOT" 0 || fail 'SOURCE_PATH_UNSAFE'
 cd "$SOURCE_ROOT" || fail 'SOURCE_ROOT_INVALID'
-
-if [ ! -d deploy ] || [ -L deploy ] || [ ! -d deploy/server ] || [ -L deploy/server ]; then
+if ! secure_directory deploy || ! secure_directory deploy/server; then
   fail 'SOURCE_PATH_UNSAFE'
 fi
-if [ ! -f "$MANIFEST_RELATIVE" ] || [ -L "$MANIFEST_RELATIVE" ]; then
+if ! secure_regular_file "$MANIFEST_RELATIVE"; then
   fail 'SOURCE_MANIFEST_INVALID'
 fi
 for asset_id in $ASSET_IDS; do
   source_relative=$(asset_source "$asset_id")
-  if [ ! -f "$source_relative" ] || [ -L "$source_relative" ]; then
-    fail 'SOURCE_ASSET_UNSAFE'
-  fi
+  secure_regular_file "$source_relative" || fail 'SOURCE_ASSET_UNSAFE'
 done
-if ! validate_manifest_shape || ! sha256sum -c "$MANIFEST_RELATIVE" >/dev/null 2>&1; then
-  fail 'SOURCE_MANIFEST_INVALID'
-fi
-/bin/sh -n "$(asset_source library)" || fail 'SOURCE_SYNTAX_INVALID'
-/bin/sh -n "$(asset_source wrapper)" || fail 'SOURCE_SYNTAX_INVALID'
+validate_and_capture_manifest || fail 'SOURCE_MANIFEST_INVALID'
+sha256sum -c "$MANIFEST_RELATIVE" >/dev/null 2>&1 || fail 'SOURCE_MANIFEST_INVALID'
 
-for directory in \
-  "$TARGET_ROOT" \
-  "$TARGET_ROOT/usr" \
-  "$TARGET_ROOT/usr/local" \
-  "$TARGET_ROOT/usr/local/libexec" \
-  "$TARGET_ROOT/usr/local/sbin" \
-  "$TARGET_ROOT/etc" \
-  "$TARGET_ROOT/etc/systemd" \
-  "$TARGET_ROOT/etc/systemd/system" \
-  "$TARGET_ROOT/etc/systemd/system/docker.service.d" \
-  "$TARGET_ROOT/etc/modules-load.d" \
-  "$TARGET_ROOT/etc/sysctl.d" \
-  "$TARGET_ROOT/var" \
-  "$TARGET_ROOT/var/backups" \
-  "$BACKUP_ROOT"; do
-  [ -n "$directory" ] && assert_safe_directory "$directory"
-done
 for asset_id in $ASSET_IDS; do
   target=$(asset_target "$asset_id")
-  if [ -L "$target" ] || { [ -e "$target" ] && [ ! -f "$target" ]; }; then
-    fail 'TARGET_PATH_UNSAFE'
+  parent=${target%/*}
+  validate_secure_chain "$parent" 1 || fail 'TARGET_PATH_UNSAFE'
+  if [ -e "$target" ] || [ -L "$target" ]; then
+    secure_regular_file "$target" || fail 'TARGET_PATH_UNSAFE'
   fi
 done
 
-ensure_directory "$TARGET_ROOT/var" '0755'
-ensure_directory "$TARGET_ROOT/var/backups" '0755'
-ensure_directory "$BACKUP_ROOT" '0700'
-chown "$INSTALL_OWNER:$INSTALL_GROUP" "$BACKUP_ROOT" || fail 'BACKUP_ROOT_OWNER_FAILED'
-chmod '0700' "$BACKUP_ROOT" || fail 'BACKUP_ROOT_MODE_FAILED'
 timestamp=$(date -u '+%Y%m%dT%H%M%SZ') || fail 'BACKUP_TIMESTAMP_FAILED'
-backup_dir=$(mktemp -d "$BACKUP_ROOT/install-$timestamp-XXXXXX") || fail 'BACKUP_CREATE_FAILED'
-chown "$INSTALL_OWNER:$INSTALL_GROUP" "$backup_dir" || fail 'BACKUP_OWNER_FAILED'
-chmod '0700' "$backup_dir" || fail 'BACKUP_MODE_FAILED'
-state_record="$backup_dir/asset-state.tsv"
-printf 'asset-state-v1\tstate\ttarget\tbackup\n' > "$state_record"
-chmod '0600' "$state_record" || fail 'BACKUP_RECORD_FAILED'
-chown "$INSTALL_OWNER:$INSTALL_GROUP" "$state_record" || fail 'BACKUP_RECORD_FAILED'
+preparing_dir=$(mktemp -d "$BACKUP_ROOT/.preparing-$timestamp-XXXXXX") || fail 'BACKUP_CREATE_FAILED'
+backup_dir=$preparing_dir
+chown "$INSTALL_OWNER:$INSTALL_GROUP" "$preparing_dir" || fail 'BACKUP_OWNER_FAILED'
+chmod '0700' "$preparing_dir" || fail 'BACKUP_MODE_FAILED'
+mkdir "$preparing_dir/snapshot" "$preparing_dir/backups" || fail 'BACKUP_CREATE_FAILED'
+chown "$INSTALL_OWNER:$INSTALL_GROUP" "$preparing_dir/snapshot" "$preparing_dir/backups" || fail 'BACKUP_OWNER_FAILED'
+chmod '0700' "$preparing_dir/snapshot" "$preparing_dir/backups" || fail 'BACKUP_MODE_FAILED'
+write_captured_manifest "$preparing_dir/captured-manifest.sha256" || fail 'TRANSACTION_SYNC_FAILED'
 
+for asset_id in $ASSET_IDS; do
+  source_relative=$(asset_source "$asset_id")
+  snapshot="$preparing_dir/snapshot/$asset_id.asset"
+  cp "$source_relative" "$snapshot" || fail 'SOURCE_SNAPSHOT_COPY_FAILED'
+  chown "$INSTALL_OWNER:$INSTALL_GROUP" "$snapshot" || fail 'SOURCE_SNAPSHOT_COPY_FAILED'
+  chmod '0600' "$snapshot" || fail 'SOURCE_SNAPSHOT_COPY_FAILED'
+  if [ "$(file_hash "$snapshot")" != "$(expected_hash "$asset_id")" ]; then
+    fail 'SOURCE_SNAPSHOT_HASH_MISMATCH'
+  fi
+  durable_file "$snapshot"
+done
+/bin/sh -n "$preparing_dir/snapshot/library.asset" || fail 'SOURCE_SYNTAX_INVALID'
+/bin/sh -n "$preparing_dir/snapshot/wrapper.asset" || fail 'SOURCE_SYNTAX_INVALID'
+
+state_record="$preparing_dir/asset-state.tsv"
+printf 'asset-state-v1\tstate\ttarget\tbackup\thash\tmode\tuid\tgid\n' > "$state_record"
 for asset_id in $ASSET_IDS; do
   target=$(asset_target "$asset_id")
   if [ -e "$target" ]; then
     backup_name="$asset_id.asset"
-    cp -p "$target" "$backup_dir/$backup_name" || fail 'BACKUP_COPY_FAILED'
-    if [ "$(file_hash "$target")" != "$(file_hash "$backup_dir/$backup_name")" ]; then
-      fail 'BACKUP_VERIFY_FAILED'
-    fi
-    printf '%s\tpresent\t%s\t%s\n' "$asset_id" "$target" "$backup_name" >> "$state_record"
+    cp -p "$target" "$preparing_dir/backups/$backup_name" || fail 'BACKUP_COPY_FAILED'
+    chown "$INSTALL_OWNER:$INSTALL_GROUP" "$preparing_dir/backups/$backup_name" || fail 'BACKUP_COPY_FAILED'
+    backup_hash=$(file_hash "$target")
+    [ "$(file_hash "$preparing_dir/backups/$backup_name")" = "$backup_hash" ] || fail 'BACKUP_VERIFY_FAILED'
+    printf '%s\tpresent\t%s\t%s\t%s\t%s\t%s\t%s\n' \
+      "$asset_id" "$target" "$backup_name" "$backup_hash" "$(file_mode "$target")" "$(file_uid "$target")" "$(file_gid "$target")" >> "$state_record"
+    durable_file "$preparing_dir/backups/$backup_name"
   else
-    printf '%s\tabsent\t%s\t-\n' "$asset_id" "$target" >> "$state_record"
+    printf '%s\tabsent\t%s\t-\t-\t-\t-\t-\n' "$asset_id" "$target" >> "$state_record"
   fi
 done
-transaction_started='1'
+chown "$INSTALL_OWNER:$INSTALL_GROUP" "$state_record" || fail 'BACKUP_RECORD_FAILED'
+chmod '0600' "$state_record" || fail 'BACKUP_RECORD_FAILED'
+durable_file "$state_record"
 
 ensure_directory "$TARGET_ROOT/usr" '0755'
 ensure_directory "$TARGET_ROOT/usr/local" '0755'
@@ -351,48 +671,99 @@ ensure_directory "$TARGET_ROOT/etc/systemd/system/docker.service.d" '0755'
 ensure_directory "$TARGET_ROOT/etc/modules-load.d" '0755'
 ensure_directory "$TARGET_ROOT/etc/sysctl.d" '0755'
 
-expected_uid=$(identity_id "$INSTALL_OWNER" user) || fail 'OWNER_RESOLUTION_FAILED'
-expected_gid=$(identity_id "$INSTALL_GROUP" group) || fail 'GROUP_RESOLUTION_FAILED'
+parents_record="$preparing_dir/parents.tsv"
+printf 'parent-state-v1\tpath\tidentity\n' > "$parents_record"
 for asset_id in $ASSET_IDS; do
-  source_relative=$(asset_source "$asset_id")
+  parent=$(asset_target "$asset_id")
+  parent=${parent%/*}
+  secure_directory "$parent" || fail 'TARGET_PATH_UNSAFE'
+  printf '%s\t%s\t%s\n' "$asset_id" "$parent" "$(file_identity "$parent")" >> "$parents_record"
+done
+chown "$INSTALL_OWNER:$INSTALL_GROUP" "$parents_record" || fail 'BACKUP_RECORD_FAILED'
+chmod '0600' "$parents_record" || fail 'BACKUP_RECORD_FAILED'
+durable_file "$parents_record"
+
+runtime_before=$(runtime_value)
+printf '%s\n' "$runtime_before" > "$preparing_dir/runtime-before"
+if [ -e "$RUNTIME_SYSCTL_PATH" ] && [ ! -L "$RUNTIME_SYSCTL_PATH" ]; then
+  printf '%s\n' "$(file_identity "$RUNTIME_SYSCTL_PATH")" > "$preparing_dir/runtime-identity"
+else
+  printf '%s\n' missing > "$preparing_dir/runtime-identity"
+fi
+for runtime_record in runtime-before runtime-identity; do
+  chown "$INSTALL_OWNER:$INSTALL_GROUP" "$preparing_dir/$runtime_record" || fail 'BACKUP_RECORD_FAILED'
+  chmod '0600' "$preparing_dir/$runtime_record" || fail 'BACKUP_RECORD_FAILED'
+  durable_file "$preparing_dir/$runtime_record"
+done
+
+write_phase "$preparing_dir" prepared || fail 'TRANSACTION_SYNC_FAILED'
+durable_directory "$preparing_dir/snapshot"
+durable_directory "$preparing_dir/backups"
+durable_directory "$preparing_dir"
+transaction_suffix=${preparing_dir##*/.preparing-}
+final_transaction="$BACKUP_ROOT/install-$transaction_suffix"
+mv -fT -- "$preparing_dir" "$final_transaction" || fail 'TRANSACTION_PREPARE_FAILED'
+durable_directory "$BACKUP_ROOT"
+preparing_dir=''
+backup_dir=$final_transaction
+state_record="$backup_dir/asset-state.tsv"
+parents_record="$backup_dir/parents.tsv"
+transaction_started='1'
+write_phase "$backup_dir" installing || fail 'TRANSACTION_SYNC_FAILED'
+
+for asset_id in $ASSET_IDS; do
+  verify_bound_parent "$backup_dir" "$asset_id" || fail "$RECOVERY_CODE"
   target=$(asset_target "$asset_id")
   mode=$(asset_mode "$asset_id")
-  target_directory=${target%/*}
-  temporary=$(mktemp "$target_directory/.kinvest-metadata-${asset_id}.XXXXXX") || fail 'STAGE_CREATE_FAILED'
+  temporary=$(mktemp "${target%/*}/.kinvest-metadata-${asset_id}.XXXXXX") || fail 'STAGE_CREATE_FAILED'
   set_stage_path "$asset_id" "$temporary"
-  cp "$source_relative" "$temporary" || fail 'STAGE_COPY_FAILED'
+  cp "$backup_dir/snapshot/$asset_id.asset" "$temporary" || fail 'STAGE_COPY_FAILED'
   chown "$INSTALL_OWNER:$INSTALL_GROUP" "$temporary" || fail 'STAGE_OWNER_FAILED'
   chmod "$mode" "$temporary" || fail 'STAGE_MODE_FAILED'
-  if [ ! -f "$temporary" ] || [ -L "$temporary" ] ||
-    [ "$(file_hash "$temporary")" != "$(file_hash "$source_relative")" ] ||
-    [ "$(file_mode "$temporary")" != "${mode#0}" ] ||
-    [ "$(file_uid "$temporary")" != "$expected_uid" ] ||
-    [ "$(file_gid "$temporary")" != "$expected_gid" ]; then
+  if [ "$(file_hash "$temporary")" != "$(expected_hash "$asset_id")" ] ||
+    [ "$(file_mode "$temporary")" != "${mode#0}" ]; then
     fail 'STAGE_VERIFY_FAILED'
   fi
   if asset_is_shell "$asset_id"; then
     /bin/sh -n "$temporary" || fail 'STAGE_SYNTAX_INVALID'
   fi
+  durable_file "$temporary"
+  verify_bound_parent "$backup_dir" "$asset_id" || fail "$RECOVERY_CODE"
 done
 
-for asset_id in $ASSET_IDS; do
+for asset_id in $INSTALL_IDS; do
+  verify_bound_parent "$backup_dir" "$asset_id" || fail "$RECOVERY_CODE"
   temporary=$(stage_path "$asset_id")
   target=$(asset_target "$asset_id")
-  if ! mv -fT -- "$temporary" "$target"; then
-    fail 'ATOMIC_REPLACE_FAILED'
-  fi
+  mv -fT -- "$temporary" "$target" || fail 'ATOMIC_REPLACE_FAILED'
   set_stage_path "$asset_id" ''
+  sync -f "$target" || fail 'TRANSACTION_SYNC_FAILED'
+  sync -f "${target%/*}" || fail 'TRANSACTION_SYNC_FAILED'
+  case "$asset_id" in
+    drop-in) # TEST_FAULT_POINT_AFTER_REPLACE_drop-in
+      ;;
+    library) # TEST_FAULT_POINT_AFTER_REPLACE_library
+      ;;
+    wrapper) # TEST_FAULT_POINT_AFTER_REPLACE_wrapper
+      ;;
+    service) # TEST_FAULT_POINT_AFTER_REPLACE_service
+      ;;
+    timer) # TEST_FAULT_POINT_AFTER_REPLACE_timer
+      ;;
+    modules-load) # TEST_FAULT_POINT_AFTER_REPLACE_modules-load
+      ;;
+    sysctl) # TEST_FAULT_POINT_AFTER_REPLACE_sysctl
+      ;;
+  esac
 done
 
 for asset_id in $ASSET_IDS; do
-  source_relative=$(asset_source "$asset_id")
+  verify_bound_parent "$backup_dir" "$asset_id" || fail "$RECOVERY_CODE"
   target=$(asset_target "$asset_id")
   mode=$(asset_mode "$asset_id")
   if [ ! -f "$target" ] || [ -L "$target" ] ||
-    [ "$(file_hash "$target")" != "$(file_hash "$source_relative")" ] ||
-    [ "$(file_mode "$target")" != "${mode#0}" ] ||
-    [ "$(file_uid "$target")" != "$expected_uid" ] ||
-    [ "$(file_gid "$target")" != "$expected_gid" ]; then
+    [ "$(file_hash "$target")" != "$(expected_hash "$asset_id")" ] ||
+    [ "$(file_mode "$target")" != "${mode#0}" ]; then
     fail 'INSTALLED_ASSET_VERIFY_FAILED'
   fi
 done
@@ -402,6 +773,11 @@ done
 if ! modprobe br_netfilter; then
   fail 'MODULE_LOAD_FAILED'
 fi
+: > "$backup_dir/runtime-sysctl-attempted"
+chown "$INSTALL_OWNER:$INSTALL_GROUP" "$backup_dir/runtime-sysctl-attempted" || fail 'BACKUP_RECORD_FAILED'
+chmod '0600' "$backup_dir/runtime-sysctl-attempted" || fail 'BACKUP_RECORD_FAILED'
+durable_file "$backup_dir/runtime-sysctl-attempted"
+durable_directory "$backup_dir"
 if ! sysctl --load "$(asset_target sysctl)"; then
   fail 'SYSCTL_LOAD_FAILED'
 fi
@@ -411,6 +787,6 @@ fi
 if ! systemctl daemon-reload; then
   fail 'DAEMON_RELOAD_FAILED'
 fi
-
+write_phase "$backup_dir" committed || fail 'TRANSACTION_SYNC_FAILED'
 transaction_committed='1'
 printf 'KINVEST_METADATA_FIREWALL_INSTALL_OK backup=%s\n' "$backup_dir"
