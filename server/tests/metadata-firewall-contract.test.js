@@ -36,7 +36,15 @@ function createFakeIptables(fixture) {
     'operation="$command $chain $*"',
     'printf "%s\\n" "$operation" >> "$KINVEST_IPTABLES_MODEL/operations"',
     'KINVEST_FAIL_MATCH=$(printenv KINVEST_FAIL_MATCH || true)',
-    'if [ -n "$KINVEST_FAIL_MATCH" ] && printf "%s\\n" "$operation" | grep -F -- "$KINVEST_FAIL_MATCH" >/dev/null; then exit 70; fi',
+    'if [ -n "$KINVEST_FAIL_MATCH" ] && printf "%s\\n" "$operation" | grep -F -- "$KINVEST_FAIL_MATCH" >/dev/null; then',
+    '  KINVEST_FAIL_MATCH_AT=$(printenv KINVEST_FAIL_MATCH_AT || true)',
+    '  failure_count_file="$KINVEST_IPTABLES_MODEL/failure-match-count"',
+    '  failure_count=0',
+    '  [ ! -f "$failure_count_file" ] || failure_count=$(cat "$failure_count_file")',
+    '  failure_count=$((failure_count + 1))',
+    '  printf "%s\\n" "$failure_count" > "$failure_count_file"',
+    '  if [ -z "$KINVEST_FAIL_MATCH_AT" ] || [ "$failure_count" -eq "$KINVEST_FAIL_MATCH_AT" ]; then exit 70; fi',
+    'fi',
     'case "$command" in',
     '  -S)',
     '    grep -Fx "$chain" "$KINVEST_IPTABLES_MODEL/chains" >/dev/null 2>&1 || exit 1',
@@ -78,7 +86,8 @@ function createFakeIptables(fixture) {
     '  case "$command" in',
     '    -D|-I)',
     '      grep -F -- "--comment kinvest-metadata-docker-start-guard" "$rules" >/dev/null 2>&1 ||',
-    '        grep -F -- "--comment kinvest-metadata-normalization-guard" "$rules" >/dev/null 2>&1 || exit 94',
+    '        grep -F -- "--comment kinvest-metadata-normalization-guard" "$rules" >/dev/null 2>&1 ||',
+    '        grep -Fx -- "-j KINVEST-METADATA" "$rules" >/dev/null 2>&1 || exit 94',
     '      ;;',
     '  esac',
     'fi'
@@ -202,8 +211,10 @@ function runWrapperActivationFixture(wrapperText, fixture, name, options = {}) {
   const fakeBin = path.join(wrapperFixture, 'bin')
   const library = path.join(wrapperFixture, 'firewall-lib.sh')
   const config = path.join(wrapperFixture, 'metadata-network.conf')
-  const activationState = path.join(wrapperFixture, 'metadata-network.state')
-  const activationTarget = path.join(wrapperFixture, 'metadata-network.state.target')
+  const activationStateDirectory = path.join(wrapperFixture, 'state')
+  const activationStateTargetDirectory = path.join(wrapperFixture, 'state-target')
+  const activationState = path.join(activationStateDirectory, 'metadata-network.state')
+  const activationTarget = path.join(activationStateDirectory, 'metadata-network.state.target')
   const operations = path.join(wrapperFixture, 'operations')
   const events = path.join(wrapperFixture, 'events')
   const lock = path.join(wrapperFixture, 'firewall.lock')
@@ -213,6 +224,8 @@ function runWrapperActivationFixture(wrapperText, fixture, name, options = {}) {
   const fakeDocker = path.join(fakeBin, 'docker')
   const fakeMktemp = path.join(fakeBin, 'mktemp')
   const fakeSha256sum = path.join(fakeBin, 'sha256sum')
+  const fakeSync = path.join(fakeBin, 'sync')
+  const fakeMv = path.join(fakeBin, 'mv')
   const configSource = 'fixture=non-secret\n'
   const configHash = crypto.createHash('sha256').update(configSource).digest('hex')
   const action = options.action || 'reconcile-active'
@@ -221,16 +234,30 @@ function runWrapperActivationFixture(wrapperText, fixture, name, options = {}) {
 
   fs.mkdirSync(fakeBin, { recursive: true })
   fs.writeFileSync(library, [
+    'kinvest_test_assert_config() {',
+    '  "$KINVEST_TEST_NODE" -e \'const fs=require("node:fs"); const [target, original, expected, snapshot]=process.argv.slice(1); if (snapshot === "1") { if (target === original) process.exit(10); if ((fs.statSync(target).mode & 0o777) !== 0o600) process.exit(11); } else if (target !== original) process.exit(12); if (fs.readFileSync(target, "utf8") !== expected) process.exit(13);\' "$1" "$KINVEST_TEST_ORIGINAL_CONFIG" "$KINVEST_TEST_CONFIG_SOURCE" "$KINVEST_TEST_EXPECT_SNAPSHOT"',
+    '}',
     'kinvest_metadata_reconcile() {',
     `  printf '%s\\n' "reconcile:$4" >> "${operations}"`,
     `  printf '%s\\n' "reconcile:$4" >> "${events}"`,
-    '  "$KINVEST_TEST_NODE" -e \'const fs=require("node:fs"); const [target, original, expected, snapshot]=process.argv.slice(1); if (snapshot === "1") { if (target === original) process.exit(10); if ((fs.statSync(target).mode & 0o777) !== 0o600) process.exit(11); } else if (target !== original) process.exit(12); if (fs.readFileSync(target, "utf8") !== expected) process.exit(13);\' "$4" "$KINVEST_TEST_ORIGINAL_CONFIG" "$KINVEST_TEST_CONFIG_SOURCE" "$KINVEST_TEST_EXPECT_SNAPSHOT"',
+    '  kinvest_test_assert_config "$4"',
+    '}',
+    'kinvest_metadata_reconcile_deny_all() {',
+    `  printf '%s\\n' "reconcile-deny-all:$3" >> "${operations}"`,
+    `  printf '%s\\n' "reconcile-deny-all:$3" >> "${events}"`,
+    '  kinvest_test_assert_config "$3"',
     '}',
     ''
   ].join('\n'))
   fs.writeFileSync(config, configSource)
   fs.writeFileSync(operations, '')
   fs.writeFileSync(events, '')
+  if (options.activationParentSymlink) {
+    fs.mkdirSync(activationStateTargetDirectory)
+    fs.symlinkSync(activationStateTargetDirectory, activationStateDirectory)
+  } else {
+    fs.mkdirSync(activationStateDirectory)
+  }
   if (!options.missingState) {
     if (options.activationSymlink) {
       fs.writeFileSync(activationTarget, stateSource)
@@ -253,6 +280,8 @@ function runWrapperActivationFixture(wrapperText, fixture, name, options = {}) {
     '  fi',
     'elif [ "$target" = "$KINVEST_TEST_ACTIVATION_STATE" ] || [ "$target" = /dev/fd/8 ]; then',
     '  printf "%s\\n" "$KINVEST_TEST_ACTIVATION_STAT"',
+    'elif [ "$target" = "$KINVEST_TEST_ACTIVATION_STATE_DIRECTORY" ]; then',
+    '  printf "%s\\n" "$KINVEST_TEST_ACTIVATION_STATE_DIRECTORY_STAT"',
     'else',
     '  printf "%s\\n" "0:0:600"',
     'fi'
@@ -267,6 +296,21 @@ function runWrapperActivationFixture(wrapperText, fixture, name, options = {}) {
     '#!/bin/sh',
     'printf "%s\\n" mktemp >> "$KINVEST_TEST_EVENTS"',
     'exec /usr/bin/mktemp "$@"'
+  ])
+  writeExecutable(fakeSync, [
+    '#!/bin/sh',
+    'set -eu',
+    'printf "%s\\n" "sync:$1" >> "$KINVEST_TEST_EVENTS"',
+    'case "${KINVEST_TEST_SYNC_FAILURE:-}" in',
+    '  temp) [ "$1" = "$KINVEST_TEST_ACTIVATION_STATE_DIRECTORY" ] || exit 88 ;;',
+    '  parent) [ "$1" != "$KINVEST_TEST_ACTIVATION_STATE_DIRECTORY" ] || exit 89 ;;',
+    'esac'
+  ])
+  writeExecutable(fakeMv, [
+    '#!/bin/sh',
+    'set -eu',
+    'printf "%s\\n" "mv:$*" >> "$KINVEST_TEST_EVENTS"',
+    'exec /bin/mv "$@"'
   ])
   writeExecutable(fakeIptables, ['#!/bin/sh', 'printf "%s\\n" iptables >> "$KINVEST_TEST_EVENTS"'])
   writeExecutable(fakeIptablesRestore, ['#!/bin/sh', 'printf "%s\\n" iptables-restore >> "$KINVEST_TEST_EVENTS"'])
@@ -283,11 +327,14 @@ function runWrapperActivationFixture(wrapperText, fixture, name, options = {}) {
     .replace('KMF_IPTABLES_RESTORE=/usr/sbin/iptables-restore', `KMF_IPTABLES_RESTORE=${fakeIptablesRestore}`)
     .replace('KMF_DOCKER=/usr/bin/docker', `KMF_DOCKER=${fakeDocker}`)
     .replace('KMF_SHA256SUM=/usr/bin/sha256sum', `KMF_SHA256SUM=${fakeSha256sum}`)
+    .replace('KMF_SYNC=/usr/bin/sync', `KMF_SYNC=${fakeSync}`)
     .replaceAll('/usr/bin/flock', fakeFlock)
   const wrapper = path.join(wrapperFixture, 'kinvest-metadata-firewall')
   writeExecutable(wrapper, instrumentedWrapper.trimEnd().split('\n'))
-  const result = runHarness(wrapper, [action], {
+  const harnessEnvironment = {
     KINVEST_TEST_ACTIVATION_STATE: activationState,
+    KINVEST_TEST_ACTIVATION_STATE_DIRECTORY: activationStateDirectory,
+    KINVEST_TEST_ACTIVATION_STATE_DIRECTORY_STAT: options.activationParentStat || '0:0:700',
     KINVEST_TEST_ACTIVATION_STAT: options.activationStat || '0:0:600',
     KINVEST_TEST_ACTIVATION_IDENTITY: options.activationIdentity || '1:2',
     KINVEST_TEST_ACTIVATION_FD_IDENTITY: options.activationFdIdentity || '1:2',
@@ -296,13 +343,36 @@ function runWrapperActivationFixture(wrapperText, fixture, name, options = {}) {
     KINVEST_TEST_EVENTS: events,
     KINVEST_TEST_EXPECT_SNAPSHOT: action === 'reconcile-active' ? '1' : '0',
     KINVEST_TEST_NODE: process.execPath,
-    KINVEST_TEST_ORIGINAL_CONFIG: config
-  })
+    KINVEST_TEST_ORIGINAL_CONFIG: config,
+    KINVEST_TEST_SYNC_FAILURE: options.syncFailure || ''
+  }
+  const result = runHarness(wrapper, options.actionArgs || [action], harnessEnvironment)
+  const eventsAfterFirst = fs.readFileSync(events, 'utf8').trim().split('\n').filter(Boolean)
+  const operationsAfterFirst = fs.readFileSync(operations, 'utf8')
+  const activationStateSourceAfterFirst = fs.existsSync(activationState)
+    ? fs.readFileSync(activationState, 'utf8')
+    : null
+  const followUpResult = options.followUpArgs
+    ? runHarness(wrapper, options.followUpArgs, {
+      ...harnessEnvironment,
+      KINVEST_TEST_EXPECT_SNAPSHOT: '1',
+      KINVEST_TEST_SYNC_FAILURE: ''
+    })
+    : null
   return {
     result,
+    followUpResult,
     config,
+    configHash,
+    activationStateSource: fs.existsSync(activationState) ? fs.readFileSync(activationState, 'utf8') : null,
+    activationStateSourceAfterFirst,
+    activationStateMode: fs.existsSync(activationState) ? fs.statSync(activationState).mode & 0o777 : null,
+    activationStateTemps: fs.readdirSync(activationStateDirectory)
+      .filter((entry) => /^metadata-network[.]state[.][0-9]+[.]/.test(entry)),
     events: fs.readFileSync(events, 'utf8').trim().split('\n').filter(Boolean),
+    eventsAfterFirst,
     operations: fs.readFileSync(operations, 'utf8'),
+    operationsAfterFirst,
     snapshots: fs.readdirSync(wrapperFixture).filter((entry) => entry.startsWith('kinvest-metadata-network.'))
   }
 }
@@ -313,6 +383,7 @@ function run() {
   const wrapper = path.resolve(__dirname, '../../deploy/server/kinvest-metadata-firewall.sh')
   const dockerDropIn = path.resolve(__dirname, '../../deploy/server/docker-kinvest-metadata-firewall.conf')
   const firewallService = path.resolve(__dirname, '../../deploy/server/kinvest-metadata-firewall.service')
+  const firewallTimer = path.resolve(__dirname, '../../deploy/server/kinvest-metadata-firewall.timer')
   const operationsDoc = path.resolve(__dirname, '../../docs/operations/2026-08-11-metadata-ssm-rollout.md')
   const fakeIptables = createFakeIptables(fixture)
   const fakeIptablesRestore = createFakeIptablesRestore(fixture)
@@ -390,6 +461,21 @@ function run() {
     '. "$1"',
     'kinvest_metadata_reconcile "$2" "$3" "$4" "$5"'
   ])
+  const denyAllReconcileHarness = path.join(fixture, 'reconcile-deny-all.sh')
+  writeExecutable(denyAllReconcileHarness, [
+    '#!/bin/sh',
+    'set -eu',
+    '. "$1"',
+    'kinvest_metadata_reconcile_deny_all "$2" "$3" "$4"',
+    'kinvest_metadata_reconcile_deny_all "$2" "$3" "$4"'
+  ])
+  const denyAllReconcileOnceHarness = path.join(fixture, 'reconcile-deny-all-once.sh')
+  writeExecutable(denyAllReconcileOnceHarness, [
+    '#!/bin/sh',
+    'set -eu',
+    '. "$1"',
+    'kinvest_metadata_reconcile_deny_all "$2" "$3" "$4"'
+  ])
   const validateConfigHarness = path.join(fixture, 'validate-config.sh')
   writeExecutable(validateConfigHarness, [
     '#!/bin/sh',
@@ -441,6 +527,70 @@ function run() {
     assert.equal(status.status, 0, status.stderr)
     const statusOperations = fs.readFileSync(path.join(model, 'operations'), 'utf8')
     assert.doesNotMatch(statusOperations, /^(?:-A|-D|-F|-I|-N|-X|RESTORE)\b/m)
+
+    const denyAllModel = createModel(fixture, 'deny-all-model')
+    fs.appendFileSync(path.join(denyAllModel, 'chains'), 'KINVEST-METADATA\n')
+    fs.writeFileSync(
+      path.join(denyAllModel, 'FORWARD.rules'),
+      '-j KINVEST-METADATA\n-j PREEXISTING-FORWARD\n-j KINVEST-METADATA\n'
+    )
+    fs.writeFileSync(
+      path.join(denyAllModel, 'DOCKER-USER.rules'),
+      '-j KINVEST-METADATA\n-j KINVEST-METADATA\n-j PREEXISTING-DOCKER-USER\n'
+    )
+    fs.writeFileSync(path.join(denyAllModel, 'KINVEST-METADATA.rules'), [
+      '-i br-kinvest-meta -s 172.31.252.2/32 -d 169.254.0.23/32 -p tcp --dport 80 -m comment --comment kinvest-metadata-app-allow -j ACCEPT',
+      '-d 169.254.0.0/16 -p tcp --dport 80 -j ACCEPT',
+      '-j RETURN',
+      ''
+    ].join('\n'))
+    const denyAll = runHarness(
+      denyAllReconcileHarness,
+      [library, fakeIptables, fakeIptablesRestore, config],
+      {
+        KINVEST_IPTABLES_MODEL: denyAllModel,
+        KINVEST_REQUIRE_GUARD_CONTINUITY: '1'
+      }
+    )
+    assert.equal(denyAll.status, 0, denyAll.stderr)
+    assert.deepEqual(rules(denyAllModel, 'FORWARD'), [
+      '-j KINVEST-METADATA',
+      '-j PREEXISTING-FORWARD'
+    ])
+    assert.deepEqual(rules(denyAllModel, 'DOCKER-USER'), [
+      '-j KINVEST-METADATA',
+      '-j PREEXISTING-DOCKER-USER'
+    ])
+    assert.deepEqual(rules(denyAllModel, 'KINVEST-METADATA'), [
+      '-d 169.254.0.23/32 -p tcp --dport 80 -m comment --comment kinvest-metadata-default-deny -j REJECT --reject-with tcp-reset',
+      '-j RETURN'
+    ])
+    assert.doesNotMatch(rules(denyAllModel, 'KINVEST-METADATA').join('\n'), /ACCEPT|169\.254\.0\.0\/16/)
+
+    const denyAllApplyFailureModel = createModel(fixture, 'deny-all-apply-failure-model')
+    const denyAllApplyFailure = runHarness(
+      denyAllReconcileOnceHarness,
+      [library, fakeIptables, fakeIptablesRestore, config],
+      {
+        KINVEST_IPTABLES_MODEL: denyAllApplyFailureModel,
+        KINVEST_FAIL_MATCH: '-A KINVEST-METADATA -j RETURN'
+      }
+    )
+    assert.notEqual(denyAllApplyFailure.status, 0)
+    assert.match(rules(denyAllApplyFailureModel, 'FORWARD')[0], /kinvest-metadata-docker-start-guard/)
+
+    const denyAllStatusFailureModel = createModel(fixture, 'deny-all-status-failure-model')
+    const denyAllStatusFailure = runHarness(
+      denyAllReconcileOnceHarness,
+      [library, fakeIptables, fakeIptablesRestore, config],
+      {
+        KINVEST_IPTABLES_MODEL: denyAllStatusFailureModel,
+        KINVEST_FAIL_MATCH: '-S KINVEST-METADATA',
+        KINVEST_FAIL_MATCH_AT: '5'
+      }
+    )
+    assert.notEqual(denyAllStatusFailure.status, 0)
+    assert.match(rules(denyAllStatusFailureModel, 'FORWARD')[0], /kinvest-metadata-docker-start-guard/)
 
     const primaryGuardRule = '-d 169.254.0.23/32 -p tcp --dport 80 -m comment --comment kinvest-metadata-docker-start-guard -j REJECT --reject-with tcp-reset'
     const normalizationGuardRule = '-d 169.254.0.23/32 -p tcp --dport 80 -m comment --comment kinvest-metadata-normalization-guard -j REJECT --reject-with tcp-reset'
@@ -622,6 +772,7 @@ function run() {
     const wrapperText = fs.readFileSync(wrapper, 'utf8')
     const dropInText = fs.readFileSync(dockerDropIn, 'utf8')
     const serviceText = fs.readFileSync(firewallService, 'utf8')
+    const timerText = fs.readFileSync(firewallTimer, 'utf8')
     const operationsText = fs.readFileSync(operationsDoc, 'utf8')
     assert.match(wrapperText, /flock -x/)
     assert.match(wrapperText, /stat -Lc/)
@@ -657,6 +808,18 @@ function run() {
       'hashing and reconciliation must use the same immutable snapshot'
     )
     assert.deepEqual(activeState.snapshots, [], 'the active config snapshot must be removed after success')
+    const denyAllState = runWrapperActivationFixture(wrapperText, fixture, 'deny-all', {
+      stateSource: 'version=1\nmode=deny-all\nconfig_sha256=__CONFIG_SHA256__\n'
+    })
+    assert.equal(denyAllState.result.status, 0, denyAllState.result.stderr)
+    assert.match(denyAllState.operations, /^reconcile-deny-all:/)
+    assert.notEqual(denyAllState.operations.trim().slice('reconcile-deny-all:'.length), denyAllState.config)
+    assert.equal(denyAllState.events[0], 'flock')
+    assert.equal(denyAllState.events[1], 'mktemp')
+    assert.match(denyAllState.events[2], /^sha256:/)
+    assert.equal(denyAllState.events[3], denyAllState.operations.trim())
+    assert.doesNotMatch(denyAllState.events.join('\n'), /^(?:iptables|iptables-restore|docker)$/m)
+    assert.deepEqual(denyAllState.snapshots, [], 'the deny-all config snapshot must be removed after success')
     const pendingDeploy = runWrapperActivationFixture(wrapperText, fixture, 'pending-deploy', {
       action: 'reconcile',
       stateSource: 'version=1\nmode=pending\nconfig_sha256=__CONFIG_SHA256__\n'
@@ -664,17 +827,116 @@ function run() {
     assert.equal(pendingDeploy.result.status, 0, pendingDeploy.result.stderr)
     assert.equal(pendingDeploy.operations, `reconcile:${pendingDeploy.config}\n`)
     assert.deepEqual(pendingDeploy.snapshots, [], 'deployment reconcile must not create an active-state snapshot')
+    const unconfirmedDenyAllActivation = runWrapperActivationFixture(wrapperText, fixture, 'unconfirmed-deny-all', {
+      action: 'activate-deny-all',
+      actionArgs: ['activate-deny-all']
+    })
+    assert.notEqual(unconfirmedDenyAllActivation.result.status, 0)
+    assert.match(unconfirmedDenyAllActivation.activationStateSource, /^version=1\nmode=active\n/)
+    assert.doesNotMatch(unconfirmedDenyAllActivation.events.join('\n'), /^(?:iptables|iptables-restore|docker)$/m)
+    const confirmedDenyAllActivation = runWrapperActivationFixture(wrapperText, fixture, 'confirmed-deny-all', {
+      action: 'activate-deny-all',
+      actionArgs: ['activate-deny-all', '--confirm-deny-all']
+    })
+    assert.equal(confirmedDenyAllActivation.result.status, 0, confirmedDenyAllActivation.result.stderr)
+    assert.equal(
+      confirmedDenyAllActivation.activationStateSource,
+      `version=1\nmode=deny-all\nconfig_sha256=${confirmedDenyAllActivation.configHash}\n`
+    )
+    assert.equal(confirmedDenyAllActivation.operations, '')
+    assert.doesNotMatch(confirmedDenyAllActivation.events.join('\n'), /^(?:iptables|iptables-restore|docker)$/m)
+    assert.equal(confirmedDenyAllActivation.activationStateMode, 0o600)
+    const stateTempSyncIndex = confirmedDenyAllActivation.events.findIndex(
+      (event) => /^sync:.*metadata-network[.]state[.][0-9]+[.]/.test(event)
+    )
+    const stateRenameIndex = confirmedDenyAllActivation.events.findIndex(
+      (event) => /^mv:-f -- .*metadata-network[.]state[.][0-9]+[.]\S+ .*metadata-network[.]state$/.test(event)
+    )
+    const stateParentSyncIndex = confirmedDenyAllActivation.events.indexOf(
+      `sync:${path.dirname(path.join(path.dirname(confirmedDenyAllActivation.config), 'state', 'metadata-network.state'))}`
+    )
+    assert.ok(stateTempSyncIndex >= 0, 'the completed activation state temp file must be fsynced')
+    assert.ok(stateRenameIndex > stateTempSyncIndex, 'the state temp file must be fsynced before atomic rename')
+    assert.ok(stateParentSyncIndex > stateRenameIndex, 'the activation state parent must be fsynced after rename')
+    assert.deepEqual(confirmedDenyAllActivation.activationStateTemps, [])
+
+    const tempSyncFailure = runWrapperActivationFixture(wrapperText, fixture, 'deny-all-temp-sync-failure', {
+      action: 'activate-deny-all',
+      actionArgs: ['activate-deny-all', '--confirm-deny-all'],
+      syncFailure: 'temp'
+    })
+    assert.notEqual(tempSyncFailure.result.status, 0)
+    assert.match(tempSyncFailure.activationStateSourceAfterFirst, /^version=1\nmode=active\n/)
+    assert.doesNotMatch(tempSyncFailure.eventsAfterFirst.join('\n'), /^mv:/m)
+    assert.doesNotMatch(tempSyncFailure.eventsAfterFirst.join('\n'), /^(?:iptables|iptables-restore|docker)$/m)
+    assert.deepEqual(tempSyncFailure.activationStateTemps, [])
+
+    const parentSyncFailure = runWrapperActivationFixture(wrapperText, fixture, 'deny-all-parent-sync-failure', {
+      action: 'activate-deny-all',
+      actionArgs: ['activate-deny-all', '--confirm-deny-all'],
+      syncFailure: 'parent'
+    })
+    assert.notEqual(parentSyncFailure.result.status, 0)
+    assert.equal(
+      parentSyncFailure.activationStateSourceAfterFirst,
+      `version=1\nmode=deny-all\nconfig_sha256=${parentSyncFailure.configHash}\n`
+    )
+    assert.match(parentSyncFailure.eventsAfterFirst.join('\n'), /^mv:/m)
+    assert.doesNotMatch(parentSyncFailure.eventsAfterFirst.join('\n'), /^(?:iptables|iptables-restore|docker)$/m)
+    assert.deepEqual(parentSyncFailure.activationStateTemps, [])
+
+    /** @type {Array<[string, { activationParentSymlink?: boolean, activationParentStat?: string }]>} */
+    const rejectedActivationParents = [
+      ['symlink', { activationParentSymlink: true }],
+      ['wrong-owner', { activationParentStat: '1000:0:700' }],
+      ['wrong-group', { activationParentStat: '0:1000:700' }],
+      ['group-writable', { activationParentStat: '0:0:770' }],
+      ['other-writable', { activationParentStat: '0:0:707' }]
+    ]
+    for (const [name, parentOptions] of rejectedActivationParents) {
+      const rejectedParent = runWrapperActivationFixture(wrapperText, fixture, `deny-all-parent-${name}`, {
+        action: 'activate-deny-all',
+        actionArgs: ['activate-deny-all', '--confirm-deny-all'],
+        ...parentOptions
+      })
+      assert.notEqual(rejectedParent.result.status, 0, `${name} activation parent must fail closed`)
+      assert.match(rejectedParent.activationStateSourceAfterFirst, /^version=1\nmode=active\n/)
+      assert.doesNotMatch(rejectedParent.eventsAfterFirst.join('\n'), /^(?:sync:|mv:|iptables|iptables-restore|docker)/m)
+      assert.deepEqual(rejectedParent.activationStateTemps, [])
+    }
+
+    const activationBoundary = runWrapperActivationFixture(wrapperText, fixture, 'deny-all-boundary', {
+      action: 'activate-deny-all',
+      actionArgs: ['activate-deny-all', '--confirm-deny-all'],
+      followUpArgs: ['reconcile-active']
+    })
+    assert.equal(activationBoundary.result.status, 0, activationBoundary.result.stderr)
+    assert.equal(activationBoundary.operationsAfterFirst, '')
+    assert.doesNotMatch(activationBoundary.eventsAfterFirst.join('\n'), /^(?:iptables|iptables-restore|docker|reconcile)/m)
+    assert.equal(
+      activationBoundary.activationStateSourceAfterFirst,
+      `version=1\nmode=deny-all\nconfig_sha256=${activationBoundary.configHash}\n`
+    )
+    assert.equal(activationBoundary.followUpResult.status, 0, activationBoundary.followUpResult.stderr)
+    assert.match(activationBoundary.operations, /^reconcile-deny-all:/)
     const rejectedActivationStates = [
       ['pending', { stateSource: 'version=1\nmode=pending\nconfig_sha256=__CONFIG_SHA256__\n' }],
+      ['old-incompatible-mode', { stateSource: 'version=1\nmode=deny\nconfig_sha256=__CONFIG_SHA256__\n' }],
       ['missing', { missingState: true }],
       ['wrong-version', { stateSource: 'version=2\nmode=active\nconfig_sha256=__CONFIG_SHA256__\n' }],
       ['wrong-order', { stateSource: 'mode=active\nversion=1\nconfig_sha256=__CONFIG_SHA256__\n' }],
       ['extra-line', { stateSource: 'version=1\nmode=active\nconfig_sha256=__CONFIG_SHA256__\nunexpected=value\n' }],
       ['hash-mismatch', { stateSource: `version=1\nmode=active\nconfig_sha256=${'0'.repeat(64)}\n` }],
+      ['deny-all-hash-mismatch', { stateSource: `version=1\nmode=deny-all\nconfig_sha256=${'0'.repeat(64)}\n` }],
       ['insecure-mode', { activationStat: '0:0:640' }],
       ['wrong-owner', { activationStat: '1000:0:600' }],
       ['wrong-group', { activationStat: '0:1000:600' }],
       ['replaced-state', { activationIdentity: '1:2', activationFdIdentity: '1:3' }],
+      ['deny-all-replaced-state', {
+        stateSource: 'version=1\nmode=deny-all\nconfig_sha256=__CONFIG_SHA256__\n',
+        activationIdentity: '1:2',
+        activationFdIdentity: '1:3'
+      }],
       ['symlink', { activationSymlink: true }]
     ]
     for (const [name, options] of rejectedActivationStates) {
@@ -692,6 +954,15 @@ function run() {
     assert.doesNotMatch(serviceText, /^Requires=docker\.service$/m)
     assert.match(serviceText, /^ExecStart=\/usr\/local\/sbin\/kinvest-metadata-firewall reconcile-active$/m)
     assert.doesNotMatch(serviceText, /^ExecStartPost=/m)
+    assert.match(timerText, /^Unit=kinvest-metadata-firewall\.service$/m)
+    assert.match(wrapperText, /activate-deny-all --confirm-deny-all/)
+    assert.match(wrapperText, /kinvest_metadata_reconcile_deny_all/)
+    assert.match(wrapperText, /^KMF_SYNC=\/usr\/bin\/sync$/m)
+    assert.ok(
+      wrapperText.indexOf('kinvest_assert_secure_state_directory') <
+        wrapperText.indexOf('kmf_activation_state_tmp=$(mktemp'),
+      'the activation state parent must be rejected before creating a state temp file'
+    )
     const libraryText = fs.readFileSync(library, 'utf8')
     assert.doesNotMatch(libraryText, /\beth1\b/)
     assert.doesNotMatch(`${wrapperText}\n${libraryText}`, /revoke.*(?:STS|secret)/i)
@@ -716,6 +987,51 @@ function run() {
     assert.match(operationsText, /not a\s+claim that the candidate is conflict-free/i)
     assert.match(operationsText, /pending[\s\S]{0,160}active/i)
     assert.match(operationsText, /routine[\s\S]{0,200}read-only[\s\S]{0,80}status/i)
+    assert.match(operationsText, /T6[\s\S]*activate-deny-all --confirm-deny-all/i)
+    assert.match(operationsText, /Kinvest[\s\S]{0,120}Nginx[\s\S]{0,160}temporary bridge containers/i)
+    assert.match(operationsText, /T7[\s\S]{0,160}separate approval/i)
+    assert.match(operationsText, /no CAM or SSM/i)
+    assert.match(
+      operationsText,
+      /`reconcile-active`[\s\S]{0,700}`mode=active`[\s\S]{0,240}`mode=deny-all`[\s\S]{0,700}dispatch/i
+    )
+    assert.match(
+      operationsText,
+      /pending[\s\S]{0,200}(?:unknown|unsupported)[\s\S]{0,200}fail(?:s)? closed/i
+    )
+    assert.doesNotMatch(
+      operationsText,
+      /`reconcile-active`[\s\S]{0,500}requires[\s\S]{0,200}exactly `version=1`, `mode=active`/i
+    )
+    const t6RollbackStart = operationsText.indexOf('### T6 rollback')
+    const t6RollbackEnd = operationsText.indexOf('## Apply and status', t6RollbackStart)
+    assert.ok(t6RollbackStart >= 0 && t6RollbackEnd > t6RollbackStart)
+    const t6RollbackText = operationsText.slice(t6RollbackStart, t6RollbackEnd)
+    const rollbackPublicationSequence = [
+      'set -eu',
+      'state_tmp="$(mktemp "$state_directory/.metadata-network.state.XXXXXX")"',
+      'chown root:root "$state_tmp"',
+      'chmod 0600 "$state_tmp"',
+      '/usr/bin/sync "$state_tmp"',
+      'mv -f -- "$state_tmp" "$state_directory/metadata-network.state"',
+      '/usr/bin/sync "$state_directory"',
+      '/usr/local/sbin/kinvest-metadata-firewall reconcile-active'
+    ]
+    const rollbackPublicationIndexes = rollbackPublicationSequence.map((step) => t6RollbackText.indexOf(step))
+    assert.ok(
+      rollbackPublicationIndexes.every((index) => index >= 0),
+      'allow-mode rollback must document every strict durable publication step'
+    )
+    assert.deepEqual(
+      [...rollbackPublicationIndexes].sort((left, right) => left - right),
+      rollbackPublicationIndexes,
+      'allow-mode rollback durability barriers must precede rename and reconciliation in order'
+    )
+    assert.doesNotMatch(
+      t6RollbackText,
+      /mv -f -- "\$state_tmp"[^\n]*metadata-network[.]state\n\s+\/usr\/local\/sbin\/kinvest-metadata-firewall reconcile-active/,
+      'allow-mode rollback must not publish state with a bare unsynced rename'
+    )
     assert.doesNotMatch(operationsText, /\bins-[a-z0-9]+\b/i)
     assert.doesNotMatch(operationsText, /\b2\.35\.1\b/)
   } finally {
