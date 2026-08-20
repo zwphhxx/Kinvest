@@ -413,6 +413,41 @@ remove_interlock() {
   sync -f "${INTERLOCK_TARGET%/*}" || return 1
 }
 
+retain_interlock_operator_required() {
+  transaction=$1
+  retained_code=$2
+  if ! install_interlock "$transaction"; then
+    RECOVERY_CODE='INTERLOCK_RESTORE_FAILED'
+    return 1
+  fi
+  systemctl daemon-reload >/dev/null 2>&1 || :
+  if ! write_phase "$transaction" operator-required; then
+    RECOVERY_CODE='TRANSACTION_SYNC_FAILED'
+    return 1
+  fi
+  RECOVERY_CODE=$retained_code
+  return 1
+}
+
+release_interlock() {
+  transaction=$1
+  remove_interlock "$transaction" || return 1
+  if systemctl daemon-reload >/dev/null 2>&1; then
+    return 0
+  fi
+  if ! install_interlock "$transaction"; then
+    RECOVERY_CODE='INTERLOCK_RESTORE_FAILED'
+    return 1
+  fi
+  systemctl daemon-reload >/dev/null 2>&1 || :
+  write_phase "$transaction" operator-required || {
+    RECOVERY_CODE='TRANSACTION_SYNC_FAILED'
+    return 1
+  }
+  RECOVERY_CODE='INTERLOCK_RELEASE_DAEMON_RELOAD_FAILED'
+  return 1
+}
+
 append_operator_transaction() {
   transaction=$1
   case "$operator_transactions" in
@@ -623,7 +658,14 @@ recover_transaction() {
   files_status='ok'
   runtime_status='not-required'
   daemon_reload_status='ok'
-  phase_status=$(cat "$transaction/phase" 2>/dev/null || printf '%s' invalid)
+  interlock_status='ok'
+  phase_status='operator-required'
+  install_interlock "$transaction" || interlock_status='failed'
+  if [ "$interlock_status" = 'ok' ]; then
+    write_phase "$transaction" operator-required || phase_status='write-failed'
+  else
+    phase_status='write-failed'
+  fi
   restore_files_from_transaction "$transaction" || files_status='failed'
   if [ -f "$transaction/runtime-sysctl-attempted" ]; then
     runtime_status='ok'
@@ -637,42 +679,18 @@ recover_transaction() {
       esac
     fi
   fi
-  interlock_status='not-required'
-  case "$runtime_status" in
-    operator-required|failed)
-      interlock_status='ok'
-      install_interlock "$transaction" || interlock_status='failed'
-      ;;
-  esac
-  if [ "$interlock_status" = 'ok' ]; then
-    if write_phase "$transaction" operator-required; then
-      phase_status='operator-required'
-    else
-      phase_status='write-failed'
-    fi
-  fi
   systemctl daemon-reload >/dev/null 2>&1 || daemon_reload_status='failed'
-  if [ "$files_status" = 'ok' ] &&
-    { [ "$runtime_status" = 'ok' ] || [ "$runtime_status" = 'not-required' ]; } &&
-    [ "$daemon_reload_status" = 'ok' ]; then
-    if write_phase "$transaction" recovered; then
-      phase_status='recovered'
-    else
-      phase_status='write-failed'
-    fi
-  fi
   printf 'KINVEST_METADATA_FIREWALL_RECOVERY_STATUS files=%s runtime=%s daemon_reload=%s phase=%s\n' \
     "$files_status" "$runtime_status" "$daemon_reload_status" "$phase_status" >&2
-  if [ "$runtime_status" = 'operator-required' ] && [ "$files_status" = 'ok' ] &&
-    [ "$interlock_status" = 'ok' ] && [ "$phase_status" = 'operator-required' ]; then
+  if [ "$files_status" = 'ok' ] &&
+    { [ "$runtime_status" = 'ok' ] || [ "$runtime_status" = 'not-required' ] || [ "$runtime_status" = 'operator-required' ]; } &&
+    [ "$interlock_status" = 'ok' ] && [ "$daemon_reload_status" = 'ok' ] &&
+    [ "$phase_status" = 'operator-required' ]; then
     RECOVERY_CODE='RECOVERY_OPERATOR_REQUIRED'
     return 1
   fi
-  if [ "$files_status" != 'ok' ] || [ "$runtime_status" = 'failed' ] ||
-    [ "$daemon_reload_status" != 'ok' ] || [ "$phase_status" != 'recovered' ]; then
-    RECOVERY_CODE='RECOVERY_INCOMPLETE'
-    return 1
-  fi
+  RECOVERY_CODE='RECOVERY_INCOMPLETE'
+  return 1
 }
 
 verify_installed_transaction() {
@@ -693,35 +711,31 @@ verify_installed_transaction() {
 complete_safe_commit() {
   transaction=$1
   verify_installed_transaction "$transaction" || {
-    RECOVERY_CODE='SAFE_COMMIT_ASSET_VERIFY_FAILED'
-    return 1
+    retain_interlock_operator_required "$transaction" 'SAFE_COMMIT_ASSET_VERIFY_FAILED'
+    return $?
   }
   modprobe br_netfilter >/dev/null 2>&1 || {
-    RECOVERY_CODE='SAFE_COMMIT_MODULE_LOAD_FAILED'
-    return 1
+    retain_interlock_operator_required "$transaction" 'SAFE_COMMIT_MODULE_LOAD_FAILED'
+    return $?
   }
   sysctl --load "$(asset_target sysctl)" >/dev/null 2>&1 || {
-    RECOVERY_CODE='SAFE_COMMIT_SYSCTL_LOAD_FAILED'
-    return 1
+    retain_interlock_operator_required "$transaction" 'SAFE_COMMIT_SYSCTL_LOAD_FAILED'
+    return $?
   }
   "$(asset_target wrapper)" verify-bridge-netfilter >/dev/null 2>&1 || {
-    RECOVERY_CODE='SAFE_COMMIT_WRAPPER_VERIFY_FAILED'
-    return 1
+    retain_interlock_operator_required "$transaction" 'SAFE_COMMIT_WRAPPER_VERIFY_FAILED'
+    return $?
   }
   verify_bridge_prerequisites || {
-    RECOVERY_CODE='SAFE_COMMIT_RUNTIME_VERIFY_FAILED'
-    return 1
+    retain_interlock_operator_required "$transaction" 'SAFE_COMMIT_RUNTIME_VERIFY_FAILED'
+    return $?
   }
   systemctl daemon-reload >/dev/null 2>&1 || {
-    RECOVERY_CODE='SAFE_COMMIT_DAEMON_RELOAD_FAILED'
-    return 1
+    retain_interlock_operator_required "$transaction" 'SAFE_COMMIT_DAEMON_RELOAD_FAILED'
+    return $?
   }
   if [ -e "$INTERLOCK_TARGET" ] || [ -L "$INTERLOCK_TARGET" ]; then
-    remove_interlock "$transaction" || return 1
-    systemctl daemon-reload >/dev/null 2>&1 || {
-      RECOVERY_CODE='INTERLOCK_RELEASE_DAEMON_RELOAD_FAILED'
-      return 1
-    }
+    release_interlock "$transaction" || return 1
   fi
   supersede_operator_transactions "$transaction" || return 1
   write_phase "$transaction" committed || {
@@ -979,6 +993,13 @@ for runtime_record in runtime-before runtime-identity; do
   durable_file "$preparing_dir/$runtime_record"
 done
 
+install_interlock "$preparing_dir" || fail "$RECOVERY_CODE"
+interlock_is_safe "$preparing_dir" || fail 'INTERLOCK_VERIFY_FAILED'
+if ! systemctl daemon-reload; then
+  fail 'INTERLOCK_DAEMON_RELOAD_FAILED'
+fi
+interlock_is_safe "$preparing_dir" || fail 'INTERLOCK_VERIFY_FAILED'
+
 write_phase "$preparing_dir" prepared || fail 'TRANSACTION_SYNC_FAILED'
 durable_directory "$preparing_dir/snapshot"
 durable_directory "$preparing_dir/backups"
@@ -1014,6 +1035,7 @@ for asset_id in $ASSET_IDS; do
   verify_bound_parent "$backup_dir" "$asset_id" || fail "$RECOVERY_CODE"
 done
 
+# TEST_FAULT_POINT_BEFORE_FIRST_RUNTIME_REPLACE
 for asset_id in $INSTALL_IDS; do
   verify_bound_parent "$backup_dir" "$asset_id" || fail "$RECOVERY_CODE"
   temporary=$(stage_path "$asset_id")
@@ -1067,18 +1089,16 @@ fi
 if ! "$(asset_target wrapper)" verify-bridge-netfilter; then
   fail 'RUNTIME_VERIFY_FAILED'
 fi
+if ! verify_bridge_prerequisites; then
+  fail 'RUNTIME_VERIFY_FAILED'
+fi
 if ! systemctl daemon-reload; then
   fail 'DAEMON_RELOAD_FAILED'
 fi
-if [ -n "$operator_transactions" ] || [ -e "$INTERLOCK_TARGET" ] || [ -L "$INTERLOCK_TARGET" ]; then
-  write_phase "$backup_dir" safe-committed || fail 'TRANSACTION_SYNC_FAILED'
-  # TEST_FAULT_POINT_AFTER_SAFE_COMMIT_BEFORE_INTERLOCK_REMOVE
-  remove_interlock "$backup_dir" || fail "$RECOVERY_CODE"
-  if ! systemctl daemon-reload; then
-    fail 'INTERLOCK_RELEASE_DAEMON_RELOAD_FAILED'
-  fi
-  supersede_operator_transactions "$backup_dir" || fail "$RECOVERY_CODE"
-fi
+write_phase "$backup_dir" safe-committed || fail 'TRANSACTION_SYNC_FAILED'
+# TEST_FAULT_POINT_AFTER_SAFE_COMMIT_BEFORE_INTERLOCK_REMOVE
+release_interlock "$backup_dir" || fail "$RECOVERY_CODE"
+supersede_operator_transactions "$backup_dir" || fail "$RECOVERY_CODE"
 write_phase "$backup_dir" committed || fail 'TRANSACTION_SYNC_FAILED'
 transaction_committed='1'
 printf 'KINVEST_METADATA_FIREWALL_INSTALL_OK backup=%s\n' "$backup_dir"

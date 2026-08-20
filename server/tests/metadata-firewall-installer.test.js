@@ -143,11 +143,19 @@ fi
     path.join(bin, 'systemctl'),
     `#!/bin/sh
 printf 'systemctl:%s\\n' "$*" >> "$KINVEST_TEST_OPERATIONS"
+if [ -n "\${KINVEST_TEST_INTERLOCK_PATH:-}" ]; then
+  interlock_state=absent
+  [ ! -f "$KINVEST_TEST_INTERLOCK_PATH" ] || interlock_state=present
+  printf 'systemctl-interlock:%s\\n' "$interlock_state" >> "$KINVEST_TEST_OPERATIONS"
+fi
 counter_file="$KINVEST_TEST_OPERATIONS.systemctl-count"
 count=0
 [ ! -f "$counter_file" ] || count=$(cat "$counter_file")
 count=$((count + 1))
 printf '%s\\n' "$count" > "$counter_file"
+[ -z "\${KINVEST_TEST_FAIL_DAEMON_RELOAD_ON:-}" ] || case ",\$KINVEST_TEST_FAIL_DAEMON_RELOAD_ON," in
+  *",$count,"*) exit 1 ;;
+esac
 [ "\${KINVEST_TEST_FAIL_DAEMON_RELOAD:-0}" != '1' ] || exit 1
 [ "$count" -gt "\${KINVEST_TEST_FAIL_DAEMON_RELOAD_COUNT:-0}" ]
 `
@@ -158,6 +166,9 @@ printf '%s\\n' "$count" > "$counter_file"
 set -eu
 [ "\${1:-}" = '-fT' ] && shift
 [ "\${1:-}" = '--' ] && shift
+[ -z "\${KINVEST_TEST_FAIL_MV_MATCH:-}" ] || case "$*" in
+  *"$KINVEST_TEST_FAIL_MV_MATCH"*) exit 1 ;;
+esac
 exec /bin/mv -f "$@"
 `
   )
@@ -269,6 +280,7 @@ function runInstaller(context, extraEnv = {}, sourceRoot = context.sourceRoot) {
       ...process.env,
       ...extraEnv,
       KINVEST_TEST_OPERATIONS: context.operations,
+      KINVEST_TEST_INTERLOCK_PATH: interlockPath(context),
       KINVEST_TEST_RUNTIME_SYSCTL: context.runtimeSysctl,
       KINVEST_TEST_RUNTIME_MODULE_PATH: context.runtimeModule
     }
@@ -334,6 +346,7 @@ async function run() {
   assert.match(installer, /sysctl --load/)
   assert.match(installer, /verify-bridge-netfilter/)
   assert.match(installer, /systemctl daemon-reload/)
+  assert.match(installer, /# TEST_FAULT_POINT_BEFORE_FIRST_RUNTIME_REPLACE/)
   assert.doesNotMatch(installer, /systemctl\s+(?:start|restart|stop|enable)|docker\s|compose\s/)
   const runner = fs.readFileSync(path.join(rootDir, 'server/tests/run-tests.js'), 'utf8')
   assert.equal((runner.match(/require\('\.\/metadata-firewall-installer[.]test'\)/g) || []).length, 1)
@@ -354,6 +367,10 @@ async function run() {
     assert.match(log, new RegExp(`^sysctl:--load ${success.targetRoot}/etc/sysctl[.]d/90-kinvest-br-netfilter[.]conf$`, 'm'))
     assert.match(log, /^wrapper:verify-bridge-netfilter$/m)
     assert.match(log, /^systemctl:daemon-reload$/m)
+    assert.deepEqual(
+      [...log.matchAll(/^systemctl-interlock:(present|absent)$/gm)].map((match) => match[1]),
+      ['present', 'present', 'absent']
+    )
     assert.doesNotMatch(log, /systemctl:(?:start|restart|stop|enable)|docker|compose/)
     assert.equal(backupDirectories(success).length, 1)
     const record = path.join(
@@ -398,9 +415,10 @@ async function run() {
       assertOriginalState(context, assets.map((asset) => asset.id))
       assert.equal(backupDirectories(context).length, 1)
       assert.match(operations(context), /^systemctl:daemon-reload$/m)
+      assertInterlock(context)
+      assert.deepEqual(transactionPhases(context), ['operator-required'])
       if (failure.code !== 'MODULE_LOAD_FAILED') {
         assert.doesNotMatch(operations(context), /^original-wrapper:verify-bridge-netfilter$/m)
-        assert.match(result.stderr, /KINVEST_METADATA_FIREWALL_RECOVERY_STATUS files=ok runtime=ok daemon_reload=ok phase=recovered/)
         assert.equal(fs.readFileSync(context.runtimeSysctl, 'utf8'), '1\n')
       }
       assert.doesNotMatch(operations(context), /systemctl:(?:start|restart|stop|enable)|docker|compose/)
@@ -438,24 +456,22 @@ async function run() {
     )
     assert.match(
       result.stderr,
-      /KINVEST_METADATA_FIREWALL_RECOVERY_STATUS files=ok runtime=ok daemon_reload=ok phase=recovered/
+      /KINVEST_METADATA_FIREWALL_RECOVERY_STATUS files=ok runtime=ok daemon_reload=ok phase=operator-required/
     )
+    assertInterlock(productionFdIdentity)
   })
 
-  const initialDaemonReloadFailure = createFixture(installer)
-  withFixture(initialDaemonReloadFailure, () => {
-    const result = runInstaller(initialDaemonReloadFailure, {
-      KINVEST_TEST_FAIL_DAEMON_RELOAD_COUNT: '1'
+  const interlockDaemonReloadFailure = createFixture(installer)
+  withFixture(interlockDaemonReloadFailure, () => {
+    const result = runInstaller(interlockDaemonReloadFailure, {
+      KINVEST_TEST_FAIL_DAEMON_RELOAD_ON: '1'
     })
     assert.notEqual(result.status, 0)
-    assert.match(result.stderr, /code=DAEMON_RELOAD_FAILED/)
-    assert.match(
-      result.stderr,
-      /KINVEST_METADATA_FIREWALL_RECOVERY_STATUS files=ok runtime=ok daemon_reload=ok phase=recovered/
-    )
-    assertOriginalState(initialDaemonReloadFailure, assets.map((asset) => asset.id))
-    assert.equal(fs.readFileSync(initialDaemonReloadFailure.runtimeSysctl, 'utf8'), '1\n')
-    assert.equal((operations(initialDaemonReloadFailure).match(/^systemctl:daemon-reload$/gm) || []).length, 2)
+    assert.match(result.stderr, /code=INTERLOCK_DAEMON_RELOAD_FAILED/)
+    assertInterlock(interlockDaemonReloadFailure)
+    assertOriginalState(interlockDaemonReloadFailure, assets.map((asset) => asset.id))
+    assert.doesNotMatch(operations(interlockDaemonReloadFailure), /^(?:modprobe|sysctl|wrapper):/m)
+    assert.deepEqual(transactionPhases(interlockDaemonReloadFailure), [])
   })
 
   const absentPriorSysctl = createFixture(installer, {
@@ -476,7 +492,7 @@ async function run() {
     assert.equal(fs.readFileSync(absentPriorSysctl.runtimeSysctl, 'utf8'), '1\n')
     assert.equal(fs.existsSync(targetPath(absentPriorSysctl, assets.find((asset) => asset.id === 'sysctl'))), false)
     assert.equal(fs.existsSync(targetPath(absentPriorSysctl, assets.find((asset) => asset.id === 'wrapper'))), false)
-    assert.equal((operations(absentPriorSysctl).match(/^systemctl:daemon-reload$/gm) || []).length, 1)
+    assert.equal((operations(absentPriorSysctl).match(/^systemctl:daemon-reload$/gm) || []).length, 2)
     assertInterlock(absentPriorSysctl)
     assert.deepEqual(transactionPhases(absentPriorSysctl), ['operator-required'])
   })
@@ -528,14 +544,14 @@ async function run() {
   withFixture(operatorRecoveryDaemonFailure, () => {
     const result = runInstaller(operatorRecoveryDaemonFailure, {
       KINVEST_TEST_FAIL_VERIFIER: '1',
-      KINVEST_TEST_FAIL_DAEMON_RELOAD: '1'
+      KINVEST_TEST_FAIL_DAEMON_RELOAD_ON: '2,3'
     })
     assert.notEqual(result.status, 0)
     assert.match(
       result.stderr,
       /KINVEST_METADATA_FIREWALL_RECOVERY_STATUS files=ok runtime=operator-required daemon_reload=failed phase=operator-required/
     )
-    assert.match(result.stderr, /rollback=failed:RECOVERY_OPERATOR_REQUIRED/)
+    assert.match(result.stderr, /rollback=failed:RECOVERY_INCOMPLETE/)
     assertInterlock(operatorRecoveryDaemonFailure)
     assert.deepEqual(transactionPhases(operatorRecoveryDaemonFailure), ['operator-required'])
   })
@@ -543,7 +559,7 @@ async function run() {
   const aggregatedRecoveryFailure = createFixture(installer)
   withFixture(aggregatedRecoveryFailure, () => {
     const result = runInstaller(aggregatedRecoveryFailure, {
-      KINVEST_TEST_FAIL_DAEMON_RELOAD_COUNT: '2',
+      KINVEST_TEST_FAIL_DAEMON_RELOAD_ON: '2,3',
       KINVEST_TEST_REMOVE_MODULE_ON_SYSCTL_CALL: '2'
     })
     assert.notEqual(result.status, 0)
@@ -553,7 +569,7 @@ async function run() {
       /KINVEST_METADATA_FIREWALL_RECOVERY_STATUS files=ok runtime=failed daemon_reload=failed phase=operator-required/
     )
     assert.match(result.stderr, /rollback=failed:RECOVERY_INCOMPLETE/)
-    assert.equal((operations(aggregatedRecoveryFailure).match(/^systemctl:daemon-reload$/gm) || []).length, 2)
+    assert.equal((operations(aggregatedRecoveryFailure).match(/^systemctl:daemon-reload$/gm) || []).length, 3)
     assertOriginalState(aggregatedRecoveryFailure, assets.map((asset) => asset.id))
     assert.equal(fs.readFileSync(aggregatedRecoveryFailure.runtimeSysctl, 'utf8'), '1\n')
     assertInterlock(aggregatedRecoveryFailure)
@@ -570,7 +586,29 @@ async function run() {
     assert.equal(second.status, 0, second.stderr)
     assert.equal(fs.existsSync(interlockPath(laterSafeRerun)), false)
     assert.deepEqual(transactionPhases(laterSafeRerun).sort(), ['committed', 'superseded'])
-    assert.equal((operations(laterSafeRerun).match(/^systemctl:daemon-reload$/gm) || []).length, 3)
+    assert.deepEqual(
+      [...operations(laterSafeRerun).matchAll(/^systemctl-interlock:(present|absent)$/gm)].map((match) => match[1]),
+      ['present', 'present', 'present', 'present', 'absent']
+    )
+  })
+
+  const safeRetryIndependentVerifier = createFixture(installer, {
+    present: assets.filter((asset) => !['wrapper', 'sysctl'].includes(asset.id)).map((asset) => asset.id)
+  })
+  withFixture(safeRetryIndependentVerifier, () => {
+    const first = runInstaller(safeRetryIndependentVerifier, { KINVEST_TEST_FAIL_VERIFIER: '1' })
+    assert.notEqual(first.status, 0)
+    assertInterlock(safeRetryIndependentVerifier)
+    fs.mkdirSync(safeRetryIndependentVerifier.runtimeModule, { recursive: true })
+    fs.writeFileSync(`${safeRetryIndependentVerifier.operations}.sysctl-count`, '0\n')
+    const second = runInstaller(safeRetryIndependentVerifier, {
+      KINVEST_TEST_REMOVE_MODULE_ON_SYSCTL_CALL: '1'
+    })
+    assert.notEqual(second.status, 0)
+    assert.match(second.stderr, /code=RUNTIME_VERIFY_FAILED/)
+    assert.match(operations(safeRetryIndependentVerifier), /^wrapper:verify-bridge-netfilter$/m)
+    assertInterlock(safeRetryIndependentVerifier)
+    assert.ok(transactionPhases(safeRetryIndependentVerifier).includes('operator-required'))
   })
 
   const sourceRace = createFixture(installer)
@@ -619,11 +657,13 @@ async function run() {
   const mixedPresent = ['library', 'service', 'drop-in', 'sysctl']
   const rollback = createFixture(installer, { present: mixedPresent })
   withFixture(rollback, () => {
-    const result = runInstaller(rollback, { KINVEST_TEST_FAIL_DAEMON_RELOAD: '1' })
+    const result = runInstaller(rollback, { KINVEST_TEST_FAIL_DAEMON_RELOAD_ON: '2' })
     assert.notEqual(result.status, 0)
     assert.match(result.stderr, /KINVEST_METADATA_FIREWALL_INSTALL_FAILED code=DAEMON_RELOAD_FAILED backup=/)
     assertOriginalState(rollback, mixedPresent)
     assert.equal(backupDirectories(rollback).length, 1)
+    assertInterlock(rollback)
+    assert.deepEqual(transactionPhases(rollback), ['operator-required'])
     const record = path.join(
       rollback.targetRoot,
       'var/backups/kinvest-metadata-firewall',
@@ -634,6 +674,32 @@ async function run() {
     for (const asset of assets) {
       assert.match(states, new RegExp(`^${asset.id}\\t${mixedPresent.includes(asset.id) ? 'present' : 'absent'}\\t`, 'm'))
     }
+  })
+
+  const restoreFailure = createFixture(installer)
+  withFixture(restoreFailure, () => {
+    const result = runInstaller(restoreFailure, {
+      KINVEST_TEST_FAIL_VERIFIER: '1',
+      KINVEST_TEST_FAIL_MV_MATCH: '.kinvest-metadata-restore-library'
+    })
+    assert.notEqual(result.status, 0)
+    assert.match(result.stderr, /rollback=failed:RECOVERY_INCOMPLETE/)
+    assertInterlock(restoreFailure)
+    assert.deepEqual(transactionPhases(restoreFailure), ['operator-required'])
+  })
+
+  const finalReloadFailure = createFixture(installer)
+  withFixture(finalReloadFailure, () => {
+    const result = runInstaller(finalReloadFailure, {
+      KINVEST_TEST_FAIL_DAEMON_RELOAD_ON: '3,4'
+    })
+    assert.notEqual(result.status, 0)
+    assert.match(result.stderr, /code=INTERLOCK_RELEASE_DAEMON_RELOAD_FAILED/)
+    assertInterlock(finalReloadFailure)
+    assert.ok(transactionPhases(finalReloadFailure).includes('operator-required'))
+    const states = [...operations(finalReloadFailure).matchAll(/^systemctl-interlock:(present|absent)$/gm)]
+      .map((match) => match[1])
+    assert.deepEqual(states.slice(0, 4), ['present', 'present', 'absent', 'present'])
   })
 
   const sourceSymlink = createFixture(installer)
@@ -659,6 +725,25 @@ async function run() {
   })
 
   const replacementOrder = ['drop-in', 'library', 'wrapper', 'service', 'timer', 'modules-load', 'sysctl']
+
+  const beforeFirstReplacement = createFixture(installer)
+  withFixture(beforeFirstReplacement, () => {
+    const marker = '# TEST_FAULT_POINT_BEFORE_FIRST_RUNTIME_REPLACE'
+    const faultScript = path.join(beforeFirstReplacement.fixture, 'crash-before-first-runtime-replace.sh')
+    const baseScript = fs.readFileSync(beforeFirstReplacement.script, 'utf8')
+    assert.match(baseScript, new RegExp(marker))
+    write(faultScript, baseScript.replace(marker, () => 'kill -KILL $$'))
+    assert.notEqual(runInstaller({ ...beforeFirstReplacement, script: faultScript }).status, 0)
+    assertInterlock(beforeFirstReplacement)
+    fs.appendFileSync(path.join(beforeFirstReplacement.sourceRoot, assets[0].source), '# stop after recovery\n')
+    const recovered = runInstaller(beforeFirstReplacement)
+    assert.notEqual(recovered.status, 0)
+    assert.match(recovered.stderr, /code=SOURCE_MANIFEST_INVALID/)
+    assertOriginalState(beforeFirstReplacement, assets.map((asset) => asset.id))
+    assertInterlock(beforeFirstReplacement)
+    assert.ok(transactionPhases(beforeFirstReplacement).includes('operator-required'))
+  })
+
   for (const faultAsset of replacementOrder) {
     const crash = createFixture(installer)
     withFixture(crash, () => {
@@ -674,11 +759,12 @@ async function run() {
       assert.notEqual(recovered.status, 0)
       assert.match(recovered.stderr, /code=SOURCE_MANIFEST_INVALID/)
       assertOriginalState(crash, assets.map((asset) => asset.id))
+      assertInterlock(crash)
       const recoveredPhases = backupDirectories(crash)
         .map((entry) => path.join(crash.targetRoot, 'var/backups/kinvest-metadata-firewall', entry, 'phase'))
         .filter((entry) => fs.existsSync(entry))
         .map((entry) => fs.readFileSync(entry, 'utf8').trim())
-      assert.ok(recoveredPhases.includes('recovered'), `missing recovered phase after ${faultAsset}`)
+      assert.ok(recoveredPhases.includes('operator-required'), `missing operator-required phase after ${faultAsset}`)
     })
   }
 
