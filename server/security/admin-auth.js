@@ -234,7 +234,7 @@ class AdminAuthService {
 
   async reauthenticate(password, rateLimitIdentity) {
     const verified = await this.verifyPasswordWithRateLimit(password, rateLimitIdentity)
-    this.repository.settleRateLimitSuccess({
+    const settled = this.repository.settleRateLimitSuccess({
       reservation: verified.reservation,
       auditEvent: this.auditEvent(
         'admin_password_reauthenticated',
@@ -243,6 +243,7 @@ class AdminAuthService {
         { reason: 'reauthenticated' }
       )
     })
+    if (!settled) fail('ADMIN_AUTH_RATE_LIMITED')
     return { authenticated: true }
   }
 

@@ -9,6 +9,8 @@ const {
 const {
   ADMIN_ABSOLUTE_TTL_MS,
   ADMIN_IDLE_TTL_MS,
+  ADMIN_LOGIN_WINDOW_MS,
+  ADMIN_MAX_FAILURES,
   AdminAuthService
 } = require('../security/admin-auth')
 
@@ -222,6 +224,42 @@ async function testLoginSettlementRollback() {
   `).get()
   assert.strictEqual(rateLimit.failure_count, 0)
   assert.strictEqual(rateLimit.in_flight_count, 1)
+}
+
+async function testStaleReauthenticationSettlementFailsClosed() {
+  const harness = await createHarness()
+  const settleRateLimitSuccess = harness.repository.settleRateLimitSuccess
+    .bind(harness.repository)
+  harness.repository.settleRateLimitSuccess = ({ reservation, auditEvent }) => {
+    harness.clock.value += ADMIN_LOGIN_WINDOW_MS
+    const replacement = harness.repository.reserveAttempt({
+      scope: reservation.scope,
+      keyDigest: reservation.keyDigest,
+      now: harness.clock.value,
+      windowMs: ADMIN_LOGIN_WINDOW_MS,
+      maxAttempts: ADMIN_MAX_FAILURES
+    })
+    assert.strictEqual(replacement.allowed, true)
+    return settleRateLimitSuccess({ reservation, auditEvent })
+  }
+
+  await expectCode(
+    () => harness.service.reauthenticate(PASSWORD, '203.0.113.63'),
+    'ADMIN_AUTH_RATE_LIMITED'
+  )
+  const rateLimit = harness.database.prepare(`
+    SELECT window_started_at, failure_count, in_flight_count
+    FROM auth_rate_limits
+  `).get()
+  assert.strictEqual(rateLimit.window_started_at, harness.clock.value)
+  assert.strictEqual(rateLimit.failure_count, 0)
+  assert.strictEqual(rateLimit.in_flight_count, 1)
+  assert.strictEqual(
+    harness.repository.listAuditEvents().filter(
+      (event) => event.eventType === 'admin_password_reauthenticated'
+    ).length,
+    0
+  )
 }
 
 async function testSecretStorageAndAuditRedaction() {
@@ -480,6 +518,7 @@ async function run() {
   await testMalformedPasswordsCountTowardRateLimit()
   await testRateLimitIdentityValidation()
   await testLoginSettlementRollback()
+  await testStaleReauthenticationSettlementFailsClosed()
   await testSecretStorageAndAuditRedaction()
   await testIdleAbsoluteExpiryAndLogout()
   await testCsrfAndReauthentication()
@@ -497,5 +536,6 @@ module.exports = {
   testMalformedPasswordsCountTowardRateLimit,
   testParsedVerifierBuffersAreCleared,
   testRateLimitIdentityValidation,
-  testRejectedCsrfDoesNotTouchSession
+  testRejectedCsrfDoesNotTouchSession,
+  testStaleReauthenticationSettlementFailsClosed
 }
