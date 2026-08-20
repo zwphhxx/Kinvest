@@ -6,6 +6,7 @@ const os = require('node:os')
 const path = require('node:path')
 
 const rootDir = path.resolve(__dirname, '../..')
+const productionFdIdentitySupported = process.platform === 'linux' && fs.existsSync('/proc/self/fd')
 const manifestRelativePath = 'deploy/server/metadata-firewall-assets.sha256'
 const assets = [
   {
@@ -207,7 +208,7 @@ printf 'original-wrapper:%s\\n' "$*" >> "$KINVEST_TEST_OPERATIONS"
 
 function createFixture(installer, {
   present = assets.map((asset) => asset.id),
-  productionFdIdentity = false
+  productionFdIdentity = productionFdIdentitySupported
 } = {}) {
   const fixture = fs.realpathSync(fs.mkdtempSync(path.join(os.tmpdir(), 'kinvest-metadata-installer-')))
   const sourceRoot = path.join(fixture, 'verified-source')
@@ -355,6 +356,14 @@ async function run() {
   assert.match(runner, /fs[.]rmSync\(pythonBytecodeCachePath, \{ recursive: true, force: true \}\)/)
 
   const success = createFixture(installer)
+  const successScript = fs.readFileSync(success.script, 'utf8')
+  if (productionFdIdentitySupported) {
+    assert.match(successScript, /^RUNTIME_FD_ROOT='\/proc\/self\/fd'$/m)
+    assert.match(successScript, /^RUNTIME_FD_IDENTITY_MODE='device-inode'$/m)
+  } else {
+    assert.match(successScript, /^RUNTIME_FD_ROOT='\/dev\/fd'$/m)
+    assert.match(successScript, /^RUNTIME_FD_IDENTITY_MODE='inode-only'$/m)
+  }
   withFixture(success, () => {
     const result = runInstaller(success)
     assert.equal(result.status, 0, result.stderr)
