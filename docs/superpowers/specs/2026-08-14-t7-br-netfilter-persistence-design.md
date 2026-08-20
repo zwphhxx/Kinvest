@@ -83,6 +83,7 @@ Installation rules:
 
 - Verify source hashes and syntax before changing the host.
 - Back up existing files and record whether each new file was previously absent.
+- Make the independent Docker recovery interlock the first durable target-side change. Atomically install and sync it in the identity-bound Docker drop-in directory, run `daemon-reload`, and verify its exact contract before writing an incomplete transaction phase or staging/replacing any runtime asset.
 - Install with same-filesystem temporary files and atomic rename.
 - Load `br_netfilter`, apply only the Kinvest sysctl file, and verify the exact runtime values.
 - On Linux, compare the opened sysctl file descriptor with the validated path by device and inode using explicitly dereferenced `stat -L`; keep the original path's non-symlink and before/after identity checks.
@@ -93,12 +94,13 @@ Rollback rules:
 - Restore every replaced file from the timestamped backup.
 - Remove a newly introduced file only when the manifest proves it was absent before installation.
 - Reload the previous module/sysctl configuration where possible.
+- Retain the durable Docker interlock for every incomplete or failed transaction, including file-restore, module, sysctl, wrapper, independent verifier, phase, and `daemon-reload` failures.
 - Keep Docker stopped if the previous configuration cannot prove bridge traffic is filtered.
 - Never use a successful command exit as a substitute for a real metadata-denial probe.
 
-An absent or unsafe prior persistent sysctl, a failed prior-config reload, or an unsafe prior runtime value is not an automatically recovered state. Rollback preserves the live value `1`, retains the timestamped backup and transaction, records phase `operator-required`, and exits nonzero with a stable diagnostic. Before attempting `daemon-reload`, it atomically installs and durably syncs `/etc/systemd/system/docker.service.d/00-kinvest-metadata-recovery-interlock.conf` as root-owned mode `0644`; its self-contained `ExecStartPre=/bin/false` blocks Docker without invoking repository code, including after reboot if systemd has not reloaded successfully.
+An absent or unsafe prior persistent sysctl, a failed prior-config reload, or an unsafe prior runtime value is not an automatically recovered state. Rollback preserves the live value `1`, retains the timestamped backup and transaction, records phase `operator-required`, and exits nonzero with a stable diagnostic. Every transaction first atomically installs and durably syncs `/etc/systemd/system/docker.service.d/00-kinvest-metadata-recovery-interlock.conf` as root-owned mode `0644`, reloads systemd, and verifies its exact contents before the transaction can become incomplete. Its self-contained `ExecStartPre=/bin/false` blocks Docker without invoking repository code, including after reboot if a later systemd reload fails.
 
-A later installer invocation may safely supersede an `operator-required` transaction. The interlock remains in place until all new persistent assets are durable, the trusted wrapper and direct bridge prerequisites pass, and `daemon-reload` succeeds. The installer then durably records `safe-committed`, removes only the exact validated interlock, reloads systemd again, marks retained operator transactions `superseded`, and finally records `committed`. Crash recovery resumes from `safe-committed`; it never marks a partial rollback `recovered` and never unblocks Docker before a durable safe state exists.
+A later installer invocation may safely supersede an `operator-required` transaction. There is one interlock-removal invariant: all exact files must be durable; the persistent module and sysctl assets must be safe; `modprobe` and the exact sysctl load must succeed; both the installed wrapper and the installer's independent `stat -L` bridge-prerequisite verifier must pass; and a first `daemon-reload` must succeed while the interlock remains present. Only then may the installer durably record `safe-committed`, atomically remove and sync the exact validated interlock, and perform the final `daemon-reload`. If that final reload fails, the installer immediately recreates and syncs the interlock, attempts to reload it, retains an incomplete/operator-required phase, and exits nonzero. Only a successful final reload allows older operator transactions to become `superseded` and the new transaction to become `committed`. Crash recovery resumes from `safe-committed`; it never marks a partial rollback `recovered` and never unblocks Docker before a durable safe state exists.
 
 ## Automated test design
 
@@ -115,6 +117,8 @@ Tests are written before implementation and must first fail for the missing beha
 - A failed non-ignored `ExecStartPost` reconciliation stops the modeled Docker service and leaves or reinstalls the boot guard instead of serving unprotected.
 - Successful post-start reconciliation ends with the exact deny-all chain and removes the boot guard only after the permanent policy is verified.
 - The installer manages module, sysctl, drop-in, hashes, modes, backup, and rollback without starting Docker.
+- A crash immediately before the first runtime replacement still leaves the durable interlock, and reinvocation cannot release it without satisfying the single removal invariant.
+- Module, restore, verifier, and consecutive reload failures retain the interlock; a failed final release reload recreates it before returning failure.
 - PR `verify`, `security`, and `container-build` checks remain secret-free.
 
 ## Controlled production recovery

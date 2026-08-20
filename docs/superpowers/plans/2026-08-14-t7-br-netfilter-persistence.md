@@ -293,7 +293,7 @@ assert.match(operations, /^systemctl:daemon-reload$/m)
 assert.doesNotMatch(operations, /systemctl:(?:start|restart):?docker/)
 ```
 
-Add failure cases for a manifest mismatch, module-load failure, sysctl failure, and prerequisite-verification failure. Assert previous assets are restored and absent assets are removed only when the backup manifest marks them absent. Add production-mode Linux fd identity coverage proving `stat -L` compares device and inode for the opened sysctl target. Model absent, unsafe, reload-failed, and unsafe-runtime prior states as operator-required failures with runtime value `1`, retained transaction state, and an independent Docker-start interlock. Cover recovery `daemon-reload` failure, later safe supersession, and crashes before every asset replacement and before interlock release.
+Add failure cases for a manifest mismatch, module-load failure, sysctl failure, prerequisite-verification failure, file-restore failure, consecutive `daemon-reload` failures, and final interlock-release reload failure. Assert previous assets are restored and absent assets are removed only when the backup manifest marks them absent. Add production-mode Linux fd identity coverage proving `stat -L` compares device and inode for the opened sysctl target. Model absent, unsafe, reload-failed, and unsafe-runtime prior states as operator-required failures with runtime value `1`, retained transaction state, and an independent Docker-start interlock. Cover initial interlock reload failure, ordinary safe-retry independent verification, later safe supersession, a crash immediately before the first runtime replacement, crashes after every asset replacement, and a crash before interlock release.
 
 - [ ] **Step 2: Register the test and observe RED**
 
@@ -326,13 +326,18 @@ test "$(id -u)" -eq 0
 cd "$source_root"
 sha256sum -c deploy/server/metadata-firewall-assets.sha256
 install -d -o root -g root -m 0700 "$backup_dir"
-# Record present/absent state, copy existing assets, then stage every replacement.
+# Record present/absent state, capture immutable sources, and bind target parents.
+# Atomically install and sync the exact Docker interlock as the first durable
+# target-side change; daemon-reload and verify it before writing an incomplete phase.
+# Record prepared/installing, then stage every replacement.
 # Verify staged modes and shell syntax.
 # Atomically rename staged files into their target directories.
 modprobe br_netfilter
 sysctl --load /etc/sysctl.d/90-kinvest-br-netfilter.conf
 /usr/local/sbin/kinvest-metadata-firewall verify-bridge-netfilter
-systemctl daemon-reload
+# Independently verify module/sysctl path and opened-fd identity with stat -L.
+systemctl daemon-reload  # interlock still present
+# Record safe-committed, atomically remove and sync the interlock, then reload again.
 ```
 
 Target mappings are fixed in the script:
@@ -356,7 +361,9 @@ If the old persistent sysctl is absent or unsafe, reloading it fails, or the pri
 ExecStartPre=/bin/false
 ```
 
-The fixed path is `/etc/systemd/system/docker.service.d/00-kinvest-metadata-recovery-interlock.conf`. It is deliberately independent of the restored wrapper and blocks Docker after reboot even when `daemon-reload` fails during recovery. A later invocation keeps the interlock until the replacement assets are durable, the installed wrapper and direct module/sysctl verification pass, and the first `daemon-reload` succeeds. It then records `safe-committed`, removes the exact validated interlock, performs a second `daemon-reload`, marks older operator transactions `superseded`, and records `committed`. An interrupted `safe-committed` transaction is completed before any new transaction begins; a partial rollback is never marked `recovered`.
+The fixed path is `/etc/systemd/system/docker.service.d/00-kinvest-metadata-recovery-interlock.conf`. It is deliberately independent of the restored wrapper and blocks Docker after reboot even when `daemon-reload` fails during recovery. It is the first durable target-side change and must be loaded and verified before any incomplete transaction phase or runtime staging/replacement. Every incomplete or failed state retains it.
+
+The single removal invariant requires exact durable files, safe persistent module/sysctl assets, successful `modprobe` and exact sysctl load, successful installed-wrapper verification, successful independent `stat -L` bridge-prerequisite verification, and a successful first `daemon-reload` while the interlock remains present. The installer then records `safe-committed`, removes and syncs only the exact validated interlock, and performs a second `daemon-reload`. If that reload fails, it immediately recreates and syncs the interlock, attempts another reload, retains an incomplete/operator-required phase, and exits nonzero. Only after a successful final reload may it mark older operator transactions `superseded` and the new transaction `committed`. An interrupted `safe-committed` transaction is completed before any new transaction begins; a partial rollback is never marked `recovered`.
 
 - [ ] **Step 4: Generate the exact asset manifest**
 
