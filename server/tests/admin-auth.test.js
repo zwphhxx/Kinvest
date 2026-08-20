@@ -128,10 +128,12 @@ async function testConcurrentAttemptReservations() {
   const harness = await createHarness()
   const originalScrypt = crypto.scrypt
   let scryptCalls = 0
-  crypto.scrypt = (...arguments_) => {
+  /** @type {typeof crypto.scrypt} */
+  const countingScrypt = (...arguments_) => {
     scryptCalls += 1
-    return originalScrypt(...arguments_)
+    return Reflect.apply(originalScrypt, crypto, arguments_)
   }
+  crypto.scrypt = countingScrypt
   let results
   try {
     results = await Promise.allSettled([
@@ -144,7 +146,15 @@ async function testConcurrentAttemptReservations() {
     crypto.scrypt = originalScrypt
   }
 
-  const codes = results.map((result) => result.reason.code)
+  const codes = results.map((result) => {
+    if (result.status !== 'rejected') {
+      assert.fail('concurrent wrong password attempt unexpectedly succeeded')
+    }
+    const reason = result.reason
+    return reason !== null && typeof reason === 'object' && 'code' in reason
+      ? reason.code
+      : undefined
+  })
   assert.strictEqual(
     codes.filter((code) => code === 'ADMIN_AUTH_INVALID').length,
     10
@@ -384,11 +394,11 @@ async function testRejectedCsrfDoesNotTouchSession() {
     FROM admin_sessions
     WHERE session_id = ?
   `)
-  const countAuthenticatedAudit = () => harness.database.prepare(`
+  const countAuthenticatedAudit = () => Number(harness.database.prepare(`
     SELECT COUNT(*) AS count
     FROM admin_auth_audit
     WHERE event_type = 'admin_session_authenticated'
-  `).get().count
+  `).get().count)
   const beforeSession = selectSession.get(login.sessionId)
   const beforeAuditCount = countAuthenticatedAudit()
 
@@ -488,7 +498,8 @@ async function testParsedVerifierBuffersAreCleared() {
       repository,
       adminVerifierMaterial: 'synthetic',
       rateLimitKey: 'short'
-    }), (error) => error.code === 'ADMIN_AUTH_CONFIG_INVALID')
+    }), (error) => error !== null && typeof error === 'object' &&
+      'code' in error && error.code === 'ADMIN_AUTH_CONFIG_INVALID')
     assert.strictEqual(failureDigest.every((value) => value === 0), true)
     assert.strictEqual(failureSalt.every((value) => value === 0), true)
   } finally {
