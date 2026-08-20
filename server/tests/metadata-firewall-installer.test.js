@@ -6,7 +6,17 @@ const os = require('node:os')
 const path = require('node:path')
 
 const rootDir = path.resolve(__dirname, '../..')
-const productionFdIdentitySupported = process.platform === 'linux' && fs.existsSync('/proc/self/fd')
+
+function requireProductionFdIdentityOnLinux(platform, procFdRootExists) {
+  if (platform !== 'linux') return false
+  assert.equal(procFdRootExists, true, 'Linux installer tests require /proc/self/fd')
+  return true
+}
+
+const productionFdIdentitySupported = requireProductionFdIdentityOnLinux(
+  process.platform,
+  fs.existsSync('/proc/self/fd')
+)
 const manifestRelativePath = 'deploy/server/metadata-firewall-assets.sha256'
 const assets = [
   {
@@ -336,6 +346,11 @@ function withFixture(context, callback) {
 }
 
 async function run() {
+  assert.throws(
+    () => requireProductionFdIdentityOnLinux('linux', false),
+    /Linux installer tests require \/proc\/self\/fd/
+  )
+
   const installerPath = path.join(rootDir, 'deploy/server/install-metadata-firewall.sh')
   const installer = fs.readFileSync(installerPath, 'utf8')
   assert.notEqual(fs.statSync(installerPath).mode & 0o111, 0, 'installer must be executable')
