@@ -158,7 +158,6 @@ class AdminAuthService {
 
   async verifyPasswordWithRateLimit(password, clientAddress) {
     this.assertConfigured()
-    this.validatePassword(password)
     const keyDigest = this.addressDigest(clientAddress)
     const now = this.now()
     const rateLimit = this.repository.getRateLimit(RATE_LIMIT_SCOPE, keyDigest)
@@ -166,7 +165,16 @@ class AdminAuthService {
       fail('ADMIN_AUTH_RATE_LIMITED')
     }
 
-    if (!await this.passwordMatches(password)) {
+    let passwordIsValid = true
+    try {
+      this.validatePassword(password)
+    } catch (error) {
+      if (!(error instanceof AdminAuthError) || error.code !== 'ADMIN_AUTH_INVALID') {
+        throw error
+      }
+      passwordIsValid = false
+    }
+    if (!passwordIsValid || !await this.passwordMatches(password)) {
       this.repository.recordRateLimitFailure({
         scope: RATE_LIMIT_SCOPE,
         keyDigest,
@@ -274,7 +282,7 @@ class AdminAuthService {
   }
 
   verifyCsrf(sessionToken, csrfToken) {
-    const session = this.getActiveSession(sessionToken, true)
+    const session = this.getActiveSession(sessionToken, false)
     const csrfDigest = digestPublicToken(csrfToken)
     if (!csrfDigest) fail('ADMIN_CSRF_INVALID')
     const expected = Buffer.from(session.csrfDigest, 'base64url')
@@ -284,6 +292,18 @@ class AdminAuthService {
     expected.fill(0)
     actual.fill(0)
     if (!valid) fail('ADMIN_CSRF_INVALID')
+    const updated = this.repository.updateSessionUsage(
+      session.sessionId,
+      session.lastUsedAt,
+      session.idleExpiresAt,
+      this.auditEvent(
+        'admin_session_authenticated',
+        session.lastUsedAt,
+        session.sessionId,
+        { sessionId: session.sessionId }
+      )
+    )
+    if (!updated) fail('ADMIN_SESSION_INVALID')
     return true
   }
 

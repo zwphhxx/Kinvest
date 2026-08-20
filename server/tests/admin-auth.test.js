@@ -122,6 +122,32 @@ async function testRateLimitIsolationAndReset() {
   }
 }
 
+async function testMalformedPasswordsCountTowardRateLimit() {
+  const harness = await createHarness()
+  const clientAddress = '203.0.113.50'
+  const malformedPasswords = [
+    '',
+    'x'.repeat(129),
+    '\u{1f600}'.repeat(129),
+    null,
+    ''
+  ]
+  for (const password of malformedPasswords) {
+    await expectCode(
+      () => harness.service.reauthenticate(password, clientAddress),
+      'ADMIN_AUTH_INVALID'
+    )
+  }
+  await expectCode(
+    () => harness.service.reauthenticate(PASSWORD, clientAddress),
+    'ADMIN_AUTH_RATE_LIMITED'
+  )
+  assert.deepStrictEqual(
+    await harness.service.reauthenticate(PASSWORD, '203.0.113.51'),
+    { authenticated: true }
+  )
+}
+
 async function testSecretStorageAndAuditRedaction() {
   const harness = await createHarness()
   const login = await harness.service.login(PASSWORD, '2001:db8::1234')
@@ -233,6 +259,43 @@ async function testCsrfAndReauthentication() {
   )
 }
 
+async function testRejectedCsrfDoesNotTouchSession() {
+  const harness = await createHarness()
+  const login = await harness.service.login(PASSWORD, '198.51.100.31')
+  const selectSession = harness.database.prepare(`
+    SELECT last_used_at, idle_expires_at
+    FROM admin_sessions
+    WHERE session_id = ?
+  `)
+  const countAuthenticatedAudit = () => harness.database.prepare(`
+    SELECT COUNT(*) AS count
+    FROM admin_auth_audit
+    WHERE event_type = 'admin_session_authenticated'
+  `).get().count
+  const beforeSession = selectSession.get(login.sessionId)
+  const beforeAuditCount = countAuthenticatedAudit()
+
+  harness.clock.value += 5 * 60 * 1000
+  await expectCode(
+    () => harness.service.verifyCsrf(login.sessionToken, 'wrong-csrf'),
+    'ADMIN_CSRF_INVALID'
+  )
+  assert.deepStrictEqual(selectSession.get(login.sessionId), beforeSession)
+  assert.strictEqual(countAuthenticatedAudit(), beforeAuditCount)
+
+  assert.strictEqual(
+    harness.service.verifyCsrf(login.sessionToken, login.csrfToken),
+    true
+  )
+  const afterValidCsrf = selectSession.get(login.sessionId)
+  assert.strictEqual(afterValidCsrf.last_used_at, harness.clock.value)
+  assert.strictEqual(
+    afterValidCsrf.idle_expires_at,
+    harness.clock.value + ADMIN_IDLE_TTL_MS
+  )
+  assert.strictEqual(countAuthenticatedAudit(), beforeAuditCount + 1)
+}
+
 async function testClearIsIdempotent() {
   const harness = await createHarness()
   harness.service.clear()
@@ -250,10 +313,16 @@ async function testClearIsIdempotent() {
 async function run() {
   await testPasswordMatchingAndValidation()
   await testRateLimitIsolationAndReset()
+  await testMalformedPasswordsCountTowardRateLimit()
   await testSecretStorageAndAuditRedaction()
   await testIdleAbsoluteExpiryAndLogout()
   await testCsrfAndReauthentication()
+  await testRejectedCsrfDoesNotTouchSession()
   await testClearIsIdempotent()
 }
 
-module.exports = { run }
+module.exports = {
+  run,
+  testMalformedPasswordsCountTowardRateLimit,
+  testRejectedCsrfDoesNotTouchSession
+}
