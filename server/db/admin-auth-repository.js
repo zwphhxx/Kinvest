@@ -21,6 +21,7 @@ function mapRateLimit(row) {
     keyDigest: row.key_digest,
     windowStartedAt: row.window_started_at,
     failureCount: row.failure_count,
+    inFlightCount: row.in_flight_count,
     blockedUntil: row.blocked_until
   }
 }
@@ -66,6 +67,7 @@ class AdminAuthRepository {
         key_digest TEXT NOT NULL,
         window_started_at INTEGER NOT NULL,
         failure_count INTEGER NOT NULL,
+        in_flight_count INTEGER NOT NULL DEFAULT 0,
         blocked_until INTEGER,
         PRIMARY KEY (scope, key_digest)
       );
@@ -78,6 +80,15 @@ class AdminAuthRepository {
         metadata_json TEXT NOT NULL
       );
     `)
+    const rateLimitColumns = this.database.prepare(
+      'PRAGMA table_info(auth_rate_limits)'
+    ).all()
+    if (!rateLimitColumns.some((column) => column.name === 'in_flight_count')) {
+      this.database.exec(`
+        ALTER TABLE auth_rate_limits
+        ADD COLUMN in_flight_count INTEGER NOT NULL DEFAULT 0
+      `)
+    }
   }
 
   withImmediateTransaction(operation) {
@@ -152,11 +163,23 @@ class AdminAuthRepository {
     })
   }
 
-  completeLogin({ scope, keyDigest, session, auditEvent }) {
+  completeLogin({ reservation, session, auditEvent }) {
     return this.withImmediateTransaction(() => {
-      this.database.prepare(
-        'DELETE FROM auth_rate_limits WHERE scope = ? AND key_digest = ?'
-      ).run(scope, keyDigest)
+      const settlement = this.database.prepare(`
+        UPDATE auth_rate_limits
+        SET failure_count = 0,
+            in_flight_count = in_flight_count - 1,
+            blocked_until = NULL
+        WHERE scope = ? AND key_digest = ? AND window_started_at = ?
+          AND in_flight_count > 0
+      `).run(
+        reservation.scope,
+        reservation.keyDigest,
+        reservation.windowStartedAt
+      )
+      if (settlement.changes !== 1) {
+        throw new Error('Admin authentication reservation is unavailable')
+      }
       this.insertSession(session)
       this.insertAudit(auditEvent)
       return mapSession(this.database.prepare(
@@ -197,37 +220,97 @@ class AdminAuthRepository {
 
   getRateLimit(scope, keyDigest) {
     return mapRateLimit(this.database.prepare(`
-      SELECT scope, key_digest, window_started_at, failure_count, blocked_until
+      SELECT scope, key_digest, window_started_at, failure_count,
+             in_flight_count, blocked_until
       FROM auth_rate_limits
       WHERE scope = ? AND key_digest = ?
     `).get(scope, keyDigest))
   }
 
-  recordRateLimitFailure({
+  reserveAttempt({ scope, keyDigest, now, windowMs, maxAttempts }) {
+    return this.withImmediateTransaction(() => {
+      let rateLimit = this.getRateLimit(scope, keyDigest)
+      if (!rateLimit || now >= rateLimit.windowStartedAt + windowMs) {
+        this.database.prepare(`
+          INSERT INTO auth_rate_limits (
+            scope, key_digest, window_started_at, failure_count,
+            in_flight_count, blocked_until
+          ) VALUES (?, ?, ?, 0, 0, NULL)
+          ON CONFLICT(scope, key_digest) DO UPDATE SET
+            window_started_at = excluded.window_started_at,
+            failure_count = 0,
+            in_flight_count = 0,
+            blocked_until = NULL
+        `).run(scope, keyDigest, now)
+        rateLimit = {
+          scope,
+          keyDigest,
+          windowStartedAt: now,
+          failureCount: 0,
+          inFlightCount: 0,
+          blockedUntil: null
+        }
+      }
+
+      const blocked = rateLimit.blockedUntil !== null &&
+        now < rateLimit.blockedUntil
+      if (blocked || rateLimit.failureCount + rateLimit.inFlightCount >= maxAttempts) {
+        return {
+          allowed: false,
+          scope,
+          keyDigest,
+          windowStartedAt: rateLimit.windowStartedAt
+        }
+      }
+      this.database.prepare(`
+        UPDATE auth_rate_limits
+        SET in_flight_count = in_flight_count + 1
+        WHERE scope = ? AND key_digest = ? AND window_started_at = ?
+      `).run(scope, keyDigest, rateLimit.windowStartedAt)
+      return {
+        allowed: true,
+        scope,
+        keyDigest,
+        windowStartedAt: rateLimit.windowStartedAt
+      }
+    })
+  }
+
+  settleRateLimitFailure({
+    reservation,
     scope,
     keyDigest,
-    now,
     windowMs,
     maxFailures,
     auditEvent
   }) {
     return this.withImmediateTransaction(() => {
-      const existing = this.getRateLimit(scope, keyDigest)
-      const inWindow = existing && now < existing.windowStartedAt + windowMs
-      const windowStartedAt = inWindow ? existing.windowStartedAt : now
-      const failureCount = (inWindow ? existing.failureCount : 0) + 1
+      const effectiveScope = reservation ? reservation.scope : scope
+      const effectiveKeyDigest = reservation ? reservation.keyDigest : keyDigest
+      const windowStartedAt = reservation.windowStartedAt
+      const existing = this.getRateLimit(effectiveScope, effectiveKeyDigest)
+      if (!existing || existing.windowStartedAt !== windowStartedAt ||
+        existing.inFlightCount < 1) {
+        return null
+      }
+      const failureCount = existing.failureCount + 1
       const blockedUntil = failureCount >= maxFailures
         ? windowStartedAt + windowMs
         : null
       this.database.prepare(`
-        INSERT INTO auth_rate_limits (
-          scope, key_digest, window_started_at, failure_count, blocked_until
-        ) VALUES (?, ?, ?, ?, ?)
-        ON CONFLICT(scope, key_digest) DO UPDATE SET
-          window_started_at = excluded.window_started_at,
-          failure_count = excluded.failure_count,
-          blocked_until = excluded.blocked_until
-      `).run(scope, keyDigest, windowStartedAt, failureCount, blockedUntil)
+        UPDATE auth_rate_limits
+        SET failure_count = ?,
+            in_flight_count = in_flight_count - 1,
+            blocked_until = ?
+        WHERE scope = ? AND key_digest = ? AND window_started_at = ?
+          AND in_flight_count > 0
+      `).run(
+        failureCount,
+        blockedUntil,
+        effectiveScope,
+        effectiveKeyDigest,
+        windowStartedAt
+      )
       this.insertAudit({
         ...auditEvent,
         metadata: {
@@ -235,15 +318,43 @@ class AdminAuthRepository {
           count: failureCount
         }
       })
-      return { scope, keyDigest, windowStartedAt, failureCount, blockedUntil }
+      return {
+        scope: effectiveScope,
+        keyDigest: effectiveKeyDigest,
+        windowStartedAt,
+        failureCount,
+        inFlightCount: existing.inFlightCount - 1,
+        blockedUntil
+      }
+    })
+  }
+
+  settleRateLimitSuccess({ reservation, auditEvent }) {
+    return this.withImmediateTransaction(() => {
+      const result = this.database.prepare(`
+        UPDATE auth_rate_limits
+        SET failure_count = 0,
+            in_flight_count = in_flight_count - 1,
+            blocked_until = NULL
+        WHERE scope = ? AND key_digest = ? AND window_started_at = ?
+          AND in_flight_count > 0
+      `).run(
+        reservation.scope,
+        reservation.keyDigest,
+        reservation.windowStartedAt
+      )
+      if (result.changes === 1) this.insertAudit(auditEvent)
+      return result.changes === 1
     })
   }
 
   clearRateLimit(scope, keyDigest, auditEvent = null) {
     return this.withImmediateTransaction(() => {
-      const result = this.database.prepare(
-        'DELETE FROM auth_rate_limits WHERE scope = ? AND key_digest = ?'
-      ).run(scope, keyDigest)
+      const result = this.database.prepare(`
+        UPDATE auth_rate_limits
+        SET failure_count = 0, blocked_until = NULL
+        WHERE scope = ? AND key_digest = ?
+      `).run(scope, keyDigest)
       if (auditEvent) this.insertAudit(auditEvent)
       return result.changes > 0
     })

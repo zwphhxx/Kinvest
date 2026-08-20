@@ -122,6 +122,38 @@ async function testRateLimitIsolationAndReset() {
   }
 }
 
+async function testConcurrentAttemptReservations() {
+  const harness = await createHarness()
+  const originalScrypt = crypto.scrypt
+  let scryptCalls = 0
+  crypto.scrypt = (...arguments_) => {
+    scryptCalls += 1
+    return originalScrypt(...arguments_)
+  }
+  let results
+  try {
+    results = await Promise.allSettled([
+      ...Array.from({ length: 10 }, () =>
+        harness.service.reauthenticate('wrong', '203.0.113.60')),
+      ...Array.from({ length: 10 }, () =>
+        harness.service.reauthenticate('wrong', '203.0.113.61'))
+    ])
+  } finally {
+    crypto.scrypt = originalScrypt
+  }
+
+  const codes = results.map((result) => result.reason.code)
+  assert.strictEqual(
+    codes.filter((code) => code === 'ADMIN_AUTH_INVALID').length,
+    10
+  )
+  assert.strictEqual(
+    codes.filter((code) => code === 'ADMIN_AUTH_RATE_LIMITED').length,
+    10
+  )
+  assert.strictEqual(scryptCalls, 10)
+}
+
 async function testMalformedPasswordsCountTowardRateLimit() {
   const harness = await createHarness()
   const clientAddress = '203.0.113.50'
@@ -146,6 +178,50 @@ async function testMalformedPasswordsCountTowardRateLimit() {
     await harness.service.reauthenticate(PASSWORD, '203.0.113.51'),
     { authenticated: true }
   )
+}
+
+async function testRateLimitIdentityValidation() {
+  for (const identity of ['', 'x'.repeat(257), 'proxy\nspoof', 'proxy\u007fspoof']) {
+    const harness = await createHarness()
+    await expectCode(
+      () => harness.service.reauthenticate(PASSWORD, identity),
+      'ADMIN_AUTH_INVALID'
+    )
+    assert.strictEqual(
+      harness.database.prepare(
+        'SELECT COUNT(*) AS count FROM auth_rate_limits'
+      ).get().count,
+      0
+    )
+  }
+}
+
+async function testLoginSettlementRollback() {
+  const harness = await createHarness()
+  harness.database.exec(`
+    CREATE TRIGGER fail_admin_session_created_audit
+    BEFORE INSERT ON admin_auth_audit
+    WHEN NEW.event_type = 'admin_session_created'
+    BEGIN
+      SELECT RAISE(ABORT, 'synthetic audit failure');
+    END;
+  `)
+  await assert.rejects(
+    () => harness.service.login(PASSWORD, '203.0.113.62'),
+    /synthetic audit failure/
+  )
+  assert.strictEqual(
+    harness.database.prepare(
+      'SELECT COUNT(*) AS count FROM admin_sessions'
+    ).get().count,
+    0
+  )
+  const rateLimit = harness.database.prepare(`
+    SELECT failure_count, in_flight_count
+    FROM auth_rate_limits
+  `).get()
+  assert.strictEqual(rateLimit.failure_count, 0)
+  assert.strictEqual(rateLimit.in_flight_count, 1)
 }
 
 async function testSecretStorageAndAuditRedaction() {
@@ -228,7 +304,10 @@ async function testIdleAbsoluteExpiryAndLogout() {
 
   const logout = await createHarness()
   const logoutLogin = await logout.service.login(PASSWORD, '192.0.2.22')
-  assert.deepStrictEqual(logout.service.logout(logoutLogin.sessionToken), {
+  assert.deepStrictEqual(logout.service.logout(
+    logoutLogin.sessionToken,
+    logoutLogin.csrfToken
+  ), {
     revoked: true
   })
   await expectCode(
@@ -296,6 +375,90 @@ async function testRejectedCsrfDoesNotTouchSession() {
   assert.strictEqual(countAuthenticatedAudit(), beforeAuditCount + 1)
 }
 
+async function testLogoutRequiresCsrfWithoutTouch() {
+  const harness = await createHarness()
+  const login = await harness.service.login(PASSWORD, '198.51.100.32')
+  const selectSession = harness.database.prepare(`
+    SELECT last_used_at, idle_expires_at, revoked_at
+    FROM admin_sessions
+    WHERE session_id = ?
+  `)
+  const authenticatedAuditCount = () => harness.database.prepare(`
+    SELECT COUNT(*) AS count
+    FROM admin_auth_audit
+    WHERE event_type = 'admin_session_authenticated'
+  `).get().count
+  const before = selectSession.get(login.sessionId)
+  const beforeAudit = authenticatedAuditCount()
+  harness.clock.value += 5 * 60 * 1000
+
+  await expectCode(
+    () => harness.service.logout(login.sessionToken, 'wrong-csrf'),
+    'ADMIN_CSRF_INVALID'
+  )
+  assert.deepStrictEqual(selectSession.get(login.sessionId), before)
+  assert.strictEqual(authenticatedAuditCount(), beforeAudit)
+  assert.strictEqual(harness.service.authenticate(login.sessionToken).sessionId, login.sessionId)
+
+  assert.deepStrictEqual(
+    harness.service.logout(login.sessionToken, login.csrfToken),
+    { revoked: true }
+  )
+  assert.strictEqual(selectSession.get(login.sessionId).revoked_at, harness.clock.value)
+}
+
+async function testParsedVerifierBuffersAreCleared() {
+  const contract = require('../security/secret-bootstrap-contract')
+  const adminAuthPath = require.resolve('../security/admin-auth')
+  const originalParser = contract.parseAdminPasswordVerifier
+  let parsed
+  contract.parseAdminPasswordVerifier = () => parsed
+  delete require.cache[adminAuthPath]
+  try {
+    const { AdminAuthService: FreshAdminAuthService } = require('../security/admin-auth')
+    const repository = { findSessionByTokenDigest() {} }
+    parsed = {
+      digest: Buffer.alloc(32, 21),
+      format: 'kinvest-admin-scrypt-v1',
+      n: 65536,
+      p: 1,
+      r: 8,
+      salt: Buffer.alloc(16, 22)
+    }
+    const digest = parsed.digest
+    const salt = parsed.salt
+    const service = new FreshAdminAuthService({
+      repository,
+      adminVerifierMaterial: 'synthetic',
+      rateLimitKey: Buffer.alloc(32, 23)
+    })
+    assert.strictEqual(digest.every((value) => value === 0), true)
+    assert.strictEqual(salt.every((value) => value === 0), true)
+    service.clear()
+
+    parsed = {
+      digest: Buffer.alloc(32, 24),
+      format: 'kinvest-admin-scrypt-v1',
+      n: 65536,
+      p: 1,
+      r: 8,
+      salt: Buffer.alloc(16, 25)
+    }
+    const failureDigest = parsed.digest
+    const failureSalt = parsed.salt
+    assert.throws(() => new FreshAdminAuthService({
+      repository,
+      adminVerifierMaterial: 'synthetic',
+      rateLimitKey: 'short'
+    }), (error) => error.code === 'ADMIN_AUTH_CONFIG_INVALID')
+    assert.strictEqual(failureDigest.every((value) => value === 0), true)
+    assert.strictEqual(failureSalt.every((value) => value === 0), true)
+  } finally {
+    contract.parseAdminPasswordVerifier = originalParser
+    delete require.cache[adminAuthPath]
+  }
+}
+
 async function testClearIsIdempotent() {
   const harness = await createHarness()
   harness.service.clear()
@@ -313,16 +476,26 @@ async function testClearIsIdempotent() {
 async function run() {
   await testPasswordMatchingAndValidation()
   await testRateLimitIsolationAndReset()
+  await testConcurrentAttemptReservations()
   await testMalformedPasswordsCountTowardRateLimit()
+  await testRateLimitIdentityValidation()
+  await testLoginSettlementRollback()
   await testSecretStorageAndAuditRedaction()
   await testIdleAbsoluteExpiryAndLogout()
   await testCsrfAndReauthentication()
   await testRejectedCsrfDoesNotTouchSession()
+  await testLogoutRequiresCsrfWithoutTouch()
   await testClearIsIdempotent()
+  await testParsedVerifierBuffersAreCleared()
 }
 
 module.exports = {
   run,
+  testConcurrentAttemptReservations,
+  testLoginSettlementRollback,
+  testLogoutRequiresCsrfWithoutTouch,
   testMalformedPasswordsCountTowardRateLimit,
+  testParsedVerifierBuffersAreCleared,
+  testRateLimitIdentityValidation,
   testRejectedCsrfDoesNotTouchSession
 }

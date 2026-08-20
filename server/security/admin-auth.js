@@ -69,20 +69,23 @@ class AdminAuthService {
     try {
       verifier = parseAdminPasswordVerifier(adminVerifierMaterial)
       key = copyRateLimitKey(rateLimitKey)
+      const verifierDigest = verifier.digest
+      if (!Buffer.isBuffer(verifier.salt) || !Buffer.isBuffer(verifierDigest) ||
+        verifier.salt.length !== 16 || verifierDigest.length !== 32 ||
+        verifier.n !== 65536 || verifier.p !== 1 || verifier.r !== 8) {
+        fail('ADMIN_AUTH_CONFIG_INVALID')
+      }
+      this.verifierSalt = Buffer.from(verifier.salt)
+      this.verifierDigest = Buffer.from(verifierDigest)
     } catch {
-      fail('ADMIN_AUTH_CONFIG_INVALID')
-    }
-    const verifierDigest = verifier.digest
-    if (!Buffer.isBuffer(verifier.salt) || !Buffer.isBuffer(verifierDigest) ||
-      verifier.salt.length !== 16 || verifierDigest.length !== 32 ||
-      verifier.n !== 65536 || verifier.p !== 1 || verifier.r !== 8) {
       if (key) key.fill(0)
       fail('ADMIN_AUTH_CONFIG_INVALID')
+    } finally {
+      if (verifier && Buffer.isBuffer(verifier.digest)) verifier.digest.fill(0)
+      if (verifier && Buffer.isBuffer(verifier.salt)) verifier.salt.fill(0)
     }
 
     this.repository = repository
-    this.verifierSalt = Buffer.from(verifier.salt)
-    this.verifierDigest = Buffer.from(verifierDigest)
     this.rateLimitKey = key
     this.now = now
     this.randomBytes = randomBytes
@@ -100,13 +103,15 @@ class AdminAuthService {
     }
   }
 
-  addressDigest(clientAddress) {
-    if (typeof clientAddress !== 'string' || clientAddress.length === 0) {
+  rateLimitIdentityDigest(rateLimitIdentity) {
+    if (typeof rateLimitIdentity !== 'string' || rateLimitIdentity.length === 0 ||
+      Buffer.byteLength(rateLimitIdentity, 'utf8') > 256 ||
+      /[\u0000-\u001f\u007f-\u009f]/.test(rateLimitIdentity)) {
       fail('ADMIN_AUTH_INVALID')
     }
     return crypto.createHmac('sha256', this.rateLimitKey)
       .update(RATE_LIMIT_DOMAIN, 'utf8')
-      .update(clientAddress, 'utf8')
+      .update(rateLimitIdentity, 'utf8')
       .digest('base64url')
   }
 
@@ -150,18 +155,18 @@ class AdminAuthService {
     }
   }
 
-  isRateLimited(rateLimit, now) {
-    return Boolean(rateLimit && rateLimit.blockedUntil !== null &&
-      now < rateLimit.blockedUntil &&
-      now < rateLimit.windowStartedAt + ADMIN_LOGIN_WINDOW_MS)
-  }
-
-  async verifyPasswordWithRateLimit(password, clientAddress) {
+  async verifyPasswordWithRateLimit(password, rateLimitIdentity) {
     this.assertConfigured()
-    const keyDigest = this.addressDigest(clientAddress)
+    const keyDigest = this.rateLimitIdentityDigest(rateLimitIdentity)
     const now = this.now()
-    const rateLimit = this.repository.getRateLimit(RATE_LIMIT_SCOPE, keyDigest)
-    if (this.isRateLimited(rateLimit, now)) {
+    const reservation = this.repository.reserveAttempt({
+      scope: RATE_LIMIT_SCOPE,
+      keyDigest,
+      now,
+      windowMs: ADMIN_LOGIN_WINDOW_MS,
+      maxAttempts: ADMIN_MAX_FAILURES
+    })
+    if (!reservation.allowed) {
       fail('ADMIN_AUTH_RATE_LIMITED')
     }
 
@@ -175,34 +180,32 @@ class AdminAuthService {
       passwordIsValid = false
     }
     if (!passwordIsValid || !await this.passwordMatches(password)) {
-      this.repository.recordRateLimitFailure({
-        scope: RATE_LIMIT_SCOPE,
-        keyDigest,
-        now,
+      const settledAt = this.now()
+      this.repository.settleRateLimitFailure({
+        reservation,
         windowMs: ADMIN_LOGIN_WINDOW_MS,
         maxFailures: ADMIN_MAX_FAILURES,
         auditEvent: this.auditEvent(
           'admin_password_rejected',
-          now,
+          settledAt,
           null,
           { reason: 'invalid-password' }
         )
       })
       fail('ADMIN_AUTH_INVALID')
     }
-    return { keyDigest, now }
+    return { reservation, now: this.now() }
   }
 
-  async login(password, clientAddress) {
-    const verified = await this.verifyPasswordWithRateLimit(password, clientAddress)
+  async login(password, rateLimitIdentity) {
+    const verified = await this.verifyPasswordWithRateLimit(password, rateLimitIdentity)
     const sessionId = this.randomToken(16)
     const sessionToken = this.randomToken(32)
     const csrfToken = this.randomToken(32)
     const absoluteExpiresAt = verified.now + ADMIN_ABSOLUTE_TTL_MS
     const idleExpiresAt = verified.now + ADMIN_IDLE_TTL_MS
     this.repository.completeLogin({
-      scope: RATE_LIMIT_SCOPE,
-      keyDigest: verified.keyDigest,
+      reservation: verified.reservation,
       session: {
         sessionId,
         tokenDigest: digestPublicToken(sessionToken),
@@ -229,18 +232,17 @@ class AdminAuthService {
     }
   }
 
-  async reauthenticate(password, clientAddress) {
-    const verified = await this.verifyPasswordWithRateLimit(password, clientAddress)
-    this.repository.clearRateLimit(
-      RATE_LIMIT_SCOPE,
-      verified.keyDigest,
-      this.auditEvent(
+  async reauthenticate(password, rateLimitIdentity) {
+    const verified = await this.verifyPasswordWithRateLimit(password, rateLimitIdentity)
+    this.repository.settleRateLimitSuccess({
+      reservation: verified.reservation,
+      auditEvent: this.auditEvent(
         'admin_password_reauthenticated',
         verified.now,
         null,
         { reason: 'reauthenticated' }
       )
-    )
+    })
     return { authenticated: true }
   }
 
@@ -283,15 +285,7 @@ class AdminAuthService {
 
   verifyCsrf(sessionToken, csrfToken) {
     const session = this.getActiveSession(sessionToken, false)
-    const csrfDigest = digestPublicToken(csrfToken)
-    if (!csrfDigest) fail('ADMIN_CSRF_INVALID')
-    const expected = Buffer.from(session.csrfDigest, 'base64url')
-    const actual = Buffer.from(csrfDigest, 'base64url')
-    const valid = expected.length === actual.length &&
-      crypto.timingSafeEqual(expected, actual)
-    expected.fill(0)
-    actual.fill(0)
-    if (!valid) fail('ADMIN_CSRF_INVALID')
+    this.assertCsrf(session, csrfToken)
     const updated = this.repository.updateSessionUsage(
       session.sessionId,
       session.lastUsedAt,
@@ -307,8 +301,21 @@ class AdminAuthService {
     return true
   }
 
-  logout(sessionToken) {
+  assertCsrf(session, csrfToken) {
+    const csrfDigest = digestPublicToken(csrfToken)
+    if (!csrfDigest) fail('ADMIN_CSRF_INVALID')
+    const expected = Buffer.from(session.csrfDigest, 'base64url')
+    const actual = Buffer.from(csrfDigest, 'base64url')
+    const valid = expected.length === actual.length &&
+      crypto.timingSafeEqual(expected, actual)
+    expected.fill(0)
+    actual.fill(0)
+    if (!valid) fail('ADMIN_CSRF_INVALID')
+  }
+
+  logout(sessionToken, csrfToken) {
     const session = this.getActiveSession(sessionToken, false)
+    this.assertCsrf(session, csrfToken)
     const now = this.now()
     const revoked = this.repository.revokeSession(
       session.sessionId,
