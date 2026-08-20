@@ -739,6 +739,7 @@ function run() {
   const firewallService = path.resolve(__dirname, '../../deploy/server/kinvest-metadata-firewall.service')
   const firewallTimer = path.resolve(__dirname, '../../deploy/server/kinvest-metadata-firewall.timer')
   const operationsDoc = path.resolve(__dirname, '../../docs/operations/2026-08-11-metadata-ssm-rollout.md')
+  const incidentDoc = path.resolve(__dirname, '../../docs/operations/2026-08-14-t7-br-netfilter-incident.md')
   const fakeIptables = createFakeIptables(fixture)
   const fakeIptablesRestore = createFakeIptablesRestore(fixture)
   const fakeDocker = createFakeDocker(fixture)
@@ -1226,6 +1227,7 @@ function run() {
     const serviceText = fs.readFileSync(firewallService, 'utf8')
     const timerText = fs.readFileSync(firewallTimer, 'utf8')
     const operationsText = fs.readFileSync(operationsDoc, 'utf8')
+    const incidentText = fs.existsSync(incidentDoc) ? fs.readFileSync(incidentDoc, 'utf8') : ''
     assert.equal(modulesLoadText, 'br_netfilter\n')
     assert.equal(bridgeNetfilterSysctlText, 'net.bridge.bridge-nf-call-iptables = 1\n')
     assert.equal(
@@ -1595,6 +1597,40 @@ function run() {
     assert.match(operationsText, /Kinvest[\s\S]{0,120}Nginx[\s\S]{0,160}temporary bridge containers/i)
     assert.match(operationsText, /T7[\s\S]{0,160}separate approval/i)
     assert.match(operationsText, /no CAM or SSM/i)
+    assert.match(operationsText, /br_netfilter[\s\S]{0,200}before Docker bridge traffic[\s\S]{0,160}filtered/i)
+    assert.match(
+      operationsText,
+      /net[.]bridge[.]bridge-nf-call-iptables = 1[\s\S]{0,120}(?:exactly|must be)[\s\S]{0,40}`?1`?/i
+    )
+    assert.match(operationsText, /Docker[\s\S]{0,240}fail(?:s)? closed[\s\S]{0,240}(?:module|sysctl|interlock|reconcile)/i)
+    assert.match(operationsText, /boot interlock[\s\S]{0,200}boot-guard/i)
+    assert.match(operationsText, /ExecStartPost[\s\S]{0,120}(?:not failure-ignored|non-ignored)[\s\S]{0,120}reconcile-active/i)
+    assert.match(operationsText, /permanent deny-all[\s\S]{0,200}(?:before|prior to)[\s\S]{0,120}(?:released|removed)/i)
+    assert.match(operationsText, /root-only[\s\S]{0,120}verified installation source/i)
+    assert.match(operationsText, /operator-required[\s\S]{0,180}interlock/i)
+    for (const section of [
+      'Detection',
+      'Impact',
+      'Containment',
+      'Root cause',
+      'Repair design',
+      'Current status',
+      'Evidence and backups',
+      'Recovery gates'
+    ]) {
+      assert.match(incidentText, new RegExp(`^## ${section}$`, 'im'))
+    }
+    assert.match(incidentText, /real bridge-container probes[\s\S]{0,160}169[.]254[.]0[.]23/i)
+    assert.match(incidentText, /Docker service and socket[\s\S]{0,100}stopped[\s\S]{0,100}RESTORE[\s\S]{0,80}not triggered/i)
+    assert.match(incidentText, /Production remains[\s\S]{0,120}Docker stopped[\s\S]{0,120}public unavailable/i)
+    assert.match(incidentText, /merged[\s\S]{0,120}separately approved/i)
+    assert.match(incidentText, /second CVM reboot[\s\S]{0,160}separate explicit approval/i)
+    assert.match(incidentText, /CVM reboot[\s\S]{0,120}tmpfs bundle[\s\S]{0,80}disappears/i)
+    assert.match(incidentText, /RESTORE[\s\S]{0,160}GitHub Production approval/i)
+    assert.match(incidentText, /never (?:request|record)[\s\S]{0,100}secret values/i)
+    assert.match(incidentText, /no CAM(?:\/SSM| or SSM)[\s\S]{0,160}real iFinD[\s\S]{0,100}model[\s\S]{0,100}database migration[\s\S]{0,100}image change/i)
+    assert.match(incidentText, /t7-cvm-20260814T033859Z/)
+    assert.match(incidentText, /t7-docker-20260814T033524Z/)
     assert.match(
       operationsText,
       /`reconcile-active`[\s\S]{0,700}`mode=active`[\s\S]{0,240}`mode=deny-all`[\s\S]{0,700}dispatch/i

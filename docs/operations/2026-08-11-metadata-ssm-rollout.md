@@ -39,8 +39,16 @@ compatibility remains a separate deployment approval and verification gate.
 
 - Only forwarded container traffic to `169.254.0.23/32` TCP port `80` is in
   scope. Host metadata access is unchanged.
-- A temporary first-position FORWARD reject guard remains installed throughout
-  validation, chain rebuilding, and permanent jump installation.
+- `br_netfilter` must load before Docker bridge traffic can be filtered by the
+  iptables-nft forwarding policy. Persist
+  `net.bridge.bridge-nf-call-iptables = 1`; its runtime value must be exactly
+  `1` before Docker may start.
+- A durable Docker boot interlock blocks startup during an incomplete or failed
+  installation. At runtime, the `boot-guard` operation installs a first-position
+  `mangle/PREROUTING` metadata DROP before Docker rebuilds its filter chains.
+- The Docker drop-in `ExecStartPost` is non-ignored and invokes
+  `reconcile-active`. The permanent deny-all policy must be restored and
+  verified before the startup protection is released.
 - The permanent chain is first in FORWARD, before any pre-existing jump, and is
   also first in DOCKER-USER for defense in depth.
 - The two permanent jumps are installed in one `iptables-restore --noflush`
@@ -110,10 +118,14 @@ must use the explicit `--env-file /etc/kinvest/metadata-network.conf` contract.
 ### Docker restart approval
 
 Required separately because live restore is disabled and a restart interrupts
-running containers. The Docker drop-in installs only the startup/stop deny guard;
-it does not run network-dependent apply or status actions that could fail
-`docker.service`. The independent oneshot service uses `Requisite` and `After`,
-so a timer attempt never starts inactive Docker. It invokes one locked
+running containers. Docker fails closed when the bridge module, exact sysctl,
+durable interlock, boot guard, or post-start reconciliation prerequisite is not
+satisfied. The drop-in verifies bridge netfilter, installs `boot-guard` and the
+filter guard, and then runs the non-ignored `ExecStartPost=reconcile-active`.
+Failed post-start reconciliation stops Docker and reinstalls startup protection;
+successful reconciliation proves the permanent deny-all policy before removing
+the temporary boot guard. The independent oneshot service uses `Requisite` and
+`After`, so a timer attempt never starts inactive Docker. It invokes one locked
 `reconcile-active` operation. Before any firewall or Docker call, the wrapper
 requires the activation state to be a regular, non-symlink, root-owned mode
 `0600` file with exactly `version=1`, either `mode=active` or `mode=deny-all`,
@@ -166,10 +178,15 @@ The intended root-owned destinations are:
     /etc/systemd/system/kinvest-metadata-firewall.service
     /etc/systemd/system/kinvest-metadata-firewall.timer
     /etc/systemd/system/docker.service.d/kinvest-metadata-firewall.conf
+    /etc/systemd/system/docker.service.d/00-kinvest-metadata-recovery-interlock.conf
+    /etc/modules-load.d/kinvest-br-netfilter.conf
+    /etc/sysctl.d/90-kinvest-br-netfilter.conf
 
 Installation commands are an operator checklist and are not authorization to
-run them. Install executable files mode `0755`, library and unit files mode
-`0644`, and the config mode `0600`, all owned by root.
+run them. The atomic installer accepts only a root-only verified installation
+source whose manifest and asset paths pass its ownership, mode, link, identity,
+and digest checks. Install executable files mode `0755`, library and unit files
+mode `0644`, and the config mode `0600`, all owned by root.
 
 ## T6 metadata deny-all procedure
 
@@ -270,6 +287,40 @@ durability barrier, rename, or reconciliation stops the sequence immediately:
 If allow-mode validation or reconciliation fails, the top-level deny guard
 remains and the rollback is not complete. Re-enabling the timer requires its
 own approval after exact allow-chain and runtime verification.
+
+## T7 bridge-netfilter persistence and controlled recovery
+
+The T7 clean reboot proved that filter rules alone are insufficient when the
+kernel bridge hook is absent. The reviewed repair persists `br_netfilter` and
+`net.bridge.bridge-nf-call-iptables = 1`, verifies the runtime value is exactly
+`1`, and orders systemd so these prerequisites exist before Docker startup.
+
+Installation is a separate production approval and must run only from the
+root-only verified installation source. The installer never starts Docker. Its
+first durable target-side change is an independent recovery interlock that
+blocks `docker.service`. Any incomplete install, failed restore, unsafe prior
+sysctl, failed verification, or failed systemd reload retains the interlock and
+records an `operator-required` state. A later reviewed installation may recover
+that state, but it may remove the interlock only after all persistent assets,
+runtime prerequisites, wrapper verification, permanent state, and systemd
+reloads have succeeded.
+
+After installation, starting Docker is another separate approval. The drop-in
+installs the boot guard before Docker can rebuild its filter chains and uses a
+non-ignored `ExecStartPost` reconciliation. The permanent deny-all chain and
+both first-position jumps must be verified before the boot guard is removed.
+Any prerequisite or reconciliation failure leaves Docker failed closed.
+
+A second CVM reboot requires separate approval after installation and the
+controlled Docker-start check. It is the only proof that modules-load and
+sysctl persistence survive a clean kernel boot. A CVM reboot also clears the
+`/run` tmpfs bundle, so Kinvest must remain unavailable until an exact RESTORE
+receives GitHub Production approval. Never request or record secret values in
+operator commands, chat, documentation, logs, evidence, or incident records.
+
+This repair changes no application image or database and performs no database
+migration. It enables no CAM or SSM, real iFinD data, or model call. Those are
+outside this incident and require their own plans and approvals.
 
 ## Apply and status
 
