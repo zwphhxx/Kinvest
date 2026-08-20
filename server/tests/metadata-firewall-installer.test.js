@@ -153,7 +153,7 @@ count=0
 [ ! -f "$counter_file" ] || count=$(cat "$counter_file")
 count=$((count + 1))
 printf '%s\\n' "$count" > "$counter_file"
-[ -z "\${KINVEST_TEST_FAIL_DAEMON_RELOAD_ON:-}" ] || case ",\$KINVEST_TEST_FAIL_DAEMON_RELOAD_ON," in
+[ -z "\${KINVEST_TEST_FAIL_DAEMON_RELOAD_ON:-}" ] || case ",$KINVEST_TEST_FAIL_DAEMON_RELOAD_ON," in
   *",$count,"*) exit 1 ;;
 esac
 [ "\${KINVEST_TEST_FAIL_DAEMON_RELOAD:-0}" != '1' ] || exit 1
@@ -350,6 +350,9 @@ async function run() {
   assert.doesNotMatch(installer, /systemctl\s+(?:start|restart|stop|enable)|docker\s|compose\s/)
   const runner = fs.readFileSync(path.join(rootDir, 'server/tests/run-tests.js'), 'utf8')
   assert.equal((runner.match(/require\('\.\/metadata-firewall-installer[.]test'\)/g) || []).length, 1)
+  assert.match(runner, /process[.]env[.]PYTHONDONTWRITEBYTECODE = '1'/)
+  assert.match(runner, /deploy\/server\/__pycache__/)
+  assert.match(runner, /fs[.]rmSync\(pythonBytecodeCachePath, \{ recursive: true, force: true \}\)/)
 
   const success = createFixture(installer)
   withFixture(success, () => {

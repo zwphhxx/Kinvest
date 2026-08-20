@@ -21,6 +21,8 @@ class FakeServer extends EventEmitter {
 }
 
 async function run() {
+  const initialUmask = process.umask()
+  try {
   const { runServerExecutable, startServer } = require('../server')
   const rejectedServer = new FakeServer()
   await assert.rejects(startServer({
@@ -181,6 +183,10 @@ async function run() {
     assert.equal(error.message.includes('ARBITRARY_UPSTREAM_CLOSE_CODE'), false)
     return true
   })
+  } finally {
+    process.umask(initialUmask)
+  }
+  assert.equal(process.umask(), initialUmask, 'server bootstrap suite must restore the parent process umask')
 }
 
 module.exports = { run }
