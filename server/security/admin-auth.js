@@ -106,7 +106,10 @@ class AdminAuthService {
   rateLimitIdentityDigest(rateLimitIdentity) {
     if (typeof rateLimitIdentity !== 'string' || rateLimitIdentity.length === 0 ||
       Buffer.byteLength(rateLimitIdentity, 'utf8') > 256 ||
-      /[\u0000-\u001f\u007f-\u009f]/.test(rateLimitIdentity)) {
+      [...rateLimitIdentity].some((character) => {
+        const codePoint = character.codePointAt(0)
+        return codePoint <= 0x1f || codePoint === 0x7f
+      })) {
       fail('ADMIN_AUTH_INVALID')
     }
     return crypto.createHmac('sha256', this.rateLimitKey)
