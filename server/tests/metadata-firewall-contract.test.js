@@ -1577,8 +1577,7 @@ function run() {
       'Compose/network recreation approval',
       'Docker restart approval',
       'iptables/systemd installation approval',
-      'CAM role binding approval',
-      'secret rotation approval',
+      'GitHub Production secret update approval',
       'reboot approval'
     ]) {
       assert.match(operationsText, new RegExp(gate, 'i'))
@@ -1588,8 +1587,6 @@ function run() {
     assert.match(operationsText, /candidate.*not pre-approved/i)
     assert.match(operationsText, /conflict preflight/i)
     assert.match(operationsText, /explicit user (?:confirmation|approval)/i)
-    assert.match(operationsText, /operator assertion/i)
-    assert.match(operationsText, /does not query[^\n]*CAM/i)
     assert.match(operationsText, /not a\s+claim that the candidate is conflict-free/i)
     assert.match(operationsText, /pending[\s\S]{0,160}active/i)
     assert.match(operationsText, /routine[\s\S]{0,200}read-only[\s\S]{0,80}status/i)
@@ -1631,6 +1628,26 @@ function run() {
     assert.match(incidentText, /no CAM(?:\/SSM| or SSM)[\s\S]{0,160}real iFinD[\s\S]{0,100}model[\s\S]{0,100}database migration[\s\S]{0,100}image change/i)
     assert.match(incidentText, /t7-cvm-20260814T033859Z/)
     assert.match(incidentText, /t7-docker-20260814T033524Z/)
+    const retiredOperationsPreamble = operationsText.slice(0, 900)
+    assert.match(retiredOperationsPreamble, /RETIRED/i)
+    assert.match(retiredOperationsPreamble, /HISTORICAL/i)
+    assert.match(retiredOperationsPreamble, /DO NOT EXECUTE/i)
+    assert.match(retiredOperationsPreamble, /GitHub Production Secrets[\s\S]{0,80}tmpfs/i)
+    assert.match(
+      retiredOperationsPreamble,
+      /[.]\/2026-08-14-t7-br-netfilter-incident[.]md/
+    )
+    assert.doesNotMatch(operationsText, /^\s*install -o root\b/m)
+    assert.match(
+      operationsText,
+      /all T7 installation[\s\S]{0,160}deploy\/server\/install-metadata-firewall[.]sh[\s\S]{0,180}root-owned verified source[\s\S]{0,120}explicit approval/i
+    )
+    assert.doesNotMatch(operationsText, /^###\s+(?:CAM|SSM)[^\n]*approval\s*$/im)
+    assert.doesNotMatch(operationsText, /^\s*kinvest-metadata-firewall rollback-pre-bind\b/m)
+    assert.doesNotMatch(operationsText, /may run:[\s\S]{0,160}rollback-pre-bind/i)
+    assert.match(operationsText, /rollback-pre-bind[\s\S]{0,160}(?:must not be used|prohibited)/i)
+    assert.match(operationsText, /never[\s\S]{0,80}(?:ask|request)[\s\S]{0,80}secret values[\s\S]{0,80}chat/i)
+    assert.match(operationsText, /RESTORE[\s\S]{0,160}GitHub Production approval/i)
     assert.match(
       operationsText,
       /`reconcile-active`[\s\S]{0,700}`mode=active`[\s\S]{0,240}`mode=deny-all`[\s\S]{0,700}dispatch/i

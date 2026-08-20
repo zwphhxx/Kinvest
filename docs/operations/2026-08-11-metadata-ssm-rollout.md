@@ -1,4 +1,11 @@
-# CVM metadata isolation and SSM rollout
+# RETIRED / HISTORICAL: CVM metadata isolation and SSM rollout
+
+**DO NOT EXECUTE any procedure in this historical document.** The current
+production route is GitHub Production Secrets plus tmpfs, with metadata
+deny-all. Use the current T7 incident and controlled recovery runbook:
+[T7 bridge filtering persistence incident](./2026-08-14-t7-br-netfilter-incident.md).
+Never ask for secret values in chat. RESTORE always requires GitHub Production
+approval; this document grants no approval and authorizes no production action.
 
 Date: 2026-08-11
 
@@ -152,16 +159,12 @@ only the unattended timer path requires an already-active state.
 Required before installing the wrapper, library, root-owned config, service,
 timer, or Docker drop-in, and before enabling any unit.
 
-### CAM role binding approval
+### GitHub Production secret update approval
 
-Required only after network isolation, Docker restart persistence, and negative
-reachability tests pass. Role binding is never implied by firewall rollout.
-
-### Secret rotation approval
-
-Required separately for creating or rotating external secret versions and for
-changing application references. Secret values never enter chat, repository
-files, or shell command arguments.
+Required separately for changing GitHub Production Environment secret material
+or application references. Secret values never enter chat, repository files,
+documentation, logs, or shell command arguments. This approval does not combine
+with or replace the separate Production deployment approval.
 
 ### Reboot approval
 
@@ -198,14 +201,12 @@ required, and Docker must not be restarted as part of T6.
 
 ### T6 installation
 
-After the iptables/systemd installation approval, install only the reviewed T6
-artifacts from the repository checkout. These commands do not grant approval:
-
-    install -o root -g root -m 0755 deploy/server/kinvest-metadata-firewall.sh /usr/local/sbin/kinvest-metadata-firewall
-    install -o root -g root -m 0644 deploy/server/kinvest-metadata-firewall-lib.sh /usr/local/libexec/kinvest-metadata-firewall-lib.sh
-    install -o root -g root -m 0644 deploy/server/kinvest-metadata-firewall.service /etc/systemd/system/kinvest-metadata-firewall.service
-    install -o root -g root -m 0644 deploy/server/kinvest-metadata-firewall.timer /etc/systemd/system/kinvest-metadata-firewall.timer
-    systemctl daemon-reload
+The former manual copy procedure is retired and must not be reconstructed from
+repository paths. All T7 installation must use
+`deploy/server/install-metadata-firewall.sh` from a root-owned verified source
+after explicit approval. The installer enforces the reviewed manifest,
+transaction recovery, durable Docker interlock, ownership, modes, and hashes;
+it does not start or restart Docker.
 
 Confirm `/etc/kinvest/metadata-network.conf` is a regular, non-symlink,
 root-owned mode `0600` file. Do not enable the timer, change activation state,
@@ -353,15 +354,12 @@ Default `rollback` is also the post-bind rollback. It installs the global deny
 guard and removes the permanent Kinvest chain and jumps, leaving all forwarded
 container metadata traffic denied. It never restores broad metadata access.
 
-Before role binding only, an operator may run:
-
-    kinvest-metadata-firewall rollback-pre-bind --assert-role-unbound
-
-The flag is an explicit operator assertion that the role is unbound. This
-operator assertion does not query, control, detach, or otherwise inspect CAM.
-Without the exact assertion, the action fails with the deny guard retained.
-After the asserted firewall cleanup, restoring any earlier Docker network state
-is still a separate approved Compose/network operation.
+`rollback-pre-bind` is prohibited and must not be used in the current metadata
+deny-all route. It belongs to the retired pre-role design and can remove the
+guard that now provides fail-closed containment. No operator assertion or
+historical CAM state authorizes that path. If current rollback cannot prove the
+bridge prerequisites and permanent deny-all policy, retain the interlock, keep
+Docker stopped, and obtain a new explicit recovery approval.
 
 These scripts do not revoke already issued STS credentials, invalidate external
 secrets, rotate secret versions, or prove that credentials have expired. Those
