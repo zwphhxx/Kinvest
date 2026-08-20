@@ -1,3 +1,16 @@
+const fs = require('node:fs')
+const path = require('node:path')
+
+const pythonBytecodeCachePath = path.resolve(__dirname, '../../deploy/server/__pycache__')
+const previousPythonDontWriteBytecode = process.env.PYTHONDONTWRITEBYTECODE
+process.env.PYTHONDONTWRITEBYTECODE = '1'
+
+function removeRepositoryPythonBytecodeCache() {
+  fs.rmSync(pythonBytecodeCachePath, { recursive: true, force: true })
+}
+
+process.once('exit', removeRepositoryPythonBytecodeCache)
+
 const tests = [
   require('./security-identity.test'),
   require('./device-approval.test'),
@@ -11,6 +24,7 @@ const tests = [
   require('./ssm-material-generator.test'),
   require('./docker-secret-bootstrap.test'),
   require('./metadata-firewall-contract.test'),
+  require('./metadata-firewall-installer.test'),
   require('./refresh-policy.test'),
   require('./refresh-rules.test'),
   require('./health.test'),
@@ -35,23 +49,34 @@ const tests = [
 async function main() {
   let hasFailure = false
 
-  for (const test of tests) {
-    try {
-      if (typeof test.run === 'function') {
-        await test.run()
-        console.log(`✅ ${test.run.name || 'test'} passed`)
+  try {
+    for (const test of tests) {
+      try {
+        if (typeof test.run === 'function') {
+          await test.run()
+          console.log(`✅ ${test.run.name || 'test'} passed`)
+        }
+      } catch (err) {
+        hasFailure = true
+        console.error(`❌ ${test.run ? test.run.name || 'test' : 'unknown'} failed`, err.message)
       }
-    } catch (err) {
-      hasFailure = true
-      console.error(`❌ ${test.run ? test.run.name || 'test' : 'unknown'} failed`, err.message)
+    }
+
+    if (hasFailure) {
+      process.exitCode = 1
+      return
+    }
+
+    console.log('All tests passed')
+  } finally {
+    removeRepositoryPythonBytecodeCache()
+    process.removeListener('exit', removeRepositoryPythonBytecodeCache)
+    if (previousPythonDontWriteBytecode === undefined) {
+      delete process.env.PYTHONDONTWRITEBYTECODE
+    } else {
+      process.env.PYTHONDONTWRITEBYTECODE = previousPythonDontWriteBytecode
     }
   }
-
-  if (hasFailure) {
-    process.exit(1)
-  }
-
-  console.log('All tests passed')
 }
 
 main()

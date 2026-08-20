@@ -1,4 +1,11 @@
-# CVM metadata isolation and SSM rollout
+# RETIRED / HISTORICAL: CVM metadata isolation and SSM rollout
+
+**DO NOT EXECUTE any procedure in this historical document.** The current
+production route is GitHub Production Secrets plus tmpfs, with metadata
+deny-all. Use the current T7 incident and controlled recovery runbook:
+[T7 bridge filtering persistence incident](./2026-08-14-t7-br-netfilter-incident.md).
+Never ask for secret values in chat. RESTORE always requires GitHub Production
+approval; this document grants no approval and authorizes no production action.
 
 Date: 2026-08-11
 
@@ -39,8 +46,16 @@ compatibility remains a separate deployment approval and verification gate.
 
 - Only forwarded container traffic to `169.254.0.23/32` TCP port `80` is in
   scope. Host metadata access is unchanged.
-- A temporary first-position FORWARD reject guard remains installed throughout
-  validation, chain rebuilding, and permanent jump installation.
+- `br_netfilter` must load before Docker bridge traffic can be filtered by the
+  iptables-nft forwarding policy. Persist
+  `net.bridge.bridge-nf-call-iptables = 1`; its runtime value must be exactly
+  `1` before Docker may start.
+- A durable Docker boot interlock blocks startup during an incomplete or failed
+  installation. At runtime, the `boot-guard` operation installs a first-position
+  `mangle/PREROUTING` metadata DROP before Docker rebuilds its filter chains.
+- The Docker drop-in `ExecStartPost` is non-ignored and invokes
+  `reconcile-active`. The permanent deny-all policy must be restored and
+  verified before the startup protection is released.
 - The permanent chain is first in FORWARD, before any pre-existing jump, and is
   also first in DOCKER-USER for defense in depth.
 - The two permanent jumps are installed in one `iptables-restore --noflush`
@@ -110,10 +125,14 @@ must use the explicit `--env-file /etc/kinvest/metadata-network.conf` contract.
 ### Docker restart approval
 
 Required separately because live restore is disabled and a restart interrupts
-running containers. The Docker drop-in installs only the startup/stop deny guard;
-it does not run network-dependent apply or status actions that could fail
-`docker.service`. The independent oneshot service uses `Requisite` and `After`,
-so a timer attempt never starts inactive Docker. It invokes one locked
+running containers. Docker fails closed when the bridge module, exact sysctl,
+durable interlock, boot guard, or post-start reconciliation prerequisite is not
+satisfied. The drop-in verifies bridge netfilter, installs `boot-guard` and the
+filter guard, and then runs the non-ignored `ExecStartPost=reconcile-active`.
+Failed post-start reconciliation stops Docker and reinstalls startup protection;
+successful reconciliation proves the permanent deny-all policy before removing
+the temporary boot guard. The independent oneshot service uses `Requisite` and
+`After`, so a timer attempt never starts inactive Docker. It invokes one locked
 `reconcile-active` operation. Before any firewall or Docker call, the wrapper
 requires the activation state to be a regular, non-symlink, root-owned mode
 `0600` file with exactly `version=1`, either `mode=active` or `mode=deny-all`,
@@ -140,16 +159,12 @@ only the unattended timer path requires an already-active state.
 Required before installing the wrapper, library, root-owned config, service,
 timer, or Docker drop-in, and before enabling any unit.
 
-### CAM role binding approval
+### GitHub Production secret update approval
 
-Required only after network isolation, Docker restart persistence, and negative
-reachability tests pass. Role binding is never implied by firewall rollout.
-
-### Secret rotation approval
-
-Required separately for creating or rotating external secret versions and for
-changing application references. Secret values never enter chat, repository
-files, or shell command arguments.
+Required separately for changing GitHub Production Environment secret material
+or application references. Secret values never enter chat, repository files,
+documentation, logs, or shell command arguments. This approval does not combine
+with or replace the separate Production deployment approval.
 
 ### Reboot approval
 
@@ -166,10 +181,15 @@ The intended root-owned destinations are:
     /etc/systemd/system/kinvest-metadata-firewall.service
     /etc/systemd/system/kinvest-metadata-firewall.timer
     /etc/systemd/system/docker.service.d/kinvest-metadata-firewall.conf
+    /etc/systemd/system/docker.service.d/00-kinvest-metadata-recovery-interlock.conf
+    /etc/modules-load.d/kinvest-br-netfilter.conf
+    /etc/sysctl.d/90-kinvest-br-netfilter.conf
 
 Installation commands are an operator checklist and are not authorization to
-run them. Install executable files mode `0755`, library and unit files mode
-`0644`, and the config mode `0600`, all owned by root.
+run them. The atomic installer accepts only a root-only verified installation
+source whose manifest and asset paths pass its ownership, mode, link, identity,
+and digest checks. Install executable files mode `0755`, library and unit files
+mode `0644`, and the config mode `0600`, all owned by root.
 
 ## T6 metadata deny-all procedure
 
@@ -181,14 +201,12 @@ required, and Docker must not be restarted as part of T6.
 
 ### T6 installation
 
-After the iptables/systemd installation approval, install only the reviewed T6
-artifacts from the repository checkout. These commands do not grant approval:
-
-    install -o root -g root -m 0755 deploy/server/kinvest-metadata-firewall.sh /usr/local/sbin/kinvest-metadata-firewall
-    install -o root -g root -m 0644 deploy/server/kinvest-metadata-firewall-lib.sh /usr/local/libexec/kinvest-metadata-firewall-lib.sh
-    install -o root -g root -m 0644 deploy/server/kinvest-metadata-firewall.service /etc/systemd/system/kinvest-metadata-firewall.service
-    install -o root -g root -m 0644 deploy/server/kinvest-metadata-firewall.timer /etc/systemd/system/kinvest-metadata-firewall.timer
-    systemctl daemon-reload
+The former manual copy procedure is retired and must not be reconstructed from
+repository paths. All T7 installation must use
+`deploy/server/install-metadata-firewall.sh` from a root-owned verified source
+after explicit approval. The installer enforces the reviewed manifest,
+transaction recovery, durable Docker interlock, ownership, modes, and hashes;
+it does not start or restart Docker.
 
 Confirm `/etc/kinvest/metadata-network.conf` is a regular, non-symlink,
 root-owned mode `0600` file. Do not enable the timer, change activation state,
@@ -271,6 +289,40 @@ If allow-mode validation or reconciliation fails, the top-level deny guard
 remains and the rollback is not complete. Re-enabling the timer requires its
 own approval after exact allow-chain and runtime verification.
 
+## T7 bridge-netfilter persistence and controlled recovery
+
+The T7 clean reboot proved that filter rules alone are insufficient when the
+kernel bridge hook is absent. The reviewed repair persists `br_netfilter` and
+`net.bridge.bridge-nf-call-iptables = 1`, verifies the runtime value is exactly
+`1`, and orders systemd so these prerequisites exist before Docker startup.
+
+Installation is a separate production approval and must run only from the
+root-only verified installation source. The installer never starts Docker. Its
+first durable target-side change is an independent recovery interlock that
+blocks `docker.service`. Any incomplete install, failed restore, unsafe prior
+sysctl, failed verification, or failed systemd reload retains the interlock and
+records an `operator-required` state. A later reviewed installation may recover
+that state, but it may remove the interlock only after all persistent assets,
+runtime prerequisites, wrapper verification, permanent state, and systemd
+reloads have succeeded.
+
+After installation, starting Docker is another separate approval. The drop-in
+installs the boot guard before Docker can rebuild its filter chains and uses a
+non-ignored `ExecStartPost` reconciliation. The permanent deny-all chain and
+both first-position jumps must be verified before the boot guard is removed.
+Any prerequisite or reconciliation failure leaves Docker failed closed.
+
+A second CVM reboot requires separate approval after installation and the
+controlled Docker-start check. It is the only proof that modules-load and
+sysctl persistence survive a clean kernel boot. A CVM reboot also clears the
+`/run` tmpfs bundle, so Kinvest must remain unavailable until an exact RESTORE
+receives GitHub Production approval. Never request or record secret values in
+operator commands, chat, documentation, logs, evidence, or incident records.
+
+This repair changes no application image or database and performs no database
+migration. It enables no CAM or SSM, real iFinD data, or model call. Those are
+outside this incident and require their own plans and approvals.
+
 ## Apply and status
 
 Run `guard` before any approved change. `apply` retains that deny guard while it
@@ -302,15 +354,12 @@ Default `rollback` is also the post-bind rollback. It installs the global deny
 guard and removes the permanent Kinvest chain and jumps, leaving all forwarded
 container metadata traffic denied. It never restores broad metadata access.
 
-Before role binding only, an operator may run:
-
-    kinvest-metadata-firewall rollback-pre-bind --assert-role-unbound
-
-The flag is an explicit operator assertion that the role is unbound. This
-operator assertion does not query, control, detach, or otherwise inspect CAM.
-Without the exact assertion, the action fails with the deny guard retained.
-After the asserted firewall cleanup, restoring any earlier Docker network state
-is still a separate approved Compose/network operation.
+`rollback-pre-bind` is prohibited and must not be used in the current metadata
+deny-all route. It belongs to the retired pre-role design and can remove the
+guard that now provides fail-closed containment. No operator assertion or
+historical CAM state authorizes that path. If current rollback cannot prove the
+bridge prerequisites and permanent deny-all policy, retain the interlock, keep
+Docker stopped, and obtain a new explicit recovery approval.
 
 These scripts do not revoke already issued STS credentials, invalidate external
 secrets, rotate secret versions, or prove that credentials have expired. Those

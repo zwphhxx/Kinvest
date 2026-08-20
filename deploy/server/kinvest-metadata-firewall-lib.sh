@@ -2,8 +2,64 @@
 
 KMF_METADATA_FIXED_IP=169.254.0.23
 KMF_CHAIN=KINVEST-METADATA
+KMF_BOOT_GUARD_COMMENT=kinvest-metadata-docker-boot-guard
 KMF_GUARD_COMMENT=kinvest-metadata-docker-start-guard
 KMF_NORMALIZATION_GUARD_COMMENT=kinvest-metadata-normalization-guard
+
+kinvest_metadata_read_bridge_nf_call_iptables() {
+  [ -f /dev/fd/7 ] && [ ! -L "$KMF_BRIDGE_NF_CALL_IPTABLES_PATH" ] || return 1
+  kmf_bridge_nf_path_identity_before=$(stat -Lc '%d:%i' "$KMF_BRIDGE_NF_CALL_IPTABLES_PATH") || return 1
+  kmf_bridge_nf_fd_identity_before=$(stat -Lc '%d:%i' /dev/fd/7) || return 1
+  [ "$kmf_bridge_nf_path_identity_before" = "$kmf_bridge_nf_fd_identity_before" ] || return 1
+
+  kmf_bridge_nf_call_iptables=
+  kmf_bridge_nf_call_iptables_extra=
+  IFS= read -r kmf_bridge_nf_call_iptables <&7 || return 1
+  if IFS= read -r kmf_bridge_nf_call_iptables_extra <&7 || [ -n "$kmf_bridge_nf_call_iptables_extra" ]; then
+    return 1
+  fi
+
+  [ -f /dev/fd/7 ] && [ ! -L "$KMF_BRIDGE_NF_CALL_IPTABLES_PATH" ] || return 1
+  kmf_bridge_nf_path_identity_after=$(stat -Lc '%d:%i' "$KMF_BRIDGE_NF_CALL_IPTABLES_PATH") || return 1
+  kmf_bridge_nf_fd_identity_after=$(stat -Lc '%d:%i' /dev/fd/7) || return 1
+  [ "$kmf_bridge_nf_path_identity_before" = "$kmf_bridge_nf_path_identity_after" ] &&
+    [ "$kmf_bridge_nf_path_identity_after" = "$kmf_bridge_nf_fd_identity_after" ] || return 1
+
+  case "$kmf_bridge_nf_call_iptables" in
+    1) kmf_bridge_nf_result=enabled ;;
+    0) kmf_bridge_nf_result=disabled ;;
+    *) return 1 ;;
+  esac
+  return 0
+}
+
+kinvest_metadata_verify_bridge_netfilter() {
+  [ -d "$KMF_BR_NETFILTER_MODULE_PATH" ] && [ ! -L "$KMF_BR_NETFILTER_MODULE_PATH" ] || {
+    printf '%s\n' 'METADATA_BR_NETFILTER_MODULE_MISSING' >&2
+    return 1
+  }
+  [ -f "$KMF_BRIDGE_NF_CALL_IPTABLES_PATH" ] && [ ! -L "$KMF_BRIDGE_NF_CALL_IPTABLES_PATH" ] || {
+    printf '%s\n' 'METADATA_BR_NETFILTER_SYSCTL_MISSING' >&2
+    return 1
+  }
+
+  kmf_bridge_nf_result=invalid
+  if ! kinvest_metadata_read_bridge_nf_call_iptables 2>/dev/null 7< "$KMF_BRIDGE_NF_CALL_IPTABLES_PATH"; then
+    printf '%s\n' 'METADATA_BR_NETFILTER_SYSCTL_INVALID' >&2
+    return 1
+  fi
+  case "$kmf_bridge_nf_result" in
+    enabled) return 0 ;;
+    disabled)
+      printf '%s\n' 'METADATA_BR_NETFILTER_SYSCTL_DISABLED' >&2
+      return 1
+      ;;
+    *)
+      printf '%s\n' 'METADATA_BR_NETFILTER_SYSCTL_INVALID' >&2
+      return 1
+      ;;
+  esac
+}
 
 kinvest_metadata_validate_ipv4() {
   kmf_value=$1
@@ -145,6 +201,37 @@ kinvest_metadata_remove_all() {
         printf '%s\n' "Metadata firewall could not check a managed rule in $kmf_remove_chain" >&2
         return 1
       fi
+      return 0
+    fi
+  done
+}
+
+kinvest_metadata_boot_guard_present() {
+  kinvest_metadata_iptables -t mangle -C PREROUTING -d "$KMF_METADATA_FIXED_IP/32" -p tcp --dport 80 -m comment --comment "$KMF_BOOT_GUARD_COMMENT" -j DROP >/dev/null 2>&1
+}
+
+kinvest_metadata_boot_guard() {
+  KMF_IPTABLES=$1
+  kmf_boot_guard_rules=$(kinvest_metadata_iptables -t mangle -S PREROUTING) || return 1
+  kmf_boot_guard_first=$(printf '%s\n' "$kmf_boot_guard_rules" | awk '$1 == "-A" { print; exit }')
+  kmf_boot_guard_expected="-A PREROUTING -d $KMF_METADATA_FIXED_IP/32 -p tcp -m tcp --dport 80 -m comment --comment $KMF_BOOT_GUARD_COMMENT -j DROP"
+  if [ "$kmf_boot_guard_first" = "$kmf_boot_guard_expected" ] && kinvest_metadata_boot_guard_present; then
+    return 0
+  fi
+  kinvest_metadata_iptables -t mangle -I PREROUTING 1 -d "$KMF_METADATA_FIXED_IP/32" -p tcp --dport 80 -m comment --comment "$KMF_BOOT_GUARD_COMMENT" -j DROP || return 1
+  kmf_boot_guard_rules=$(kinvest_metadata_iptables -t mangle -S PREROUTING) || return 1
+  kmf_boot_guard_first=$(printf '%s\n' "$kmf_boot_guard_rules" | awk '$1 == "-A" { print; exit }')
+  [ "$kmf_boot_guard_first" = "$kmf_boot_guard_expected" ] && kinvest_metadata_boot_guard_present
+}
+
+kinvest_metadata_remove_boot_guard() {
+  KMF_IPTABLES=$1
+  while :; do
+    if kinvest_metadata_boot_guard_present; then
+      kinvest_metadata_iptables -t mangle -D PREROUTING -d "$KMF_METADATA_FIXED_IP/32" -p tcp --dport 80 -m comment --comment "$KMF_BOOT_GUARD_COMMENT" -j DROP || return 1
+    else
+      kmf_boot_guard_check_status=$?
+      [ "$kmf_boot_guard_check_status" -eq 1 ] || return 1
       return 0
     fi
   done

@@ -15,6 +15,7 @@ function createModel(fixture, name) {
   fs.writeFileSync(path.join(model, 'chains'), 'FORWARD\nDOCKER-USER\n')
   fs.writeFileSync(path.join(model, 'FORWARD.rules'), '-j PREEXISTING-FORWARD\n')
   fs.writeFileSync(path.join(model, 'DOCKER-USER.rules'), '-j PREEXISTING-DOCKER-USER\n')
+  fs.writeFileSync(path.join(model, 'mangle.PREROUTING.rules'), '')
   fs.writeFileSync(path.join(model, 'operations'), '')
   return model
 }
@@ -23,18 +24,140 @@ function rules(model, chain) {
   return fs.readFileSync(path.join(model, `${chain}.rules`), 'utf8').trim().split('\n').filter(Boolean)
 }
 
+const metadataBootGuardRule = '-d 169.254.0.23/32 -p tcp --dport 80 -m comment --comment kinvest-metadata-docker-boot-guard -j DROP'
+const metadataStartGuardRule = '-d 169.254.0.23/32 -p tcp --dport 80 -m comment --comment kinvest-metadata-docker-start-guard -j REJECT --reject-with tcp-reset'
+const metadataDefaultDenyRule = '-d 169.254.0.23/32 -p tcp --dport 80 -m comment --comment kinvest-metadata-default-deny -j REJECT --reject-with tcp-reset'
+
+function recordFirewallTransition(model, name, containersCanRun = false) {
+  const forward = rules(model, 'FORWARD')
+  const dockerUser = rules(model, 'DOCKER-USER')
+  const bootGuard = rules(model, 'mangle.PREROUTING').includes(metadataBootGuardRule)
+  const filterGuard = forward.some((rule) => (
+    rule === metadataStartGuardRule || rule.includes('--comment kinvest-metadata-normalization-guard')
+  ))
+  const managedChainFile = path.join(model, 'KINVEST-METADATA.rules')
+  const managedChain = fs.existsSync(managedChainFile) ? rules(model, 'KINVEST-METADATA') : []
+  const managedDeny = forward[0] === '-j KINVEST-METADATA' &&
+    dockerUser[0] === '-j KINVEST-METADATA' &&
+    managedChain.includes(metadataDefaultDenyRule)
+  return {
+    bootGuard,
+    containersCanRun,
+    dockerUser,
+    equivalentDeny: bootGuard || filterGuard || managedDeny,
+    filterGuard,
+    forward,
+    managedDeny,
+    name
+  }
+}
+
+function assertContinuousMetadataDeny(transitions) {
+  for (const transition of transitions) {
+    assert.equal(
+      transition.equivalentDeny,
+      true,
+      `${transition.name} must retain an equivalent deny for 169.254.0.23:80`
+    )
+  }
+}
+
+function simulateDockerFilterRebuild(model, options = {}) {
+  const transitions = [recordFirewallTransition(model, 'pre-start-guards-installed')]
+  fs.writeFileSync(path.join(model, 'FORWARD.rules'), '-j DOCKER-USER\n-j PREEXISTING-FORWARD\n')
+  transitions.push(recordFirewallTransition(model, 'docker-forward-reset'))
+  fs.writeFileSync(path.join(model, 'DOCKER-USER.rules'), '-j RETURN\n')
+  transitions.push(recordFirewallTransition(model, 'docker-user-reset'))
+  if (options.removeBootGuard) {
+    fs.writeFileSync(path.join(model, 'mangle.PREROUTING.rules'), '')
+    transitions.push(recordFirewallTransition(model, 'docker-removed-boot-guard'))
+  }
+  transitions.push(recordFirewallTransition(model, 'docker-containers-ready', true))
+  return transitions
+}
+
+function dropInCommands(dropInText, directive) {
+  return dropInText.split('\n')
+    .filter((line) => line.startsWith(`${directive}=`))
+    .map((line) => {
+      const command = line.slice(directive.length + 1)
+      const prefixes = command.match(/^[-+!:@]+/)?.[0] || ''
+      const fields = command.slice(prefixes.length).trim().split(/\s+/)
+      return {
+        args: fields.slice(1),
+        ignoredFailure: prefixes.includes('-')
+      }
+    })
+}
+
+function runDropInLifecycle(dropInText, wrapper, environment, model) {
+  const startPreResults = []
+  for (const command of dropInCommands(dropInText, 'ExecStartPre')) {
+    const result = runHarness(wrapper, command.args, environment)
+    startPreResults.push(result)
+    if (result.status !== 0 && !command.ignoredFailure) {
+      return { dockerServing: false, serviceState: 'failed-before-start', startPreResults }
+    }
+  }
+
+  let dockerServing = true
+  const transitions = simulateDockerFilterRebuild(model)
+  assertContinuousMetadataDeny(transitions)
+  const startPostResults = []
+  for (const command of dropInCommands(dropInText, 'ExecStartPost')) {
+    const result = runHarness(wrapper, command.args, environment)
+    startPostResults.push(result)
+    if (result.status !== 0 && !command.ignoredFailure) {
+      dockerServing = false
+      fs.writeFileSync(path.join(model, 'FORWARD.rules'), '-j PREEXISTING-FORWARD\n')
+      fs.writeFileSync(path.join(model, 'DOCKER-USER.rules'), '-j RETURN\n')
+      transitions.push(recordFirewallTransition(model, 'docker-stopped-after-start-post-failure'))
+      const stopPostResults = dropInCommands(dropInText, 'ExecStopPost')
+        .map((stopCommand) => runHarness(wrapper, stopCommand.args, environment))
+      transitions.push(recordFirewallTransition(model, 'stop-post-guards-installed'))
+      assertContinuousMetadataDeny(transitions)
+      return {
+        dockerServing,
+        serviceState: 'failed-and-stopped',
+        startPostResults,
+        startPreResults,
+        stopPostResults,
+        transitions
+      }
+    }
+  }
+  return {
+    dockerServing,
+    serviceState: 'serving',
+    startPostResults,
+    startPreResults,
+    transitions
+  }
+}
+
 function createFakeIptables(fixture) {
   const fake = path.join(fixture, 'iptables')
   writeExecutable(fake, [
     '#!/bin/sh',
     'set -eu',
     '[ "$1" = "-w" ] && shift 2',
+    'table=filter',
+    'if [ "$1" = "-t" ]; then table=$2; shift 2; fi',
     'command=$1',
     'chain=$2',
     'shift 2',
-    'rules="$KINVEST_IPTABLES_MODEL/$chain.rules"',
-    'operation="$command $chain $*"',
+    'if [ "$table" = filter ]; then',
+    '  rules="$KINVEST_IPTABLES_MODEL/$chain.rules"',
+    '  operation="$command $chain $*"',
+    'else',
+    '  rules="$KINVEST_IPTABLES_MODEL/$table.$chain.rules"',
+    '  operation="$command $table/$chain $*"',
+    'fi',
     'printf "%s\\n" "$operation" >> "$KINVEST_IPTABLES_MODEL/operations"',
+    'KINVEST_REMOVE_PATH_MATCH=$(printenv KINVEST_REMOVE_PATH_MATCH || true)',
+    'if [ -n "$KINVEST_REMOVE_PATH_MATCH" ] && printf "%s\\n" "$operation" | grep -F -- "$KINVEST_REMOVE_PATH_MATCH" >/dev/null; then',
+    '  rmdir -- "$KINVEST_REMOVE_PATH"',
+    'fi',
     'KINVEST_FAIL_MATCH=$(printenv KINVEST_FAIL_MATCH || true)',
     'if [ -n "$KINVEST_FAIL_MATCH" ] && printf "%s\\n" "$operation" | grep -F -- "$KINVEST_FAIL_MATCH" >/dev/null; then',
     '  KINVEST_FAIL_MATCH_AT=$(printenv KINVEST_FAIL_MATCH_AT || true)',
@@ -47,7 +170,11 @@ function createFakeIptables(fixture) {
     'fi',
     'case "$command" in',
     '  -S)',
-    '    grep -Fx "$chain" "$KINVEST_IPTABLES_MODEL/chains" >/dev/null 2>&1 || exit 1',
+    '    if [ "$table" = filter ]; then',
+    '      grep -Fx "$chain" "$KINVEST_IPTABLES_MODEL/chains" >/dev/null 2>&1 || exit 1',
+    '    else',
+    '      [ "$table/$chain" = mangle/PREROUTING ] || exit 1',
+    '    fi',
     '    while IFS= read -r rule; do',
     '      if [ -n "$rule" ]; then',
     '        canonical=$(printf "%s\\n" "$rule" | sed "s/ -p tcp --dport / -p tcp -m tcp --dport /")',
@@ -181,7 +308,7 @@ function runWrapperPermissionFixture(wrapperText, fixture) {
   const fakeIptablesRestore = path.join(fakeBin, 'iptables-restore')
   const fakeDocker = path.join(fakeBin, 'docker')
   fs.mkdirSync(fakeBin, { recursive: true })
-  fs.writeFileSync(library, 'kinvest_metadata_status() { :; }\n')
+  fs.writeFileSync(library, 'kinvest_metadata_verify_bridge_netfilter() { :; }\nkinvest_metadata_status() { :; }\n')
   fs.writeFileSync(config, 'fixture=non-secret\n')
   writeExecutable(path.join(fakeBin, 'stat'), [
     '#!/bin/sh',
@@ -210,6 +337,8 @@ function runWrapperActivationFixture(wrapperText, fixture, name, options = {}) {
   const wrapperFixture = path.join(fixture, `wrapper-activation-${name}`)
   const fakeBin = path.join(wrapperFixture, 'bin')
   const library = path.join(wrapperFixture, 'firewall-lib.sh')
+  const bridgeNetfilterModule = path.join(wrapperFixture, 'sys-module-br-netfilter')
+  const bridgeNfCallIptables = path.join(wrapperFixture, 'bridge-nf-call-iptables')
   const config = path.join(wrapperFixture, 'metadata-network.conf')
   const activationStateDirectory = path.join(wrapperFixture, 'state')
   const activationStateTargetDirectory = path.join(wrapperFixture, 'state-target')
@@ -233,7 +362,13 @@ function runWrapperActivationFixture(wrapperText, fixture, name, options = {}) {
     .replaceAll('__CONFIG_SHA256__', configHash)
 
   fs.mkdirSync(fakeBin, { recursive: true })
-  fs.writeFileSync(library, [
+  if (!options.moduleMissing) fs.mkdirSync(bridgeNetfilterModule)
+  fs.writeFileSync(bridgeNfCallIptables, '1\n')
+  const fixtureLibrarySource = options.productionLibrary
+    ? `. "${options.productionLibrary}"\n`
+    : [
+    'kinvest_metadata_verify_bridge_netfilter() { :; }',
+    'kinvest_metadata_remove_boot_guard() { :; }',
     'kinvest_test_assert_config() {',
     '  "$KINVEST_TEST_NODE" -e \'const fs=require("node:fs"); const [target, original, expected, snapshot]=process.argv.slice(1); if (snapshot === "1") { if (target === original) process.exit(10); if ((fs.statSync(target).mode & 0o777) !== 0o600) process.exit(11); } else if (target !== original) process.exit(12); if (fs.readFileSync(target, "utf8") !== expected) process.exit(13);\' "$1" "$KINVEST_TEST_ORIGINAL_CONFIG" "$KINVEST_TEST_CONFIG_SOURCE" "$KINVEST_TEST_EXPECT_SNAPSHOT"',
     '}',
@@ -248,7 +383,8 @@ function runWrapperActivationFixture(wrapperText, fixture, name, options = {}) {
     '  kinvest_test_assert_config "$3"',
     '}',
     ''
-  ].join('\n'))
+  ].join('\n')
+  fs.writeFileSync(library, fixtureLibrarySource)
   fs.writeFileSync(config, configSource)
   fs.writeFileSync(operations, '')
   fs.writeFileSync(events, '')
@@ -344,7 +480,9 @@ function runWrapperActivationFixture(wrapperText, fixture, name, options = {}) {
     KINVEST_TEST_EXPECT_SNAPSHOT: action === 'reconcile-active' ? '1' : '0',
     KINVEST_TEST_NODE: process.execPath,
     KINVEST_TEST_ORIGINAL_CONFIG: config,
-    KINVEST_TEST_SYNC_FAILURE: options.syncFailure || ''
+    KINVEST_TEST_SYNC_FAILURE: options.syncFailure || '',
+    KMF_BR_NETFILTER_MODULE_PATH: bridgeNetfilterModule,
+    KMF_BRIDGE_NF_CALL_IPTABLES_PATH: bridgeNfCallIptables
   }
   const result = runHarness(wrapper, options.actionArgs || [action], harnessEnvironment)
   const eventsAfterFirst = fs.readFileSync(events, 'utf8').trim().split('\n').filter(Boolean)
@@ -377,18 +515,243 @@ function runWrapperActivationFixture(wrapperText, fixture, name, options = {}) {
   }
 }
 
+function runWrapperBridgeNetfilterFixture(wrapperText, library, fixture, name, options = {}) {
+  const wrapperFixture = path.join(fixture, `wrapper-bridge-netfilter-${name}`)
+  const fakeBin = path.join(wrapperFixture, 'bin')
+  const bridgeNetfilterModule = path.join(wrapperFixture, 'sys-module-br-netfilter')
+  const bridgeNetfilterModuleTarget = path.join(wrapperFixture, 'sys-module-br-netfilter-target')
+  const bridgeNfCallIptables = path.join(wrapperFixture, 'bridge-nf-call-iptables')
+  const bridgeNfCallIptablesTarget = path.join(wrapperFixture, 'bridge-nf-call-iptables-target')
+  const bridgeNfCallIptablesReplacement = path.join(wrapperFixture, 'bridge-nf-call-iptables-replacement')
+  const operations = path.join(wrapperFixture, 'operations')
+  const lock = path.join(wrapperFixture, 'firewall.lock')
+  const fakeFlock = path.join(fakeBin, 'flock')
+  const fakeIptables = path.join(fakeBin, 'iptables')
+  const fakeIptablesRestore = path.join(fakeBin, 'iptables-restore')
+  const fakeDocker = path.join(fakeBin, 'docker')
+  const fakeSha256sum = path.join(fakeBin, 'sha256sum')
+
+  fs.mkdirSync(fakeBin, { recursive: true })
+  if (options.moduleType === 'file') {
+    fs.writeFileSync(bridgeNetfilterModule, '')
+  } else if (options.moduleType === 'symlink') {
+    fs.mkdirSync(bridgeNetfilterModuleTarget)
+    fs.symlinkSync(bridgeNetfilterModuleTarget, bridgeNetfilterModule)
+  } else if (options.moduleType !== 'missing') {
+    fs.mkdirSync(bridgeNetfilterModule)
+  }
+  if (options.sysctlType === 'symlink') {
+    fs.writeFileSync(bridgeNfCallIptablesTarget, options.sysctlValue || '1\n')
+    fs.symlinkSync(bridgeNfCallIptablesTarget, bridgeNfCallIptables)
+  } else if (options.sysctlType !== 'missing') {
+    fs.writeFileSync(
+      bridgeNfCallIptables,
+      options.sysctlValue || '1\n',
+      { mode: options.sysctlMode === undefined ? 0o600 : options.sysctlMode }
+    )
+  }
+  if (options.sysctlSymlinkReplacement) {
+    fs.writeFileSync(bridgeNfCallIptablesReplacement, '1\n')
+  }
+  fs.writeFileSync(operations, '')
+  writeExecutable(path.join(fakeBin, 'stat'), [
+    '#!/bin/sh',
+    'format=$2',
+    'target=$3',
+    'if [ "$format" = "%d:%i" ]; then',
+    '  if [ "$target" = /dev/fd/7 ]; then',
+    '    if [ "${KINVEST_TEST_REPLACE_SYSCTL_ON_FD_STAT:-0}" = 1 ]; then',
+    '      /bin/mv "$KINVEST_TEST_SYSCTL_PATH" "$KINVEST_TEST_SYSCTL_PATH.original"',
+    '      /bin/ln -s "$KINVEST_TEST_SYSCTL_REPLACEMENT" "$KINVEST_TEST_SYSCTL_PATH"',
+    '    fi',
+    '    printf "%s\\n" "${KINVEST_TEST_SYSCTL_FD_IDENTITY:-1:2}"',
+    '  else',
+    '    printf "%s\\n" "${KINVEST_TEST_SYSCTL_PATH_IDENTITY:-1:2}"',
+    '  fi',
+    'else',
+    '  printf "%s\\n" "0:0:644"',
+    'fi'
+  ])
+  for (const [dependency, executable] of [
+    ['flock', fakeFlock],
+    ['iptables', fakeIptables],
+    ['iptables-restore', fakeIptablesRestore],
+    ['docker', fakeDocker],
+    ['sha256sum', fakeSha256sum]
+  ]) {
+    fs.writeFileSync(executable, `#!/bin/sh\nprintf '%s\\n' '${dependency}' >> '${operations}'\n`, { mode: 0o600 })
+  }
+
+  const instrumentedWrapper = wrapperText
+    .replace('PATH=/usr/sbin:/usr/bin:/sbin:/bin', `PATH=${fakeBin}:/usr/sbin:/usr/bin:/sbin:/bin`)
+    .replace('KMF_LIBRARY=/usr/local/libexec/kinvest-metadata-firewall-lib.sh', `KMF_LIBRARY=${library}`)
+    .replace('KMF_LOCK=/run/lock/kinvest-metadata-firewall.lock', `KMF_LOCK=${lock}`)
+    .replace('KMF_IPTABLES=/usr/sbin/iptables', `KMF_IPTABLES=${fakeIptables}`)
+    .replace('KMF_IPTABLES_RESTORE=/usr/sbin/iptables-restore', `KMF_IPTABLES_RESTORE=${fakeIptablesRestore}`)
+    .replace('KMF_DOCKER=/usr/bin/docker', `KMF_DOCKER=${fakeDocker}`)
+    .replace('KMF_SHA256SUM=/usr/bin/sha256sum', `KMF_SHA256SUM=${fakeSha256sum}`)
+    .replaceAll('/usr/bin/flock', fakeFlock)
+  const wrapper = path.join(wrapperFixture, 'kinvest-metadata-firewall')
+  writeExecutable(wrapper, instrumentedWrapper.trimEnd().split('\n'))
+  const wrapperArguments = options.args || ['verify-bridge-netfilter']
+  const harnessFile = options.shell || wrapper
+  const harnessArguments = options.shell ? [wrapper, ...wrapperArguments] : wrapperArguments
+  const result = runHarness(harnessFile, harnessArguments, {
+    KMF_BR_NETFILTER_MODULE_PATH: bridgeNetfilterModule,
+    KMF_BRIDGE_NF_CALL_IPTABLES_PATH: bridgeNfCallIptables,
+    KINVEST_TEST_REPLACE_SYSCTL_ON_FD_STAT: options.sysctlSymlinkReplacement ? '1' : '0',
+    KINVEST_TEST_SYSCTL_FD_IDENTITY: options.sysctlIdentityMismatch ? '1:3' : '1:2',
+    KINVEST_TEST_SYSCTL_PATH: bridgeNfCallIptables,
+    KINVEST_TEST_SYSCTL_PATH_IDENTITY: '1:2',
+    KINVEST_TEST_SYSCTL_REPLACEMENT: bridgeNfCallIptablesReplacement
+  })
+  return {
+    result,
+    operations: fs.readFileSync(operations, 'utf8').trim().split('\n').filter(Boolean)
+  }
+}
+
+function runCleanBootFixture(
+  wrapperText,
+  library,
+  dropInText,
+  fixture,
+  fakeIptables,
+  fakeIptablesRestore,
+  fakeDocker,
+  sourceConfig
+) {
+  const bootFixture = path.join(fixture, 'clean-boot')
+  const fakeBin = path.join(bootFixture, 'bin')
+  const runtime = path.join(bootFixture, 'run')
+  const bridgeNetfilterModule = path.join(bootFixture, 'sys-module-br-netfilter')
+  const bridgeNfCallIptables = path.join(bootFixture, 'bridge-nf-call-iptables')
+  const config = path.join(bootFixture, 'metadata-network.conf')
+  const activationState = path.join(bootFixture, 'metadata-network.state')
+  const lock = path.join(bootFixture, 'firewall.lock')
+  const fakeFlock = path.join(fakeBin, 'flock')
+  const fakeSha256sum = path.join(fakeBin, 'sha256sum')
+
+  fs.mkdirSync(fakeBin, { recursive: true })
+  fs.mkdirSync(runtime)
+  fs.copyFileSync(sourceConfig, config)
+  fs.chmodSync(config, 0o600)
+  const configHash = crypto.createHash('sha256').update(fs.readFileSync(config)).digest('hex')
+  const model = createModel(bootFixture, 'iptables-model')
+
+  writeExecutable(path.join(fakeBin, 'stat'), [
+    '#!/bin/sh',
+    'case "$2" in',
+    '  "%d:%i") printf "%s\\n" "1:2" ;;',
+    '  "%u:%g:%a") printf "%s\\n" "0:0:600" ;;',
+    '  *) exit 1 ;;',
+    'esac'
+  ])
+  writeExecutable(fakeFlock, ['#!/bin/sh', 'exit 0'])
+  writeExecutable(fakeSha256sum, [
+    '#!/bin/sh',
+    `printf "%s  %s\\n" "${configHash}" "$1"`
+  ])
+
+  const instrumentedWrapper = wrapperText
+    .replace('PATH=/usr/sbin:/usr/bin:/sbin:/bin', `PATH=${fakeBin}:/usr/sbin:/usr/bin:/sbin:/bin`)
+    .replace('KMF_LIBRARY=/usr/local/libexec/kinvest-metadata-firewall-lib.sh', `KMF_LIBRARY=${library}`)
+    .replace('KMF_LOCK=/run/lock/kinvest-metadata-firewall.lock', `KMF_LOCK=${lock}`)
+    .replace('KMF_IPTABLES=/usr/sbin/iptables', `KMF_IPTABLES=${fakeIptables}`)
+    .replace('KMF_IPTABLES_RESTORE=/usr/sbin/iptables-restore', `KMF_IPTABLES_RESTORE=${fakeIptablesRestore}`)
+    .replace('KMF_DOCKER=/usr/bin/docker', `KMF_DOCKER=${fakeDocker}`)
+    .replace('KMF_SHA256SUM=/usr/bin/sha256sum', `KMF_SHA256SUM=${fakeSha256sum}`)
+    .replaceAll('/usr/bin/flock', fakeFlock)
+  const wrapper = path.join(bootFixture, 'kinvest-metadata-firewall')
+  writeExecutable(wrapper, instrumentedWrapper.trimEnd().split('\n'))
+
+  const environment = {
+    KINVEST_IPTABLES_MODEL: model,
+    KMF_ACTIVATION_STATE: activationState,
+    KMF_BR_NETFILTER_MODULE_PATH: bridgeNetfilterModule,
+    KMF_BRIDGE_NF_CALL_IPTABLES_PATH: bridgeNfCallIptables,
+    KMF_CONFIG: config,
+    KMF_RUNTIME_DIR: runtime
+  }
+  const missingModuleVerification = runHarness(wrapper, ['verify-bridge-netfilter'], environment)
+  const operationsAfterMissingModule = fs.readFileSync(path.join(model, 'operations'), 'utf8')
+
+  fs.mkdirSync(bridgeNetfilterModule)
+  fs.writeFileSync(bridgeNfCallIptables, '1\n')
+  const enabledVerification = runHarness(wrapper, ['verify-bridge-netfilter'], environment)
+  const preStartBootGuard = runHarness(wrapper, ['boot-guard'], environment)
+  const preStartGuard = runHarness(wrapper, ['guard'], environment)
+  const dockerTransitions = simulateDockerFilterRebuild(model)
+
+  fs.writeFileSync(
+    activationState,
+    `version=1\nmode=deny-all\nconfig_sha256=${configHash}\n`,
+    { mode: 0o600 }
+  )
+  const reconcileActive = runHarness(wrapper, ['reconcile-active'], environment)
+  dockerTransitions.push(recordFirewallTransition(model, 'reconcile-active-complete', true))
+
+  const negativeModel = createModel(bootFixture, 'negative-iptables-model')
+  const negativeEnvironment = { ...environment, KINVEST_IPTABLES_MODEL: negativeModel }
+  const negativeBootGuard = runHarness(wrapper, ['boot-guard'], negativeEnvironment)
+  const negativeStartGuard = runHarness(wrapper, ['guard'], negativeEnvironment)
+  const negativeTransitions = simulateDockerFilterRebuild(negativeModel, { removeBootGuard: true })
+
+  const failedStartModel = createModel(bootFixture, 'failed-start-iptables-model')
+  const failedStartEnvironment = {
+    ...environment,
+    KINVEST_FAIL_MATCH: '-A KINVEST-METADATA -j RETURN',
+    KINVEST_IPTABLES_MODEL: failedStartModel
+  }
+  const failedStartLifecycle = runDropInLifecycle(
+    dropInText,
+    wrapper,
+    failedStartEnvironment,
+    failedStartModel
+  )
+
+  return {
+    dockerTransitions,
+    enabledVerification,
+    failedStartLifecycle,
+    finalDockerUser: rules(model, 'DOCKER-USER'),
+    finalForward: rules(model, 'FORWARD'),
+    finalManagedChain: rules(model, 'KINVEST-METADATA'),
+    missingModuleVerification,
+    negativeBootGuard,
+    negativeStartGuard,
+    negativeTransitions,
+    operationsAfterMissingModule,
+    preStartBootGuard,
+    preStartGuard,
+    reconcileActive,
+    sysctlValue: fs.readFileSync(bridgeNfCallIptables, 'utf8')
+  }
+}
+
 function run() {
   const fixture = fs.mkdtempSync(path.join(os.tmpdir(), 'kinvest-metadata-firewall-'))
   const library = path.resolve(__dirname, '../../deploy/server/kinvest-metadata-firewall-lib.sh')
   const wrapper = path.resolve(__dirname, '../../deploy/server/kinvest-metadata-firewall.sh')
+  const modulesLoad = path.resolve(__dirname, '../../deploy/server/kinvest-br-netfilter.modules-load.conf')
+  const bridgeNetfilterSysctl = path.resolve(__dirname, '../../deploy/server/kinvest-br-netfilter.sysctl.conf')
   const dockerDropIn = path.resolve(__dirname, '../../deploy/server/docker-kinvest-metadata-firewall.conf')
   const firewallService = path.resolve(__dirname, '../../deploy/server/kinvest-metadata-firewall.service')
   const firewallTimer = path.resolve(__dirname, '../../deploy/server/kinvest-metadata-firewall.timer')
   const operationsDoc = path.resolve(__dirname, '../../docs/operations/2026-08-11-metadata-ssm-rollout.md')
+  const incidentDoc = path.resolve(__dirname, '../../docs/operations/2026-08-14-t7-br-netfilter-incident.md')
   const fakeIptables = createFakeIptables(fixture)
   const fakeIptablesRestore = createFakeIptablesRestore(fixture)
   const fakeDocker = createFakeDocker(fixture)
+  const bridgeNetfilterModule = path.join(fixture, 'sys-module-br-netfilter')
+  const bridgeNfCallIptables = path.join(fixture, 'bridge-nf-call-iptables')
   const config = path.join(fixture, 'metadata-network.conf')
+  fs.mkdirSync(bridgeNetfilterModule)
+  fs.writeFileSync(bridgeNfCallIptables, '1\n')
+  const previousBridgeNetfilterModulePath = process.env.KMF_BR_NETFILTER_MODULE_PATH
+  const previousBridgeNfCallIptablesPath = process.env.KMF_BRIDGE_NF_CALL_IPTABLES_PATH
+  process.env.KMF_BR_NETFILTER_MODULE_PATH = bridgeNetfilterModule
+  process.env.KMF_BRIDGE_NF_CALL_IPTABLES_PATH = bridgeNfCallIptables
   fs.writeFileSync(config, [
     'KINVEST_METADATA_NETWORK=kinvest-metadata-egress',
     'KINVEST_METADATA_SUBNET=172.31.252.0/29',
@@ -461,6 +824,14 @@ function run() {
     '. "$1"',
     'kinvest_metadata_reconcile "$2" "$3" "$4" "$5"'
   ])
+  const gatedReconcileHarness = path.join(fixture, 'gated-reconcile.sh')
+  writeExecutable(gatedReconcileHarness, [
+    '#!/bin/sh',
+    'set -eu',
+    '. "$1"',
+    'kinvest_metadata_verify_bridge_netfilter',
+    'kinvest_metadata_reconcile "$2" "$3" "$4" "$5"'
+  ])
   const denyAllReconcileHarness = path.join(fixture, 'reconcile-deny-all.sh')
   writeExecutable(denyAllReconcileHarness, [
     '#!/bin/sh',
@@ -483,8 +854,31 @@ function run() {
     '. "$1"',
     'kinvest_metadata_validate_config "$2"'
   ])
+  const verifyCallerFdHarness = path.join(fixture, 'verify-caller-fd.sh')
+  writeExecutable(verifyCallerFdHarness, [
+    '#!/bin/sh',
+    'set -eu',
+    '. "$1"',
+    'exec 7< "$2"',
+    'kinvest_metadata_verify_bridge_netfilter',
+    'IFS= read -r kmf_caller_fd_value <&7',
+    '[ "$kmf_caller_fd_value" = caller-owned ]'
+  ])
 
   try {
+    const callerFd = path.join(fixture, 'caller-fd')
+    const callerFdBin = path.join(fixture, 'caller-fd-bin')
+    fs.mkdirSync(callerFdBin)
+    fs.writeFileSync(callerFd, 'caller-owned\n')
+    writeExecutable(path.join(callerFdBin, 'stat'), [
+      '#!/bin/sh',
+      'printf "%s\\n" "1:2"'
+    ])
+    const preservedCallerFd = runHarness(verifyCallerFdHarness, [library, callerFd], {
+      PATH: `${callerFdBin}:${process.env.PATH}`
+    })
+    assert.equal(preservedCallerFd.status, 0, preservedCallerFd.stderr)
+
     const model = createModel(fixture, 'happy-model')
     const commandArgs = [library, fakeIptables, fakeIptablesRestore, fakeDocker, config]
     const happyDockerEnvironment = {
@@ -680,6 +1074,29 @@ function run() {
     assert.notEqual(reconcileStatusFailure.status, 0)
     assert.match(rules(reconcileStatusFailureModel, 'FORWARD')[0], /kinvest-metadata-docker-start-guard/)
 
+    const disappearingModule = path.join(fixture, 'disappearing-sys-module-br-netfilter')
+    fs.mkdirSync(disappearingModule)
+    const disappearingModuleModel = createModel(fixture, 'disappearing-module-model')
+    const disappearingModuleFailureMatch = '-A KINVEST-METADATA -j RETURN'
+    const disappearingModuleReconcile = runHarness(gatedReconcileHarness, commandArgs, {
+      KINVEST_FAIL_MATCH: disappearingModuleFailureMatch,
+      KINVEST_IPTABLES_MODEL: disappearingModuleModel,
+      KINVEST_REMOVE_PATH: disappearingModule,
+      KINVEST_REMOVE_PATH_MATCH: disappearingModuleFailureMatch,
+      KMF_BR_NETFILTER_MODULE_PATH: disappearingModule,
+      PATH: `${callerFdBin}:${process.env.PATH}`
+    })
+    assert.notEqual(disappearingModuleReconcile.status, 0)
+    assert.equal(fs.existsSync(disappearingModule), false)
+    const disappearingModuleOperations = fs.readFileSync(path.join(disappearingModuleModel, 'operations'), 'utf8').trim().split('\n')
+    const disappearingModuleFailureIndex = disappearingModuleOperations.indexOf(disappearingModuleFailureMatch)
+    assert.ok(disappearingModuleFailureIndex >= 0)
+    assert.equal(
+      disappearingModuleOperations.slice(disappearingModuleFailureIndex + 1)[0].trim(),
+      '-S FORWARD',
+      'recovery guard must remain usable if bridge netfilter disappears after entry gating'
+    )
+
     const invalidConfigs = [
       ['duplicate-key', `${fs.readFileSync(config, 'utf8')}KINVEST_METADATA_IP=169.254.0.23\n`],
       ['unknown-key', `${fs.readFileSync(config, 'utf8')}KINVEST_UNKNOWN=value\n`],
@@ -769,11 +1186,79 @@ function run() {
     assert.deepEqual(rules(preBindModel, 'FORWARD'), ['-j PREEXISTING-FORWARD'])
     assert.deepEqual(rules(preBindModel, 'DOCKER-USER'), ['-j PREEXISTING-DOCKER-USER'])
 
+    const missingModuleRollbackModel = createModel(fixture, 'missing-module-rollback-model')
+    const missingModuleRollbackApplied = runHarness(applyOnceHarness, commandArgs, {
+      KINVEST_IPTABLES_MODEL: missingModuleRollbackModel
+    })
+    assert.equal(missingModuleRollbackApplied.status, 0, missingModuleRollbackApplied.stderr)
+    const missingModuleRollback = runHarness(rollbackHarness, [library, fakeIptables], {
+      KINVEST_IPTABLES_MODEL: missingModuleRollbackModel,
+      KMF_BR_NETFILTER_MODULE_PATH: path.join(fixture, 'missing-module-for-rollback')
+    })
+    assert.equal(missingModuleRollback.status, 0, missingModuleRollback.stderr)
+    assert.deepEqual(rules(missingModuleRollbackModel, 'FORWARD'), [primaryGuardRule, '-j PREEXISTING-FORWARD'])
+    assert.deepEqual(rules(missingModuleRollbackModel, 'DOCKER-USER'), ['-j PREEXISTING-DOCKER-USER'])
+    assert.match(fs.readFileSync(path.join(missingModuleRollbackModel, 'operations'), 'utf8'), /-X KINVEST-METADATA/)
+
+    const missingSysctlPreBindModel = createModel(fixture, 'missing-sysctl-pre-bind-model')
+    const missingSysctlPreBindApplied = runHarness(applyOnceHarness, commandArgs, {
+      KINVEST_IPTABLES_MODEL: missingSysctlPreBindModel
+    })
+    assert.equal(missingSysctlPreBindApplied.status, 0, missingSysctlPreBindApplied.stderr)
+    const missingSysctlPreBindRollback = runHarness(
+      preBindRollbackHarness,
+      [library, fakeIptables, '--assert-role-unbound'],
+      {
+        KINVEST_IPTABLES_MODEL: missingSysctlPreBindModel,
+        KMF_BRIDGE_NF_CALL_IPTABLES_PATH: path.join(fixture, 'missing-sysctl-for-pre-bind')
+      }
+    )
+    assert.equal(missingSysctlPreBindRollback.status, 0, missingSysctlPreBindRollback.stderr)
+    assert.deepEqual(rules(missingSysctlPreBindModel, 'FORWARD'), ['-j PREEXISTING-FORWARD'])
+    assert.deepEqual(rules(missingSysctlPreBindModel, 'DOCKER-USER'), ['-j PREEXISTING-DOCKER-USER'])
+    assert.match(fs.readFileSync(path.join(missingSysctlPreBindModel, 'operations'), 'utf8'), /-X KINVEST-METADATA/)
+
     const wrapperText = fs.readFileSync(wrapper, 'utf8')
+    const modulesLoadText = fs.existsSync(modulesLoad) ? fs.readFileSync(modulesLoad, 'utf8') : null
+    const bridgeNetfilterSysctlText = fs.existsSync(bridgeNetfilterSysctl)
+      ? fs.readFileSync(bridgeNetfilterSysctl, 'utf8')
+      : null
     const dropInText = fs.readFileSync(dockerDropIn, 'utf8')
     const serviceText = fs.readFileSync(firewallService, 'utf8')
     const timerText = fs.readFileSync(firewallTimer, 'utf8')
     const operationsText = fs.readFileSync(operationsDoc, 'utf8')
+    const incidentText = fs.existsSync(incidentDoc) ? fs.readFileSync(incidentDoc, 'utf8') : ''
+    assert.equal(modulesLoadText, 'br_netfilter\n')
+    assert.equal(bridgeNetfilterSysctlText, 'net.bridge.bridge-nf-call-iptables = 1\n')
+    assert.equal(
+      dropInText,
+      '[Unit]\n' +
+        'After=systemd-modules-load.service systemd-sysctl.service\n' +
+        '\n' +
+      '[Service]\n' +
+        'ExecStartPre=+/usr/local/sbin/kinvest-metadata-firewall verify-bridge-netfilter\n' +
+        'ExecStartPre=+/usr/local/sbin/kinvest-metadata-firewall boot-guard\n' +
+        'ExecStartPre=+/usr/local/sbin/kinvest-metadata-firewall guard\n' +
+        'ExecStartPost=+/usr/local/sbin/kinvest-metadata-firewall reconcile-active\n' +
+        'ExecStopPost=+/usr/local/sbin/kinvest-metadata-firewall boot-guard\n' +
+        'ExecStopPost=+/usr/local/sbin/kinvest-metadata-firewall guard\n'
+    )
+    const dropInSequence = [
+      'After=systemd-modules-load.service systemd-sysctl.service',
+      'ExecStartPre=+/usr/local/sbin/kinvest-metadata-firewall verify-bridge-netfilter',
+      'ExecStartPre=+/usr/local/sbin/kinvest-metadata-firewall boot-guard',
+      'ExecStartPre=+/usr/local/sbin/kinvest-metadata-firewall guard',
+      'ExecStartPost=+/usr/local/sbin/kinvest-metadata-firewall reconcile-active',
+      'ExecStopPost=+/usr/local/sbin/kinvest-metadata-firewall boot-guard',
+      'ExecStopPost=+/usr/local/sbin/kinvest-metadata-firewall guard'
+    ]
+    const dropInSequencePositions = dropInSequence.map((line) => dropInText.indexOf(line))
+    assert.ok(dropInSequencePositions.every((position) => position >= 0))
+    assert.deepEqual(
+      [...dropInSequencePositions].sort((left, right) => left - right),
+      dropInSequencePositions,
+      'Docker bridge-netfilter and firewall hooks must retain their required order'
+    )
     assert.match(wrapperText, /flock -x/)
     assert.match(wrapperText, /stat -Lc/)
     assert.match(wrapperText, /-L/)
@@ -782,6 +1267,8 @@ function run() {
     assert.match(wrapperText, /validate-config/)
     assert.match(wrapperText, /reconcile/)
     assert.match(wrapperText, /^KMF_CONFIG=\$\{KMF_CONFIG:-\/etc\/kinvest\/metadata-network\.conf\}$/m)
+    assert.match(wrapperText, /^KMF_BR_NETFILTER_MODULE_PATH=\$\{KMF_BR_NETFILTER_MODULE_PATH:-\/sys\/module\/br_netfilter\}$/m)
+    assert.match(wrapperText, /^KMF_BRIDGE_NF_CALL_IPTABLES_PATH=\$\{KMF_BRIDGE_NF_CALL_IPTABLES_PATH:-\/proc\/sys\/net\/bridge\/bridge-nf-call-iptables\}$/m)
     assert.match(wrapperText, /^KMF_ACTIVATION_STATE=\$\{KMF_ACTIVATION_STATE:-\/root\/docker\/kinvest\/state\/metadata-network\.state\}$/m)
     assert.match(wrapperText, /kinvest_assert_active_config_binding/)
     assert.match(wrapperText, /exec 8< "\$KMF_ACTIVATION_STATE"/)
@@ -794,6 +1281,118 @@ function run() {
     const insecureConfig = runWrapperPermissionFixture(wrapperText, fixture)
     assert.notEqual(insecureConfig.status, 0, 'root:root mode 0640 metadata config must be rejected')
     assert.match(insecureConfig.stderr, /mode 0600/i)
+
+    const verifierCases = [
+      ['module-missing', { moduleType: 'missing' }, 'METADATA_BR_NETFILTER_MODULE_MISSING'],
+      ['module-not-directory', { moduleType: 'file' }, 'METADATA_BR_NETFILTER_MODULE_MISSING'],
+      ['module-symlink', { moduleType: 'symlink' }, 'METADATA_BR_NETFILTER_MODULE_MISSING'],
+      ['sysctl-missing', { sysctlType: 'missing' }, 'METADATA_BR_NETFILTER_SYSCTL_MISSING'],
+      ['sysctl-symlink', { sysctlType: 'symlink' }, 'METADATA_BR_NETFILTER_SYSCTL_MISSING'],
+      ['sysctl-disabled', { sysctlValue: '0\n' }, 'METADATA_BR_NETFILTER_SYSCTL_DISABLED'],
+      ['sysctl-invalid', { sysctlValue: '1 \n' }, 'METADATA_BR_NETFILTER_SYSCTL_INVALID'],
+      ['sysctl-missing-newline', { sysctlValue: '1' }, 'METADATA_BR_NETFILTER_SYSCTL_INVALID'],
+      ['sysctl-extra-lines', { sysctlValue: '1\n1\n' }, 'METADATA_BR_NETFILTER_SYSCTL_INVALID'],
+      ['sysctl-open-failure', { sysctlMode: 0o000 }, 'METADATA_BR_NETFILTER_SYSCTL_INVALID'],
+      ['sysctl-identity-mismatch', { sysctlIdentityMismatch: true }, 'METADATA_BR_NETFILTER_SYSCTL_INVALID'],
+      ['sysctl-symlink-replacement', { sysctlSymlinkReplacement: true }, 'METADATA_BR_NETFILTER_SYSCTL_INVALID']
+    ]
+    if (fs.existsSync('/bin/dash')) {
+      verifierCases.push([
+        'sysctl-open-failure-dash',
+        { shell: '/bin/dash', sysctlMode: 0o000 },
+        'METADATA_BR_NETFILTER_SYSCTL_INVALID'
+      ])
+    }
+    for (const [name, options, expectedCode] of verifierCases) {
+      const verification = runWrapperBridgeNetfilterFixture(wrapperText, library, fixture, name, options)
+      assert.notEqual(verification.result.status, 0, `${name} must fail closed`)
+      assert.equal(verification.result.stdout, '')
+      assert.equal(verification.result.stderr, `${expectedCode}\n`)
+      assert.deepEqual(verification.operations, [], `${name} must not invoke firewall or Docker dependencies`)
+    }
+    const enabledBridgeNetfilter = runWrapperBridgeNetfilterFixture(wrapperText, library, fixture, 'enabled')
+    assert.equal(enabledBridgeNetfilter.result.status, 0, enabledBridgeNetfilter.result.stderr)
+    assert.equal(enabledBridgeNetfilter.result.stdout, '')
+    assert.equal(enabledBridgeNetfilter.result.stderr, '')
+    assert.deepEqual(enabledBridgeNetfilter.operations, [])
+
+    for (const action of ['guard', 'apply', 'status', 'reconcile']) {
+      const gatedAction = runWrapperBridgeNetfilterFixture(wrapperText, library, fixture, `missing-module-${action}`, {
+        args: [action],
+        moduleType: 'missing'
+      })
+      assert.notEqual(gatedAction.result.status, 0, `${action} must fail closed without bridge netfilter`)
+      assert.equal(gatedAction.result.stdout, '')
+      assert.equal(gatedAction.result.stderr, 'METADATA_BR_NETFILTER_MODULE_MISSING\n')
+      assert.deepEqual(gatedAction.operations, [], `${action} must fail before dependency operations`)
+    }
+
+    const expectedUsage = 'Usage: kinvest-metadata-firewall validate-config|verify-bridge-netfilter|boot-guard|guard|apply|status|reconcile|reconcile-active|activate-deny-all --confirm-deny-all|rollback|rollback-pre-bind --assert-role-unbound'
+    const invalidVerifierArguments = runWrapperBridgeNetfilterFixture(wrapperText, library, fixture, 'invalid-arguments', {
+      args: ['verify-bridge-netfilter', 'unexpected']
+    })
+    assert.equal(invalidVerifierArguments.result.status, 2)
+    assert.equal(invalidVerifierArguments.result.stderr, `${expectedUsage}\n`)
+    assert.deepEqual(invalidVerifierArguments.operations, [])
+
+    const cleanBoot = runCleanBootFixture(
+      wrapperText,
+      library,
+      dropInText,
+      fixture,
+      fakeIptables,
+      fakeIptablesRestore,
+      fakeDocker,
+      config
+    )
+    assert.notEqual(cleanBoot.missingModuleVerification.status, 0)
+    assert.equal(cleanBoot.missingModuleVerification.stderr, 'METADATA_BR_NETFILTER_MODULE_MISSING\n')
+    assert.equal(cleanBoot.operationsAfterMissingModule, '')
+    assert.equal(cleanBoot.sysctlValue, '1\n')
+    assert.equal(cleanBoot.enabledVerification.status, 0, cleanBoot.enabledVerification.stderr)
+    assert.equal(cleanBoot.preStartBootGuard.status, 0, cleanBoot.preStartBootGuard.stderr)
+    assert.equal(cleanBoot.preStartGuard.status, 0, cleanBoot.preStartGuard.stderr)
+    assert.deepEqual(cleanBoot.dockerTransitions.map((transition) => transition.name), [
+      'pre-start-guards-installed',
+      'docker-forward-reset',
+      'docker-user-reset',
+      'docker-containers-ready',
+      'reconcile-active-complete'
+    ])
+    assert.equal(cleanBoot.dockerTransitions[1].filterGuard, false)
+    assert.equal(cleanBoot.dockerTransitions[1].bootGuard, true)
+    assertContinuousMetadataDeny(cleanBoot.dockerTransitions)
+    assert.equal(cleanBoot.reconcileActive.status, 0, cleanBoot.reconcileActive.stderr)
+    assert.deepEqual(cleanBoot.finalManagedChain, [
+      '-d 169.254.0.23/32 -p tcp --dport 80 -m comment --comment kinvest-metadata-default-deny -j REJECT --reject-with tcp-reset',
+      '-j RETURN'
+    ])
+    assert.doesNotMatch(cleanBoot.finalManagedChain.join('\n'), /kinvest-metadata-app-allow/)
+    assert.deepEqual(cleanBoot.finalForward, [
+      '-j KINVEST-METADATA',
+      '-j DOCKER-USER',
+      '-j PREEXISTING-FORWARD'
+    ])
+    assert.deepEqual(cleanBoot.finalDockerUser, ['-j KINVEST-METADATA', '-j RETURN'])
+    assert.doesNotMatch(
+      cleanBoot.finalForward.join('\n'),
+      /kinvest-metadata-(?:docker-start|normalization)-guard/
+    )
+    assert.equal(cleanBoot.dockerTransitions.at(-1).bootGuard, false)
+    assert.equal(cleanBoot.dockerTransitions.at(-1).managedDeny, true)
+    assert.equal(cleanBoot.negativeBootGuard.status, 0, cleanBoot.negativeBootGuard.stderr)
+    assert.equal(cleanBoot.negativeStartGuard.status, 0, cleanBoot.negativeStartGuard.stderr)
+    assert.throws(
+      () => assertContinuousMetadataDeny(cleanBoot.negativeTransitions),
+      /docker-removed-boot-guard must retain an equivalent deny/
+    )
+    assert.equal(cleanBoot.failedStartLifecycle.startPreResults.every((result) => result.status === 0), true)
+    assert.notEqual(cleanBoot.failedStartLifecycle.startPostResults[0].status, 0)
+    assert.equal(cleanBoot.failedStartLifecycle.serviceState, 'failed-and-stopped')
+    assert.equal(cleanBoot.failedStartLifecycle.dockerServing, false)
+    assert.equal(cleanBoot.failedStartLifecycle.stopPostResults.every((result) => result.status === 0), true)
+    assert.equal(cleanBoot.failedStartLifecycle.transitions.at(-1).bootGuard, true)
+
     const activeState = runWrapperActivationFixture(wrapperText, fixture, 'active')
     assert.equal(activeState.result.status, 0, activeState.result.stderr)
     assert.match(activeState.operations, /^reconcile:/)
@@ -808,6 +1407,14 @@ function run() {
       'hashing and reconciliation must use the same immutable snapshot'
     )
     assert.deepEqual(activeState.snapshots, [], 'the active config snapshot must be removed after success')
+    const missingModuleActiveReconcile = runWrapperActivationFixture(wrapperText, fixture, 'missing-module', {
+      moduleMissing: true,
+      productionLibrary: library
+    })
+    assert.notEqual(missingModuleActiveReconcile.result.status, 0)
+    assert.equal(missingModuleActiveReconcile.result.stderr, 'METADATA_BR_NETFILTER_MODULE_MISSING\n')
+    assert.equal(missingModuleActiveReconcile.operations, '')
+    assert.deepEqual(missingModuleActiveReconcile.events, [])
     const denyAllState = runWrapperActivationFixture(wrapperText, fixture, 'deny-all', {
       stateSource: 'version=1\nmode=deny-all\nconfig_sha256=__CONFIG_SHA256__\n'
     })
@@ -947,7 +1554,6 @@ function run() {
       assert.deepEqual(rejected.snapshots, [], `${name} must remove the config snapshot after failure`)
     }
     assert.match(dropInText, /ExecStartPre=.* guard/)
-    assert.doesNotMatch(dropInText, /^ExecStartPost=/m)
     assert.match(dropInText, /ExecStopPost=.* guard/)
     assert.match(serviceText, /^Requisite=docker\.service$/m)
     assert.match(serviceText, /^After=docker\.service$/m)
@@ -971,8 +1577,7 @@ function run() {
       'Compose/network recreation approval',
       'Docker restart approval',
       'iptables/systemd installation approval',
-      'CAM role binding approval',
-      'secret rotation approval',
+      'GitHub Production secret update approval',
       'reboot approval'
     ]) {
       assert.match(operationsText, new RegExp(gate, 'i'))
@@ -982,8 +1587,6 @@ function run() {
     assert.match(operationsText, /candidate.*not pre-approved/i)
     assert.match(operationsText, /conflict preflight/i)
     assert.match(operationsText, /explicit user (?:confirmation|approval)/i)
-    assert.match(operationsText, /operator assertion/i)
-    assert.match(operationsText, /does not query[^\n]*CAM/i)
     assert.match(operationsText, /not a\s+claim that the candidate is conflict-free/i)
     assert.match(operationsText, /pending[\s\S]{0,160}active/i)
     assert.match(operationsText, /routine[\s\S]{0,200}read-only[\s\S]{0,80}status/i)
@@ -991,6 +1594,60 @@ function run() {
     assert.match(operationsText, /Kinvest[\s\S]{0,120}Nginx[\s\S]{0,160}temporary bridge containers/i)
     assert.match(operationsText, /T7[\s\S]{0,160}separate approval/i)
     assert.match(operationsText, /no CAM or SSM/i)
+    assert.match(operationsText, /br_netfilter[\s\S]{0,200}before Docker bridge traffic[\s\S]{0,160}filtered/i)
+    assert.match(
+      operationsText,
+      /net[.]bridge[.]bridge-nf-call-iptables = 1[\s\S]{0,120}(?:exactly|must be)[\s\S]{0,40}`?1`?/i
+    )
+    assert.match(operationsText, /Docker[\s\S]{0,240}fail(?:s)? closed[\s\S]{0,240}(?:module|sysctl|interlock|reconcile)/i)
+    assert.match(operationsText, /boot interlock[\s\S]{0,200}boot-guard/i)
+    assert.match(operationsText, /ExecStartPost[\s\S]{0,120}(?:not failure-ignored|non-ignored)[\s\S]{0,120}reconcile-active/i)
+    assert.match(operationsText, /permanent deny-all[\s\S]{0,200}(?:before|prior to)[\s\S]{0,120}(?:released|removed)/i)
+    assert.match(operationsText, /root-only[\s\S]{0,120}verified installation source/i)
+    assert.match(operationsText, /operator-required[\s\S]{0,180}interlock/i)
+    for (const section of [
+      'Detection',
+      'Impact',
+      'Containment',
+      'Root cause',
+      'Repair design',
+      'Current status',
+      'Evidence and backups',
+      'Recovery gates'
+    ]) {
+      assert.match(incidentText, new RegExp(`^## ${section}$`, 'im'))
+    }
+    assert.match(incidentText, /real bridge-container probes[\s\S]{0,160}169[.]254[.]0[.]23/i)
+    assert.match(incidentText, /Docker service and socket[\s\S]{0,100}stopped[\s\S]{0,100}RESTORE[\s\S]{0,80}not triggered/i)
+    assert.match(incidentText, /Production remains[\s\S]{0,120}Docker stopped[\s\S]{0,120}public unavailable/i)
+    assert.match(incidentText, /merged[\s\S]{0,120}separately approved/i)
+    assert.match(incidentText, /second CVM reboot[\s\S]{0,160}separate explicit approval/i)
+    assert.match(incidentText, /CVM reboot[\s\S]{0,120}tmpfs bundle[\s\S]{0,80}disappears/i)
+    assert.match(incidentText, /RESTORE[\s\S]{0,160}GitHub Production approval/i)
+    assert.match(incidentText, /never (?:request|record)[\s\S]{0,100}secret values/i)
+    assert.match(incidentText, /no CAM(?:\/SSM| or SSM)[\s\S]{0,160}real iFinD[\s\S]{0,100}model[\s\S]{0,100}database migration[\s\S]{0,100}image change/i)
+    assert.match(incidentText, /t7-cvm-20260814T033859Z/)
+    assert.match(incidentText, /t7-docker-20260814T033524Z/)
+    const retiredOperationsPreamble = operationsText.slice(0, 900)
+    assert.match(retiredOperationsPreamble, /RETIRED/i)
+    assert.match(retiredOperationsPreamble, /HISTORICAL/i)
+    assert.match(retiredOperationsPreamble, /DO NOT EXECUTE/i)
+    assert.match(retiredOperationsPreamble, /GitHub Production Secrets[\s\S]{0,80}tmpfs/i)
+    assert.match(
+      retiredOperationsPreamble,
+      /[.]\/2026-08-14-t7-br-netfilter-incident[.]md/
+    )
+    assert.doesNotMatch(operationsText, /^\s*install -o root\b/m)
+    assert.match(
+      operationsText,
+      /all T7 installation[\s\S]{0,160}deploy\/server\/install-metadata-firewall[.]sh[\s\S]{0,180}root-owned verified source[\s\S]{0,120}explicit approval/i
+    )
+    assert.doesNotMatch(operationsText, /^###\s+(?:CAM|SSM)[^\n]*approval\s*$/im)
+    assert.doesNotMatch(operationsText, /^\s*kinvest-metadata-firewall rollback-pre-bind\b/m)
+    assert.doesNotMatch(operationsText, /may run:[\s\S]{0,160}rollback-pre-bind/i)
+    assert.match(operationsText, /rollback-pre-bind[\s\S]{0,160}(?:must not be used|prohibited)/i)
+    assert.match(operationsText, /never[\s\S]{0,80}(?:ask|request)[\s\S]{0,80}secret values[\s\S]{0,80}chat/i)
+    assert.match(operationsText, /RESTORE[\s\S]{0,160}GitHub Production approval/i)
     assert.match(
       operationsText,
       /`reconcile-active`[\s\S]{0,700}`mode=active`[\s\S]{0,240}`mode=deny-all`[\s\S]{0,700}dispatch/i
@@ -1035,6 +1692,16 @@ function run() {
     assert.doesNotMatch(operationsText, /\bins-[a-z0-9]+\b/i)
     assert.doesNotMatch(operationsText, /\b2\.35\.1\b/)
   } finally {
+    if (previousBridgeNetfilterModulePath === undefined) {
+      delete process.env.KMF_BR_NETFILTER_MODULE_PATH
+    } else {
+      process.env.KMF_BR_NETFILTER_MODULE_PATH = previousBridgeNetfilterModulePath
+    }
+    if (previousBridgeNfCallIptablesPath === undefined) {
+      delete process.env.KMF_BRIDGE_NF_CALL_IPTABLES_PATH
+    } else {
+      process.env.KMF_BRIDGE_NF_CALL_IPTABLES_PATH = previousBridgeNfCallIptablesPath
+    }
     fs.rmSync(fixture, { recursive: true, force: true })
   }
 }
