@@ -10,7 +10,7 @@ const { prepareFinanceRows } = require('../public/finance-contract')
 const { isVerifiedDataBlock } = require('../public/data-source-contract')
 const { bootstrapSecrets } = require('./security/secret-bootstrap')
 const { createAccessControlRuntime } = require('./security/access-control-runtime')
-const { openDb } = require('./db/refresh-db')
+const { closeDb, openDb } = require('./db/refresh-db')
 
 const PORT = Number(process.env.PORT || 4173)
 const ROOT = path.join(__dirname, '..')
@@ -385,6 +385,7 @@ async function startServer({
   bootstrap = bootstrapSecrets,
   createAccessRuntime = createAccessControlRuntime,
   openDatabase = openDb,
+  closeDatabase = closeDb,
   runtimeServer = server,
   port = PORT,
   processRef = process,
@@ -397,7 +398,8 @@ async function startServer({
     accessRuntime = createAccessRuntime({
       env,
       secretRuntime,
-      openDatabase
+      openDatabase,
+      closeDatabase
     })
   } catch (error) {
     secretRuntime.clear()
@@ -451,7 +453,9 @@ async function startServer({
     cleanup()
     throw error
   }
-  logger.log(`Kinvest mock server started at http://localhost:${port}`)
+  try {
+    logger.log(`Kinvest mock server started at http://localhost:${port}`)
+  } catch {}
   return runtimeServer
 }
 

@@ -1,6 +1,15 @@
 const assert = require('node:assert/strict')
 const crypto = require('node:crypto')
+const fs = require('node:fs')
+const os = require('node:os')
+const path = require('node:path')
 const { DatabaseSync } = require('node:sqlite')
+const {
+  closeDb,
+  getDbPath,
+  openDb,
+  setDbPath
+} = require('../db/refresh-db')
 const {
   ADMIN_SECRET_NAME,
   DEVICE_HMAC_SECRET_NAME,
@@ -73,12 +82,16 @@ function enabledEnv(versionConfig = VERSION_CONFIG) {
 }
 
 function testDisabledAvoidsSecretsAndDatabase() {
+  let openCalls = 0
+  let closeCalls = 0
   const forbiddenDatabase = new Proxy({}, {
     get() { throw new Error('database was accessed') }
   })
   const runtime = createAccessControlRuntime({
     env: {},
     database: forbiddenDatabase,
+    openDatabase() { openCalls += 1 },
+    closeDatabase() { closeCalls += 1 },
     secretRuntime: {
       get status() { throw new Error('secret status was read') },
       readSecret() { throw new Error('secret was read') }
@@ -89,14 +102,18 @@ function testDisabledAvoidsSecretsAndDatabase() {
   assert.equal(runtime.deviceApproval, null)
   assert.doesNotThrow(() => runtime.clear())
   assert.doesNotThrow(() => runtime.clear())
+  assert.equal(openCalls, 0)
+  assert.equal(closeCalls, 0)
 }
 
 function testEnabledComposesWorkingServicesAndClearsMaterial() {
   const secret = createSecretRuntime()
   const database = new DatabaseSync(':memory:')
+  let borrowedCloseCalls = 0
   const runtime = createAccessControlRuntime({
     env: enabledEnv(),
     database,
+    closeDatabase() { borrowedCloseCalls += 1 },
     secretRuntime: secret.runtime,
     now: () => Date.UTC(2026, 7, 21),
     randomBytes: (size) => Buffer.alloc(size, 13)
@@ -161,8 +178,82 @@ function testEnabledComposesWorkingServicesAndClearsMaterial() {
   ]
   runtime.clear()
   runtime.clear()
+  assert.strictEqual(borrowedCloseCalls, 0)
   assert.strictEqual(retained.every((value) =>
     value.every((byte) => byte === 0)), true)
+}
+
+function testOwnedDatabaseClosesOnceAndFailureCloses() {
+  const ownedDatabase = new DatabaseSync(':memory:')
+  let ownedOpenCalls = 0
+  let ownedCloseCalls = 0
+  const ownedRuntime = createAccessControlRuntime({
+    env: enabledEnv(),
+    secretRuntime: createSecretRuntime().runtime,
+    openDatabase() {
+      ownedOpenCalls += 1
+      return ownedDatabase
+    },
+    closeDatabase(database) {
+      assert.strictEqual(database, ownedDatabase)
+      ownedCloseCalls += 1
+      database.close()
+    }
+  })
+  assert.strictEqual(ownedOpenCalls, 1)
+  ownedRuntime.clear()
+  ownedRuntime.clear()
+  assert.strictEqual(ownedCloseCalls, 1)
+
+  const rawFailingDatabase = new DatabaseSync(':memory:')
+  const failingDatabase = new Proxy(rawFailingDatabase, {
+    get(target, property) {
+      if (property === 'exec') {
+        return (sql) => {
+          if (String(sql).includes('CREATE TABLE IF NOT EXISTS device_auth_requests')) {
+            throw new Error('SENSITIVE_INITIALIZE_FAILURE')
+          }
+          return target.exec(sql)
+        }
+      }
+      const value = target[property]
+      return typeof value === 'function' ? value.bind(target) : value
+    }
+  })
+  let failureCloseCalls = 0
+  expectCode(() => createAccessControlRuntime({
+    env: enabledEnv(),
+    secretRuntime: createSecretRuntime().runtime,
+    openDatabase: () => failingDatabase,
+    closeDatabase(database) {
+      assert.strictEqual(database, failingDatabase)
+      failureCloseCalls += 1
+      database.close()
+    }
+  }), 'ACCESS_CONTROL_CONFIG_INVALID')
+  assert.strictEqual(failureCloseCalls, 1)
+}
+
+function testRefreshDatabaseCanCloseAndReopen() {
+  const previousPath = getDbPath()
+  const directory = fs.mkdtempSync(path.join(os.tmpdir(), 'kinvest-refresh-db-'))
+  const databasePath = path.join(directory, 'refresh.sqlite')
+  try {
+    closeDb()
+    setDbPath(databasePath)
+    const first = openDb()
+    closeDb()
+    closeDb()
+    const second = openDb()
+    assert.notStrictEqual(second, first)
+    assert.doesNotThrow(() => second.prepare(
+      'SELECT COUNT(*) AS count FROM refresh_counters'
+    ).get())
+    closeDb()
+  } finally {
+    setDbPath(previousPath)
+    fs.rmSync(directory, { recursive: true, force: true })
+  }
 }
 
 function testConfigurationFailuresAreStableAndFailClosed() {
@@ -199,6 +290,8 @@ function testConfigurationFailuresAreStableAndFailClosed() {
 async function run() {
   testDisabledAvoidsSecretsAndDatabase()
   testEnabledComposesWorkingServicesAndClearsMaterial()
+  testOwnedDatabaseClosesOnceAndFailureCloses()
+  testRefreshDatabaseCanCloseAndReopen()
   testConfigurationFailuresAreStableAndFailClosed()
 }
 

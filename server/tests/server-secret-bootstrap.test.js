@@ -24,6 +24,40 @@ async function run() {
   const initialUmask = process.umask()
   try {
   const { runServerExecutable, startServer } = require('../server')
+  const loggerFailureOrder = []
+  const loggerFailureProcess = new EventEmitter()
+  const loggerFailureServer = new FakeServer()
+  await startServer({
+    runtimeServer: loggerFailureServer,
+    bootstrap: async () => ({
+      status: Object.freeze({ mode: 'disabled', referenceCount: 0 }),
+      clear() { loggerFailureOrder.push('secret') }
+    }),
+    createAccessRuntime: ({ closeDatabase }) => {
+      assert.equal(typeof closeDatabase, 'function')
+      let cleared = false
+      return {
+        status: Object.freeze({ mode: 'disabled' }),
+        adminAuth: null,
+        deviceApproval: null,
+        clear() {
+          if (cleared) return
+          cleared = true
+          loggerFailureOrder.push('access')
+          loggerFailureOrder.push('database')
+        }
+      }
+    },
+    processRef: loggerFailureProcess,
+    logger: {
+      log() { throw new Error('SENSITIVE_LOGGER_FAILURE') }
+    }
+  })
+  assert.equal(loggerFailureServer.listenCalls, 1)
+  loggerFailureProcess.emit('SIGTERM')
+  assert.equal(loggerFailureServer.closeCalls, 1)
+  assert.deepStrictEqual(loggerFailureOrder, ['access', 'database', 'secret'])
+
   const accessFailureServer = new FakeServer()
   let accessFailureSecretClearCount = 0
   await assert.rejects(startServer({

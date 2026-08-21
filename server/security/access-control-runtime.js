@@ -96,6 +96,7 @@ function createAccessControlRuntime({
   secretRuntime,
   database,
   openDatabase,
+  closeDatabase,
   now = Date.now,
   randomBytes = crypto.randomBytes
 } = {}) {
@@ -107,6 +108,14 @@ function createAccessControlRuntime({
   let parsedHmacMaterial
   let rateLimitKey
   let adminAuth
+  let sharedDatabase
+  let ownsDatabase = false
+  let databaseClosed = false
+  const closeOwnedDatabase = () => {
+    if (!ownsDatabase || databaseClosed) return
+    databaseClosed = true
+    closeDatabase(sharedDatabase)
+  }
   try {
     const selection = readVersionSelection(env, secretRuntime)
     adminMaterial = secretRuntime.readSecret({
@@ -123,9 +132,14 @@ function createAccessControlRuntime({
       .update(ADMIN_RATE_LIMIT_KEY_DOMAIN, 'utf8')
       .digest()
 
-    const sharedDatabase = database || (
-      typeof openDatabase === 'function' ? openDatabase() : null
-    )
+    if (database) {
+      sharedDatabase = database
+    } else {
+      if (typeof openDatabase !== 'function' ||
+        typeof closeDatabase !== 'function') fail()
+      sharedDatabase = openDatabase()
+      ownsDatabase = true
+    }
     if (!sharedDatabase) fail()
     const adminRepository = new AdminAuthRepository(sharedDatabase)
     const deviceRepository = new DeviceAuthRepository(sharedDatabase)
@@ -158,10 +172,14 @@ function createAccessControlRuntime({
         if (cleared) return
         cleared = true
         adminAuth.clear()
+        closeOwnedDatabase()
       }
     })
   } catch (error) {
     if (adminAuth) adminAuth.clear()
+    try {
+      closeOwnedDatabase()
+    } catch {}
     if (error instanceof AccessControlRuntimeError) throw error
     fail()
   } finally {
