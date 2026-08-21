@@ -12,6 +12,7 @@ function removeRepositoryPythonBytecodeCache() {
 process.once('exit', removeRepositoryPythonBytecodeCache)
 
 const tests = [
+  require('./admin-auth.test'),
   require('./security-identity.test'),
   require('./device-approval.test'),
   require('./cvm-ssm-secret-provider.test'),
