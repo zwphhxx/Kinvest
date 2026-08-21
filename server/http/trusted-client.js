@@ -69,7 +69,7 @@ function resolveClientIdentity(req, { trustedProxyAddresses = [] } = {}) {
     Object.prototype.hasOwnProperty.call(req.headers, 'x-real-ip')
   const hasForwarded = req.headers &&
     Object.prototype.hasOwnProperty.call(req.headers, 'x-forwarded-for')
-  if (!hasReal && !hasForwarded) return directAddress
+  if (!hasReal && !hasForwarded) fail()
   if (!hasReal || !hasForwarded) fail()
   const real = singleHeader(req.headers, 'x-real-ip')
   const forwarded = singleHeader(req.headers, 'x-forwarded-for')

@@ -11,6 +11,7 @@ const REQUEST_RATE_WINDOW_MS = 10 * 60 * 1000
 const REQUEST_RATE_MAX = 5
 const REQUEST_ACTIVE_MAX = 3
 const REQUEST_IP_DIGEST_DOMAIN = 'kinvest-device-request-ip-v1\0'
+const REQUEST_CODE_DIGEST_DOMAIN = 'kinvest-device-request-code-v1\0'
 const TOKEN_ROTATION_MS = 30 * DAY_MS
 const TOKEN_GRACE_MS = 5 * 60 * 1000
 const TOKEN_IDLE_MS = 90 * DAY_MS
@@ -49,18 +50,15 @@ function hashValue(value) {
   return crypto.createHash('sha256').update(value).digest('base64url')
 }
 
-function hashRequestCode(requestId, requestCode) {
-  return crypto.scryptSync(
-    String(requestCode),
-    `kinvest-device-request-code-v1:${requestId}`,
-    32,
-    {
-      N: 16384,
-      r: 8,
-      p: 1,
-      maxmem: 64 * 1024 * 1024
-    }
-  ).toString('base64url')
+function hashRequestCode(key, requestId, requestCode) {
+  const normalizedCode = typeof requestCode === 'string' &&
+    /^\d{6}$/.test(requestCode) ? requestCode : 'invalid'
+  return crypto.createHmac('sha256', key)
+    .update(REQUEST_CODE_DIGEST_DOMAIN, 'utf8')
+    .update(requestId, 'utf8')
+    .update('\0', 'utf8')
+    .update(normalizedCode, 'utf8')
+    .digest('base64url')
 }
 
 function hmacToken(secret, token) {
@@ -131,6 +129,7 @@ class DeviceApprovalService {
     hmacSecretName,
     activeHmacVersionId,
     requestIpDigestKey,
+    requestCodeDigestKey,
     requireRequestRateLimitIdentity = false,
     now = Date.now,
     randomBytes = crypto.randomBytes
@@ -146,6 +145,7 @@ class DeviceApprovalService {
     this.now = now
     this.randomBytes = randomBytes
     this.requestIpDigestKey = copyRequestIpDigestKey(requestIpDigestKey)
+    this.requestCodeDigestKey = copyRequestIpDigestKey(requestCodeDigestKey)
     this.requireRequestRateLimitIdentity =
       requireRequestRateLimitIdentity === true
     this.cleared = false
@@ -200,7 +200,11 @@ class DeviceApprovalService {
       requestId,
       deviceName: normalizedDeviceName,
       ipDigest: normalizedIpDigest,
-      requestCodeDigest: hashRequestCode(requestId, requestCode),
+      requestCodeDigest: hashRequestCode(
+        this.requestCodeDigestKey,
+        requestId,
+        requestCode
+      ),
       browserCredentialDigest: hashValue(browserCredential),
       createdAt: now,
       expiresAt
@@ -284,6 +288,7 @@ class DeviceApprovalService {
   clear() {
     if (this.cleared) return
     this.requestIpDigestKey.fill(0)
+    this.requestCodeDigestKey.fill(0)
     this.cleared = true
   }
 
@@ -307,7 +312,11 @@ class DeviceApprovalService {
       return { approved: true, requestId }
     }
 
-    const suppliedDigest = hashRequestCode(requestId, requestCode)
+    const suppliedDigest = hashRequestCode(
+      this.requestCodeDigestKey,
+      requestId,
+      requestCode
+    )
     if (!digestsEqual(suppliedDigest, request.requestCodeDigest)) {
       const updated = this.repository.runInImmediateTransaction(() => {
         const failedRequest = this.repository.recordFailedAttempt(

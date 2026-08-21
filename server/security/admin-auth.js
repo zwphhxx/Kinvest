@@ -288,21 +288,32 @@ class AdminAuthService {
   }
 
   verifyCsrf(sessionToken, csrfToken) {
-    const session = this.getActiveSession(sessionToken, false)
-    this.assertCsrf(session, csrfToken)
-    const updated = this.repository.updateSessionUsage(
-      session.sessionId,
-      session.lastUsedAt,
-      session.idleExpiresAt,
-      this.auditEvent(
+    this.assertConfigured()
+    const tokenDigest = digestPublicToken(sessionToken)
+    const csrfDigest = digestPublicToken(csrfToken)
+    if (!tokenDigest) fail('ADMIN_SESSION_INVALID')
+    if (!csrfDigest) fail('ADMIN_CSRF_INVALID')
+    const now = this.now()
+    const result = this.repository.verifyAndTouchSession({
+      tokenDigest,
+      expectedCsrfDigest: csrfDigest,
+      now,
+      idleTtlMs: ADMIN_IDLE_TTL_MS,
+      auditEvent: this.auditEvent(
         'admin_session_authenticated',
-        session.lastUsedAt,
-        session.sessionId,
-        { sessionId: session.sessionId }
+        now,
+        null,
+        {}
       )
-    )
-    if (!updated) fail('ADMIN_SESSION_INVALID')
-    return true
+    })
+    if (result.status === 'session_expired') fail('ADMIN_SESSION_EXPIRED')
+    if (result.status === 'csrf_invalid') fail('ADMIN_CSRF_INVALID')
+    if (result.status !== 'authenticated') fail('ADMIN_SESSION_INVALID')
+    return {
+      sessionId: result.session.sessionId,
+      idleExpiresAt: result.session.idleExpiresAt,
+      absoluteExpiresAt: result.session.absoluteExpiresAt
+    }
   }
 
   refreshCsrf(sessionToken) {
@@ -312,8 +323,8 @@ class AdminAuthService {
       sessionId: session.sessionId,
       expectedCsrfDigest: session.csrfDigest,
       csrfDigest: digestPublicToken(csrfToken),
-      lastUsedAt: session.lastUsedAt,
-      idleExpiresAt: session.idleExpiresAt,
+      now: session.lastUsedAt,
+      idleTtlMs: ADMIN_IDLE_TTL_MS,
       auditEvent: this.auditEvent(
         'admin_csrf_rotated',
         session.lastUsedAt,

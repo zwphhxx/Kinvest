@@ -124,7 +124,7 @@ function createRuntime(mode = 'device-approval') {
       if (csrf !== CSRF_TOKEN && csrf !== NEW_CSRF_TOKEN) {
         throw codedError('ADMIN_CSRF_INVALID')
       }
-      return true
+      return { idleExpiresAt: NOW + 1800000, absoluteExpiresAt: NOW + 28800000 }
     },
     async reauthenticate(password, identity) {
       calls.push(['reauthenticate', password, identity])

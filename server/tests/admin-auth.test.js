@@ -376,9 +376,9 @@ async function testCsrfAndReauthentication() {
   )
 
   const login = await harness.service.login(PASSWORD, '198.51.100.30')
-  assert.strictEqual(
-    harness.service.verifyCsrf(login.sessionToken, login.csrfToken),
-    true
+  assert.equal(
+    harness.service.verifyCsrf(login.sessionToken, login.csrfToken).sessionId,
+    login.sessionId
   )
   await expectCode(
     () => harness.service.verifyCsrf(login.sessionToken, 'wrong-csrf'),
@@ -410,9 +410,9 @@ async function testRejectedCsrfDoesNotTouchSession() {
   assert.deepStrictEqual(selectSession.get(login.sessionId), beforeSession)
   assert.strictEqual(countAuthenticatedAudit(), beforeAuditCount)
 
-  assert.strictEqual(
-    harness.service.verifyCsrf(login.sessionToken, login.csrfToken),
-    true
+  assert.equal(
+    harness.service.verifyCsrf(login.sessionToken, login.csrfToken).sessionId,
+    login.sessionId
   )
   const afterValidCsrf = selectSession.get(login.sessionId)
   assert.strictEqual(afterValidCsrf.last_used_at, harness.clock.value)
@@ -538,8 +538,8 @@ async function testCsrfRefreshIsAtomicAndRevokesPreviousToken() {
     'ADMIN_CSRF_INVALID'
   )
   assert.equal(
-    harness.service.verifyCsrf(login.sessionToken, refreshed.csrfToken),
-    true
+    harness.service.verifyCsrf(login.sessionToken, refreshed.csrfToken).sessionId,
+    login.sessionId
   )
   const after = harness.repository.findSessionByTokenDigest(before.tokenDigest)
   assert.notEqual(after.csrfDigest, before.csrfDigest)

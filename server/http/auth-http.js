@@ -1,4 +1,5 @@
 const crypto = require('node:crypto')
+const { TextDecoder } = require('node:util')
 
 const { resolveClientIdentity } = require('./trusted-client')
 
@@ -10,6 +11,12 @@ const ADMIN_COOKIE = '__Host-kinvest-admin'
 const TOKEN_PATTERN = /^[A-Za-z0-9_-]{43}$/
 const REQUEST_ID_PATTERN = /^[A-Za-z0-9_-]{22}$/
 const TERMINAL_REQUEST_STATES = new Set(['expired', 'locked', 'consumed'])
+const TERMINAL_REQUEST_ERRORS = new Set([
+  'REQUEST_EXPIRED',
+  'REQUEST_LOCKED',
+  'REQUEST_ALREADY_USED',
+  'REQUEST_NOT_FOUND'
+])
 
 class HttpBoundaryError extends Error {
   constructor(code, status) {
@@ -118,7 +125,46 @@ function exactObject(value, allowed, required = allowed) {
   return value
 }
 
-function readJson(req) {
+function assertNoDuplicateTopLevelKeys(source) {
+  const seen = new Set()
+  let depth = 0
+  let inString = false
+  let escaped = false
+  let stringStart = -1
+  let expectingKey = false
+  for (let index = 0; index < source.length; index += 1) {
+    const character = source[index]
+    if (inString) {
+      if (escaped) {
+        escaped = false
+      } else if (character === '\\') {
+        escaped = true
+      } else if (character === '"') {
+        inString = false
+        if (depth === 1 && expectingKey) {
+          const key = JSON.parse(source.slice(stringStart, index + 1))
+          if (seen.has(key)) boundaryError('JSON_INVALID', 400)
+          seen.add(key)
+          expectingKey = false
+        }
+      }
+      continue
+    }
+    if (character === '"') {
+      inString = true
+      stringStart = index
+    } else if (character === '{' || character === '[') {
+      depth += 1
+      if (depth === 1 && character === '{') expectingKey = true
+    } else if (character === '}' || character === ']') {
+      depth -= 1
+    } else if (character === ',' && depth === 1) {
+      expectingKey = true
+    }
+  }
+}
+
+function parseStrictJsonBody(req) {
   const type = req.headers['content-type']
   if (typeof type !== 'string' ||
     !/^application\/json(?:\s*;\s*charset=utf-8)?$/i.test(type)) {
@@ -132,26 +178,38 @@ function readJson(req) {
   return new Promise((resolve, reject) => {
     const chunks = []
     let size = 0
+    let settled = false
+    const rejectOnce = (error) => {
+      if (settled) return
+      settled = true
+      reject(error)
+    }
     req.on('data', (chunk) => {
       size += chunk.length
       if (size <= JSON_BODY_LIMIT) chunks.push(chunk)
     })
     req.once('error', () =>
-      reject(new HttpBoundaryError('JSON_INVALID', 400)))
+      rejectOnce(new HttpBoundaryError('JSON_INVALID', 400)))
+    req.once('aborted', () =>
+      rejectOnce(new HttpBoundaryError('JSON_INVALID', 400)))
     req.once('end', () => {
+      if (settled) return
       if (size > JSON_BODY_LIMIT) {
-        reject(new HttpBoundaryError('BODY_TOO_LARGE', 413))
+        rejectOnce(new HttpBoundaryError('BODY_TOO_LARGE', 413))
         return
       }
       try {
-        const raw = Buffer.concat(chunks).toString('utf8')
+        const raw = new TextDecoder('utf-8', { fatal: true })
+          .decode(Buffer.concat(chunks))
+        assertNoDuplicateTopLevelKeys(raw)
         const parsed = raw.length === 0 ? {} : JSON.parse(raw)
         if (parsed === null || typeof parsed !== 'object' || Array.isArray(parsed)) {
           boundaryError('JSON_INVALID', 400)
         }
+        settled = true
         resolve(parsed)
       } catch (error) {
-        reject(error instanceof HttpBoundaryError
+        rejectOnce(error instanceof HttpBoundaryError
           ? error
           : new HttpBoundaryError('JSON_INVALID', 400))
       }
@@ -274,14 +332,14 @@ function createAuthHttpController({
 
   function authenticateMutation(req, res) {
     const token = rawAdminToken(req)
-    admin.verifyCsrf(token, csrfHeader(req))
-    refreshAdminCookie(res, token, admin.authenticate(token))
+    const authenticated = admin.verifyCsrf(token, csrfHeader(req))
+    refreshAdminCookie(res, token, authenticated)
     return token
   }
 
   async function jsonMutation(req) {
     requireOrigin(req, publicOrigin)
-    return readJson(req)
+    return parseStrictJsonBody(req)
   }
 
   async function route(req, res, segments) {
@@ -463,6 +521,8 @@ function createAuthHttpController({
           clearHostCookie(res, ADMIN_COOKIE)
         } else if (safe.code === 'REQUEST_AUTH_REQUIRED') {
           clearHostCookie(res, REQUEST_COOKIE)
+        } else if (TERMINAL_REQUEST_ERRORS.has(safe.code)) {
+          clearHostCookie(res, REQUEST_COOKIE)
         } else if (safe.code === 'ADMIN_AUTH_REQUIRED') {
           clearHostCookie(res, ADMIN_COOKIE)
         }
@@ -480,5 +540,6 @@ function createAuthHttpController({
 
 module.exports = {
   HttpBoundaryError,
-  createAuthHttpController
+  createAuthHttpController,
+  parseStrictJsonBody
 }

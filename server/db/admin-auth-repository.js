@@ -1,3 +1,5 @@
+const crypto = require('node:crypto')
+
 const AUDIT_METADATA_KEYS = new Set(['count', 'reason', 'sessionId'])
 
 function mapSession(row) {
@@ -24,6 +26,14 @@ function mapRateLimit(row) {
     inFlightCount: row.in_flight_count,
     blockedUntil: row.blocked_until
   }
+}
+
+function digestsEqual(left, right) {
+  if (typeof left !== 'string' || typeof right !== 'string') return false
+  const expected = Buffer.from(left, 'base64url')
+  const actual = Buffer.from(right, 'base64url')
+  return expected.length === actual.length &&
+    crypto.timingSafeEqual(expected, actual)
 }
 
 function sanitizeMetadata(metadata) {
@@ -206,28 +216,101 @@ class AdminAuthRepository {
     })
   }
 
+  verifyAndTouchSession({
+    tokenDigest,
+    expectedCsrfDigest,
+    now,
+    idleTtlMs,
+    auditEvent
+  }) {
+    return this.withImmediateTransaction(() => {
+      const session = this.findSessionByTokenDigest(tokenDigest)
+      if (!session || session.revokedAt !== null) return { status: 'session_invalid' }
+      if (now >= session.idleExpiresAt || now >= session.absoluteExpiresAt) {
+        return { status: 'session_expired' }
+      }
+      if (!digestsEqual(session.csrfDigest, expectedCsrfDigest)) {
+        return { status: 'csrf_invalid' }
+      }
+      const idleExpiresAt = Math.min(
+        now + idleTtlMs,
+        session.absoluteExpiresAt
+      )
+      const result = this.database.prepare(`
+        UPDATE admin_sessions
+        SET last_used_at = ?, idle_expires_at = ?
+        WHERE token_digest = ? AND csrf_digest = ? AND revoked_at IS NULL
+          AND idle_expires_at > ? AND absolute_expires_at > ?
+      `).run(
+        now,
+        idleExpiresAt,
+        tokenDigest,
+        expectedCsrfDigest,
+        now,
+        now
+      )
+      if (result.changes !== 1) return { status: 'session_invalid' }
+      this.insertAudit({
+        ...auditEvent,
+        subjectId: session.sessionId,
+        metadata: {
+          ...auditEvent.metadata,
+          sessionId: session.sessionId
+        }
+      })
+      return {
+        status: 'authenticated',
+        session: mapSession(this.database.prepare(
+          'SELECT * FROM admin_sessions WHERE token_digest = ?'
+        ).get(tokenDigest))
+      }
+    })
+  }
+
   rotateSessionCsrf({
     sessionId,
     expectedCsrfDigest,
     csrfDigest,
-    lastUsedAt,
-    idleExpiresAt,
+    now,
+    idleTtlMs,
     auditEvent
   }) {
     return this.withImmediateTransaction(() => {
+      const current = mapSession(this.database.prepare(
+        'SELECT * FROM admin_sessions WHERE session_id = ?'
+      ).get(sessionId))
+      if (!current || current.revokedAt !== null ||
+        now >= current.idleExpiresAt || now >= current.absoluteExpiresAt ||
+        !digestsEqual(current.csrfDigest, expectedCsrfDigest)) {
+        return false
+      }
+      const idleExpiresAt = Math.min(
+        now + idleTtlMs,
+        current.absoluteExpiresAt
+      )
       const result = this.database.prepare(`
         UPDATE admin_sessions
         SET csrf_digest = ?, last_used_at = ?, idle_expires_at = ?
         WHERE session_id = ? AND csrf_digest = ? AND revoked_at IS NULL
+          AND idle_expires_at > ? AND absolute_expires_at > ?
       `).run(
         csrfDigest,
-        lastUsedAt,
+        now,
         idleExpiresAt,
         sessionId,
-        expectedCsrfDigest
+        expectedCsrfDigest,
+        now,
+        now
       )
       if (result.changes !== 1) return false
-      this.insertAudit(auditEvent)
+      this.insertAudit({
+        ...auditEvent,
+        subjectId: current.sessionId,
+        metadata: {
+          ...auditEvent.metadata,
+          sessionId: current.sessionId
+        }
+      })
       return true
     })
   }

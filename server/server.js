@@ -11,7 +11,11 @@ const { isVerifiedDataBlock } = require('../public/data-source-contract')
 const { bootstrapSecrets } = require('./security/secret-bootstrap')
 const { createAccessControlRuntime } = require('./security/access-control-runtime')
 const { closeDb, openDb } = require('./db/refresh-db')
-const { createAuthHttpController } = require('./http/auth-http')
+const {
+  HttpBoundaryError,
+  createAuthHttpController,
+  parseStrictJsonBody
+} = require('./http/auth-http')
 const { parseTrustedProxyAddresses } = require('./http/trusted-client')
 
 const PORT = Number(process.env.PORT || 4173)
@@ -49,20 +53,10 @@ function formatJson(res, body, status = 200) {
   res.end(payload)
 }
 
-function parseBody(req) {
-  return new Promise((resolve) => {
-    const chunks = []
-    req.on('data', (chunk) => chunks.push(chunk))
-    req.on('end', () => {
-      const raw = Buffer.concat(chunks).toString('utf8')
-      resolve(raw ? JSON.parse(raw) : {})
-    })
-    req.on('error', () => resolve({}))
-  })
-}
-
 function parseSegments(pathname) {
-  return String(pathname || '/').split('/').filter(Boolean)
+  const normalized = String(pathname || '/')
+  if (!normalized.startsWith('/')) return []
+  return normalized.slice(1).split('/')
 }
 
 function toApiError(message, code = 400, details = {}) {
@@ -316,24 +310,43 @@ async function routeApi(req, res, pathname, query, {
   if (await authHttp.handle(req, res, segments)) return true
   if (accessRuntime.status.mode === 'device-approval' &&
     !authHttp.authorizeInvestment(req, res)) return true
-  if (segments[1] === 'watchlist' && req.method === 'GET') {
+  if (segments.length === 2 && segments[1] === 'watchlist' &&
+    req.method === 'GET') {
     await apiGetWatchlist(req, res)
     return true
   }
-  if (segments[1] === 'search' && req.method === 'GET') {
+  if (segments.length === 2 && segments[1] === 'search' &&
+    req.method === 'GET') {
     await apiSearch(req, res, query)
     return true
   }
-  if (segments[1] === 'company' && segments[2] && req.method === 'GET') {
+  if (segments.length === 3 && segments[1] === 'company' &&
+    segments[2] && req.method === 'GET') {
     await apiCompany(req, res, segments[2])
     return true
   }
-  if (segments[1] === 'company' && segments[2] && req.method === 'POST' && segments[3] === 'refresh') {
-    await parseBody(req)
+  if (segments.length === 4 && segments[1] === 'company' && segments[2] &&
+    req.method === 'POST' && segments[3] === 'refresh') {
+    try {
+      if (req.headers.origin !== 'https://dearmina.cn') {
+        throw new HttpBoundaryError('ORIGIN_INVALID', 403)
+      }
+      const body = await parseStrictJsonBody(req)
+      if (Object.keys(body).length !== 0) {
+        throw new HttpBoundaryError('JSON_INVALID', 400)
+      }
+    } catch (error) {
+      const safe = error instanceof HttpBoundaryError
+        ? error
+        : new HttpBoundaryError('INTERNAL_ERROR', 500)
+      formatJson(res, { error: safe.code }, safe.status)
+      return true
+    }
     await apiRefresh(req, res, segments[2])
     return true
   }
-  if (segments[1] === 'research' && segments[2] && req.method === 'GET') {
+  if (segments.length === 3 && segments[1] === 'research' &&
+    segments[2] && req.method === 'GET') {
     await apiResearch(req, res, segments[2])
     return true
   }
@@ -445,13 +458,21 @@ async function startServer({
     secretRuntime.clear()
     throw error
   }
+  let trustedProxyAddresses
+  try {
+    trustedProxyAddresses = parseTrustedProxyAddresses(
+      env.KINVEST_TRUSTED_PROXY_ADDRESSES,
+      { required: accessRuntime.status.mode === 'device-approval' }
+    )
+  } catch {
+    accessRuntime.clear()
+    secretRuntime.clear()
+    throw Object.assign(new Error('HTTP security configuration invalid'), {
+      code: 'HTTP_SECURITY_CONFIG_INVALID'
+    })
+  }
   if (!runtimeServer) {
-    let trustedProxyAddresses
     try {
-      trustedProxyAddresses = parseTrustedProxyAddresses(
-        env.KINVEST_TRUSTED_PROXY_ADDRESSES,
-        { required: accessRuntime.status.mode === 'device-approval' }
-      )
       runtimeServer = http.createServer(createRequestHandler({
         accessRuntime,
         trustedProxyAddresses

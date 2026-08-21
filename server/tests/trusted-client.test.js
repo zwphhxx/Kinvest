@@ -32,6 +32,11 @@ function run() {
     'x-forwarded-for': '198.51.100.9'
   }), trusted), '172.31.252.4')
 
+  assert.throws(
+    () => resolveClientIdentity(request('172.31.252.3'), trusted),
+    /CLIENT_IDENTITY_INVALID/
+  )
+
   assert.throws(() => resolveClientIdentity(request('172.31.252.3', {
     'x-real-ip': '198.51.100.9',
     'x-forwarded-for': '198.51.100.10'
