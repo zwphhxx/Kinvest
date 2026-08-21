@@ -3,12 +3,12 @@ const { DeviceAuthRepository } = require('../../db/device-auth-repository')
 
 const database = new DatabaseSync(process.argv[2])
 process.send({ type: 'ready' })
-process.once('message', (message) => {
+process.once('message', (/** @type {any} */ message) => {
   if (!message || message.type !== 'go') return
   try {
     new DeviceAuthRepository(database).initialize()
     process.send({ type: 'done', ok: true })
-  } catch (error) {
+  } catch (/** @type {any} */ error) {
     process.send({
       type: 'done',
       ok: false,

@@ -43,7 +43,7 @@ function assertValidDatabaseTarget(databasePath) {
   }
 }
 
-function run({
+function run(/** @type {any} */ {
   databasePath,
   now = Date.now,
   effectiveUid,

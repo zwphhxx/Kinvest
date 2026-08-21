@@ -705,7 +705,7 @@ function testExpandMigrationIsIdempotentAndPreservesLegacyRows() {
 
   assert.deepStrictEqual(
     database.prepare('PRAGMA table_info(device_auth_requests)').all()
-      .filter((column) => ['device_name', 'ip_digest'].includes(column.name))
+      .filter((column) => ['device_name', 'ip_digest'].includes(String(column.name)))
       .map((column) => column.name),
     ['device_name', 'ip_digest']
   )
@@ -728,7 +728,7 @@ function createInitializeWorker(databasePath) {
   let resolveDone
   const ready = new Promise((resolve) => { resolveReady = resolve })
   const done = new Promise((resolve) => { resolveDone = resolve })
-  worker.on('message', (message) => {
+  worker.on('message', (/** @type {any} */ message) => {
     if (message && message.type === 'ready') resolveReady()
     if (message && message.type === 'done') resolveDone(message)
   })
@@ -797,7 +797,7 @@ async function testConcurrentExpandMigrationIsAtomic() {
     )
     assert.deepStrictEqual(
       verify.prepare('PRAGMA table_info(device_auth_requests)').all()
-        .filter((column) => ['device_name', 'ip_digest'].includes(column.name))
+        .filter((column) => ['device_name', 'ip_digest'].includes(String(column.name)))
         .map((column) => column.name),
       ['device_name', 'ip_digest']
     )

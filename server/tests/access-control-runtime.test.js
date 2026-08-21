@@ -32,7 +32,7 @@ const VERSION_CONFIG = JSON.stringify({
 const ADMIN_PASSWORD = 'runtime-fixture-password'
 
 function expectCode(callback, expectedCode) {
-  assert.throws(callback, (error) => {
+  assert.throws(callback, (/** @type {any} */ error) => {
     assert.equal(error && error.code, expectedCode)
     return true
   })

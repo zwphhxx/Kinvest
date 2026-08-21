@@ -139,7 +139,7 @@ class DeviceApprovalService {
     this.activeHmacVersionId = versionId
   }
 
-  createRequest({ deviceName, ipDigest = null } = {}) {
+  createRequest(/** @type {any} */ { deviceName, ipDigest = null } = {}) {
     const normalizedDeviceName = normalizeDeviceName(deviceName)
     const normalizedIpDigest = normalizeIpDigest(ipDigest)
     const now = this.now()

@@ -91,7 +91,7 @@ function createRestrictedDeviceHmacProvider(secretRuntime, activeVersionId) {
   })
 }
 
-function createAccessControlRuntime({
+function createAccessControlRuntime(/** @type {any} */ {
   env = process.env,
   secretRuntime,
   database,
@@ -179,7 +179,9 @@ function createAccessControlRuntime({
     if (adminAuth) adminAuth.clear()
     try {
       closeOwnedDatabase()
-    } catch {}
+    } catch {
+      // Preserve the stable access-control startup failure.
+    }
     if (error instanceof AccessControlRuntimeError) throw error
     fail()
   } finally {

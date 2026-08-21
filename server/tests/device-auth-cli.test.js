@@ -10,7 +10,7 @@ const {
 } = require('../cli/revoke-all-devices')
 
 function expectCode(callback, expectedCode) {
-  assert.throws(callback, (error) => {
+  assert.throws(callback, (/** @type {any} */ error) => {
     assert.equal(error && error.code, expectedCode)
     assert.strictEqual(String(error.message).includes('.sqlite'), false)
     return true

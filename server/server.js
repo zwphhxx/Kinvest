@@ -455,7 +455,9 @@ async function startServer({
   }
   try {
     logger.log(`Kinvest mock server started at http://localhost:${port}`)
-  } catch {}
+  } catch {
+    // Logging is best-effort after the server is listening.
+  }
   return runtimeServer
 }
 
