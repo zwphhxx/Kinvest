@@ -9,12 +9,15 @@ const { resolveSecurityIdentity } = require('./domain/security-identity')
 const { prepareFinanceRows } = require('../public/finance-contract')
 const { isVerifiedDataBlock } = require('../public/data-source-contract')
 const { bootstrapSecrets } = require('./security/secret-bootstrap')
+const { createAccessControlRuntime } = require('./security/access-control-runtime')
+const { closeDb, openDb } = require('./db/refresh-db')
 
 const PORT = Number(process.env.PORT || 4173)
 const ROOT = path.join(__dirname, '..')
 const PUBLIC_DIR = path.join(ROOT, 'public')
 const RUNTIME_FILE_CREATION_MASK = 0o077
 const SECRET_BOOTSTRAP_ERROR_CODES = new Set([
+  'ACCESS_CONTROL_CONFIG_INVALID',
   'SECRET_BOOTSTRAP_CONFIG_INVALID',
   'SECRET_MATERIAL_INVALID',
   'SECRET_MATERIAL_LOAD_FAILED',
@@ -380,6 +383,9 @@ function stableStartupErrorCode(error) {
 async function startServer({
   env = process.env,
   bootstrap = bootstrapSecrets,
+  createAccessRuntime = createAccessControlRuntime,
+  openDatabase = openDb,
+  closeDatabase = closeDb,
   runtimeServer = server,
   port = PORT,
   processRef = process,
@@ -387,6 +393,18 @@ async function startServer({
 } = {}) {
   applyRuntimeFileCreationMask()
   const secretRuntime = await bootstrap({ env })
+  let accessRuntime
+  try {
+    accessRuntime = createAccessRuntime({
+      env,
+      secretRuntime,
+      openDatabase,
+      closeDatabase
+    })
+  } catch (error) {
+    secretRuntime.clear()
+    throw error
+  }
   let cleaned = false
   const cleanup = () => {
     if (cleaned) return
@@ -394,6 +412,7 @@ async function startServer({
     processRef.removeListener('SIGTERM', handleSignal)
     processRef.removeListener('SIGINT', handleSignal)
     runtimeServer.removeListener('close', cleanup)
+    accessRuntime.clear()
     secretRuntime.clear()
   }
   const handleSignal = () => {
@@ -434,7 +453,11 @@ async function startServer({
     cleanup()
     throw error
   }
-  logger.log(`Kinvest mock server started at http://localhost:${port}`)
+  try {
+    logger.log(`Kinvest mock server started at http://localhost:${port}`)
+  } catch {
+    // Logging is best-effort after the server is listening.
+  }
   return runtimeServer
 }
 

@@ -15,6 +15,8 @@ const tests = [
   require('./admin-auth.test'),
   require('./security-identity.test'),
   require('./device-approval.test'),
+  require('./access-control-runtime.test'),
+  require('./device-auth-cli.test'),
   require('./cvm-ssm-secret-provider.test'),
   require('./github-tmpfs-secret-provider.test'),
   require('./secret-bootstrap-contract.test'),

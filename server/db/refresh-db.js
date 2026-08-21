@@ -42,6 +42,13 @@ function openDb() {
   return db
 }
 
+function closeDb() {
+  if (!db) return
+  const database = db
+  db = null
+  database.close()
+}
+
 function todayKey(date = new Date()) {
   return new Date(date).toISOString().slice(0, 10)
 }
@@ -100,6 +107,7 @@ module.exports = {
   getDbPath,
   setDbPath,
   openDb,
+  closeDb,
   todayKey,
   getManualRefreshCount,
   incrementManualRefreshCount,
