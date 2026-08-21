@@ -368,8 +368,20 @@
       if (decision.showLogin) {
         clearAdminSensitiveState()
         showLogin(contracts.authErrorMessage(error.code))
-      } else if (decision.restoreSession && sessionLifecycle.resume(suspension)) {
-        setLive(contracts.authErrorMessage(error.code), 'error')
+      } else if (decision.revalidate) {
+        try {
+          await restoreCsrf()
+          if (!sessionLifecycle.resume(suspension)) {
+            clearAdminSensitiveState()
+            showLogin('无法确认管理员会话状态，请重新登录。')
+            return
+          }
+          await refreshLists()
+          setLive('退出未完成，会话仍有效，请重试。', 'error')
+        } catch {
+          clearAdminSensitiveState()
+          showLogin('无法确认管理员会话状态，请重新登录。')
+        }
       }
     } finally {
       setBusy('logout', button, false)
@@ -381,15 +393,20 @@
     setBootstrapPending(true)
     try {
       await restoreCsrf()
-      if (!bootstrapGate.settle(bootstrapTicket)) return
-      setBootstrapPending(false)
-      sessionLifecycle.activate()
-      showDesk()
-      await refreshLists()
     } catch {
       if (!bootstrapGate.settle(bootstrapTicket)) return
       setBootstrapPending(false)
       showLogin()
+      return
+    }
+    if (!bootstrapGate.settle(bootstrapTicket)) return
+    setBootstrapPending(false)
+    sessionLifecycle.activate()
+    showDesk()
+    try {
+      await refreshLists()
+    } catch (error) {
+      await handleError(error)
     }
   }
 

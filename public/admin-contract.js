@@ -23,8 +23,8 @@
 
   function logoutFailureDecision(code) {
     return code === 'ADMIN_AUTH_REQUIRED'
-      ? Object.freeze({ restoreSession: false, showLogin: true })
-      : Object.freeze({ restoreSession: true, showLogin: false })
+      ? Object.freeze({ revalidate: false, showLogin: true })
+      : Object.freeze({ revalidate: true, showLogin: false })
   }
 
   function createAdminBootstrapGate() {

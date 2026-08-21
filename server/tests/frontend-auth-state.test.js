@@ -169,6 +169,18 @@ async function run() {
   assert.equal(bootstrapGate.settle(bootstrapTicket), false)
   assert.equal(adminView, 'desk')
 
+  const settledBootstrapGate = createAdminBootstrapGate()
+  const settledBootstrapTicket = settledBootstrapGate.begin()
+  assert.equal(settledBootstrapGate.settle(settledBootstrapTicket), true)
+  const bootstrapListFailure = deferred()
+  let bootstrapListFailureHandled = false
+  const bootstrapListRun = bootstrapListFailure.promise.catch(() => {
+    bootstrapListFailureHandled = true
+  })
+  bootstrapListFailure.reject(new Error('list failed after bootstrap settled'))
+  await bootstrapListRun
+  assert.equal(bootstrapListFailureHandled, true)
+
   adminLifecycle.activate()
   const writeTicket = adminLifecycle.beginRequest()
   const lateWrite = deferred()
@@ -184,23 +196,42 @@ async function run() {
   assert.equal(writeTicket.signal.aborted, true)
   assert.equal(writeCommitted, false)
 
-  const transientLogout = deferred()
-  const transientRecovery = transientLogout.promise.catch((error) => {
-    const decision = logoutFailureDecision(error.code)
-    if (decision.restoreSession) adminLifecycle.resume(logoutSuspension)
+  assert.deepEqual(logoutFailureDecision('UNKNOWN'), {
+    revalidate: true,
+    showLogin: false
   })
-  transientLogout.reject({ code: 'UNKNOWN' })
-  await transientRecovery
+  const logoutRevalidation = deferred()
+  let logoutRevalidationCleared = false
+  const transientRecovery = logoutRevalidation.promise.then(
+    () => adminLifecycle.resume(logoutSuspension),
+    () => { logoutRevalidationCleared = true }
+  )
+  assert.throws(() => adminLifecycle.beginRequest(), /ADMIN_EPOCH_INACTIVE/)
+  logoutRevalidation.resolve({ csrfToken: 'revalidated-csrf' })
+  assert.equal(await transientRecovery, true)
+  assert.equal(logoutRevalidationCleared, false)
   const recoveredTicket = adminLifecycle.beginRequest()
   assert.equal(recoveredTicket.signal.aborted, false)
   adminLifecycle.finishRequest(recoveredTicket)
 
-  const terminalSuspension = adminLifecycle.suspend()
+  adminLifecycle.suspend()
   assert.deepEqual(logoutFailureDecision('ADMIN_AUTH_REQUIRED'), {
-    restoreSession: false,
+    revalidate: false,
     showLogin: true
   })
-  assert.equal(adminLifecycle.resume({ epoch: terminalSuspension.epoch - 1 }), false)
+  assert.throws(() => adminLifecycle.beginRequest(), /ADMIN_EPOCH_INACTIVE/)
+
+  adminLifecycle.activate()
+  const failedRevalidationSuspension = adminLifecycle.suspend()
+  const failedRevalidation = deferred()
+  let failedRevalidationRequiresClear = false
+  const failedRevalidationRun = failedRevalidation.promise.catch(() => {
+    failedRevalidationRequiresClear = true
+  })
+  failedRevalidation.reject({ code: 'ADMIN_AUTH_REQUIRED' })
+  await failedRevalidationRun
+  assert.equal(failedRevalidationRequiresClear, true)
+  assert.equal(adminLifecycle.resume({ epoch: failedRevalidationSuspension.epoch - 1 }), false)
   assert.throws(() => adminLifecycle.beginRequest(), /ADMIN_EPOCH_INACTIVE/)
 
   const scheduled = []

@@ -157,6 +157,8 @@ function assertAdminDeskContract() {
   assert.match(script, /function runAdminWrite\(/)
   assert.match(script, /sessionLifecycle\.suspend\(\)/)
   assert.match(script, /sessionLifecycle\.resume\(/)
+  assert.match(script, /logoutFailureDecision[\s\S]*restoreCsrf\(\)[\s\S]*sessionLifecycle\.resume\(suspension\)/)
+  assert.match(script, /showDesk\(\)[\s\S]*try\s*\{[\s\S]*refreshLists\(\)[\s\S]*catch[\s\S]*handleError/)
   assert.match(script, /approvedRequestDecision/)
   assert.match(script, /clearAdminSensitiveState\(\)/)
   assert.match(adminContract, /replay:\s*false/)
