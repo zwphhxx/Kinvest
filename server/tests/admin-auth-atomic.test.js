@@ -162,9 +162,61 @@ async function testConcurrentStaleCsrfRotationAndExpiredRotation() {
   }
 }
 
+async function testStaleCsrfCannotLogoutAfterConcurrentConnectionRotation() {
+  const directory = fs.mkdtempSync(path.join(os.tmpdir(), 'kinvest-logout-race-'))
+  const databasePath = path.join(directory, 'auth.sqlite')
+  const setupDatabase = new DatabaseSync(databasePath)
+  setupDatabase.exec('PRAGMA busy_timeout = 5000')
+  const setupRepository = new AdminAuthRepository(setupDatabase)
+  setupRepository.initialize()
+  const fixture = sessionFixture()
+  setupRepository.createSession(fixture)
+  setupDatabase.close()
+
+  const rotateDatabase = new DatabaseSync(databasePath)
+  const logoutDatabase = new DatabaseSync(databasePath)
+  rotateDatabase.exec('PRAGMA busy_timeout = 5000')
+  logoutDatabase.exec('PRAGMA busy_timeout = 5000')
+  const rotateRepository = new AdminAuthRepository(rotateDatabase)
+  const logoutRepository = new AdminAuthRepository(logoutDatabase)
+
+  try {
+    const rotated = rotateRepository.rotateSessionCsrf({
+      sessionId: fixture.sessionId,
+      expectedCsrfDigest: fixture.csrfDigest,
+      csrfDigest: digest('csrf-rotated'),
+      now: 2000,
+      idleTtlMs: 5000,
+      auditEvent: audit('audit-rotate-before-logout', 2000)
+    })
+    assert.equal(rotated, true)
+
+    const staleLogout = logoutRepository.verifyCsrfAndRevokeSession({
+      tokenDigest: fixture.tokenDigest,
+      expectedCsrfDigest: fixture.csrfDigest,
+      now: 2001,
+      auditEvent: {
+        ...audit('audit-stale-logout', 2001),
+        eventType: 'admin_session_revoked'
+      }
+    })
+    assert.equal(staleLogout.status, 'csrf_invalid')
+    assert.equal(
+      logoutRepository.findSessionByTokenDigest(fixture.tokenDigest).revokedAt,
+      null
+    )
+    assert.equal(logoutRepository.listAuditEvents().length, 1)
+  } finally {
+    rotateDatabase.close()
+    logoutDatabase.close()
+    fs.rmSync(directory, { recursive: true, force: true })
+  }
+}
+
 async function run() {
   testAtomicVerifyTouchAndDeadlinePredicates()
   await testConcurrentStaleCsrfRotationAndExpiredRotation()
+  await testStaleCsrfCannotLogoutAfterConcurrentConnectionRotation()
 }
 
 module.exports = { run }

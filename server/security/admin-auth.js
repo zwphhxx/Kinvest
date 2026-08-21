@@ -358,20 +358,26 @@ class AdminAuthService {
   }
 
   logout(sessionToken, csrfToken) {
-    const session = this.getActiveSession(sessionToken, false)
-    this.assertCsrf(session, csrfToken)
+    this.assertConfigured()
+    const tokenDigest = digestPublicToken(sessionToken)
+    if (!tokenDigest) fail('ADMIN_SESSION_INVALID')
+    const csrfDigest = digestPublicToken(csrfToken)
+    if (!csrfDigest) fail('ADMIN_CSRF_INVALID')
     const now = this.now()
-    const revoked = this.repository.revokeSession(
-      session.sessionId,
+    const result = this.repository.verifyCsrfAndRevokeSession({
+      tokenDigest,
+      expectedCsrfDigest: csrfDigest,
       now,
-      this.auditEvent(
+      auditEvent: this.auditEvent(
         'admin_session_revoked',
         now,
-        session.sessionId,
-        { reason: 'logout', sessionId: session.sessionId }
+        null,
+        { reason: 'logout' }
       )
-    )
-    if (!revoked) fail('ADMIN_SESSION_INVALID')
+    })
+    if (result.status === 'session_expired') fail('ADMIN_SESSION_EXPIRED')
+    if (result.status === 'csrf_invalid') fail('ADMIN_CSRF_INVALID')
+    if (result.status !== 'revoked') fail('ADMIN_SESSION_INVALID')
     return { revoked: true }
   }
 

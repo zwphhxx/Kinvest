@@ -287,7 +287,8 @@ async function apiResearch(req, res, code) {
 
 async function routeApi(req, res, pathname, query, {
   accessRuntime,
-  authHttp
+  authHttp,
+  publicOrigin
 }) {
   const segments = parseSegments(pathname)
   if (segments[0] !== 'api') {
@@ -328,7 +329,7 @@ async function routeApi(req, res, pathname, query, {
   if (segments.length === 4 && segments[1] === 'company' && segments[2] &&
     req.method === 'POST' && segments[3] === 'refresh') {
     try {
-      if (req.headers.origin !== 'https://dearmina.cn') {
+      if (req.headers.origin !== publicOrigin) {
         throw new HttpBoundaryError('ORIGIN_INVALID', 403)
       }
       const body = await parseStrictJsonBody(req)
@@ -401,7 +402,8 @@ function createRequestHandler({
       const pathname = urlObj.pathname
       if (await routeApi(req, res, pathname, urlObj.searchParams, {
         accessRuntime,
-        authHttp
+        authHttp,
+        publicOrigin
       })) return
       if (req.method !== 'GET') {
         formatJson(res, toApiError('方法不允许', 405), 405)

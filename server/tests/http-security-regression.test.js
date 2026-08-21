@@ -10,6 +10,7 @@ const ORIGIN = 'https://dearmina.cn'
 const NOW = Date.UTC(2026, 7, 21, 9, 0, 0)
 const VALID_DEVICE = 'V'.repeat(43)
 const REVOKED_DEVICE = 'R'.repeat(43)
+const EXPIRED_DEVICE = 'E'.repeat(43)
 const ADMIN_TOKEN = 'A'.repeat(43)
 const BROWSER_CREDENTIAL = 'B'.repeat(43)
 
@@ -29,6 +30,7 @@ function createRuntime() {
     adminAuth: {},
     deviceApproval: {
       authenticate(token) {
+        if (token === EXPIRED_DEVICE) throw codedError('TOKEN_EXPIRED')
         if (token !== VALID_DEVICE) throw codedError('TOKEN_INVALID')
         return {
           authenticated: true,
@@ -44,11 +46,11 @@ function createRuntime() {
   }
 }
 
-async function start(runtime = createRuntime()) {
+async function start(runtime = createRuntime(), publicOrigin = ORIGIN) {
   const server = http.createServer(createRequestHandler({
     accessRuntime: runtime,
     now: () => NOW,
-    publicOrigin: ORIGIN,
+    publicOrigin,
     trustedProxyAddresses: ['127.0.0.1']
   }))
   await new Promise((resolve, reject) => {
@@ -99,6 +101,7 @@ async function testDefaultDenyInvestmentRouteMatrix() {
     null,
     '__Host-kinvest-device=invalid',
     `__Host-kinvest-device=${REVOKED_DEVICE}`,
+    `__Host-kinvest-device=${EXPIRED_DEVICE}`,
     `__Host-kinvest-admin=${ADMIN_TOKEN}`
   ]
   try {
@@ -122,6 +125,50 @@ async function testDefaultDenyInvestmentRouteMatrix() {
     }
   } finally {
     await running.close()
+  }
+}
+
+async function testRefreshUsesInjectedOriginAndDisabledCompatibility() {
+  const customOrigin = 'https://family.example.test'
+  const enabled = await start(createRuntime(), customOrigin)
+  try {
+    const accepted = await request(enabled.baseUrl, '/api/company/9988.HK/refresh', {
+      method: 'POST',
+      headers: {
+        origin: customOrigin,
+        'content-type': 'application/json',
+        cookie: `__Host-kinvest-device=${VALID_DEVICE}`
+      },
+      body: '{}'
+    })
+    assert.equal(accepted.status, 200)
+    assert.equal(accepted.body.success, true)
+
+    const rejected = await request(enabled.baseUrl, '/api/company/9988.HK/refresh', {
+      method: 'POST',
+      headers: validMutationHeaders(),
+      body: '{}'
+    })
+    assert.equal(rejected.status, 403)
+    assert.deepEqual(rejected.body, { error: 'ORIGIN_INVALID' })
+  } finally {
+    await enabled.close()
+  }
+
+  const disabled = await start({ status: { mode: 'disabled' } }, customOrigin)
+  try {
+    const compatible = await request(disabled.baseUrl, '/api/company/9988.HK/refresh', {
+      method: 'POST',
+      headers: {
+        origin: customOrigin,
+        'content-type': 'application/json'
+      },
+      body: '{}'
+    })
+    assert.equal(compatible.status, 200)
+    assert.equal(compatible.body.success, true)
+  } finally {
+    await disabled.close()
   }
 }
 
@@ -278,6 +325,7 @@ async function testEnabledStartupCannotBypassTrustedProxyConfig() {
 async function run() {
   await testDefaultDenyInvestmentRouteMatrix()
   await testRefreshStrictMutationAndExactRoutes()
+  await testRefreshUsesInjectedOriginAndDisabledCompatibility()
   await testStrictJsonRejectsMalformedUtf8DuplicatesAndAbort()
   await testRedeemTerminalErrorsClearRequestCookie()
   await testEnabledStartupCannotBypassTrustedProxyConfig()

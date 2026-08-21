@@ -315,6 +315,46 @@ class AdminAuthRepository {
     })
   }
 
+  verifyCsrfAndRevokeSession({
+    tokenDigest,
+    expectedCsrfDigest,
+    now,
+    auditEvent
+  }) {
+    return this.withImmediateTransaction(() => {
+      const session = this.findSessionByTokenDigest(tokenDigest)
+      if (!session || session.revokedAt !== null) return { status: 'session_invalid' }
+      if (now >= session.idleExpiresAt || now >= session.absoluteExpiresAt) {
+        return { status: 'session_expired' }
+      }
+      if (!digestsEqual(session.csrfDigest, expectedCsrfDigest)) {
+        return { status: 'csrf_invalid' }
+      }
+      const result = this.database.prepare(`
+        UPDATE admin_sessions
+        SET revoked_at = ?
+        WHERE token_digest = ? AND csrf_digest = ? AND revoked_at IS NULL
+          AND idle_expires_at > ? AND absolute_expires_at > ?
+      `).run(
+        now,
+        tokenDigest,
+        expectedCsrfDigest,
+        now,
+        now
+      )
+      if (result.changes !== 1) return { status: 'session_invalid' }
+      this.insertAudit({
+        ...auditEvent,
+        subjectId: session.sessionId,
+        metadata: {
+          ...auditEvent.metadata,
+          sessionId: session.sessionId
+        }
+      })
+      return { status: 'revoked' }
+    })
+  }
+
   revokeSession(sessionId, revokedAt, auditEvent = null) {
     return this.withImmediateTransaction(() => {
       const result = this.database.prepare(`
