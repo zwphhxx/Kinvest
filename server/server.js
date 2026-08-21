@@ -11,6 +11,8 @@ const { isVerifiedDataBlock } = require('../public/data-source-contract')
 const { bootstrapSecrets } = require('./security/secret-bootstrap')
 const { createAccessControlRuntime } = require('./security/access-control-runtime')
 const { closeDb, openDb } = require('./db/refresh-db')
+const { createAuthHttpController } = require('./http/auth-http')
+const { parseTrustedProxyAddresses } = require('./http/trusted-client')
 
 const PORT = Number(process.env.PORT || 4173)
 const ROOT = path.join(__dirname, '..')
@@ -26,7 +28,8 @@ const SECRET_BOOTSTRAP_ERROR_CODES = new Set([
   'SSM_BOOTSTRAP_INVALID',
   'SSM_CLIENT_UNAVAILABLE',
   'SSM_SECRET_LOAD_FAILED',
-  'TEMPORARY_CREDENTIALS_REQUIRED'
+  'TEMPORARY_CREDENTIALS_REQUIRED',
+  'HTTP_SECURITY_CONFIG_INVALID'
 ])
 
 const MIME = {
@@ -288,7 +291,10 @@ async function apiResearch(req, res, code) {
   })
 }
 
-async function routeApi(req, res, pathname, query) {
+async function routeApi(req, res, pathname, query, {
+  accessRuntime,
+  authHttp
+}) {
   const segments = parseSegments(pathname)
   if (segments[0] !== 'api') {
     return false
@@ -307,6 +313,9 @@ async function routeApi(req, res, pathname, query) {
     }
     return true
   }
+  if (await authHttp.handle(req, res, segments)) return true
+  if (accessRuntime.status.mode === 'device-approval' &&
+    !authHttp.authorizeInvestment(req, res)) return true
   if (segments[1] === 'watchlist' && req.method === 'GET') {
     await apiGetWatchlist(req, res)
     return true
@@ -352,18 +361,49 @@ function serveStatic(req, res, pathname) {
   })
 }
 
-const server = http.createServer(async (req, res) => {
-  const urlObj = new URL(req.url, `http://localhost:${PORT}`)
-  const pathname = urlObj.pathname
-  if (await routeApi(req, res, pathname, urlObj.searchParams)) {
-    return
+function createRequestHandler({
+  accessRuntime,
+  now = Date.now,
+  publicOrigin = 'https://dearmina.cn',
+  trustedProxyAddresses = []
+} = {}) {
+  if (!accessRuntime || !accessRuntime.status ||
+    (accessRuntime.status.mode !== 'disabled' &&
+      accessRuntime.status.mode !== 'device-approval') ||
+    (accessRuntime.status.mode === 'device-approval' &&
+      (!accessRuntime.adminAuth || !accessRuntime.deviceApproval))) {
+    throw Object.assign(new Error('ACCESS_CONTROL_RUNTIME_REQUIRED'), {
+      code: 'ACCESS_CONTROL_RUNTIME_REQUIRED'
+    })
   }
-  if (req.method !== 'GET') {
-    formatJson(res, toApiError('方法不允许', 405), 405)
-    return
+  const authHttp = createAuthHttpController({
+    accessRuntime,
+    now,
+    publicOrigin,
+    trustedProxyAddresses
+  })
+  return async (req, res) => {
+    try {
+      const urlObj = new URL(req.url, `http://localhost:${PORT}`)
+      const pathname = urlObj.pathname
+      if (await routeApi(req, res, pathname, urlObj.searchParams, {
+        accessRuntime,
+        authHttp
+      })) return
+      if (req.method !== 'GET') {
+        formatJson(res, toApiError('方法不允许', 405), 405)
+        return
+      }
+      serveStatic(req, res, pathname)
+    } catch {
+      if (!res.headersSent) {
+        formatJson(res, { error: 'INTERNAL_ERROR' }, 500)
+      } else {
+        res.destroy()
+      }
+    }
   }
-  serveStatic(req, res, pathname)
-})
+}
 
 function applyRuntimeFileCreationMask() {
   return process.umask(RUNTIME_FILE_CREATION_MASK)
@@ -386,7 +426,7 @@ async function startServer({
   createAccessRuntime = createAccessControlRuntime,
   openDatabase = openDb,
   closeDatabase = closeDb,
-  runtimeServer = server,
+  runtimeServer,
   port = PORT,
   processRef = process,
   logger = console
@@ -404,6 +444,25 @@ async function startServer({
   } catch (error) {
     secretRuntime.clear()
     throw error
+  }
+  if (!runtimeServer) {
+    let trustedProxyAddresses
+    try {
+      trustedProxyAddresses = parseTrustedProxyAddresses(
+        env.KINVEST_TRUSTED_PROXY_ADDRESSES,
+        { required: accessRuntime.status.mode === 'device-approval' }
+      )
+      runtimeServer = http.createServer(createRequestHandler({
+        accessRuntime,
+        trustedProxyAddresses
+      }))
+    } catch {
+      accessRuntime.clear()
+      secretRuntime.clear()
+      throw Object.assign(new Error('HTTP security configuration invalid'), {
+        code: 'HTTP_SECURITY_CONFIG_INVALID'
+      })
+    }
   }
   let cleaned = false
   const cleanup = () => {
@@ -484,6 +543,7 @@ module.exports = {
   apiRefresh,
   apiResearch,
   applyRuntimeFileCreationMask,
+  createRequestHandler,
   runServerExecutable,
   stableStartupErrorCode,
   startServer,

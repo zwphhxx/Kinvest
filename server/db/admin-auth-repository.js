@@ -206,6 +206,32 @@ class AdminAuthRepository {
     })
   }
 
+  rotateSessionCsrf({
+    sessionId,
+    expectedCsrfDigest,
+    csrfDigest,
+    lastUsedAt,
+    idleExpiresAt,
+    auditEvent
+  }) {
+    return this.withImmediateTransaction(() => {
+      const result = this.database.prepare(`
+        UPDATE admin_sessions
+        SET csrf_digest = ?, last_used_at = ?, idle_expires_at = ?
+        WHERE session_id = ? AND csrf_digest = ? AND revoked_at IS NULL
+      `).run(
+        csrfDigest,
+        lastUsedAt,
+        idleExpiresAt,
+        sessionId,
+        expectedCsrfDigest
+      )
+      if (result.changes !== 1) return false
+      this.insertAudit(auditEvent)
+      return true
+    })
+  }
+
   revokeSession(sessionId, revokedAt, auditEvent = null) {
     return this.withImmediateTransaction(() => {
       const result = this.database.prepare(`

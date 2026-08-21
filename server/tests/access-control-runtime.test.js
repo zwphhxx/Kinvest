@@ -134,7 +134,10 @@ function testEnabledComposesWorkingServicesAndClearsMaterial() {
   expectedRateLimitKey.fill(0)
   assert.strictEqual(runtime.adminAuth.rateLimitIdentityDigest('198.51.100.1').length, 43)
 
-  const request = runtime.deviceApproval.createRequest({ deviceName: 'Runtime Device' })
+  const request = runtime.deviceApproval.createRequest({
+    deviceName: 'Runtime Device',
+    rateLimitIdentity: '198.51.100.1'
+  })
   runtime.deviceApproval.approveRequest({
     requestId: request.requestId,
     requestCode: request.requestCode,

@@ -305,6 +305,35 @@ class AdminAuthService {
     return true
   }
 
+  refreshCsrf(sessionToken) {
+    const session = this.getActiveSession(sessionToken, false)
+    const csrfToken = this.randomToken(32)
+    const rotated = this.repository.rotateSessionCsrf({
+      sessionId: session.sessionId,
+      expectedCsrfDigest: session.csrfDigest,
+      csrfDigest: digestPublicToken(csrfToken),
+      lastUsedAt: session.lastUsedAt,
+      idleExpiresAt: session.idleExpiresAt,
+      auditEvent: this.auditEvent(
+        'admin_csrf_rotated',
+        session.lastUsedAt,
+        session.sessionId,
+        { sessionId: session.sessionId }
+      )
+    })
+    if (!rotated) fail('ADMIN_SESSION_INVALID')
+    return {
+      csrfToken,
+      idleExpiresAt: session.idleExpiresAt,
+      absoluteExpiresAt: session.absoluteExpiresAt
+    }
+  }
+
+  listAuditEvents() {
+    this.assertConfigured()
+    return this.repository.listAuditEvents()
+  }
+
   assertCsrf(session, csrfToken) {
     const csrfDigest = digestPublicToken(csrfToken)
     if (!csrfDigest) fail('ADMIN_CSRF_INVALID')
