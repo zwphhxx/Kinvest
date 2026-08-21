@@ -21,6 +21,35 @@
     return Object.freeze({ clear: false, restore: false, refresh: false, replay: false })
   }
 
+  function logoutFailureDecision(code) {
+    return code === 'ADMIN_AUTH_REQUIRED'
+      ? Object.freeze({ restoreSession: false, showLogin: true })
+      : Object.freeze({ restoreSession: true, showLogin: false })
+  }
+
+  function createAdminBootstrapGate() {
+    let pending = true
+    let generation = 0
+
+    function begin() {
+      if (!pending) throw new Error('ADMIN_BOOTSTRAP_COMPLETE')
+      return Object.freeze({ generation })
+    }
+
+    function settle(ticket) {
+      if (!pending || !ticket || ticket.generation !== generation) return false
+      pending = false
+      generation += 1
+      return true
+    }
+
+    return Object.freeze({
+      begin,
+      canLogin: () => !pending,
+      settle
+    })
+  }
+
   function createAdminSecurityState() {
     let csrfToken = null
     let restorePromise = null
@@ -83,6 +112,17 @@
       active = true
     }
 
+    function suspend() {
+      invalidate()
+      return Object.freeze({ epoch: currentEpoch })
+    }
+
+    function resume(suspension) {
+      if (active || !suspension || suspension.epoch !== currentEpoch) return false
+      active = true
+      return true
+    }
+
     function beginRequest() {
       if (!active) throw new Error('ADMIN_EPOCH_INACTIVE')
       const controller = new AbortController()
@@ -104,13 +144,23 @@
       if (ticket && ticket.controller) controllers.delete(ticket.controller)
     }
 
-    return Object.freeze({ activate, beginRequest, commit, finishRequest, invalidate })
+    return Object.freeze({
+      activate,
+      beginRequest,
+      commit,
+      finishRequest,
+      invalidate,
+      resume,
+      suspend
+    })
   }
 
   return Object.freeze({
     approvedRequestDecision,
+    createAdminBootstrapGate,
     createAdminSessionLifecycle,
     createAdminSecurityState,
+    logoutFailureDecision,
     mutationFailureDecision
   })
 })

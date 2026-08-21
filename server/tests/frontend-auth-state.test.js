@@ -20,8 +20,10 @@ async function run() {
   } = require('../../public/auth-lifecycle')
   const {
     approvedRequestDecision,
+    createAdminBootstrapGate,
     createAdminSessionLifecycle,
     createAdminSecurityState,
+    logoutFailureDecision,
     mutationFailureDecision
   } = require('../../public/admin-contract')
 
@@ -150,6 +152,56 @@ async function run() {
   await assert.rejects(lateListRender, /ADMIN_EPOCH_STALE/)
   assert.equal(listTicket.signal.aborted, true)
   assert.equal(lateAdminRendered, false)
+
+  const bootstrapGate = createAdminBootstrapGate()
+  const bootstrapTicket = bootstrapGate.begin()
+  const bootstrapResponse = deferred()
+  let adminView = 'checking'
+  const bootstrapRun = bootstrapResponse.promise.then(() => {
+    if (bootstrapGate.settle(bootstrapTicket)) adminView = 'login'
+  })
+  assert.equal(bootstrapGate.canLogin(), false)
+  bootstrapResponse.resolve({ csrfToken: 'bootstrap-csrf' })
+  await bootstrapRun
+  assert.equal(bootstrapGate.canLogin(), true)
+  assert.equal(adminView, 'login')
+  adminView = 'desk'
+  assert.equal(bootstrapGate.settle(bootstrapTicket), false)
+  assert.equal(adminView, 'desk')
+
+  adminLifecycle.activate()
+  const writeTicket = adminLifecycle.beginRequest()
+  const lateWrite = deferred()
+  let writeCommitted = false
+  const lateWriteCommit = lateWrite.promise.then(() =>
+    adminLifecycle.commit(writeTicket, () => {
+      writeCommitted = true
+    })
+  )
+  const logoutSuspension = adminLifecycle.suspend()
+  lateWrite.resolve({ success: true })
+  await assert.rejects(lateWriteCommit, /ADMIN_EPOCH_STALE/)
+  assert.equal(writeTicket.signal.aborted, true)
+  assert.equal(writeCommitted, false)
+
+  const transientLogout = deferred()
+  const transientRecovery = transientLogout.promise.catch((error) => {
+    const decision = logoutFailureDecision(error.code)
+    if (decision.restoreSession) adminLifecycle.resume(logoutSuspension)
+  })
+  transientLogout.reject({ code: 'UNKNOWN' })
+  await transientRecovery
+  const recoveredTicket = adminLifecycle.beginRequest()
+  assert.equal(recoveredTicket.signal.aborted, false)
+  adminLifecycle.finishRequest(recoveredTicket)
+
+  const terminalSuspension = adminLifecycle.suspend()
+  assert.deepEqual(logoutFailureDecision('ADMIN_AUTH_REQUIRED'), {
+    restoreSession: false,
+    showLogin: true
+  })
+  assert.equal(adminLifecycle.resume({ epoch: terminalSuspension.epoch - 1 }), false)
+  assert.throws(() => adminLifecycle.beginRequest(), /ADMIN_EPOCH_INACTIVE/)
 
   const scheduled = []
   const redeemRetry = createSingleFlightRetry({

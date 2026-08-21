@@ -3,6 +3,7 @@
   const adminContracts = /** @type {any} */ (window).KinvestAdmin
   const securityState = adminContracts.createAdminSecurityState()
   const sessionLifecycle = adminContracts.createAdminSessionLifecycle()
+  const bootstrapGate = adminContracts.createAdminBootstrapGate()
   const busy = new Set()
   const byId = (id) => document.getElementById(id)
 
@@ -19,6 +20,16 @@
     else busy.delete(key)
     button.disabled = value
     button.setAttribute('aria-busy', String(value))
+  }
+
+  function setBootstrapPending(value) {
+    const form = byId('admin-login-form')
+    const password = /** @type {HTMLInputElement} */ (byId('admin-password'))
+    const button = /** @type {HTMLButtonElement} */ (byId('admin-login-submit'))
+    form.setAttribute('aria-busy', String(value))
+    password.disabled = value
+    button.disabled = value || busy.has('login')
+    if (value) setLive('正在检查管理员会话，请稍候。')
   }
 
   /**
@@ -50,6 +61,19 @@
       })
     }
     return payload
+  }
+
+  async function runAdminWrite(operation, onCommit) {
+    const ticket = sessionLifecycle.beginRequest()
+    try {
+      const result = await operation(ticket.signal)
+      return await sessionLifecycle.commit(ticket, () => onCommit(result))
+    } catch (error) {
+      if (error.name === 'AbortError' || error.message === 'ADMIN_EPOCH_STALE') return undefined
+      throw error
+    } finally {
+      sessionLifecycle.finishRequest(ticket)
+    }
   }
 
   function dateText(value) {
@@ -161,11 +185,15 @@
         if (busy.has(key)) return
         setBusy(key, button, true)
         try {
-          await api(`/api/admin/device-requests/${encodeURIComponent(item.requestId)}/approve`, {
-            method: 'POST', body: { requestCode: input.value }, csrf: true
-          })
-          setLive('设备申请已批准。', 'success')
-          await refreshLists()
+          await runAdminWrite(
+            (signal) => api(`/api/admin/device-requests/${encodeURIComponent(item.requestId)}/approve`, {
+              method: 'POST', body: { requestCode: input.value }, csrf: true, signal
+            }),
+            () => {
+              setLive('设备申请已批准。', 'success')
+              return refreshLists()
+            }
+          )
         } catch (error) {
           await handleError(error)
         } finally {
@@ -197,11 +225,15 @@
         if (busy.has(key) || !window.confirm('确认立即撤销这台设备吗？')) return
         setBusy(key, button, true)
         try {
-          await api(`/api/admin/devices/${encodeURIComponent(item.credentialId)}/revoke`, {
-            method: 'POST', body: {}, csrf: true
-          })
-          setLive('设备访问已撤销。', 'success')
-          await refreshLists()
+          await runAdminWrite(
+            (signal) => api(`/api/admin/devices/${encodeURIComponent(item.credentialId)}/revoke`, {
+              method: 'POST', body: {}, csrf: true, signal
+            }),
+            () => {
+              setLive('设备访问已撤销。', 'success')
+              return refreshLists()
+            }
+          )
         } catch (error) {
           await handleError(error)
         } finally {
@@ -265,6 +297,10 @@
     event.preventDefault()
     const button = /** @type {HTMLButtonElement} */ (byId('admin-login-submit'))
     const passwordInput = /** @type {HTMLInputElement} */ (byId('admin-password'))
+    if (!bootstrapGate.canLogin()) {
+      setLive('正在检查管理员会话，请稍候。')
+      return
+    }
     if (busy.has('login')) return
     setBusy('login', button, true)
     try {
@@ -298,13 +334,17 @@
     }
     setBusy('revoke-all', button, true)
     try {
-      await api('/api/admin/devices/revoke-all', {
-        method: 'POST', body: { password: passwordInput.value }, csrf: true
-      })
-      passwordInput.value = ''
-      phraseInput.value = ''
-      setLive('所有设备访问已撤销。', 'success')
-      await refreshLists()
+      await runAdminWrite(
+        (signal) => api('/api/admin/devices/revoke-all', {
+          method: 'POST', body: { password: passwordInput.value }, csrf: true, signal
+        }),
+        () => {
+          passwordInput.value = ''
+          phraseInput.value = ''
+          setLive('所有设备访问已撤销。', 'success')
+          return refreshLists()
+        }
+      )
     } catch (error) {
       passwordInput.value = ''
       await handleError(error)
@@ -316,7 +356,7 @@
   byId('admin-logout').addEventListener('click', async () => {
     const button = /** @type {HTMLButtonElement} */ (byId('admin-logout'))
     if (busy.has('logout')) return
-    sessionLifecycle.invalidate()
+    const suspension = sessionLifecycle.suspend()
     setBusy('logout', button, true)
     try {
       await api('/api/admin/logout', { method: 'POST', body: {}, csrf: true })
@@ -324,19 +364,31 @@
       showLogin()
       setLive('管理员已退出。', 'success')
     } catch (error) {
-      await handleError(error)
+      const decision = adminContracts.logoutFailureDecision(error.code)
+      if (decision.showLogin) {
+        clearAdminSensitiveState()
+        showLogin(contracts.authErrorMessage(error.code))
+      } else if (decision.restoreSession && sessionLifecycle.resume(suspension)) {
+        setLive(contracts.authErrorMessage(error.code), 'error')
+      }
     } finally {
       setBusy('logout', button, false)
     }
   })
 
   async function bootstrap() {
+    const bootstrapTicket = bootstrapGate.begin()
+    setBootstrapPending(true)
     try {
       await restoreCsrf()
+      if (!bootstrapGate.settle(bootstrapTicket)) return
+      setBootstrapPending(false)
       sessionLifecycle.activate()
       showDesk()
       await refreshLists()
     } catch {
+      if (!bootstrapGate.settle(bootstrapTicket)) return
+      setBootstrapPending(false)
       showLogin()
     }
   }
