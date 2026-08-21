@@ -9,6 +9,8 @@ const financeContracts = /** @type {any} */ (window).KinvestFinance
 const valuationContracts = /** @type {any} */ (window).KinvestValuation
 const authContracts = /** @type {any} */ (window).KinvestAuth
 const authUi = /** @type {any} */ (window).KinvestAuthUi
+const lifecycleContracts = /** @type {any} */ (window).KinvestAuthLifecycle
+const lifecycle = lifecycleContracts.createAuthorizedRequestLifecycle()
 
 const el = {
   globalStatus: document.getElementById('global-status'),
@@ -58,17 +60,51 @@ function percent(v) {
 }
 
 async function getJson(url, options = {}) {
-  const res = await fetch(url, { credentials: 'same-origin', ...options })
-  if (!res.ok) {
-    const body = await res.json().catch(() => ({}))
-    if (res.status === 401 && body.error === 'AUTH_REQUIRED') {
-      clearInvestmentState()
-      authUi.showGate()
-      throw new Error('访问许可已失效，请重新申请。')
+  const ticket = lifecycle.beginRequest()
+  try {
+    let res
+    try {
+      res = await fetch(url, {
+        credentials: 'same-origin',
+        ...options,
+        signal: ticket.signal
+      })
+    } catch (error) {
+      if (error.name === 'AbortError') {
+        throw Object.assign(new Error('STALE_RESPONSE'), { code: 'STALE_RESPONSE' })
+      }
+      const failure = authContracts.classifyApiFailure(0, {})
+      throw Object.assign(new Error('INVESTMENT_REQUEST_FAILED'), failure)
     }
-    throw new Error(body.error || `请求失败：${res.status}`)
+    const body = await res.json().catch(() => ({}))
+    if (!res.ok) {
+      const failure = authContracts.classifyApiFailure(res.status, body)
+      if (failure.code === 'AUTH_REQUIRED') enterGate()
+      throw Object.assign(new Error('INVESTMENT_REQUEST_FAILED'), failure)
+    }
+    if (!lifecycle.canCommit(ticket)) {
+      throw Object.assign(new Error('STALE_RESPONSE'), { code: 'STALE_RESPONSE' })
+    }
+    return body
+  } finally {
+    lifecycle.finishRequest(ticket)
   }
-  return res.json()
+}
+
+async function getAuthStatus() {
+  let response
+  try {
+    response = await fetch('/api/auth/status', { credentials: 'same-origin' })
+  } catch {
+    const failure = authContracts.classifyApiFailure(0, {})
+    throw Object.assign(new Error('AUTH_STATUS_FAILED'), failure)
+  }
+  const body = await response.json().catch(() => ({}))
+  if (!response.ok) {
+    const failure = authContracts.classifyApiFailure(response.status, body)
+    throw Object.assign(new Error('AUTH_STATUS_FAILED'), failure)
+  }
+  return authContracts.normalizeAuthStatus(body)
 }
 
 function clearInvestmentState() {
@@ -94,6 +130,21 @@ function clearInvestmentState() {
   el.globalStatus.textContent = '设备访问许可已失效。'
 }
 
+function enterGate() {
+  lifecycle.invalidate()
+  clearInvestmentState()
+  authUi.showGate()
+}
+
+async function runInvestmentTask(task, target = el.globalStatus) {
+  try {
+    await task()
+  } catch (error) {
+    if (error.code === 'STALE_RESPONSE' || error.name === 'AbortError') return
+    target.textContent = authContracts.authErrorMessage(error.code)
+  }
+}
+
 function renderGlobalStatus(companiesCount) {
   el.globalStatus.textContent = `看板可运行：当前 mock 数据 ${companiesCount} 家。默认页不展示 AI 投资观点，行情失败将回退最近成功数据。`
 }
@@ -109,7 +160,10 @@ function renderWatchlistItem(item, list, selectedCode) {
     <p class="muted">来源：${item.refreshState.marketLabel} / ${item.refreshState.autoRefreshCycleMinutes}分钟</p>
     <p class="hint">下次自动刷新：${formatDateTime(item.refreshState.nextAutoRefreshAt)}</p>
   `
-  card.addEventListener('click', () => loadCompany(item.securityCode))
+  card.addEventListener('click', () => runInvestmentTask(
+    () => loadCompany(item.securityCode),
+    el.companyEmpty
+  ))
   list.appendChild(card)
 }
 
@@ -346,7 +400,10 @@ function renderSearchResults(items) {
     const availability = item.configured === false ? ' · 未收录' : ''
     row.innerHTML = `<p><strong>${item.nameZh}（${item.securityCode}）</strong></p><p class="muted">${item.market} · ${item.symbol || ''}${aliases}${availability}</p>`
     if (item.configured !== false) {
-      row.addEventListener('click', () => loadCompany(item.securityCode))
+      row.addEventListener('click', () => runInvestmentTask(
+        () => loadCompany(item.securityCode),
+        el.companyEmpty
+      ))
     } else {
       row.setAttribute('aria-disabled', 'true')
     }
@@ -389,7 +446,9 @@ async function doRefresh() {
       await loadWatchlist()
     }
   } catch (err) {
-    alert(err.message || '刷新失败')
+    if (err.code !== 'STALE_RESPONSE') {
+      el.globalStatus.textContent = authContracts.authErrorMessage(err.code)
+    }
   }
 }
 
@@ -400,8 +459,10 @@ function bindEvents() {
       el.searchResults.innerHTML = ''
       return
     }
-    const data = await getJson(`/api/search?q=${encodeURIComponent(q)}`)
-    renderSearchResults(data.data)
+    await runInvestmentTask(async () => {
+      const data = await getJson(`/api/search?q=${encodeURIComponent(q)}`)
+      renderSearchResults(data.data)
+    }, el.searchHint)
   })
 
   el.searchInput.addEventListener('keydown', (ev) => {
@@ -425,23 +486,28 @@ function bindEvents() {
 }
 
 async function bootstrap() {
-  const authStatus = authContracts.normalizeAuthStatus(
-    await getJson('/api/auth/status', { credentials: 'same-origin' })
-  )
-  if (!authStatus.authorized) {
-    authUi.showGate()
+  let authStatus
+  try {
+    authStatus = await getAuthStatus()
+  } catch {
+    authUi.showUnavailable()
     return
   }
+  if (!authStatus.authorized) {
+    enterGate()
+    return
+  }
+  lifecycle.authorize()
   authUi.showDashboard()
   bindEvents()
-  await loadWatchlist()
-  if (state.watchlist[0]) {
-    await loadCompany(state.watchlist[0].securityCode)
-  } else {
-    el.companyEmpty.textContent = '关注清单为空：请先搜索并手动添加公司。'
-  }
+  await runInvestmentTask(async () => {
+    await loadWatchlist()
+    if (state.watchlist[0]) {
+      await loadCompany(state.watchlist[0].securityCode)
+    } else {
+      el.companyEmpty.textContent = '关注清单为空：请先搜索并手动添加公司。'
+    }
+  })
 }
 
-bootstrap().catch(() => {
-  authUi.showUnavailable()
-})
+bootstrap()

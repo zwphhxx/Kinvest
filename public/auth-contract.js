@@ -25,8 +25,22 @@
     AUTH_REQUIRED: '这台设备尚未获得家庭访问许可。',
     ORIGIN_INVALID: '当前页面来源无法执行此操作。',
     JSON_INVALID: '提交内容格式不正确。',
-    BODY_TOO_LARGE: '提交内容过长。'
+    BODY_TOO_LARGE: '提交内容过长。',
+    SEARCH_QUERY_INVALID: '请输入有效的公司名称或证券代码。',
+    SECURITY_NOT_CONFIGURED: '这家公司尚未收录。',
+    SECURITY_IDENTITY_CONFLICT: '证券身份存在冲突，暂时不能展示。',
+    REFRESH_COOLDOWN: '手动刷新仍在冷却，请稍后再试。',
+    REFRESH_DAILY_LIMIT: '今天的手动刷新额度已经用完。',
+    REFRESH_NOT_ALLOWED: '当前状态不允许手动刷新。',
+    NOT_FOUND: '没有找到请求的内容。'
   })
+  const stableCodes = new Set(Object.keys(errorMessages))
+  const terminalPollErrors = new Set([
+    'REQUEST_EXPIRED',
+    'REQUEST_LOCKED',
+    'REQUEST_NOT_FOUND',
+    'REQUEST_AUTH_REQUIRED'
+  ])
 
   function fail(code) {
     throw Object.assign(new Error(code), { code })
@@ -71,6 +85,31 @@
     return errorMessages[code] || '暂时无法完成，请稍后重试。'
   }
 
+  function classifyApiFailure(status, payload) {
+    const supplied = payload && typeof payload === 'object' && typeof payload.error === 'string'
+      ? payload.error
+      : 'UNKNOWN'
+    const code = stableCodes.has(supplied) ? supplied : 'UNKNOWN'
+    return Object.freeze({
+      code,
+      message: authErrorMessage(code),
+      retryable: status === 0 || status >= 500
+    })
+  }
+
+  function pollErrorDecision(error) {
+    if (terminalPollErrors.has(error && error.code)) {
+      return Object.freeze({ terminal: true, confirmAuthorization: false, retry: false })
+    }
+    if (error && error.code === 'REQUEST_ALREADY_USED') {
+      return Object.freeze({ terminal: false, confirmAuthorization: true, retry: false })
+    }
+    if (error && (error.status === 0 || error.status >= 500)) {
+      return Object.freeze({ terminal: false, confirmAuthorization: false, retry: true })
+    }
+    return Object.freeze({ terminal: true, confirmAuthorization: false, retry: false })
+  }
+
   function formatRequestCode(code) {
     return typeof code === 'string' && /^\d{6}$/.test(code)
       ? `${code.slice(0, 3)} ${code.slice(3)}`
@@ -85,11 +124,13 @@
 
   return Object.freeze({
     authErrorMessage,
+    classifyApiFailure,
     formatExpiry,
     formatRequestCode,
     normalizeAuthStatus,
     normalizeDeviceName,
     normalizeRequestStatus,
-    pollDecision
+    pollDecision,
+    pollErrorDecision
   })
 })

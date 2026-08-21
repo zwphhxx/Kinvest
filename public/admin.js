@@ -1,7 +1,7 @@
 (function startAdminDesk() {
   const contracts = /** @type {any} */ (window).KinvestAuth
-  let csrfToken = null
-  let csrfRestorePromise = null
+  const adminContracts = /** @type {any} */ (window).KinvestAdmin
+  const securityState = adminContracts.createAdminSecurityState()
   const busy = new Set()
   const byId = (id) => document.getElementById(id)
 
@@ -29,6 +29,7 @@
     const headers = { Accept: 'application/json' }
     if (body !== undefined) headers['Content-Type'] = 'application/json'
     if (csrf) {
+      const csrfToken = securityState.getCsrf()
       if (!csrfToken) throw Object.assign(new Error('ADMIN_AUTH_REQUIRED'), { code: 'ADMIN_AUTH_REQUIRED' })
       headers['x-kinvest-csrf'] = csrfToken
     }
@@ -40,8 +41,10 @@
     })
     const payload = await response.json().catch(() => ({}))
     if (!response.ok) {
+      const failure = contracts.classifyApiFailure(response.status, payload)
       throw Object.assign(new Error('ADMIN_REQUEST_FAILED'), {
-        code: typeof payload.error === 'string' ? payload.error : 'UNKNOWN'
+        ...failure,
+        status: response.status
       })
     }
     return payload
@@ -60,8 +63,22 @@
     return node
   }
 
+  function clearAdminSensitiveState() {
+    securityState.clear()
+    for (const id of ['admin-password', 'revoke-all-password', 'revoke-all-phrase']) {
+      const input = /** @type {HTMLInputElement} */ (byId(id))
+      if (input) input.value = ''
+    }
+    for (const input of document.querySelectorAll('.approval-code-input')) {
+      (/** @type {HTMLInputElement} */ (input)).value = ''
+    }
+    byId('pending-requests').replaceChildren()
+    byId('approved-devices').replaceChildren()
+    byId('auth-audit').replaceChildren()
+  }
+
   function showLogin(message = '') {
-    csrfToken = null
+    clearAdminSensitiveState()
     byId('admin-desk').classList.add('hidden')
     byId('admin-login').classList.remove('hidden')
     if (message) setLive(message, 'error')
@@ -74,26 +91,17 @@
   }
 
   async function restoreCsrf() {
-    if (csrfRestorePromise) return csrfRestorePromise
-    csrfRestorePromise = api('/api/admin/csrf', { method: 'POST', body: {} })
-      .then((recovered) => {
-        csrfToken = recovered.csrfToken
-        return recovered
-      })
-      .finally(() => {
-        csrfRestorePromise = null
-      })
-    return csrfRestorePromise
+    return securityState.restore(() => api('/api/admin/csrf', { method: 'POST', body: {} }))
   }
 
   async function handleError(error) {
+    const decision = adminContracts.mutationFailureDecision(error.code)
+    if (decision.clear) clearAdminSensitiveState()
     if (error.code === 'ADMIN_AUTH_REQUIRED') {
-      csrfToken = null
       showLogin(contracts.authErrorMessage(error.code))
       return
     }
     if (error.code === 'ADMIN_CSRF_INVALID') {
-      csrfToken = null
       try {
         await restoreCsrf()
         await refreshLists()
@@ -125,8 +133,15 @@
       heading.append(text('strong', item.deviceName || '未命名设备'))
       heading.append(text('span', `到期 ${dateText(item.expiresAt)}`, 'admin-meta'))
       const form = document.createElement('form')
+      const decision = adminContracts.approvedRequestDecision(item)
+      if (!decision.approvable) {
+        row.append(heading, text('p', decision.label, 'admin-meta'))
+        list.appendChild(row)
+        continue
+      }
       const label = text('label', '输入家人屏幕上的 6 位申请码', 'auth-field')
       const input = document.createElement('input')
+      input.className = 'approval-code-input'
       input.inputMode = 'numeric'
       input.autocomplete = 'one-time-code'
       input.maxLength = 6
@@ -241,7 +256,7 @@
       const result = await api('/api/admin/login', {
         method: 'POST', body: { password: passwordInput.value }
       })
-      csrfToken = result.csrfToken
+      securityState.setCsrf(result.csrfToken)
       passwordInput.value = ''
       showDesk()
       setLive('管理员会话已建立。', 'success')
@@ -288,6 +303,7 @@
     setBusy('logout', button, true)
     try {
       await api('/api/admin/logout', { method: 'POST', body: {}, csrf: true })
+      clearAdminSensitiveState()
       showLogin()
       setLive('管理员已退出。', 'success')
     } catch (error) {
@@ -308,7 +324,7 @@
   }
 
   window.addEventListener('beforeunload', () => {
-    csrfToken = null
+    clearAdminSensitiveState()
   })
 
   bootstrap()

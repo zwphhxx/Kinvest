@@ -37,6 +37,7 @@ const tests = [
   require('./refresh-rules.test'),
   require('./health.test'),
   require('./build.test'),
+  require('./frontend-auth-state.test'),
   require('./frontend-auth-contract.test'),
   require('./frontend-contract.test'),
   require('./data-source-contract.test'),

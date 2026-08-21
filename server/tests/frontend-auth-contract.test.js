@@ -35,6 +35,7 @@ function assertMainGateContract() {
   const html = read('public/index.html')
   const app = read('public/app.js')
   const gate = read('public/auth-ui.js')
+  const lifecycle = read('public/auth-lifecycle.js')
 
   assert.match(html, /id="auth-checking"[^>]*role="status"/)
   assert.match(html, /id="auth-gate"[^>]*class="auth-shell hidden"/)
@@ -43,11 +44,11 @@ function assertMainGateContract() {
   assert.match(html, /<script src="\/auth-contract\.js" defer><\/script>/)
   assert.match(html, /<script src="\/auth-ui\.js" defer><\/script>/)
 
-  assert.match(app, /async function bootstrap\(\) \{[\s\S]*getJson\('\/api\/auth\/status'[\s\S]*if \(!authStatus\.authorized\) \{[\s\S]*return[\s\S]*await loadWatchlist\(\)/)
+  assert.match(app, /async function bootstrap\(\) \{[\s\S]*getAuthStatus\(\)[\s\S]*if \(!authStatus\.authorized\) \{[\s\S]*return[\s\S]*await loadWatchlist\(\)/)
   assert.match(app, /if \(!authStatus\.authorized\) \{[\s\S]*return[\s\S]*\}/)
   assert.match(app, /credentials:\s*'same-origin'/)
   assert.match(app, /function clearInvestmentState\(/)
-  assert.match(app, /if \(res\.status === 401[\s\S]*clearInvestmentState\(\)[\s\S]*showGate\(\)/)
+  assert.match(app, /if \(failure\.code === 'AUTH_REQUIRED'\) enterGate\(\)/)
   assert.match(app, /el\.marketStatus[\s\S]*el\.thermo/)
 
   for (const endpoint of [
@@ -68,9 +69,14 @@ function assertMainGateContract() {
   assert.match(gate, /redeemPromise/)
   assert.match(gate, /pollController === controller/)
   assert.match(gate, /Math\.min\([^\n]*15000/)
-  assert.match(gate, /REQUEST_ALREADY_USED[\s\S]*\/api\/auth\/status/)
+  assert.match(gate, /decision\.confirmAuthorization[\s\S]*\/api\/auth\/status/)
   assert.match(gate, /server status/i)
   assert.match(gate, /setAttribute\('aria-busy'/)
+  assert.match(app, /createAuthorizedRequestLifecycle/)
+  assert.match(app, /lifecycle\.invalidate\(\)/)
+  assert.match(app, /lifecycle\.canCommit\(/)
+  assert.doesNotMatch(app, /body\.error \|\|/)
+  assert.match(lifecycle, /AbortController/)
 }
 
 function assertResearchGateContract() {
@@ -90,6 +96,7 @@ function assertResearchGateContract() {
 function assertAdminDeskContract() {
   const html = read('public/admin.html')
   const script = read('public/admin.js')
+  const adminContract = read('public/admin-contract.js')
 
   assert.match(html, /<title>Kinvest 家庭设备管理<\/title>/)
   assert.match(html, /id="admin-login"/)
@@ -119,11 +126,15 @@ function assertAdminDeskContract() {
   assert.match(script, /replaceChildren/)
   assert.match(script, /password:\s*passwordInput\.value/)
   assert.doesNotMatch(script, /passwordInput\.value\.trim\(/)
-  assert.match(script, /csrfRestorePromise/)
+  assert.match(script, /securityState\.restore/)
   assert.match(script, /ADMIN_CSRF_INVALID[\s\S]*refreshLists/)
-  assert.match(script, /beforeunload[\s\S]*csrfToken = null/)
-  assert.match(script, /ADMIN_AUTH_REQUIRED[\s\S]*csrfToken = null/)
+  assert.match(script, /beforeunload[\s\S]*clearAdminSensitiveState\(\)/)
+  assert.match(script, /ADMIN_AUTH_REQUIRED[\s\S]*clearAdminSensitiveState\(\)/)
   assert.doesNotMatch(script, /retryMutation|replayMutation/)
+  assert.match(script, /function clearAdminSensitiveState\(/)
+  assert.match(script, /approvedRequestDecision/)
+  assert.match(script, /clearAdminSensitiveState\(\)/)
+  assert.match(adminContract, /replay:\s*false/)
 }
 
 function assertVisualAndBuildContract() {
@@ -149,8 +160,10 @@ function assertVisualAndBuildContract() {
 
   for (const file of [
     'public/auth-contract.js',
+    'public/auth-lifecycle.js',
     'public/auth-ui.js',
     'public/auth.css',
+    'public/admin-contract.js',
     'public/admin.html',
     'public/admin.js'
   ]) assert.match(build, new RegExp(file.replace('.', '\\.')))

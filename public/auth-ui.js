@@ -8,6 +8,7 @@
   let pollGeneration = 0
   let networkFailures = 0
   let redeemPromise = null
+  let alreadyUsedConfirmationAttempted = false
   let stopped = false
   let submitBusy = false
   let bound = false
@@ -15,19 +16,28 @@
   const byId = (id) => document.getElementById(id)
 
   async function api(path, options = {}) {
-    const response = await fetch(path, {
-      credentials: 'same-origin',
-      ...options,
-      headers: {
-        Accept: 'application/json',
-        ...(options.body === undefined ? {} : { 'Content-Type': 'application/json' }),
-        ...(options.headers || {})
-      }
-    })
+    let response
+    try {
+      response = await fetch(path, {
+        credentials: 'same-origin',
+        ...options,
+        headers: {
+          Accept: 'application/json',
+          ...(options.body === undefined ? {} : { 'Content-Type': 'application/json' }),
+          ...(options.headers || {})
+        }
+      })
+    } catch (error) {
+      if (error.name === 'AbortError') throw error
+      const failure = contracts.classifyApiFailure(0, {})
+      throw Object.assign(new Error('AUTH_REQUEST_FAILED'), { ...failure, status: 0 })
+    }
     const payload = await response.json().catch(() => ({}))
     if (!response.ok) {
+      const failure = contracts.classifyApiFailure(response.status, payload)
       throw Object.assign(new Error('AUTH_REQUEST_FAILED'), {
-        code: typeof payload.error === 'string' ? payload.error : 'UNKNOWN'
+        ...failure,
+        status: response.status
       })
     }
     return payload
@@ -75,6 +85,46 @@
     }[status] || '这份申请已结束，请重新申请。'
   }
 
+  function terminateWithReapply(message) {
+    stopPolling()
+    requestStatus = 'consumed'
+    setLive(message, 'error')
+    byId('request-again').classList.remove('hidden')
+  }
+
+  async function handlePollingFailure(error, generation) {
+    if (generation !== pollGeneration) return
+    const decision = contracts.pollErrorDecision(error)
+    if (decision.confirmAuthorization) {
+      if (alreadyUsedConfirmationAttempted) {
+        terminateWithReapply('这份申请已经结束，请重新申请。')
+        return
+      }
+      alreadyUsedConfirmationAttempted = true
+      try {
+        const authStatus = contracts.normalizeAuthStatus(await api('/api/auth/status'))
+        if (authStatus.authorized) {
+          window.location.reload()
+          return
+        }
+      } catch {
+        // Confirmation failure is terminal and must never start another poll.
+      }
+      terminateWithReapply('未能确认这台设备已登录，请重新申请。')
+      return
+    }
+    if (decision.terminal) {
+      terminateWithReapply(contracts.authErrorMessage(error.code))
+      return
+    }
+    if (decision.retry) {
+      networkFailures += 1
+      const delay = Math.min(pollIntervalMs * (2 ** networkFailures), 15000)
+      setLive('网络暂时不可用，稍后会自动重试。', 'error')
+      schedulePoll(generation, delay)
+    }
+  }
+
   async function redeemOnce(generation) {
     if (!requestId || generation !== pollGeneration) return
     pausePolling()
@@ -87,15 +137,7 @@
       if (payload.authorized !== true) throw new Error('AUTH_REQUEST_FAILED')
       window.location.reload()
     } catch (error) {
-      if (error.code === 'REQUEST_ALREADY_USED') {
-        const authStatus = contracts.normalizeAuthStatus(await api('/api/auth/status'))
-        if (authStatus.authorized) {
-          window.location.reload()
-          return
-        }
-      }
-      setLive(contracts.authErrorMessage(error.code), 'error')
-      byId('request-again').classList.remove('hidden')
+      await handlePollingFailure(error, generation)
     }
   }
 
@@ -131,10 +173,7 @@
       if (decision.poll) schedulePoll(generation)
     } catch (error) {
       if (error.name === 'AbortError' || generation !== pollGeneration) return
-      setLive(contracts.authErrorMessage(error.code), 'error')
-      networkFailures += 1
-      const delay = Math.min(pollIntervalMs * (2 ** networkFailures), 15000)
-      schedulePoll(generation, delay)
+      await handlePollingFailure(error, generation)
     } finally {
       if (pollController === controller) pollController = null
     }
@@ -169,6 +208,7 @@
       requestId = created.requestId
       requestStatus = 'pending'
       redeemPromise = null
+      alreadyUsedConfirmationAttempted = false
       networkFailures = 0
       pollGeneration += 1
       showRequest(created)
@@ -188,6 +228,7 @@
     requestId = null
     requestStatus = null
     redeemPromise = null
+    alreadyUsedConfirmationAttempted = false
     byId('request-code').replaceChildren()
     byId('request-ticket').classList.add('hidden')
     byId('request-again').classList.add('hidden')

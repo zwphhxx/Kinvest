@@ -26,11 +26,13 @@ async function runBuildArtifactsExist() {
   const fixturePath = path.join(repositoryRoot, 'server', 'data', 'build-leak.log')
   const expectedArtifacts = [
     'package.json',
+    'public/admin-contract.js',
     'public/admin.html',
     'public/admin.js',
     'public/app.css',
     'public/app.js',
     'public/auth-contract.js',
+    'public/auth-lifecycle.js',
     'public/auth-ui.js',
     'public/auth.css',
     'public/data-source-contract.js',
@@ -46,10 +48,16 @@ async function runBuildArtifactsExist() {
     'server/ai/model-quota.js',
     'server/ai/research-safety.js',
     'server/data/mockData.js',
+    'server/db/admin-auth-repository.js',
+    'server/db/database-identity.js',
     'server/db/device-auth-repository.js',
     'server/db/refresh-db.js',
     'server/domain/security-identity.js',
+    'server/http/auth-http.js',
+    'server/http/trusted-client.js',
     'server/secret-preflight.js',
+    'server/security/access-control-runtime.js',
+    'server/security/admin-auth.js',
     'server/security/cvm-ssm-secret-provider.js',
     'server/security/device-approval.js',
     'server/security/github-tmpfs-secret-provider.js',
@@ -91,6 +99,13 @@ async function runBuildArtifactsExist() {
       'tencentcloud-sdk-nodejs-common': '4.1.220',
       'tencentcloud-sdk-nodejs-ssm': '4.1.275'
     })
+
+    const distServerPath = path.join(repositoryRoot, 'dist', 'server', 'server.js')
+    delete require.cache[require.resolve(distServerPath)]
+    assert.doesNotThrow(
+      () => require(distServerPath),
+      'Built server runtime must load with every local production dependency present'
+    )
 
     for (const artifact of expectedArtifacts.filter((file) => file.endsWith('.html'))) {
       const html = fs.readFileSync(path.join(repositoryRoot, 'dist', artifact), 'utf8')
