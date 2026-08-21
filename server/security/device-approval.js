@@ -14,7 +14,9 @@ const TOKEN_ABSOLUTE_MS = 365 * DAY_MS
 
 const ERROR_MESSAGES = {
   ADMIN_AUTH_REQUIRED: 'Administrator authentication is required',
+  DEVICE_NAME_INVALID: 'The device name is invalid',
   HMAC_VERSION_IN_USE: 'The HMAC version is referenced by an active credential',
+  IP_DIGEST_INVALID: 'The IP digest is invalid',
   REQUEST_ALREADY_USED: 'The request has already been used',
   REQUEST_BROWSER_MISMATCH: 'The browser request credential does not match',
   REQUEST_CODE_INVALID: 'The request code is invalid',
@@ -82,6 +84,32 @@ function cookieContract() {
   }
 }
 
+function normalizeDeviceName(value) {
+  if (typeof value !== 'string') {
+    throw new DeviceApprovalError('DEVICE_NAME_INVALID')
+  }
+  const normalized = value.trim().normalize('NFC')
+  const characters = Array.from(normalized)
+  if (characters.length < 1 || characters.length > 40 ||
+    Buffer.byteLength(normalized, 'utf8') > 160 ||
+    characters.some((character) => {
+      const codePoint = character.codePointAt(0)
+      return codePoint <= 0x1f || codePoint === 0x7f
+    })) {
+    throw new DeviceApprovalError('DEVICE_NAME_INVALID')
+  }
+  return normalized
+}
+
+function normalizeIpDigest(value) {
+  if (value === null) return null
+  if (typeof value !== 'string' ||
+    !/^[A-Za-z0-9_-]{43}$/.test(value)) {
+    throw new DeviceApprovalError('IP_DIGEST_INVALID')
+  }
+  return value
+}
+
 class DeviceApprovalService {
   constructor({
     repository,
@@ -111,7 +139,9 @@ class DeviceApprovalService {
     this.activeHmacVersionId = versionId
   }
 
-  createRequest() {
+  createRequest({ deviceName, ipDigest = null } = {}) {
+    const normalizedDeviceName = normalizeDeviceName(deviceName)
+    const normalizedIpDigest = normalizeIpDigest(ipDigest)
     const now = this.now()
     const requestId = this.randomBytes(16).toString('base64url')
     const browserCredential = this.randomBytes(32).toString('base64url')
@@ -122,6 +152,8 @@ class DeviceApprovalService {
     this.repository.runInImmediateTransaction(() => {
       this.repository.insertRequest({
         requestId,
+        deviceName: normalizedDeviceName,
+        ipDigest: normalizedIpDigest,
         requestCodeDigest: hashRequestCode(requestId, requestCode),
         browserCredentialDigest: hashValue(browserCredential),
         createdAt: now,
@@ -220,6 +252,9 @@ class DeviceApprovalService {
       absoluteExpiresAt: request.approvedAt + TOKEN_ABSOLUTE_MS,
       hmacVersionId: this.activeHmacVersionId,
       deviceId: this.randomBytes(16).toString('base64url'),
+      deviceName: request.deviceName === null
+        ? null
+        : normalizeDeviceName(request.deviceName),
       now
     })
     this.repository.runInImmediateTransaction(() => {
@@ -407,6 +442,7 @@ class DeviceApprovalService {
     absoluteExpiresAt,
     hmacVersionId,
     deviceId,
+    deviceName,
     now,
     token = this.randomBytes(32).toString('base64url'),
     secret = this.readHmacSecret(hmacVersionId)
@@ -417,6 +453,7 @@ class DeviceApprovalService {
       record: {
         credentialId,
         deviceId,
+        deviceName,
         tokenDigest: hmacToken(secret, token),
         hmacVersionId,
         approvedAt,
@@ -492,6 +529,7 @@ class DeviceApprovalService {
       absoluteExpiresAt: credential.absoluteExpiresAt,
       hmacVersionId: replacementHmacVersionId,
       deviceId: credential.deviceId,
+      deviceName: credential.deviceName,
       now,
       token: replacementToken,
       secret: replacementSecret

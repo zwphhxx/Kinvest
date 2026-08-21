@@ -85,8 +85,8 @@ function countRows(database, tableName) {
   return Number(database.prepare(`SELECT COUNT(*) AS count FROM ${tableName}`).get().count)
 }
 
-function issueDevice(harness) {
-  const request = harness.service.createRequest()
+function issueDevice(harness, deviceName = 'Test Device') {
+  const request = harness.service.createRequest({ deviceName })
   harness.service.approveRequest({
     requestId: request.requestId,
     requestCode: request.requestCode,
@@ -141,7 +141,7 @@ function testSecretProviderContract() {
 
 function testRequestApprovalAndRedemption() {
   const harness = createHarness()
-  const request = harness.service.createRequest()
+  const request = harness.service.createRequest({ deviceName: 'Test Device' })
 
   assert.strictEqual(Buffer.from(request.browserCredential, 'base64url').length, 32)
   assert.strictEqual(request.expiresAt - harness.clock.value, 10 * 60 * 1000)
@@ -197,7 +197,7 @@ function testRequestApprovalAndRedemption() {
 
 function testRequestExpiryAndAttemptLock() {
   const expired = createHarness()
-  const expiredRequest = expired.service.createRequest()
+  const expiredRequest = expired.service.createRequest({ deviceName: 'Test Device' })
   expired.clock.value += (10 * 60 * 1000) + 1
   expectCode(() => expired.service.approveRequest({
     requestId: expiredRequest.requestId,
@@ -206,7 +206,7 @@ function testRequestExpiryAndAttemptLock() {
   }), 'REQUEST_EXPIRED')
 
   const locked = createHarness()
-  const lockedRequest = locked.service.createRequest()
+  const lockedRequest = locked.service.createRequest({ deviceName: 'Test Device' })
   for (let attempt = 1; attempt <= 5; attempt += 1) {
     expectCode(() => locked.service.approveRequest({
       requestId: lockedRequest.requestId,
@@ -223,7 +223,7 @@ function testRequestExpiryAndAttemptLock() {
 
 function testApprovedRequestIsIdempotentBeforeCodeValidation() {
   const harness = createHarness()
-  const request = harness.service.createRequest()
+  const request = harness.service.createRequest({ deviceName: 'Test Device' })
   harness.service.approveRequest({
     requestId: request.requestId,
     requestCode: request.requestCode,
@@ -250,7 +250,7 @@ function testApprovedRequestIsIdempotentBeforeCodeValidation() {
   }).token.length > 0, true)
 
   const expired = createHarness()
-  const expiredRequest = expired.service.createRequest()
+  const expiredRequest = expired.service.createRequest({ deviceName: 'Test Device' })
   expired.service.approveRequest({
     requestId: expiredRequest.requestId,
     requestCode: expiredRequest.requestCode,
@@ -501,11 +501,11 @@ function testMissingActiveVersionDoesNotBlockOtherDevices() {
 function testStateAndAuditAreAtomic() {
   const creation = createHarness()
   installAuditFailure(creation.database, 'device_request_created')
-  expectAuditFailure(() => creation.service.createRequest())
+  expectAuditFailure(() => creation.service.createRequest({ deviceName: 'Test Device' }))
   assert.strictEqual(countRows(creation.database, 'device_auth_requests'), 0)
 
   const failedAttempt = createHarness()
-  const failedRequest = failedAttempt.service.createRequest()
+  const failedRequest = failedAttempt.service.createRequest({ deviceName: 'Test Device' })
   installAuditFailure(failedAttempt.database, 'device_request_code_rejected')
   expectAuditFailure(() => failedAttempt.service.approveRequest({
     requestId: failedRequest.requestId,
@@ -515,7 +515,7 @@ function testStateAndAuditAreAtomic() {
   assert.strictEqual(failedAttempt.repository.getRequest(failedRequest.requestId).failedAttempts, 0)
 
   const approval = createHarness()
-  const approvalRequest = approval.service.createRequest()
+  const approvalRequest = approval.service.createRequest({ deviceName: 'Test Device' })
   installAuditFailure(approval.database, 'device_request_approved')
   expectAuditFailure(() => approval.service.approveRequest({
     requestId: approvalRequest.requestId,
@@ -525,7 +525,7 @@ function testStateAndAuditAreAtomic() {
   assert.strictEqual(approval.repository.getRequest(approvalRequest.requestId).approvedAt, null)
 
   const redemption = createHarness()
-  const redemptionRequest = redemption.service.createRequest()
+  const redemptionRequest = redemption.service.createRequest({ deviceName: 'Test Device' })
   redemption.service.approveRequest({
     requestId: redemptionRequest.requestId,
     requestCode: redemptionRequest.requestCode,
@@ -584,7 +584,7 @@ function testStateAndAuditAreAtomic() {
 
 function testAuditDoesNotContainSecrets() {
   const harness = createHarness()
-  const request = harness.service.createRequest()
+  const request = harness.service.createRequest({ deviceName: 'Test Device' })
   harness.service.approveRequest({
     requestId: request.requestId,
     requestCode: request.requestCode,
@@ -601,6 +601,7 @@ function testAuditDoesNotContainSecrets() {
     request.requestCode,
     request.browserCredential,
     credential.token,
+    'Test Device',
     'synthetic-hmac-key-one',
     'synthetic-hmac-key-two'
   ]
@@ -609,7 +610,160 @@ function testAuditDoesNotContainSecrets() {
   }
 }
 
+function testExpandMigrationIsIdempotentAndPreservesLegacyRows() {
+  const database = new DatabaseSync(':memory:')
+  database.exec(`
+    CREATE TABLE device_auth_requests (
+      request_id TEXT PRIMARY KEY,
+      request_code_digest TEXT NOT NULL,
+      browser_credential_digest TEXT NOT NULL,
+      created_at INTEGER NOT NULL,
+      expires_at INTEGER NOT NULL,
+      failed_attempts INTEGER NOT NULL DEFAULT 0,
+      approved_at INTEGER,
+      consumed_at INTEGER,
+      locked_at INTEGER
+    );
+    CREATE TABLE device_credentials (
+      credential_id TEXT PRIMARY KEY,
+      device_id TEXT NOT NULL,
+      token_digest TEXT NOT NULL UNIQUE,
+      hmac_version_id TEXT NOT NULL,
+      approved_at INTEGER NOT NULL,
+      rotated_at INTEGER NOT NULL,
+      last_used_at INTEGER NOT NULL,
+      idle_expires_at INTEGER NOT NULL,
+      absolute_expires_at INTEGER NOT NULL,
+      revoked_at INTEGER,
+      replacement_credential_id TEXT,
+      replacement_grace_expires_at INTEGER
+    );
+  `)
+  database.prepare(`
+    INSERT INTO device_auth_requests (
+      request_id, request_code_digest, browser_credential_digest,
+      created_at, expires_at
+    ) VALUES (?, ?, ?, ?, ?)
+  `).run('legacy-request', 'legacy-code-digest', 'legacy-browser-digest', 10, 20)
+  database.prepare(`
+    INSERT INTO device_credentials (
+      credential_id, device_id, token_digest, hmac_version_id,
+      approved_at, rotated_at, last_used_at, idle_expires_at,
+      absolute_expires_at
+    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+  `).run('legacy-credential', 'legacy-device', 'legacy-token-digest',
+    VERSION_ONE, 10, 10, 10, 20, 30)
+
+  const repository = new DeviceAuthRepository(database)
+  repository.initialize()
+  repository.initialize()
+
+  assert.deepStrictEqual(
+    database.prepare('PRAGMA table_info(device_auth_requests)').all()
+      .filter((column) => ['device_name', 'ip_digest'].includes(column.name))
+      .map((column) => column.name),
+    ['device_name', 'ip_digest']
+  )
+  assert.strictEqual(repository.getRequest('legacy-request').requestCodeDigest,
+    'legacy-code-digest')
+  assert.strictEqual(repository.getRequest('legacy-request').deviceName, null)
+  assert.strictEqual(repository.getRequest('legacy-request').ipDigest, null)
+  assert.strictEqual(repository.getCredential('legacy-credential').tokenDigest,
+    'legacy-token-digest')
+  assert.strictEqual(repository.getCredential('legacy-credential').deviceName, null)
+}
+
+function testDeviceNameAndIpDigestValidation() {
+  const harness = createHarness()
+  const ipDigest = Buffer.alloc(32, 7).toString('base64url')
+  const normalized = harness.service.createRequest({
+    deviceName: '  Cafe\u0301 Phone  ',
+    ipDigest
+  })
+  const stored = harness.repository.getRequest(normalized.requestId)
+  assert.strictEqual(stored.deviceName, 'Caf\u00e9 Phone')
+  assert.strictEqual(stored.ipDigest, ipDigest)
+  assert.strictEqual(
+    harness.repository.getRequest(
+      harness.service.createRequest({ deviceName: '\u{1f4f1}'.repeat(40) }).requestId
+    ).deviceName,
+    '\u{1f4f1}'.repeat(40)
+  )
+
+  const invalidNames = [
+    undefined,
+    null,
+    123,
+    '',
+    '   ',
+    'x\u0000y',
+    'x\u001fy',
+    'x\u007fy',
+    'a'.repeat(41),
+    '\u{1f4f1}'.repeat(41)
+  ]
+  for (const deviceName of invalidNames) {
+    expectCode(() => harness.service.createRequest({ deviceName }),
+      'DEVICE_NAME_INVALID')
+  }
+  expectCode(() => harness.service.createRequest(), 'DEVICE_NAME_INVALID')
+
+  for (const invalidDigest of [42, '', 'a'.repeat(42), `${'a'.repeat(42)}=`]) {
+    expectCode(() => harness.service.createRequest({
+      deviceName: 'Digest Device',
+      ipDigest: invalidDigest
+    }), 'IP_DIGEST_INVALID')
+  }
+}
+
+function testDeviceNameSurvivesRedemptionAndRotation() {
+  const harness = createHarness()
+  const { credential } = issueDevice(harness, '  Living Room \u{1f4fa}  ')
+  const original = harness.repository.getCredential(credential.credentialId)
+  assert.strictEqual(original.deviceName, 'Living Room \u{1f4fa}')
+
+  harness.service.setActiveHmacVersionId(VERSION_TWO)
+  harness.clock.value += 30 * DAY_MS
+  const rotated = harness.service.authenticate(credential.token)
+  assert.strictEqual(
+    harness.repository.getCredential(rotated.replacementCredentialId).deviceName,
+    original.deviceName
+  )
+}
+
+function testSafeListingsDoNotExposeDigests() {
+  const harness = createHarness()
+  const ipDigest = Buffer.alloc(32, 8).toString('base64url')
+  const pending = harness.service.createRequest({
+    deviceName: 'Pending Device',
+    ipDigest
+  })
+  const issued = issueDevice(harness, 'Issued Device')
+  const pendingRows = harness.repository.listPendingRequests(harness.clock.value)
+  const deviceRows = harness.repository.listDevices(harness.clock.value)
+
+  assert.deepStrictEqual(pendingRows.map((row) => row.requestId), [pending.requestId])
+  assert.strictEqual(pendingRows[0].deviceName, 'Pending Device')
+  assert.strictEqual(deviceRows.length, 1)
+  assert.strictEqual(deviceRows[0].deviceName, 'Issued Device')
+  assert.strictEqual(deviceRows[0].credentialId, issued.credential.credentialId)
+  const listing = JSON.stringify({ pendingRows, deviceRows })
+  for (const forbidden of [
+    'requestCodeDigest',
+    'browserCredentialDigest',
+    'tokenDigest',
+    'ipDigest',
+    ipDigest
+  ]) {
+    assert.strictEqual(listing.includes(forbidden), false)
+  }
+}
+
 async function run() {
+  testExpandMigrationIsIdempotentAndPreservesLegacyRows()
+  testDeviceNameAndIpDigestValidation()
+  testDeviceNameSurvivesRedemptionAndRotation()
+  testSafeListingsDoNotExposeDigests()
   testSecretProviderContract()
   testRequestApprovalAndRedemption()
   testRequestExpiryAndAttemptLock()

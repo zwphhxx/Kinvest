@@ -15,6 +15,8 @@ function mapRequest(row) {
   if (!row) return null
   return {
     requestId: row.request_id,
+    deviceName: row.device_name,
+    ipDigest: row.ip_digest,
     requestCodeDigest: row.request_code_digest,
     browserCredentialDigest: row.browser_credential_digest,
     createdAt: row.created_at,
@@ -31,6 +33,7 @@ function mapCredential(row) {
   return {
     credentialId: row.credential_id,
     deviceId: row.device_id,
+    deviceName: row.device_name,
     tokenDigest: row.token_digest,
     hmacVersionId: row.hmac_version_id,
     approvedAt: row.approved_at,
@@ -63,6 +66,8 @@ class DeviceAuthRepository {
     this.database.exec(`
       CREATE TABLE IF NOT EXISTS device_auth_requests (
         request_id TEXT PRIMARY KEY,
+        device_name TEXT,
+        ip_digest TEXT,
         request_code_digest TEXT NOT NULL,
         browser_credential_digest TEXT NOT NULL,
         created_at INTEGER NOT NULL,
@@ -76,6 +81,7 @@ class DeviceAuthRepository {
       CREATE TABLE IF NOT EXISTS device_credentials (
         credential_id TEXT PRIMARY KEY,
         device_id TEXT NOT NULL,
+        device_name TEXT,
         token_digest TEXT NOT NULL UNIQUE,
         hmac_version_id TEXT NOT NULL,
         approved_at INTEGER NOT NULL,
@@ -102,6 +108,28 @@ class DeviceAuthRepository {
         metadata_json TEXT NOT NULL
       );
     `)
+
+    const requestColumns = this.database.prepare(
+      'PRAGMA table_info(device_auth_requests)'
+    ).all()
+    if (!requestColumns.some((column) => column.name === 'device_name')) {
+      this.database.exec(
+        'ALTER TABLE device_auth_requests ADD COLUMN device_name TEXT'
+      )
+    }
+    if (!requestColumns.some((column) => column.name === 'ip_digest')) {
+      this.database.exec(
+        'ALTER TABLE device_auth_requests ADD COLUMN ip_digest TEXT'
+      )
+    }
+    const credentialColumns = this.database.prepare(
+      'PRAGMA table_info(device_credentials)'
+    ).all()
+    if (!credentialColumns.some((column) => column.name === 'device_name')) {
+      this.database.exec(
+        'ALTER TABLE device_credentials ADD COLUMN device_name TEXT'
+      )
+    }
   }
 
   runInImmediateTransaction(operation) {
@@ -120,13 +148,17 @@ class DeviceAuthRepository {
     this.database.prepare(`
       INSERT INTO device_auth_requests (
         request_id,
+        device_name,
+        ip_digest,
         request_code_digest,
         browser_credential_digest,
         created_at,
         expires_at
-      ) VALUES (?, ?, ?, ?, ?)
+      ) VALUES (?, ?, ?, ?, ?, ?, ?)
     `).run(
       request.requestId,
+      request.deviceName,
+      request.ipDigest,
       request.requestCodeDigest,
       request.browserCredentialDigest,
       request.createdAt,
@@ -176,7 +208,15 @@ class DeviceAuthRepository {
     if (Number(consumed.changes) !== 1) {
       return false
     }
-    this.insertCredential(credential)
+    const request = this.database.prepare(`
+      SELECT device_name
+      FROM device_auth_requests
+      WHERE request_id = ?
+    `).get(requestId)
+    this.insertCredential({
+      ...credential,
+      deviceName: request.device_name
+    })
     return true
   }
 
@@ -185,6 +225,7 @@ class DeviceAuthRepository {
       INSERT INTO device_credentials (
         credential_id,
         device_id,
+        device_name,
         token_digest,
         hmac_version_id,
         approved_at,
@@ -192,10 +233,11 @@ class DeviceAuthRepository {
         last_used_at,
         idle_expires_at,
         absolute_expires_at
-      ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+      ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
     `).run(
       credential.credentialId,
       credential.deviceId,
+      credential.deviceName ?? null,
       credential.tokenDigest,
       credential.hmacVersionId,
       credential.approvedAt,
@@ -241,6 +283,11 @@ class DeviceAuthRepository {
   }
 
   rotateCredential(oldCredentialId, replacement, graceExpiresAt) {
+    const original = this.database.prepare(`
+      SELECT device_name
+      FROM device_credentials
+      WHERE credential_id = ?
+    `).get(oldCredentialId)
     const changed = this.database.prepare(`
       UPDATE device_credentials
       SET replacement_credential_id = ?, replacement_grace_expires_at = ?
@@ -251,8 +298,53 @@ class DeviceAuthRepository {
     if (Number(changed.changes) !== 1) {
       return false
     }
-    this.insertCredential(replacement)
+    this.insertCredential({
+      ...replacement,
+      deviceName: original.device_name
+    })
     return true
+  }
+
+  listPendingRequests(now) {
+    return this.database.prepare(`
+      SELECT request_id, device_name, created_at, expires_at,
+             failed_attempts, approved_at, locked_at
+      FROM device_auth_requests
+      WHERE consumed_at IS NULL
+        AND locked_at IS NULL
+        AND expires_at > ?
+      ORDER BY created_at, request_id
+    `).all(now).map((row) => ({
+      requestId: row.request_id,
+      deviceName: row.device_name,
+      createdAt: row.created_at,
+      expiresAt: row.expires_at,
+      failedAttempts: row.failed_attempts,
+      approvedAt: row.approved_at,
+      lockedAt: row.locked_at
+    }))
+  }
+
+  listDevices(now) {
+    return this.database.prepare(`
+      SELECT credential_id, device_id, device_name, approved_at,
+             rotated_at, last_used_at, idle_expires_at, absolute_expires_at
+      FROM device_credentials
+      WHERE revoked_at IS NULL
+        AND replacement_credential_id IS NULL
+        AND idle_expires_at > ?
+        AND absolute_expires_at > ?
+      ORDER BY approved_at, credential_id
+    `).all(now, now).map((row) => ({
+      credentialId: row.credential_id,
+      deviceId: row.device_id,
+      deviceName: row.device_name,
+      approvedAt: row.approved_at,
+      rotatedAt: row.rotated_at,
+      lastUsedAt: row.last_used_at,
+      idleExpiresAt: row.idle_expires_at,
+      absoluteExpiresAt: row.absolute_expires_at
+    }))
   }
 
   revokeCredential(credentialId, revokedAt) {

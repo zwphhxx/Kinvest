@@ -24,6 +24,47 @@ async function run() {
   const initialUmask = process.umask()
   try {
   const { runServerExecutable, startServer } = require('../server')
+  const accessFailureServer = new FakeServer()
+  let accessFailureSecretClearCount = 0
+  await assert.rejects(startServer({
+    env: { KINVEST_ACCESS_CONTROL_MODE: 'device-approval' },
+    runtimeServer: accessFailureServer,
+    bootstrap: async () => ({
+      status: Object.freeze({ mode: 'github-tmpfs-v1', referenceCount: 2 }),
+      clear() { accessFailureSecretClearCount += 1 }
+    }),
+    createAccessRuntime: () => {
+      throw Object.assign(new Error('fixture access material must never be logged'), {
+        code: 'ACCESS_CONTROL_CONFIG_INVALID'
+      })
+    },
+    processRef: new EventEmitter(),
+    logger: { log() {} }
+  }))
+  assert.equal(accessFailureServer.listenCalls, 0)
+  assert.equal(accessFailureSecretClearCount, 1)
+
+  const cleanupOrder = []
+  const cleanupProcess = new EventEmitter()
+  const cleanupServer = new FakeServer()
+  await startServer({
+    runtimeServer: cleanupServer,
+    bootstrap: async () => ({
+      status: Object.freeze({ mode: 'disabled', referenceCount: 0 }),
+      clear() { cleanupOrder.push('secret') }
+    }),
+    createAccessRuntime: () => ({
+      status: Object.freeze({ mode: 'disabled' }),
+      adminAuth: null,
+      deviceApproval: null,
+      clear() { cleanupOrder.push('access') }
+    }),
+    processRef: cleanupProcess,
+    logger: { log() {} }
+  })
+  cleanupProcess.emit('SIGTERM')
+  assert.deepStrictEqual(cleanupOrder, ['access', 'secret'])
+
   const rejectedServer = new FakeServer()
   await assert.rejects(startServer({
     runtimeServer: rejectedServer,
@@ -78,6 +119,25 @@ async function run() {
   assert.equal(executableServer.listenCalls, 0)
   assert.equal(executableStderr.join(''), 'SSM_SECRET_LOAD_FAILED\n')
   assert.equal(executableStderr.join('').includes(secretMarker), false)
+
+  const accessStderr = []
+  assert.equal(await runServerExecutable({
+    env: { KINVEST_ACCESS_CONTROL_MODE: 'device-approval' },
+    runtimeServer: new FakeServer(),
+    bootstrap: async () => ({
+      status: Object.freeze({ mode: 'github-tmpfs-v1', referenceCount: 2 }),
+      clear() {}
+    }),
+    createAccessRuntime: () => {
+      throw Object.assign(new Error('sensitive access failure'), {
+        code: 'ACCESS_CONTROL_CONFIG_INVALID'
+      })
+    },
+    processRef: new EventEmitter(),
+    logger: { log() {} },
+    stderr: { write: (value) => accessStderr.push(String(value)) }
+  }), 1)
+  assert.equal(accessStderr.join(''), 'ACCESS_CONTROL_CONFIG_INVALID\n')
 
   const upstreamCode = 'ADMIN_PASSWORD_VERIFIER_V20260812_001'
   const allowlistStderr = []
