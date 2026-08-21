@@ -350,3 +350,15 @@ output:focus-visible {
     animation: none;
   }
 }
+
+.checking-shell.hidden,
+.auth-shell.hidden,
+#dashboard-shell.hidden,
+.research-wrap.hidden,
+#research-body.hidden,
+#admin-login.hidden,
+#admin-desk.hidden,
+#request-ticket.hidden,
+#request-again.hidden {
+  display: none !important;
+}

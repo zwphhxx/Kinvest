@@ -268,11 +268,16 @@
     })
   }
 
+  function applyTopLevelState(mode) {
+    const visibility = contracts.topLevelVisibility(mode)
+    byId('auth-checking').classList.toggle('hidden', !visibility.checking)
+    byId('auth-gate').classList.toggle('hidden', !visibility.gate)
+    byId('dashboard-shell').classList.toggle('hidden', !visibility.dashboard)
+  }
+
   function showGate() {
     stopped = false
-    byId('auth-checking').classList.add('hidden')
-    byId('dashboard-shell').classList.add('hidden')
-    byId('auth-gate').classList.remove('hidden')
+    applyTopLevelState('gate')
     bind()
     byId('device-name').focus()
   }
@@ -280,17 +285,13 @@
   function showDashboard() {
     stopped = true
     stopPolling()
-    byId('auth-checking').classList.add('hidden')
-    byId('auth-gate').classList.add('hidden')
-    byId('dashboard-shell').classList.remove('hidden')
+    applyTopLevelState('dashboard')
   }
 
   function showUnavailable() {
     stopped = true
     stopPolling()
-    byId('auth-gate').classList.add('hidden')
-    byId('dashboard-shell').classList.add('hidden')
-    byId('auth-checking').classList.remove('hidden')
+    applyTopLevelState('checking')
     byId('auth-checking-text').textContent = '暂时无法确认设备状态。为了保护家庭数据，页面没有继续加载。'
     const retry = byId('auth-retry')
     retry.classList.remove('hidden')

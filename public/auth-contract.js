@@ -110,6 +110,16 @@
     return Object.freeze({ terminal: true, confirmAuthorization: false, retry: false })
   }
 
+  function topLevelVisibility(mode) {
+    const states = {
+      checking: { checking: true, gate: false, dashboard: false },
+      gate: { checking: false, gate: true, dashboard: false },
+      dashboard: { checking: false, gate: false, dashboard: true }
+    }
+    if (!Object.hasOwn(states, mode)) fail('AUTH_VIEW_STATE_INVALID')
+    return Object.freeze(states[mode])
+  }
+
   function formatRequestCode(code) {
     return typeof code === 'string' && /^\d{6}$/.test(code)
       ? `${code.slice(0, 3)} ${code.slice(3)}`
@@ -131,6 +141,7 @@
     normalizeDeviceName,
     normalizeRequestStatus,
     pollDecision,
-    pollErrorDecision
+    pollErrorDecision,
+    topLevelVisibility
   })
 })

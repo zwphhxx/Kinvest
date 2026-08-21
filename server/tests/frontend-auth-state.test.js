@@ -57,6 +57,18 @@ async function run() {
   assert.equal(auth.pollErrorDecision({ code: 'UNKNOWN', status: 503 }).retry, true)
   assert.equal(auth.pollErrorDecision({ code: 'UNKNOWN', status: 400 }).terminal, true)
 
+  const expectedTopLevelStates = {
+    checking: { checking: true, gate: false, dashboard: false },
+    gate: { checking: false, gate: true, dashboard: false },
+    dashboard: { checking: false, gate: false, dashboard: true }
+  }
+  for (const [mode, expected] of Object.entries(expectedTopLevelStates)) {
+    const visibility = auth.topLevelVisibility(mode)
+    assert.deepEqual(visibility, expected)
+    assert.equal(Object.values(visibility).filter(Boolean).length, 1)
+  }
+  assert.throws(() => auth.topLevelVisibility('unknown'), /AUTH_VIEW_STATE_INVALID/)
+
   assert.deepEqual(approvedRequestDecision({ approvedAt: 123 }), {
     approvable: false,
     label: '已批准，等待设备兑换'

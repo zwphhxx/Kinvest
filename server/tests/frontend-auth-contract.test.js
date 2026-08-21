@@ -5,6 +5,16 @@ const path = require('node:path')
 const root = path.resolve(__dirname, '../..')
 const read = (relativePath) => fs.readFileSync(path.join(root, relativePath), 'utf8')
 
+function extractLastCssRule(css, selector) {
+  const selectorIndex = css.lastIndexOf(selector)
+  assert.notEqual(selectorIndex, -1, `Missing CSS selector: ${selector}`)
+  const openingBrace = css.indexOf('{', selectorIndex)
+  assert.notEqual(openingBrace, -1, `Missing CSS block: ${selector}`)
+  const closingBrace = css.indexOf('}', openingBrace)
+  assert.notEqual(closingBrace, -1, `Unclosed CSS block: ${selector}`)
+  return { declarations: css.slice(openingBrace + 1, closingBrace), selectorIndex }
+}
+
 function assertPureAuthContract() {
   const auth = require('../../public/auth-contract')
 
@@ -72,6 +82,10 @@ function assertMainGateContract() {
   assert.match(gate, /decision\.confirmAuthorization[\s\S]*\/api\/auth\/status/)
   assert.match(gate, /server status/i)
   assert.match(gate, /setAttribute\('aria-busy'/)
+  assert.match(gate, /function applyTopLevelState\(/)
+  assert.match(gate, /applyTopLevelState\('dashboard'\)/)
+  assert.match(gate, /applyTopLevelState\('gate'\)/)
+  assert.match(gate, /applyTopLevelState\('checking'\)/)
   assert.match(app, /createAuthorizedRequestLifecycle/)
   assert.match(app, /lifecycle\.invalidate\(\)/)
   assert.match(app, /lifecycle\.canCommit\(/)
@@ -150,6 +164,17 @@ function assertVisualAndBuildContract() {
   assert.match(css, /@keyframes auth-entry/)
   assert.match(css, /min-height:\s*44px/)
   assert.match(css, /overflow-wrap:\s*anywhere/)
+
+  const robustHidden = extractLastCssRule(css, '.checking-shell.hidden')
+  assert.match(robustHidden.declarations, /display:\s*none\s*!important;/)
+  assert.ok(robustHidden.selectorIndex > css.lastIndexOf('.checking-shell {'))
+  assert.ok(robustHidden.selectorIndex > css.lastIndexOf('.auth-shell {'))
+  for (const selector of [
+    '.auth-shell.hidden',
+    '.research-wrap.hidden',
+    '#admin-login.hidden',
+    '#admin-desk.hidden'
+  ]) assert.ok(css.includes(selector), `Missing robust hidden selector: ${selector}`)
 
   const combinedMarkup = `${read('public/index.html')}\n${read('public/admin.html')}\n${read('public/research.html')}`
   assert.doesNotMatch(combinedMarkup, /<style(?:\s|>)/i)
