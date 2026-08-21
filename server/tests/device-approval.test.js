@@ -904,6 +904,21 @@ function testSafeListingsDoNotExposeDigests() {
   ]) {
     assert.strictEqual(listing.includes(forbidden), false)
   }
+
+  const revoked = issueDevice(harness, 'Revoked Device').credential
+  assert.deepStrictEqual(harness.service.revokeCredential(revoked.credentialId), {
+    devicesRevoked: 1,
+    credentialsRevoked: 1
+  })
+  const beforeRotation = issueDevice(harness, 'Rotated Device').credential
+  harness.service.setActiveHmacVersionId(VERSION_TWO)
+  harness.clock.value += 30 * DAY_MS
+  const rotation = harness.service.authenticate(beforeRotation.token)
+  const currentIds = harness.repository.listDevices(harness.clock.value)
+    .map((row) => row.credentialId)
+  assert.strictEqual(currentIds.includes(revoked.credentialId), false)
+  assert.strictEqual(currentIds.includes(beforeRotation.credentialId), false)
+  assert.strictEqual(currentIds.includes(rotation.replacementCredentialId), true)
 }
 
 function testHmacBuffersAreClearedAcrossAllPaths() {
