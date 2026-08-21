@@ -38,6 +38,37 @@ function testNonRootFailsBeforeDatabaseOpen() {
   }), 'DEVICE_REVOKE_ROOT_REQUIRED')
 }
 
+function testMissingOrNonfunctionGetuidFailsBeforeDatabaseOpen() {
+  const directory = fs.mkdtempSync(path.join(os.tmpdir(), 'kinvest-no-root-'))
+  const cases = [null, 'root', 0]
+  for (const getuid of cases) {
+    const databasePath = path.join(directory, `case-${String(getuid)}.sqlite`)
+    expectCode(() => revokeAllDevices({
+      databasePath,
+      now: () => 100,
+      getuid,
+      stdout: { write() {} }
+    }), 'DEVICE_REVOKE_ROOT_REQUIRED')
+    assert.strictEqual(fs.existsSync(databasePath), false)
+  }
+
+  const originalGetuid = process.getuid
+  const undefinedDatabasePath = path.join(directory, 'undefined.sqlite')
+  try {
+    process.getuid = undefined
+    expectCode(() => revokeAllDevices({
+      databasePath: undefinedDatabasePath,
+      now: () => 100,
+      getuid: undefined,
+      stdout: { write() {} }
+    }), 'DEVICE_REVOKE_ROOT_REQUIRED')
+    assert.strictEqual(fs.existsSync(undefinedDatabasePath), false)
+  } finally {
+    process.getuid = originalGetuid
+    fs.rmSync(directory, { recursive: true, force: true })
+  }
+}
+
 function testRootRevokesAllWithAuditAndSafeRepeat() {
   const directory = fs.mkdtempSync(path.join(os.tmpdir(), 'kinvest-revoke-'))
   const databasePath = path.join(directory, 'device-auth.sqlite')
@@ -96,6 +127,7 @@ function testRootRevokesAllWithAuditAndSafeRepeat() {
 
 async function run() {
   testNonRootFailsBeforeDatabaseOpen()
+  testMissingOrNonfunctionGetuidFailsBeforeDatabaseOpen()
   testRootRevokesAllWithAuditAndSafeRepeat()
 }
 

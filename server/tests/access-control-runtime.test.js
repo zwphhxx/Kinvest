@@ -123,10 +123,36 @@ function testEnabledComposesWorkingServicesAndClearsMaterial() {
     requestCode: request.requestCode,
     adminAuthenticated: true
   })
-  assert.strictEqual(runtime.deviceApproval.redeemRequest({
+  const credential = runtime.deviceApproval.redeemRequest({
     requestId: request.requestId,
     browserCredential: request.browserCredential
-  }).token.length, 43)
+  })
+  assert.strictEqual(credential.token.length, 43)
+  const storedDigest = database.prepare(`
+    SELECT token_digest
+    FROM device_credentials
+    WHERE credential_id = ?
+  `).get(credential.credentialId).token_digest
+  const serializedHmac = createMaterials().hmac
+  const decodedDigest = crypto.createHmac(
+    'sha256',
+    Buffer.from(serializedHmac, 'base64url')
+  ).update(credential.token).digest('base64url')
+  const serializedDigest = crypto.createHmac(
+    'sha256',
+    Buffer.from(serializedHmac, 'utf8')
+  ).update(credential.token).digest('base64url')
+  assert.strictEqual(storedDigest, decodedDigest)
+  assert.notStrictEqual(storedDigest, serializedDigest)
+
+  const readsBeforeRejectedReference = secret.reads.length
+  expectCode(() => runtime.deviceApproval.secretProvider.readSecret({
+    secretName: ADMIN_SECRET_NAME,
+    versionId: HMAC_VERSION
+  }), 'SECRET_NOT_FOUND')
+  assert.strictEqual(secret.reads.length, readsBeforeRejectedReference)
+  assert.strictEqual(secret.returned.every((value) =>
+    value.every((byte) => byte === 0)), true)
 
   const retained = [
     runtime.adminAuth.verifierDigest,

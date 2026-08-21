@@ -4,6 +4,10 @@ const { DeviceAuthRepository } = require('../db/device-auth-repository')
 const { AdminAuthService } = require('./admin-auth')
 const { DeviceApprovalService } = require('./device-approval')
 const {
+  SecretProviderError,
+  validateSecretReference
+} = require('./secret-provider')
+const {
   ADMIN_SECRET_NAME,
   DEVICE_HMAC_SECRET_NAME,
   parseDeviceHmacSecret,
@@ -65,6 +69,28 @@ function readVersionSelection(env, secretRuntime) {
   return selection
 }
 
+function createRestrictedDeviceHmacProvider(secretRuntime, activeVersionId) {
+  return Object.freeze({
+    readSecret(reference) {
+      validateSecretReference(reference)
+      if (reference.secretName !== DEVICE_HMAC_SECRET_NAME ||
+        reference.versionId !== activeVersionId) {
+        throw new SecretProviderError('SECRET_NOT_FOUND')
+      }
+      let serialized
+      let decoded
+      try {
+        serialized = secretRuntime.readSecret(reference)
+        decoded = parseDeviceHmacSecret(serialized)
+        return Buffer.from(decoded)
+      } finally {
+        if (Buffer.isBuffer(serialized)) serialized.fill(0)
+        if (Buffer.isBuffer(decoded)) decoded.fill(0)
+      }
+    }
+  })
+}
+
 function createAccessControlRuntime({
   env = process.env,
   secretRuntime,
@@ -114,7 +140,10 @@ function createAccessControlRuntime({
     })
     const deviceApproval = new DeviceApprovalService({
       repository: deviceRepository,
-      secretProvider: secretRuntime,
+      secretProvider: createRestrictedDeviceHmacProvider(
+        secretRuntime,
+        selection.deviceTokenHmac.active
+      ),
       hmacSecretName: DEVICE_HMAC_SECRET_NAME,
       activeHmacVersionId: selection.deviceTokenHmac.active,
       now,

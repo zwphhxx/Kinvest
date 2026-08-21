@@ -94,7 +94,7 @@ function normalizeDeviceName(value) {
     Buffer.byteLength(normalized, 'utf8') > 160 ||
     characters.some((character) => {
       const codePoint = character.codePointAt(0)
-      return codePoint <= 0x1f || codePoint === 0x7f
+      return codePoint <= 0x1f || (codePoint >= 0x7f && codePoint <= 0x9f)
     })) {
     throw new DeviceApprovalError('DEVICE_NAME_INVALID')
   }
@@ -247,16 +247,23 @@ class DeviceApprovalService {
       throw new DeviceApprovalError('REQUEST_BROWSER_MISMATCH')
     }
 
-    const issued = this.createCredential({
-      approvedAt: request.approvedAt,
-      absoluteExpiresAt: request.approvedAt + TOKEN_ABSOLUTE_MS,
-      hmacVersionId: this.activeHmacVersionId,
-      deviceId: this.randomBytes(16).toString('base64url'),
-      deviceName: request.deviceName === null
-        ? null
-        : normalizeDeviceName(request.deviceName),
-      now
-    })
+    const credentialSecret = this.readHmacSecret(this.activeHmacVersionId)
+    let issued
+    try {
+      issued = this.createCredential({
+        approvedAt: request.approvedAt,
+        absoluteExpiresAt: request.approvedAt + TOKEN_ABSOLUTE_MS,
+        hmacVersionId: this.activeHmacVersionId,
+        deviceId: this.randomBytes(16).toString('base64url'),
+        deviceName: request.deviceName === null
+          ? null
+          : normalizeDeviceName(request.deviceName),
+        now,
+        secret: credentialSecret
+      })
+    } finally {
+      if (Buffer.isBuffer(credentialSecret)) credentialSecret.fill(0)
+    }
     this.repository.runInImmediateTransaction(() => {
       if (!this.repository.consumeRequestAndInsertCredential(
         requestId,
@@ -307,28 +314,32 @@ class DeviceApprovalService {
       const replacementSecret = this.readHmacSecretOrUnavailable(
         replacement.hmacVersionId
       )
-      const replacementToken = deriveReplacementToken(
-        replacementSecret,
-        token,
-        credential.credentialId
-      )
-      if (!digestsEqual(
-        hmacToken(replacementSecret, replacementToken),
-        replacement.tokenDigest
-      )) {
-        throw new DeviceApprovalError('TOKEN_INVALID')
-      }
-      return {
-        authenticated: true,
-        credentialId: credential.credentialId,
-        deviceId: credential.deviceId,
-        hmacVersionId: credential.hmacVersionId,
-        replacementCredentialId: replacement.credentialId,
-        replacementHmacVersionId: replacement.hmacVersionId,
-        token: replacementToken,
-        rotated: true,
-        concurrentGrace: true,
-        cookie: cookieContract()
+      try {
+        const replacementToken = deriveReplacementToken(
+          replacementSecret,
+          token,
+          credential.credentialId
+        )
+        if (!digestsEqual(
+          hmacToken(replacementSecret, replacementToken),
+          replacement.tokenDigest
+        )) {
+          throw new DeviceApprovalError('TOKEN_INVALID')
+        }
+        return {
+          authenticated: true,
+          credentialId: credential.credentialId,
+          deviceId: credential.deviceId,
+          hmacVersionId: credential.hmacVersionId,
+          replacementCredentialId: replacement.credentialId,
+          replacementHmacVersionId: replacement.hmacVersionId,
+          token: replacementToken,
+          rotated: true,
+          concurrentGrace: true,
+          cookie: cookieContract()
+        }
+      } finally {
+        if (Buffer.isBuffer(replacementSecret)) replacementSecret.fill(0)
       }
     }
 
@@ -445,7 +456,7 @@ class DeviceApprovalService {
     deviceName,
     now,
     token = this.randomBytes(32).toString('base64url'),
-    secret = this.readHmacSecret(hmacVersionId)
+    secret
   }) {
     const credentialId = this.randomBytes(16).toString('base64url')
     return {
@@ -469,35 +480,42 @@ class DeviceApprovalService {
     const secrets = new Map()
     const unavailableVersions = new Set()
     let hasUnavailableVersion = false
-    for (const credential of this.repository.listCredentialCandidates(now)) {
-      if (unavailableVersions.has(credential.hmacVersionId)) continue
-      if (!secrets.has(credential.hmacVersionId)) {
-        try {
-          secrets.set(
-            credential.hmacVersionId,
-            this.readHmacSecret(credential.hmacVersionId)
-          )
-        } catch (error) {
-          if (
-            error instanceof SecretProviderError &&
-            error.code === 'SECRET_NOT_FOUND'
-          ) {
-            unavailableVersions.add(credential.hmacVersionId)
-            hasUnavailableVersion = true
-            continue
+    try {
+      for (const credential of this.repository.listCredentialCandidates(now)) {
+        if (unavailableVersions.has(credential.hmacVersionId)) continue
+        if (!secrets.has(credential.hmacVersionId)) {
+          try {
+            secrets.set(
+              credential.hmacVersionId,
+              this.readHmacSecret(credential.hmacVersionId)
+            )
+          } catch (error) {
+            if (
+              error instanceof SecretProviderError &&
+              error.code === 'SECRET_NOT_FOUND'
+            ) {
+              unavailableVersions.add(credential.hmacVersionId)
+              hasUnavailableVersion = true
+              continue
+            }
+            throw error
           }
-          throw error
+        }
+        const digest = hmacToken(secrets.get(credential.hmacVersionId), token)
+        if (digestsEqual(digest, credential.tokenDigest)) {
+          return credential
         }
       }
-      const digest = hmacToken(secrets.get(credential.hmacVersionId), token)
-      if (digestsEqual(digest, credential.tokenDigest)) {
-        return credential
+      if (hasUnavailableVersion) {
+        throw new DeviceApprovalError('TOKEN_KEY_UNAVAILABLE')
       }
+      return null
+    } finally {
+      for (const secret of secrets.values()) {
+        if (Buffer.isBuffer(secret)) secret.fill(0)
+      }
+      secrets.clear()
     }
-    if (hasUnavailableVersion) {
-      throw new DeviceApprovalError('TOKEN_KEY_UNAVAILABLE')
-    }
-    return null
   }
 
   readHmacSecretOrUnavailable(hmacVersionId) {
@@ -519,55 +537,59 @@ class DeviceApprovalService {
     const replacementSecret = this.readHmacSecretOrUnavailable(
       replacementHmacVersionId
     )
-    const replacementToken = deriveReplacementToken(
-      replacementSecret,
-      rawToken,
-      credential.credentialId
-    )
-    const issued = this.createCredential({
-      approvedAt: credential.approvedAt,
-      absoluteExpiresAt: credential.absoluteExpiresAt,
-      hmacVersionId: replacementHmacVersionId,
-      deviceId: credential.deviceId,
-      deviceName: credential.deviceName,
-      now,
-      token: replacementToken,
-      secret: replacementSecret
-    })
-    const graceExpiresAt = now + TOKEN_GRACE_MS
-    this.repository.runInImmediateTransaction(() => {
-      if (!this.repository.rotateCredential(
-        credential.credentialId,
-        issued.record,
-        graceExpiresAt
-      )) {
-        throw new DeviceApprovalError('TOKEN_REPLACED')
-      }
-      this.repository.addAuditEvent(
-        'device_credential_rotated',
-        now,
-        credential.credentialId,
-        {
-          credentialId: credential.credentialId,
-          replacementCredentialId: issued.record.credentialId,
-          deviceId: credential.deviceId,
-          hmacVersionId: issued.record.hmacVersionId
-        }
+    try {
+      const replacementToken = deriveReplacementToken(
+        replacementSecret,
+        rawToken,
+        credential.credentialId
       )
-    })
-    return {
-      authenticated: true,
-      credentialId: credential.credentialId,
-      deviceId: issued.record.deviceId,
-      hmacVersionId: credential.hmacVersionId,
-      replacementCredentialId: issued.record.credentialId,
-      replacementHmacVersionId: issued.record.hmacVersionId,
-      token: replacementToken,
-      idleExpiresAt: issued.record.idleExpiresAt,
-      absoluteExpiresAt: issued.record.absoluteExpiresAt,
-      rotated: true,
-      concurrentGrace: false,
-      cookie: cookieContract()
+      const issued = this.createCredential({
+        approvedAt: credential.approvedAt,
+        absoluteExpiresAt: credential.absoluteExpiresAt,
+        hmacVersionId: replacementHmacVersionId,
+        deviceId: credential.deviceId,
+        deviceName: credential.deviceName,
+        now,
+        token: replacementToken,
+        secret: replacementSecret
+      })
+      const graceExpiresAt = now + TOKEN_GRACE_MS
+      this.repository.runInImmediateTransaction(() => {
+        if (!this.repository.rotateCredential(
+          credential.credentialId,
+          issued.record,
+          graceExpiresAt
+        )) {
+          throw new DeviceApprovalError('TOKEN_REPLACED')
+        }
+        this.repository.addAuditEvent(
+          'device_credential_rotated',
+          now,
+          credential.credentialId,
+          {
+            credentialId: credential.credentialId,
+            replacementCredentialId: issued.record.credentialId,
+            deviceId: credential.deviceId,
+            hmacVersionId: issued.record.hmacVersionId
+          }
+        )
+      })
+      return {
+        authenticated: true,
+        credentialId: credential.credentialId,
+        deviceId: issued.record.deviceId,
+        hmacVersionId: credential.hmacVersionId,
+        replacementCredentialId: issued.record.credentialId,
+        replacementHmacVersionId: issued.record.hmacVersionId,
+        token: replacementToken,
+        idleExpiresAt: issued.record.idleExpiresAt,
+        absoluteExpiresAt: issued.record.absoluteExpiresAt,
+        rotated: true,
+        concurrentGrace: false,
+        cookie: cookieContract()
+      }
+    } finally {
+      if (Buffer.isBuffer(replacementSecret)) replacementSecret.fill(0)
     }
   }
 }

@@ -36,7 +36,7 @@ function createHarness(options = {}) {
   const clock = {
     value: options.now || Date.UTC(2026, 6, 31, 8, 0, 0)
   }
-  const secretProvider = new MockSecretProvider({
+  const secretProvider = options.secretProvider || new MockSecretProvider({
     [`${SECRET_NAME}:${VERSION_ONE}`]: 'synthetic-hmac-key-one',
     [`${SECRET_NAME}:${VERSION_TWO}`]: 'synthetic-hmac-key-two'
   })
@@ -50,6 +50,32 @@ function createHarness(options = {}) {
   })
 
   return { clock, database, repository, secretProvider, service }
+}
+
+function createTrackingSecretProvider() {
+  const returned = []
+  let callCount = 0
+  let failOnCall = null
+  return {
+    returned,
+    get callCount() { return callCount },
+    failOn(callNumber) { failOnCall = callNumber },
+    readSecret({ versionId }) {
+      callCount += 1
+      if (callCount === failOnCall) {
+        throw new Error('TRACKING_PROVIDER_FAILURE')
+      }
+      const value = Buffer.alloc(32, versionId === VERSION_ONE ? 21 : 22)
+      returned.push(value)
+      return value
+    }
+  }
+}
+
+function assertReturnedSecretsCleared(provider) {
+  assert.strictEqual(provider.returned.length > 0, true)
+  assert.strictEqual(provider.returned.every((value) =>
+    value.every((byte) => byte === 0)), true)
 }
 
 function expectCode(callback, expectedCode) {
@@ -699,6 +725,9 @@ function testDeviceNameAndIpDigestValidation() {
     'x\u0000y',
     'x\u001fy',
     'x\u007fy',
+    'x\u0080y',
+    'x\u0085y',
+    'x\u009fy',
     'a'.repeat(41),
     '\u{1f4f1}'.repeat(41)
   ]
@@ -759,11 +788,51 @@ function testSafeListingsDoNotExposeDigests() {
   }
 }
 
+function testHmacBuffersAreClearedAcrossAllPaths() {
+  const successProvider = createTrackingSecretProvider()
+  const success = createHarness({ secretProvider: successProvider })
+  const successCredential = issueDevice(success).credential
+  assertReturnedSecretsCleared(successProvider)
+  assert.strictEqual(success.service.authenticate(successCredential.token).authenticated,
+    true)
+  assertReturnedSecretsCleared(successProvider)
+
+  const noMatchProvider = createTrackingSecretProvider()
+  const noMatch = createHarness({ secretProvider: noMatchProvider })
+  issueDevice(noMatch)
+  expectCode(() => noMatch.service.authenticate('not-a-device-token'),
+    'TOKEN_INVALID')
+  assertReturnedSecretsCleared(noMatchProvider)
+
+  const rotationProvider = createTrackingSecretProvider()
+  const rotation = createHarness({ secretProvider: rotationProvider })
+  const original = issueDevice(rotation).credential
+  rotation.service.setActiveHmacVersionId(VERSION_TWO)
+  rotation.clock.value += 30 * DAY_MS
+  const replacement = rotation.service.authenticate(original.token)
+  assert.strictEqual(replacement.rotated, true)
+  assertReturnedSecretsCleared(rotationProvider)
+  assert.strictEqual(rotation.service.authenticate(original.token).concurrentGrace,
+    true)
+  assertReturnedSecretsCleared(rotationProvider)
+
+  const failureProvider = createTrackingSecretProvider()
+  const failure = createHarness({ secretProvider: failureProvider })
+  issueDevice(failure)
+  failure.service.setActiveHmacVersionId(VERSION_TWO)
+  issueDevice(failure)
+  failureProvider.failOn(failureProvider.callCount + 2)
+  assert.throws(() => failure.service.authenticate('not-a-device-token'),
+    /TRACKING_PROVIDER_FAILURE/)
+  assertReturnedSecretsCleared(failureProvider)
+}
+
 async function run() {
   testExpandMigrationIsIdempotentAndPreservesLegacyRows()
   testDeviceNameAndIpDigestValidation()
   testDeviceNameSurvivesRedemptionAndRotation()
   testSafeListingsDoNotExposeDigests()
+  testHmacBuffersAreClearedAcrossAllPaths()
   testSecretProviderContract()
   testRequestApprovalAndRedemption()
   testRequestExpiryAndAttemptLock()

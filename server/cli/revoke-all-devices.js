@@ -19,10 +19,10 @@ class DeviceRevokeError extends Error {
 function run({
   databasePath,
   now = Date.now,
-  getuid = process.getuid,
+  getuid,
   stdout = process.stdout
 } = {}) {
-  if (typeof getuid === 'function' && getuid() !== 0) {
+  if (typeof getuid !== 'function' || getuid() !== 0) {
     throw new DeviceRevokeError('DEVICE_REVOKE_ROOT_REQUIRED')
   }
 
@@ -62,7 +62,8 @@ function run({
 if (require.main === module) {
   try {
     run({
-      databasePath: process.env.KINVEST_DB_PATH || DEFAULT_DATABASE_PATH
+      databasePath: process.env.KINVEST_DB_PATH || DEFAULT_DATABASE_PATH,
+      getuid: process.getuid
     })
   } catch (error) {
     const code = error instanceof DeviceRevokeError
