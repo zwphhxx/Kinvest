@@ -123,6 +123,12 @@ class DeviceAuthRepository {
         subject_id TEXT,
         metadata_json TEXT NOT NULL
       );
+
+      CREATE TABLE IF NOT EXISTS device_request_rate_limits (
+        ip_digest TEXT PRIMARY KEY,
+        window_started_at INTEGER NOT NULL,
+        request_count INTEGER NOT NULL
+      );
       `)
 
       const requestColumns = this.database.prepare(
@@ -185,6 +191,58 @@ class DeviceAuthRepository {
       request.createdAt,
       request.expiresAt
     )
+  }
+
+  createRequestWithLimits({
+    request,
+    now,
+    windowMs,
+    maxRequests,
+    maxActive,
+    auditEvent
+  }) {
+    return this.runInImmediateTransaction(() => {
+      let limit = this.database.prepare(`
+        SELECT window_started_at, request_count
+        FROM device_request_rate_limits
+        WHERE ip_digest = ?
+      `).get(request.ipDigest)
+      if (!limit || now >= limit.window_started_at + windowMs) {
+        limit = { window_started_at: now, request_count: 0 }
+      }
+      if (Number(limit.request_count) >= maxRequests) return 'rate_limited'
+      const active = Number(this.database.prepare(`
+        SELECT COUNT(*) AS count
+        FROM device_auth_requests
+        WHERE ip_digest = ?
+          AND consumed_at IS NULL
+          AND locked_at IS NULL
+          AND expires_at > ?
+      `).get(request.ipDigest, now).count)
+      if (active >= maxActive) return 'active_limit'
+
+      this.database.prepare(`
+        INSERT INTO device_request_rate_limits (
+          ip_digest, window_started_at, request_count
+        ) VALUES (?, ?, 1)
+        ON CONFLICT(ip_digest) DO UPDATE SET
+          window_started_at = excluded.window_started_at,
+          request_count = CASE
+            WHEN device_request_rate_limits.window_started_at =
+              excluded.window_started_at
+              THEN device_request_rate_limits.request_count + 1
+            ELSE 1
+          END
+      `).run(request.ipDigest, limit.window_started_at)
+      this.insertRequest(request)
+      this.addAuditEvent(
+        auditEvent.eventType,
+        auditEvent.occurredAt,
+        auditEvent.subjectId,
+        auditEvent.metadata
+      )
+      return 'created'
+    })
   }
 
   getRequest(requestId) {

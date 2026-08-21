@@ -376,9 +376,9 @@ async function testCsrfAndReauthentication() {
   )
 
   const login = await harness.service.login(PASSWORD, '198.51.100.30')
-  assert.strictEqual(
-    harness.service.verifyCsrf(login.sessionToken, login.csrfToken),
-    true
+  assert.equal(
+    harness.service.verifyCsrf(login.sessionToken, login.csrfToken).sessionId,
+    login.sessionId
   )
   await expectCode(
     () => harness.service.verifyCsrf(login.sessionToken, 'wrong-csrf'),
@@ -410,9 +410,9 @@ async function testRejectedCsrfDoesNotTouchSession() {
   assert.deepStrictEqual(selectSession.get(login.sessionId), beforeSession)
   assert.strictEqual(countAuthenticatedAudit(), beforeAuditCount)
 
-  assert.strictEqual(
-    harness.service.verifyCsrf(login.sessionToken, login.csrfToken),
-    true
+  assert.equal(
+    harness.service.verifyCsrf(login.sessionToken, login.csrfToken).sessionId,
+    login.sessionId
   )
   const afterValidCsrf = selectSession.get(login.sessionId)
   assert.strictEqual(afterValidCsrf.last_used_at, harness.clock.value)
@@ -522,6 +522,31 @@ async function testClearIsIdempotent() {
   )
 }
 
+async function testCsrfRefreshIsAtomicAndRevokesPreviousToken() {
+  const harness = await createHarness()
+  const login = await harness.service.login(PASSWORD, '192.0.2.71')
+  const before = harness.repository.findSessionByTokenDigest(
+    crypto.createHash('sha256').update(login.sessionToken).digest('base64url')
+  )
+  const refreshed = harness.service.refreshCsrf(login.sessionToken)
+
+  assert.equal(Buffer.from(refreshed.csrfToken, 'base64url').length, 32)
+  assert.notEqual(refreshed.csrfToken, login.csrfToken)
+  assert.equal(refreshed.idleExpiresAt, harness.clock.value + ADMIN_IDLE_TTL_MS)
+  await expectCode(
+    () => harness.service.verifyCsrf(login.sessionToken, login.csrfToken),
+    'ADMIN_CSRF_INVALID'
+  )
+  assert.equal(
+    harness.service.verifyCsrf(login.sessionToken, refreshed.csrfToken).sessionId,
+    login.sessionId
+  )
+  const after = harness.repository.findSessionByTokenDigest(before.tokenDigest)
+  assert.notEqual(after.csrfDigest, before.csrfDigest)
+  const serialized = JSON.stringify(harness.repository.listAuditEvents())
+  assert.equal(serialized.includes(refreshed.csrfToken), false)
+}
+
 async function run() {
   await testPasswordMatchingAndValidation()
   await testRateLimitIsolationAndReset()
@@ -535,6 +560,7 @@ async function run() {
   await testCsrfAndReauthentication()
   await testRejectedCsrfDoesNotTouchSession()
   await testLogoutRequiresCsrfWithoutTouch()
+  await testCsrfRefreshIsAtomicAndRevokesPreviousToken()
   await testClearIsIdempotent()
   await testParsedVerifierBuffersAreCleared()
 }
@@ -542,6 +568,7 @@ async function run() {
 module.exports = {
   run,
   testConcurrentAttemptReservations,
+  testCsrfRefreshIsAtomicAndRevokesPreviousToken,
   testLoginSettlementRollback,
   testLogoutRequiresCsrfWithoutTouch,
   testMalformedPasswordsCountTowardRateLimit,

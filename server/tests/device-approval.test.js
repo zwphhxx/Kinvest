@@ -4,6 +4,7 @@ const fs = require('node:fs')
 const os = require('node:os')
 const path = require('node:path')
 const { fork } = require('node:child_process')
+const { Worker } = require('node:worker_threads')
 const { DatabaseSync } = require('node:sqlite')
 const {
   MockSecretProvider,
@@ -50,11 +51,159 @@ function createHarness(options = {}) {
     secretProvider,
     hmacSecretName: SECRET_NAME,
     activeHmacVersionId: options.activeHmacVersionId || VERSION_ONE,
+    requestIpDigestKey: Buffer.alloc(32, 44),
+    requestCodeDigestKey: Buffer.alloc(32, 45),
     now: () => clock.value,
     randomBytes: createRandomSource()
   })
 
   return { clock, database, repository, secretProvider, service }
+}
+
+function testRequestStatusAndTransactionalRequestLimits() {
+  const harness = createHarness()
+  const first = harness.service.createRequest({
+    deviceName: 'Family iPad',
+    rateLimitIdentity: '198.51.100.40'
+  })
+  const stored = harness.repository.getRequest(first.requestId)
+  assert.match(stored.ipDigest, /^[A-Za-z0-9_-]{43}$/)
+  assert.notEqual(stored.ipDigest, '198.51.100.40')
+  assert.deepStrictEqual(harness.service.getRequestStatus({
+    requestId: first.requestId,
+    browserCredential: first.browserCredential
+  }), {
+    requestId: first.requestId,
+    status: 'pending',
+    expiresAt: first.expiresAt
+  })
+  expectCode(() => harness.service.getRequestStatus({
+    requestId: first.requestId,
+    browserCredential: 'wrong-browser-credential'
+  }), 'REQUEST_BROWSER_MISMATCH')
+
+  harness.service.approveRequest({
+    requestId: first.requestId,
+    requestCode: first.requestCode,
+    adminAuthenticated: true
+  })
+  assert.equal(harness.service.getRequestStatus({
+    requestId: first.requestId,
+    browserCredential: first.browserCredential
+  }).status, 'approved')
+
+  harness.service.createRequest({ deviceName: 'Phone', rateLimitIdentity: '198.51.100.40' })
+  harness.service.createRequest({ deviceName: 'Laptop', rateLimitIdentity: '198.51.100.40' })
+  expectCode(() => harness.service.createRequest({
+    deviceName: 'Fourth',
+    rateLimitIdentity: '198.51.100.40'
+  }), 'REQUEST_ACTIVE_LIMIT')
+
+  const rateHarness = createHarness()
+  for (let count = 0; count < 5; count += 1) {
+    const created = rateHarness.service.createRequest({
+      deviceName: `Device ${count}`,
+      rateLimitIdentity: '203.0.113.55'
+    })
+    rateHarness.database.prepare(
+      'UPDATE device_auth_requests SET consumed_at = ? WHERE request_id = ?'
+    ).run(rateHarness.clock.value, created.requestId)
+  }
+  expectCode(() => rateHarness.service.createRequest({
+    deviceName: 'Sixth',
+    rateLimitIdentity: '203.0.113.55'
+  }), 'REQUEST_RATE_LIMITED')
+
+  const pending = harness.service.listPendingRequests()
+  assert.equal(pending.length, 3)
+  assert.equal(JSON.stringify(pending).includes(stored.ipDigest), false)
+  assert.ok(Array.isArray(harness.service.listDevices()))
+  assert.ok(Array.isArray(harness.service.listAuditEvents()))
+  harness.service.clear()
+  harness.service.clear()
+}
+
+async function testConcurrentRequestLimitBoundaryIsAtomic() {
+  const boundaryNow = Date.UTC(2026, 6, 31, 8, 0, 0)
+  const directory = fs.mkdtempSync(path.join(os.tmpdir(), 'kinvest-request-limit-'))
+  const databasePath = path.join(directory, 'device-auth.sqlite')
+  const database = new DatabaseSync(databasePath)
+  const harness = createHarness({ database })
+  const identity = '198.51.100.77'
+  const first = harness.service.createRequest({ deviceName: 'One', rateLimitIdentity: identity })
+  harness.service.createRequest({ deviceName: 'Two', rateLimitIdentity: identity })
+  const ipDigest = harness.repository.getRequest(first.requestId).ipDigest
+  database.close()
+
+  const repositoryPath = require.resolve('../db/device-auth-repository')
+  const workerSource = `
+    const { parentPort, workerData } = require('node:worker_threads')
+    const { DatabaseSync } = require('node:sqlite')
+    const { DeviceAuthRepository } = require(workerData.repositoryPath)
+    const database = new DatabaseSync(workerData.databasePath)
+    const repository = new DeviceAuthRepository(database)
+    repository.initialize()
+    parentPort.once('message', () => {
+      try {
+        const result = repository.createRequestWithLimits(workerData.input)
+        parentPort.postMessage({ result })
+      } catch (error) {
+        parentPort.postMessage({ error: error && error.message })
+      } finally {
+        database.close()
+      }
+    })
+  `
+  const makeInput = (marker) => ({
+    request: {
+      requestId: marker.repeat(22),
+      deviceName: `Concurrent ${marker}`,
+      ipDigest,
+      requestCodeDigest: marker.repeat(43),
+      browserCredentialDigest: marker.toLowerCase().repeat(43),
+      createdAt: boundaryNow,
+      expiresAt: boundaryNow + 600000
+    },
+    now: boundaryNow,
+    windowMs: 600000,
+    maxRequests: 5,
+    maxActive: 3,
+    auditEvent: {
+      eventType: 'device_request_created',
+      occurredAt: boundaryNow,
+      subjectId: marker.repeat(22),
+      metadata: { requestId: marker.repeat(22) }
+    }
+  })
+  const workers = ['X', 'Y'].map((marker) => new Worker(workerSource, {
+    eval: true,
+    workerData: { repositoryPath, databasePath, input: makeInput(marker) }
+  }))
+  const outcomes = workers.map((worker) => new Promise((resolve, reject) => {
+    worker.once('message', resolve)
+    worker.once('error', reject)
+    worker.postMessage('start')
+  }))
+
+  try {
+    const results = await Promise.all(outcomes)
+    assert.deepStrictEqual(
+      results.map((entry) => entry.result).sort(),
+      ['active_limit', 'created']
+    )
+    const verification = new DatabaseSync(databasePath)
+    assert.equal(Number(verification.prepare(`
+      SELECT COUNT(*) AS count FROM device_auth_requests
+      WHERE consumed_at IS NULL AND locked_at IS NULL AND expires_at > ?
+    `).get(boundaryNow).count), 3)
+    assert.equal(Number(verification.prepare(
+      'SELECT COUNT(*) AS count FROM device_auth_audit'
+    ).get().count), 3)
+    verification.close()
+  } finally {
+    await Promise.all(workers.map((worker) => worker.terminate()))
+    fs.rmSync(directory, { recursive: true, force: true })
+  }
 }
 
 class InterleavingDeviceAuthRepository extends DeviceAuthRepository {
@@ -1045,6 +1194,151 @@ function testAuthenticationRejectsCommittedRevocationBeforeCas() {
   }
 }
 
+function testRequestCodeDigestUsesKeyedHmacWithoutScrypt() {
+  const harness = createHarness()
+  const originalScryptSync = crypto.scryptSync
+  let scryptCalls = 0
+  crypto.scryptSync = () => {
+    scryptCalls += 1
+    throw new Error('SYNC_SCRYPT_MUST_NOT_RUN')
+  }
+  let first
+  try {
+    for (let count = 0; count < 5; count += 1) {
+      const created = harness.service.createRequest({
+        deviceName: `Rate Device ${count}`,
+        rateLimitIdentity: '198.51.100.88'
+      })
+      if (!first) first = created
+      harness.database.prepare(
+        'UPDATE device_auth_requests SET consumed_at = ? WHERE request_id = ?'
+      ).run(harness.clock.value, created.requestId)
+    }
+    expectCode(() => harness.service.createRequest({
+      deviceName: 'Rate Device 6',
+      rateLimitIdentity: '198.51.100.88'
+    }), 'REQUEST_RATE_LIMITED')
+  } finally {
+    crypto.scryptSync = originalScryptSync
+  }
+  assert.equal(scryptCalls, 0)
+  const stored = harness.database.prepare(`
+    SELECT request_code_digest
+    FROM device_auth_requests
+    WHERE request_id = ?
+  `).get(first.requestId)
+  assert.match(stored.request_code_digest, /^[A-Za-z0-9_-]{43}$/)
+  assert.notEqual(stored.request_code_digest, first.requestCode)
+  harness.service.clear()
+  assert.equal(
+    harness.service.requestCodeDigestKey.every((value) => value === 0),
+    true
+  )
+}
+
+async function testConcurrentFifthSixthRateBoundaryIsAtomic() {
+  const boundaryNow = Date.UTC(2026, 6, 31, 8, 0, 0)
+  const directory = fs.mkdtempSync(path.join(os.tmpdir(), 'kinvest-rate-boundary-'))
+  const databasePath = path.join(directory, 'device-auth.sqlite')
+  const database = new DatabaseSync(databasePath)
+  const harness = createHarness({ database })
+  const identity = '203.0.113.99'
+  let ipDigest
+  for (let count = 0; count < 4; count += 1) {
+    const created = harness.service.createRequest({
+      deviceName: `Consumed ${count}`,
+      rateLimitIdentity: identity
+    })
+    ipDigest = harness.repository.getRequest(created.requestId).ipDigest
+    database.prepare(
+      'UPDATE device_auth_requests SET consumed_at = ? WHERE request_id = ?'
+    ).run(boundaryNow, created.requestId)
+  }
+  database.close()
+
+  const repositoryPath = require.resolve('../db/device-auth-repository')
+  const workerSource = `
+    const { parentPort, workerData } = require('node:worker_threads')
+    const { DatabaseSync } = require('node:sqlite')
+    const { DeviceAuthRepository } = require(workerData.repositoryPath)
+    const database = new DatabaseSync(workerData.databasePath)
+    database.exec('PRAGMA busy_timeout = 5000')
+    const repository = new DeviceAuthRepository(database)
+    repository.initialize()
+    parentPort.once('message', () => {
+      try {
+        parentPort.postMessage({
+          result: repository.createRequestWithLimits(workerData.input)
+        })
+      } catch (error) {
+        parentPort.postMessage({ error: error && error.message })
+      } finally {
+        database.close()
+      }
+    })
+  `
+  const makeInput = (marker) => ({
+    request: {
+      requestId: marker.repeat(22),
+      deviceName: `Boundary ${marker}`,
+      ipDigest,
+      requestCodeDigest: marker.repeat(43),
+      browserCredentialDigest: marker.toLowerCase().repeat(43),
+      createdAt: boundaryNow,
+      expiresAt: boundaryNow + 600000
+    },
+    now: boundaryNow,
+    windowMs: 600000,
+    maxRequests: 5,
+    maxActive: 3,
+    auditEvent: {
+      eventType: 'device_request_created',
+      occurredAt: boundaryNow,
+      subjectId: marker.repeat(22),
+      metadata: { requestId: marker.repeat(22) }
+    }
+  })
+  const workers = ['M', 'P'].map((marker) => new Worker(workerSource, {
+    eval: true,
+    workerData: { repositoryPath, databasePath, input: makeInput(marker) }
+  }))
+  const outcomes = workers.map((worker) => new Promise((resolve, reject) => {
+    worker.once('message', resolve)
+    worker.once('error', reject)
+    worker.postMessage('start')
+  }))
+  try {
+    const results = await Promise.all(outcomes)
+    assert.deepEqual(
+      results.map((entry) => entry.result).sort(),
+      ['created', 'rate_limited']
+    )
+    const verification = new DatabaseSync(databasePath)
+    const rate = verification.prepare(`
+      SELECT request_count
+      FROM device_request_rate_limits
+      WHERE ip_digest = ?
+    `).get(ipDigest)
+    assert.equal(rate.request_count, 5)
+    assert.equal(
+      verification.prepare(
+        'SELECT COUNT(*) AS count FROM device_auth_requests'
+      ).get().count,
+      5
+    )
+    assert.equal(
+      verification.prepare(
+        'SELECT COUNT(*) AS count FROM device_auth_audit'
+      ).get().count,
+      5
+    )
+    verification.close()
+  } finally {
+    await Promise.all(workers.map((worker) => worker.terminate()))
+    fs.rmSync(directory, { recursive: true, force: true })
+  }
+}
+
 async function run() {
   await testConcurrentExpandMigrationIsAtomic()
   testDatabaseIdentityMarkerAndForeignRollback()
@@ -1054,6 +1348,10 @@ async function run() {
   testSafeListingsDoNotExposeDigests()
   testHmacBuffersAreClearedAcrossAllPaths()
   testAuthenticationRejectsCommittedRevocationBeforeCas()
+  testRequestStatusAndTransactionalRequestLimits()
+  await testConcurrentRequestLimitBoundaryIsAtomic()
+  testRequestCodeDigestUsesKeyedHmacWithoutScrypt()
+  await testConcurrentFifthSixthRateBoundaryIsAtomic()
   testSecretProviderContract()
   testRequestApprovalAndRedemption()
   testRequestExpiryAndAttemptLock()

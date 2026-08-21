@@ -7,10 +7,16 @@ const {
 const DAY_MS = 24 * 60 * 60 * 1000
 const REQUEST_TTL_MS = 10 * 60 * 1000
 const REQUEST_MAX_ATTEMPTS = 5
+const REQUEST_RATE_WINDOW_MS = 10 * 60 * 1000
+const REQUEST_RATE_MAX = 5
+const REQUEST_ACTIVE_MAX = 3
+const REQUEST_IP_DIGEST_DOMAIN = 'kinvest-device-request-ip-v1\0'
+const REQUEST_CODE_DIGEST_DOMAIN = 'kinvest-device-request-code-v1\0'
 const TOKEN_ROTATION_MS = 30 * DAY_MS
 const TOKEN_GRACE_MS = 5 * 60 * 1000
 const TOKEN_IDLE_MS = 90 * DAY_MS
 const TOKEN_ABSOLUTE_MS = 365 * DAY_MS
+const REQUEST_ID_PATTERN = /^[A-Za-z0-9_-]{22}$/
 
 const ERROR_MESSAGES = {
   ADMIN_AUTH_REQUIRED: 'Administrator authentication is required',
@@ -24,6 +30,8 @@ const ERROR_MESSAGES = {
   REQUEST_LOCKED: 'The request is locked',
   REQUEST_NOT_APPROVED: 'The request is not approved',
   REQUEST_NOT_FOUND: 'The request is unavailable',
+  REQUEST_ACTIVE_LIMIT: 'Too many active requests exist for this client',
+  REQUEST_RATE_LIMITED: 'Device requests are temporarily rate limited',
   TOKEN_EXPIRED: 'The device credential has expired',
   TOKEN_INVALID: 'The device credential is invalid',
   TOKEN_KEY_UNAVAILABLE: 'A required device credential key is unavailable',
@@ -42,18 +50,15 @@ function hashValue(value) {
   return crypto.createHash('sha256').update(value).digest('base64url')
 }
 
-function hashRequestCode(requestId, requestCode) {
-  return crypto.scryptSync(
-    String(requestCode),
-    `kinvest-device-request-code-v1:${requestId}`,
-    32,
-    {
-      N: 16384,
-      r: 8,
-      p: 1,
-      maxmem: 64 * 1024 * 1024
-    }
-  ).toString('base64url')
+function hashRequestCode(key, requestId, requestCode) {
+  const normalizedCode = typeof requestCode === 'string' &&
+    /^\d{6}$/.test(requestCode) ? requestCode : 'invalid'
+  return crypto.createHmac('sha256', key)
+    .update(REQUEST_CODE_DIGEST_DOMAIN, 'utf8')
+    .update(requestId, 'utf8')
+    .update('\0', 'utf8')
+    .update(normalizedCode, 'utf8')
+    .digest('base64url')
 }
 
 function hmacToken(secret, token) {
@@ -110,12 +115,22 @@ function normalizeIpDigest(value) {
   return value
 }
 
+function copyRequestIpDigestKey(value) {
+  if (!Buffer.isBuffer(value) || value.length < 16) {
+    throw new DeviceApprovalError('IP_DIGEST_INVALID')
+  }
+  return Buffer.from(value)
+}
+
 class DeviceApprovalService {
   constructor({
     repository,
     secretProvider,
     hmacSecretName,
     activeHmacVersionId,
+    requestIpDigestKey,
+    requestCodeDigestKey,
+    requireRequestRateLimitIdentity = false,
     now = Date.now,
     randomBytes = crypto.randomBytes
   }) {
@@ -129,6 +144,11 @@ class DeviceApprovalService {
     this.activeHmacVersionId = activeHmacVersionId
     this.now = now
     this.randomBytes = randomBytes
+    this.requestIpDigestKey = copyRequestIpDigestKey(requestIpDigestKey)
+    this.requestCodeDigestKey = copyRequestIpDigestKey(requestCodeDigestKey)
+    this.requireRequestRateLimitIdentity =
+      requireRequestRateLimitIdentity === true
+    this.cleared = false
   }
 
   setActiveHmacVersionId(versionId) {
@@ -139,9 +159,36 @@ class DeviceApprovalService {
     this.activeHmacVersionId = versionId
   }
 
-  createRequest(/** @type {any} */ { deviceName, ipDigest = null } = {}) {
+  digestRequestIp(identity) {
+    if (typeof identity !== 'string' || identity.length < 1 ||
+      identity.length > 256 || identity !== identity.trim() ||
+      Array.from(identity).some((character) => {
+        const codePoint = character.codePointAt(0)
+        return codePoint <= 0x1f || codePoint === 0x7f
+      })) {
+      throw new DeviceApprovalError('IP_DIGEST_INVALID')
+    }
+    return crypto.createHmac('sha256', this.requestIpDigestKey)
+      .update(REQUEST_IP_DIGEST_DOMAIN, 'utf8')
+      .update(identity, 'utf8')
+      .digest('base64url')
+  }
+
+  createRequest(/** @type {any} */ {
+    deviceName,
+    ipDigest = null,
+    rateLimitIdentity
+  } = {}) {
     const normalizedDeviceName = normalizeDeviceName(deviceName)
-    const normalizedIpDigest = normalizeIpDigest(ipDigest)
+    if (ipDigest !== null && rateLimitIdentity !== undefined) {
+      throw new DeviceApprovalError('IP_DIGEST_INVALID')
+    }
+    const normalizedIpDigest = rateLimitIdentity === undefined
+      ? normalizeIpDigest(ipDigest)
+      : this.digestRequestIp(rateLimitIdentity)
+    if (this.requireRequestRateLimitIdentity && normalizedIpDigest === null) {
+      throw new DeviceApprovalError('IP_DIGEST_INVALID')
+    }
     const now = this.now()
     const requestId = this.randomBytes(16).toString('base64url')
     const browserCredential = this.randomBytes(32).toString('base64url')
@@ -149,18 +196,53 @@ class DeviceApprovalService {
     const requestCode = String(codeNumber).padStart(6, '0')
     const expiresAt = now + REQUEST_TTL_MS
 
-    this.repository.runInImmediateTransaction(() => {
-      this.repository.insertRequest({
+    const record = {
+      requestId,
+      deviceName: normalizedDeviceName,
+      ipDigest: normalizedIpDigest,
+      requestCodeDigest: hashRequestCode(
+        this.requestCodeDigestKey,
         requestId,
-        deviceName: normalizedDeviceName,
-        ipDigest: normalizedIpDigest,
-        requestCodeDigest: hashRequestCode(requestId, requestCode),
-        browserCredentialDigest: hashValue(browserCredential),
-        createdAt: now,
-        expiresAt
+        requestCode
+      ),
+      browserCredentialDigest: hashValue(browserCredential),
+      createdAt: now,
+      expiresAt
+    }
+    if (normalizedIpDigest === null) {
+      this.repository.runInImmediateTransaction(() => {
+        this.repository.insertRequest(record)
+        this.repository.addAuditEvent(
+          'device_request_created',
+          now,
+          requestId,
+          { requestId }
+        )
       })
-      this.repository.addAuditEvent('device_request_created', now, requestId, { requestId })
-    })
+    } else {
+      const result = this.repository.createRequestWithLimits({
+        request: record,
+        now,
+        windowMs: REQUEST_RATE_WINDOW_MS,
+        maxRequests: REQUEST_RATE_MAX,
+        maxActive: REQUEST_ACTIVE_MAX,
+        auditEvent: {
+          eventType: 'device_request_created',
+          occurredAt: now,
+          subjectId: requestId,
+          metadata: { requestId }
+        }
+      })
+      if (result === 'rate_limited') {
+        throw new DeviceApprovalError('REQUEST_RATE_LIMITED')
+      }
+      if (result === 'active_limit') {
+        throw new DeviceApprovalError('REQUEST_ACTIVE_LIMIT')
+      }
+      if (result !== 'created') {
+        throw new DeviceApprovalError('REQUEST_NOT_FOUND')
+      }
+    }
 
     return {
       requestId,
@@ -168,6 +250,46 @@ class DeviceApprovalService {
       requestCode,
       expiresAt
     }
+  }
+
+  getRequestStatus({ requestId, browserCredential }) {
+    if (!REQUEST_ID_PATTERN.test(String(requestId || ''))) {
+      throw new DeviceApprovalError('REQUEST_NOT_FOUND')
+    }
+    const request = this.requireRequest(requestId)
+    const supplied = typeof browserCredential === 'string' &&
+      /^[A-Za-z0-9_-]{43}$/.test(browserCredential)
+      ? hashValue(browserCredential)
+      : hashValue('invalid-browser-credential')
+    if (!digestsEqual(supplied, request.browserCredentialDigest)) {
+      throw new DeviceApprovalError('REQUEST_BROWSER_MISMATCH')
+    }
+    const now = this.now()
+    let status = 'pending'
+    if (request.consumedAt !== null) status = 'consumed'
+    else if (request.lockedAt !== null) status = 'locked'
+    else if (now >= request.expiresAt) status = 'expired'
+    else if (request.approvedAt !== null) status = 'approved'
+    return { requestId, status, expiresAt: request.expiresAt }
+  }
+
+  listPendingRequests() {
+    return this.repository.listPendingRequests(this.now())
+  }
+
+  listDevices() {
+    return this.repository.listDevices(this.now())
+  }
+
+  listAuditEvents() {
+    return this.repository.listAuditEvents()
+  }
+
+  clear() {
+    if (this.cleared) return
+    this.requestIpDigestKey.fill(0)
+    this.requestCodeDigestKey.fill(0)
+    this.cleared = true
   }
 
   approveRequest({ requestId, requestCode, adminAuthenticated }) {
@@ -190,7 +312,11 @@ class DeviceApprovalService {
       return { approved: true, requestId }
     }
 
-    const suppliedDigest = hashRequestCode(requestId, requestCode)
+    const suppliedDigest = hashRequestCode(
+      this.requestCodeDigestKey,
+      requestId,
+      requestCode
+    )
     if (!digestsEqual(suppliedDigest, request.requestCodeDigest)) {
       const updated = this.repository.runInImmediateTransaction(() => {
         const failedRequest = this.repository.recordFailedAttempt(
@@ -358,6 +484,8 @@ class DeviceApprovalService {
           replacementCredentialId: replacement.credentialId,
           replacementHmacVersionId: replacement.hmacVersionId,
           token: replacementToken,
+          idleExpiresAt: replacementIdleExpiresAt,
+          absoluteExpiresAt: replacement.absoluteExpiresAt,
           rotated: true,
           concurrentGrace: true,
           cookie: cookieContract()

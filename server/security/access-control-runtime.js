@@ -15,6 +15,10 @@ const {
 } = require('./secret-bootstrap-contract')
 
 const ADMIN_RATE_LIMIT_KEY_DOMAIN = 'kinvest-admin-rate-limit-key-v1'
+const DEVICE_REQUEST_RATE_LIMIT_KEY_DOMAIN =
+  'kinvest-device-request-rate-limit-key-v1'
+const DEVICE_REQUEST_CODE_DIGEST_KEY_DOMAIN =
+  'kinvest-device-request-code-digest-key-v1'
 
 class AccessControlRuntimeError extends Error {
   constructor() {
@@ -107,6 +111,8 @@ function createAccessControlRuntime(/** @type {any} */ {
   let hmacMaterial
   let parsedHmacMaterial
   let rateLimitKey
+  let requestIpDigestKey
+  let requestCodeDigestKey
   let adminAuth
   let sharedDatabase
   let ownsDatabase = false
@@ -130,6 +136,12 @@ function createAccessControlRuntime(/** @type {any} */ {
     parsedHmacMaterial = parseDeviceHmacSecret(hmacMaterial)
     rateLimitKey = crypto.createHmac('sha256', parsedHmacMaterial)
       .update(ADMIN_RATE_LIMIT_KEY_DOMAIN, 'utf8')
+      .digest()
+    requestIpDigestKey = crypto.createHmac('sha256', parsedHmacMaterial)
+      .update(DEVICE_REQUEST_RATE_LIMIT_KEY_DOMAIN, 'utf8')
+      .digest()
+    requestCodeDigestKey = crypto.createHmac('sha256', parsedHmacMaterial)
+      .update(DEVICE_REQUEST_CODE_DIGEST_KEY_DOMAIN, 'utf8')
       .digest()
 
     if (database) {
@@ -160,6 +172,9 @@ function createAccessControlRuntime(/** @type {any} */ {
       ),
       hmacSecretName: DEVICE_HMAC_SECRET_NAME,
       activeHmacVersionId: selection.deviceTokenHmac.active,
+      requestIpDigestKey,
+      requestCodeDigestKey,
+      requireRequestRateLimitIdentity: true,
       now,
       randomBytes
     })
@@ -172,6 +187,7 @@ function createAccessControlRuntime(/** @type {any} */ {
         if (cleared) return
         cleared = true
         adminAuth.clear()
+        deviceApproval.clear()
         closeOwnedDatabase()
       }
     })
@@ -189,6 +205,8 @@ function createAccessControlRuntime(/** @type {any} */ {
     if (Buffer.isBuffer(hmacMaterial)) hmacMaterial.fill(0)
     if (Buffer.isBuffer(parsedHmacMaterial)) parsedHmacMaterial.fill(0)
     if (Buffer.isBuffer(rateLimitKey)) rateLimitKey.fill(0)
+    if (Buffer.isBuffer(requestIpDigestKey)) requestIpDigestKey.fill(0)
+    if (Buffer.isBuffer(requestCodeDigestKey)) requestCodeDigestKey.fill(0)
   }
 }
 
