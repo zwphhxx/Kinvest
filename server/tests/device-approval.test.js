@@ -3,6 +3,7 @@ const crypto = require('crypto')
 const fs = require('node:fs')
 const os = require('node:os')
 const path = require('node:path')
+const { fork } = require('node:child_process')
 const { DatabaseSync } = require('node:sqlite')
 const {
   MockSecretProvider,
@@ -717,6 +718,105 @@ function testExpandMigrationIsIdempotentAndPreservesLegacyRows() {
   assert.strictEqual(repository.getCredential('legacy-credential').deviceName, null)
 }
 
+function createInitializeWorker(databasePath) {
+  const worker = fork(
+    path.join(__dirname, 'fixtures/device-auth-init-worker.js'),
+    [databasePath],
+    { stdio: ['ignore', 'ignore', 'ignore', 'ipc'] }
+  )
+  let resolveReady
+  let resolveDone
+  const ready = new Promise((resolve) => { resolveReady = resolve })
+  const done = new Promise((resolve) => { resolveDone = resolve })
+  worker.on('message', (message) => {
+    if (message && message.type === 'ready') resolveReady()
+    if (message && message.type === 'done') resolveDone(message)
+  })
+  worker.on('exit', (code) => {
+    if (code !== 0) resolveDone({ type: 'done', ok: false, code: 'WORKER_EXIT' })
+  })
+  return { worker, ready, done }
+}
+
+async function testConcurrentExpandMigrationIsAtomic() {
+  const directory = fs.mkdtempSync(path.join(os.tmpdir(), 'kinvest-init-'))
+  const databasePath = path.join(directory, 'legacy.sqlite')
+  const legacy = new DatabaseSync(databasePath)
+  legacy.exec(`
+    CREATE TABLE device_auth_requests (
+      request_id TEXT PRIMARY KEY,
+      request_code_digest TEXT NOT NULL,
+      browser_credential_digest TEXT NOT NULL,
+      created_at INTEGER NOT NULL,
+      expires_at INTEGER NOT NULL,
+      failed_attempts INTEGER NOT NULL DEFAULT 0,
+      approved_at INTEGER,
+      consumed_at INTEGER,
+      locked_at INTEGER
+    );
+    CREATE TABLE device_credentials (
+      credential_id TEXT PRIMARY KEY,
+      device_id TEXT NOT NULL,
+      token_digest TEXT NOT NULL UNIQUE,
+      hmac_version_id TEXT NOT NULL,
+      approved_at INTEGER NOT NULL,
+      rotated_at INTEGER NOT NULL,
+      last_used_at INTEGER NOT NULL,
+      idle_expires_at INTEGER NOT NULL,
+      absolute_expires_at INTEGER NOT NULL,
+      revoked_at INTEGER,
+      replacement_credential_id TEXT,
+      replacement_grace_expires_at INTEGER
+    );
+  `)
+  legacy.prepare(`
+    INSERT INTO device_auth_requests (
+      request_id, request_code_digest, browser_credential_digest,
+      created_at, expires_at
+    ) VALUES (?, ?, ?, ?, ?)
+  `).run('concurrent-legacy', 'preserved-code-digest',
+    'preserved-browser-digest', 1, 2)
+  legacy.close()
+
+  const workers = [
+    createInitializeWorker(databasePath),
+    createInitializeWorker(databasePath)
+  ]
+  try {
+    await Promise.all(workers.map((entry) => entry.ready))
+    for (const entry of workers) entry.worker.send({ type: 'go' })
+    const results = await Promise.all(workers.map((entry) => entry.done))
+    assert.deepStrictEqual(results.map((result) => result.ok), [true, true])
+
+    const verify = new DatabaseSync(databasePath)
+    const repository = new DeviceAuthRepository(verify)
+    repository.initialize()
+    assert.strictEqual(
+      Number(verify.prepare('PRAGMA busy_timeout').get().timeout),
+      5000
+    )
+    assert.deepStrictEqual(
+      verify.prepare('PRAGMA table_info(device_auth_requests)').all()
+        .filter((column) => ['device_name', 'ip_digest'].includes(column.name))
+        .map((column) => column.name),
+      ['device_name', 'ip_digest']
+    )
+    assert.strictEqual(
+      verify.prepare('PRAGMA table_info(device_credentials)').all()
+        .some((column) => column.name === 'device_name'),
+      true
+    )
+    assert.strictEqual(
+      repository.getRequest('concurrent-legacy').requestCodeDigest,
+      'preserved-code-digest'
+    )
+    verify.close()
+  } finally {
+    for (const entry of workers) entry.worker.kill()
+    fs.rmSync(directory, { recursive: true, force: true })
+  }
+}
+
 function testDeviceNameAndIpDigestValidation() {
   const harness = createHarness()
   const ipDigest = Buffer.alloc(32, 7).toString('base64url')
@@ -890,6 +990,7 @@ function testAuthenticationRejectsCommittedRevocationBeforeCas() {
 }
 
 async function run() {
+  await testConcurrentExpandMigrationIsAtomic()
   testExpandMigrationIsIdempotentAndPreservesLegacyRows()
   testDeviceNameAndIpDigestValidation()
   testDeviceNameSurvivesRedemptionAndRotation()

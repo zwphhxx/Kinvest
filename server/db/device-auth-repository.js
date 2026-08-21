@@ -63,7 +63,10 @@ class DeviceAuthRepository {
   }
 
   initialize() {
-    this.database.exec(`
+    this.database.exec('PRAGMA busy_timeout = 5000')
+    this.database.exec('BEGIN IMMEDIATE')
+    try {
+      this.database.exec(`
       CREATE TABLE IF NOT EXISTS device_auth_requests (
         request_id TEXT PRIMARY KEY,
         device_name TEXT,
@@ -107,28 +110,33 @@ class DeviceAuthRepository {
         subject_id TEXT,
         metadata_json TEXT NOT NULL
       );
-    `)
+      `)
 
-    const requestColumns = this.database.prepare(
-      'PRAGMA table_info(device_auth_requests)'
-    ).all()
-    if (!requestColumns.some((column) => column.name === 'device_name')) {
-      this.database.exec(
-        'ALTER TABLE device_auth_requests ADD COLUMN device_name TEXT'
-      )
-    }
-    if (!requestColumns.some((column) => column.name === 'ip_digest')) {
-      this.database.exec(
-        'ALTER TABLE device_auth_requests ADD COLUMN ip_digest TEXT'
-      )
-    }
-    const credentialColumns = this.database.prepare(
-      'PRAGMA table_info(device_credentials)'
-    ).all()
-    if (!credentialColumns.some((column) => column.name === 'device_name')) {
-      this.database.exec(
-        'ALTER TABLE device_credentials ADD COLUMN device_name TEXT'
-      )
+      const requestColumns = this.database.prepare(
+        'PRAGMA table_info(device_auth_requests)'
+      ).all()
+      if (!requestColumns.some((column) => column.name === 'device_name')) {
+        this.database.exec(
+          'ALTER TABLE device_auth_requests ADD COLUMN device_name TEXT'
+        )
+      }
+      if (!requestColumns.some((column) => column.name === 'ip_digest')) {
+        this.database.exec(
+          'ALTER TABLE device_auth_requests ADD COLUMN ip_digest TEXT'
+        )
+      }
+      const credentialColumns = this.database.prepare(
+        'PRAGMA table_info(device_credentials)'
+      ).all()
+      if (!credentialColumns.some((column) => column.name === 'device_name')) {
+        this.database.exec(
+          'ALTER TABLE device_credentials ADD COLUMN device_name TEXT'
+        )
+      }
+      this.database.exec('COMMIT')
+    } catch (error) {
+      this.database.exec('ROLLBACK')
+      throw error
     }
   }
 
