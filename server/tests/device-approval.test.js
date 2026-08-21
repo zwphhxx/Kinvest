@@ -19,6 +19,7 @@ const {
 const SECRET_NAME = 'kinvest-prod-device-token-hmac-key'
 const VERSION_ONE = 'v20260731-001'
 const VERSION_TWO = 'v20260731-002'
+const KINVEST_APPLICATION_ID = 1263095382
 
 function createRandomSource() {
   let counter = 0
@@ -718,6 +719,46 @@ function testExpandMigrationIsIdempotentAndPreservesLegacyRows() {
   assert.strictEqual(repository.getCredential('legacy-credential').deviceName, null)
 }
 
+function testDatabaseIdentityMarkerAndForeignRollback() {
+  const sharedDatabase = new DatabaseSync(':memory:')
+  sharedDatabase.exec(`
+    CREATE TABLE refresh_counters (
+      code TEXT NOT NULL,
+      date TEXT NOT NULL,
+      manual_count INTEGER NOT NULL DEFAULT 0,
+      updated_at TEXT NOT NULL,
+      PRIMARY KEY (code, date)
+    )
+  `)
+  new DeviceAuthRepository(sharedDatabase).initialize()
+  assert.strictEqual(
+    Number(sharedDatabase.prepare('PRAGMA application_id').get().application_id),
+    KINVEST_APPLICATION_ID
+  )
+  assert.strictEqual(
+    sharedDatabase.prepare('PRAGMA table_info(device_credentials)').all().length > 0,
+    true
+  )
+
+  const foreignDatabase = new DatabaseSync(':memory:')
+  foreignDatabase.exec(`
+    PRAGMA application_id = 123456;
+    CREATE TABLE unrelated_data (id INTEGER PRIMARY KEY)
+  `)
+  expectCode(
+    () => new DeviceAuthRepository(foreignDatabase).initialize(),
+    'DEVICE_AUTH_DATABASE_IDENTITY_INVALID'
+  )
+  assert.strictEqual(
+    Number(foreignDatabase.prepare('PRAGMA application_id').get().application_id),
+    123456
+  )
+  assert.strictEqual(
+    foreignDatabase.prepare('PRAGMA table_info(device_credentials)').all().length,
+    0
+  )
+}
+
 function createInitializeWorker(databasePath) {
   const worker = fork(
     path.join(__dirname, 'fixtures/device-auth-init-worker.js'),
@@ -1006,6 +1047,7 @@ function testAuthenticationRejectsCommittedRevocationBeforeCas() {
 
 async function run() {
   await testConcurrentExpandMigrationIsAtomic()
+  testDatabaseIdentityMarkerAndForeignRollback()
   testExpandMigrationIsIdempotentAndPreservesLegacyRows()
   testDeviceNameAndIpDigestValidation()
   testDeviceNameSurvivesRedemptionAndRotation()

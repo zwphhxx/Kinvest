@@ -2,6 +2,11 @@ const fs = require('node:fs')
 const path = require('node:path')
 const { DatabaseSync } = require('node:sqlite')
 const { DeviceAuthRepository } = require('../db/device-auth-repository')
+const {
+  KINVEST_SQLITE_APPLICATION_ID,
+  hasStrictLegacyDeviceSchema,
+  readApplicationId
+} = require('../db/database-identity')
 
 const DEFAULT_DATABASE_PATH = path.join(__dirname, '../data/kinvest.sqlite')
 
@@ -43,6 +48,22 @@ function assertValidDatabaseTarget(databasePath) {
   }
 }
 
+function assertValidDatabaseIdentity(databasePath) {
+  let database
+  try {
+    database = new DatabaseSync(databasePath, { readOnly: true })
+    const applicationId = readApplicationId(database)
+    if (applicationId === KINVEST_SQLITE_APPLICATION_ID) return
+    if (applicationId === 0 && hasStrictLegacyDeviceSchema(database)) return
+    throw new DeviceRevokeError('DEVICE_REVOKE_DATABASE_INVALID')
+  } catch (error) {
+    if (error instanceof DeviceRevokeError) throw error
+    throw new DeviceRevokeError('DEVICE_REVOKE_DATABASE_INVALID')
+  } finally {
+    if (database) database.close()
+  }
+}
+
 function run(/** @type {any} */ {
   databasePath,
   now = Date.now,
@@ -59,6 +80,7 @@ function run(/** @type {any} */ {
       throw new DeviceRevokeError('DEVICE_REVOKE_FAILED')
     }
     assertValidDatabaseTarget(databasePath)
+    assertValidDatabaseIdentity(databasePath)
     database = new DatabaseSync(databasePath)
     const repository = new DeviceAuthRepository(database)
     repository.initialize()

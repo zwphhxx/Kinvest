@@ -9,6 +9,8 @@ const {
   selectExecutableEffectiveUid
 } = require('../cli/revoke-all-devices')
 
+const KINVEST_APPLICATION_ID = 1263095382
+
 function expectCode(callback, expectedCode) {
   assert.throws(callback, (/** @type {any} */ error) => {
     assert.equal(error && error.code, expectedCode)
@@ -118,6 +120,136 @@ function testInvalidDatabaseTargetsFailClosed() {
   fs.rmSync(directory, { recursive: true, force: true })
 }
 
+function assertDatabaseHasNoDeviceSchema(databasePath, expectedApplicationId = 0) {
+  const database = new DatabaseSync(databasePath, { readOnly: true })
+  assert.strictEqual(
+    Number(database.prepare('PRAGMA application_id').get().application_id),
+    expectedApplicationId
+  )
+  assert.strictEqual(
+    database.prepare('PRAGMA table_info(device_auth_requests)').all().length,
+    0
+  )
+  assert.strictEqual(
+    database.prepare('PRAGMA table_info(device_credentials)').all().length,
+    0
+  )
+  assert.strictEqual(
+    database.prepare('PRAGMA table_info(device_auth_audit)').all().length,
+    0
+  )
+  database.close()
+}
+
+function testEmptyAndUnrelatedDatabasesAreRejectedWithoutMutation() {
+  const directory = fs.mkdtempSync(path.join(os.tmpdir(), 'kinvest-db-identity-'))
+  try {
+    const emptyPath = path.join(directory, 'empty.sqlite')
+    new DatabaseSync(emptyPath).close()
+    fs.chmodSync(emptyPath, 0o600)
+    expectCode(() => revokeAllDevices({
+      databasePath: emptyPath,
+      now: () => 300,
+      effectiveUid: () => 0,
+      stdout: { write() { return true } }
+    }), 'DEVICE_REVOKE_DATABASE_INVALID')
+    assertDatabaseHasNoDeviceSchema(emptyPath)
+
+    const unrelatedPath = path.join(directory, 'unrelated.sqlite')
+    const unrelated = new DatabaseSync(unrelatedPath)
+    unrelated.exec('CREATE TABLE unrelated_data (id INTEGER PRIMARY KEY)')
+    unrelated.prepare('INSERT INTO unrelated_data (id) VALUES (?)').run(7)
+    unrelated.close()
+    fs.chmodSync(unrelatedPath, 0o600)
+    expectCode(() => revokeAllDevices({
+      databasePath: unrelatedPath,
+      now: () => 300,
+      effectiveUid: () => 0,
+      stdout: { write() { return true } }
+    }), 'DEVICE_REVOKE_DATABASE_INVALID')
+    assertDatabaseHasNoDeviceSchema(unrelatedPath)
+    const verifyUnrelated = new DatabaseSync(unrelatedPath, { readOnly: true })
+    assert.strictEqual(Number(verifyUnrelated.prepare(
+      'SELECT COUNT(*) AS count FROM unrelated_data'
+    ).get().count), 1)
+    verifyUnrelated.close()
+  } finally {
+    fs.rmSync(directory, { recursive: true, force: true })
+  }
+}
+
+function testStrictLegacyDatabaseIsUpgradedAndRevoked() {
+  const directory = fs.mkdtempSync(path.join(os.tmpdir(), 'kinvest-legacy-'))
+  const databasePath = path.join(directory, 'legacy.sqlite')
+  const legacy = new DatabaseSync(databasePath)
+  legacy.exec(`
+    CREATE TABLE device_auth_requests (
+      request_id TEXT PRIMARY KEY,
+      request_code_digest TEXT NOT NULL,
+      browser_credential_digest TEXT NOT NULL,
+      created_at INTEGER NOT NULL,
+      expires_at INTEGER NOT NULL,
+      failed_attempts INTEGER NOT NULL DEFAULT 0,
+      approved_at INTEGER,
+      consumed_at INTEGER,
+      locked_at INTEGER
+    );
+    CREATE TABLE device_credentials (
+      credential_id TEXT PRIMARY KEY,
+      device_id TEXT NOT NULL,
+      token_digest TEXT NOT NULL UNIQUE,
+      hmac_version_id TEXT NOT NULL,
+      approved_at INTEGER NOT NULL,
+      rotated_at INTEGER NOT NULL,
+      last_used_at INTEGER NOT NULL,
+      idle_expires_at INTEGER NOT NULL,
+      absolute_expires_at INTEGER NOT NULL,
+      revoked_at INTEGER,
+      replacement_credential_id TEXT,
+      replacement_grace_expires_at INTEGER
+    );
+    CREATE TABLE device_auth_audit (
+      event_id INTEGER PRIMARY KEY AUTOINCREMENT,
+      event_type TEXT NOT NULL,
+      occurred_at INTEGER NOT NULL,
+      subject_id TEXT,
+      metadata_json TEXT NOT NULL
+    );
+  `)
+  legacy.prepare(`
+    INSERT INTO device_credentials (
+      credential_id, device_id, token_digest, hmac_version_id,
+      approved_at, rotated_at, last_used_at, idle_expires_at,
+      absolute_expires_at
+    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+  `).run('legacy-credential', 'legacy-device', 'legacy-token',
+    'v20260821-002', 1, 1, 1, 1000, 2000)
+  legacy.close()
+  fs.chmodSync(databasePath, 0o600)
+
+  const output = []
+  assert.strictEqual(revokeAllDevices({
+    databasePath,
+    now: () => 400,
+    effectiveUid: () => 0,
+    stdout: { write(value) { output.push(String(value)); return true } }
+  }), 1)
+  assert.strictEqual(output.join(''),
+    'KINVEST_DEVICE_REVOKE_ALL_OK credentials=1\n')
+  const verify = new DatabaseSync(databasePath, { readOnly: true })
+  assert.strictEqual(
+    Number(verify.prepare('PRAGMA application_id').get().application_id),
+    KINVEST_APPLICATION_ID
+  )
+  assert.strictEqual(Number(verify.prepare(`
+    SELECT COUNT(*) AS count
+    FROM device_credentials
+    WHERE revoked_at = 400
+  `).get().count), 1)
+  verify.close()
+  fs.rmSync(directory, { recursive: true, force: true })
+}
+
 function testRootRevokesAllWithAuditAndSafeRepeat() {
   const directory = fs.mkdtempSync(path.join(os.tmpdir(), 'kinvest-revoke-'))
   const databasePath = path.join(directory, 'device-auth.sqlite')
@@ -125,6 +257,10 @@ function testRootRevokesAllWithAuditAndSafeRepeat() {
   const setupDatabase = new DatabaseSync(databasePath)
   const setupRepository = new DeviceAuthRepository(setupDatabase)
   setupRepository.initialize()
+  assert.strictEqual(
+    Number(setupDatabase.prepare('PRAGMA application_id').get().application_id),
+    KINVEST_APPLICATION_ID
+  )
   insertCredential(setupRepository, 1, now)
   insertCredential(setupRepository, 2, now)
   setupDatabase.close()
@@ -180,6 +316,8 @@ async function run() {
   testMissingOrNonfunctionEffectiveUidFailsBeforeDatabaseOpen()
   testExecutableEffectiveUidPrefersEffectiveIdentity()
   testInvalidDatabaseTargetsFailClosed()
+  testEmptyAndUnrelatedDatabasesAreRejectedWithoutMutation()
+  testStrictLegacyDatabaseIsUpgradedAndRevoked()
   testRootRevokesAllWithAuditAndSafeRepeat()
 }
 

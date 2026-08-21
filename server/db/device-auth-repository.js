@@ -1,3 +1,10 @@
+const {
+  DeviceAuthDatabaseIdentityError,
+  KINVEST_SQLITE_APPLICATION_ID,
+  readApplicationId,
+  setKinvestApplicationId
+} = require('./database-identity')
+
 const AUDIT_METADATA_KEYS = new Set([
   'requestId',
   'credentialId',
@@ -66,6 +73,12 @@ class DeviceAuthRepository {
     this.database.exec('PRAGMA busy_timeout = 5000')
     this.database.exec('BEGIN IMMEDIATE')
     try {
+      const applicationId = readApplicationId(this.database)
+      if (applicationId === 0) {
+        setKinvestApplicationId(this.database)
+      } else if (applicationId !== KINVEST_SQLITE_APPLICATION_ID) {
+        throw new DeviceAuthDatabaseIdentityError()
+      }
       this.database.exec(`
       CREATE TABLE IF NOT EXISTS device_auth_requests (
         request_id TEXT PRIMARY KEY,
