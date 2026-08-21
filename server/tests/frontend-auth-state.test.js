@@ -1,10 +1,26 @@
 const assert = require('node:assert/strict')
 
+function deferred() {
+  /** @type {(value: unknown) => void} */
+  let resolve = () => {}
+  /** @type {(reason?: unknown) => void} */
+  let reject = () => {}
+  const promise = new Promise((resolvePromise, rejectPromise) => {
+    resolve = resolvePromise
+    reject = rejectPromise
+  })
+  return { promise, resolve, reject }
+}
+
 async function run() {
   const auth = require('../../public/auth-contract')
-  const { createAuthorizedRequestLifecycle } = require('../../public/auth-lifecycle')
+  const {
+    createAuthorizedRequestLifecycle,
+    createSingleFlightRetry
+  } = require('../../public/auth-lifecycle')
   const {
     approvedRequestDecision,
+    createAdminSessionLifecycle,
     createAdminSecurityState,
     mutationFailureDecision
   } = require('../../public/admin-contract')
@@ -25,6 +41,20 @@ async function run() {
   const second = lifecycle.beginRequest()
   assert.equal(lifecycle.canCommit(second), true)
   lifecycle.finishRequest(second)
+
+  lifecycle.authorize()
+  const lateInvestment = deferred()
+  const lateInvestmentTicket = lifecycle.beginRequest()
+  let lateInvestmentRendered = false
+  const lateInvestmentRender = lateInvestment.promise.then(() =>
+    lifecycle.commit(lateInvestmentTicket, () => {
+      lateInvestmentRendered = true
+    })
+  )
+  lifecycle.invalidate()
+  lateInvestment.resolve({ status: 200 })
+  await assert.rejects(lateInvestmentRender, /AUTH_EPOCH_STALE/)
+  assert.equal(lateInvestmentRendered, false)
 
   assert.deepEqual(
     auth.classifyApiFailure(401, { error: 'AUTH_REQUIRED' }),
@@ -97,6 +127,68 @@ async function run() {
   assert.equal(adminState.getCsrf(), 'csrf-two')
   adminState.clear()
   assert.equal(adminState.getCsrf(), null)
+
+  const staleCsrf = deferred()
+  const staleRestore = adminState.restore(() => staleCsrf.promise)
+  adminState.clear()
+  staleCsrf.resolve({ csrfToken: 'must-not-survive' })
+  await assert.rejects(staleRestore, /ADMIN_CSRF_STALE/)
+  assert.equal(adminState.getCsrf(), null)
+
+  const adminLifecycle = createAdminSessionLifecycle()
+  adminLifecycle.activate()
+  const listTicket = adminLifecycle.beginRequest()
+  const lateList = deferred()
+  let lateAdminRendered = false
+  const lateListRender = lateList.promise.then(() =>
+    adminLifecycle.commit(listTicket, () => {
+      lateAdminRendered = true
+    })
+  )
+  adminLifecycle.invalidate()
+  lateList.resolve({ requests: [] })
+  await assert.rejects(lateListRender, /ADMIN_EPOCH_STALE/)
+  assert.equal(listTicket.signal.aborted, true)
+  assert.equal(lateAdminRendered, false)
+
+  const scheduled = []
+  const redeemRetry = createSingleFlightRetry({
+    baseDelayMs: 100,
+    maxDelayMs: 400,
+    setTimer(callback, delay) {
+      scheduled.push({ callback, delay })
+      return scheduled.length
+    },
+    clearTimer() {}
+  })
+  redeemRetry.activate(9)
+  const firstRedeem = deferred()
+  const secondRedeem = deferred()
+  let redeemCalls = 0
+  const redeemOperation = () => {
+    redeemCalls += 1
+    return redeemCalls === 1 ? firstRedeem.promise : secondRedeem.promise
+  }
+  const firstRedeemRun = redeemRetry.run(
+    9,
+    redeemOperation,
+    () => ({ retry: true, terminal: false })
+  )
+  assert.equal(
+    redeemRetry.run(9, redeemOperation, () => ({ retry: true, terminal: false })),
+    firstRedeemRun
+  )
+  firstRedeem.reject(new Error('network'))
+  assert.deepEqual(await firstRedeemRun, { kind: 'retry', delayMs: 100 })
+  assert.equal(scheduled.length, 1)
+  assert.equal(scheduled[0].delay, 100)
+  const secondRedeemRun = scheduled[0].callback()
+  secondRedeem.resolve({ redeemed: true })
+  assert.deepEqual(await secondRedeemRun, {
+    kind: 'success',
+    value: { redeemed: true }
+  })
+  assert.equal(redeemCalls, 2)
 
   assert.deepEqual(mutationFailureDecision('ADMIN_CSRF_INVALID'), {
     clear: true,

@@ -1,5 +1,6 @@
 (function exposeAuthUi(root) {
   const contracts = (/** @type {any} */ (root)).KinvestAuth
+  const lifecycleContracts = (/** @type {any} */ (root)).KinvestAuthLifecycle
   const pollIntervalMs = 2500
   let requestId = null
   let requestStatus = null
@@ -7,11 +8,17 @@
   let pollController = null
   let pollGeneration = 0
   let networkFailures = 0
-  let redeemPromise = null
+  let redeemController = null
   let alreadyUsedConfirmationAttempted = false
   let stopped = false
   let submitBusy = false
   let bound = false
+  const redeemRetry = lifecycleContracts.createSingleFlightRetry({
+    baseDelayMs: pollIntervalMs,
+    maxDelayMs: 15000,
+    setTimer: (callback, delay) => window.setTimeout(callback, delay),
+    clearTimer: (timer) => window.clearTimeout(timer)
+  })
 
   const byId = (id) => document.getElementById(id)
 
@@ -63,6 +70,12 @@
     pollGeneration += 1
   }
 
+  function stopRedeem() {
+    if (redeemController) redeemController.abort()
+    redeemController = null
+    redeemRetry.cancel()
+  }
+
   function schedulePoll(generation = pollGeneration, delay = pollIntervalMs) {
     pausePolling()
     if (!requestId || stopped || document.hidden || requestStatus !== 'pending') return
@@ -87,6 +100,7 @@
 
   function terminateWithReapply(message) {
     stopPolling()
+    stopRedeem()
     requestStatus = 'consumed'
     setLive(message, 'error')
     byId('request-again').classList.remove('hidden')
@@ -125,25 +139,63 @@
     }
   }
 
-  async function redeemOnce(generation) {
-    if (!requestId || generation !== pollGeneration) return
-    pausePolling()
-    setLive('已批准，正在为这台设备建立家庭访问许可。', 'success')
-    try {
-      const payload = await api(`/api/auth/device-requests/${encodeURIComponent(requestId)}/redeem`, {
-        method: 'POST',
-        body: '{}'
-      })
-      if (payload.authorized !== true) throw new Error('AUTH_REQUEST_FAILED')
+  async function handleRedeemOutcome(outcome, error, decision, generation) {
+    if (generation !== pollGeneration || outcome.kind === 'stale') return
+    if (outcome.kind === 'success') {
       window.location.reload()
-    } catch (error) {
-      await handlePollingFailure(error, generation)
+      return
     }
+    if (outcome.kind === 'retry') {
+      setLive('设备已批准，网络恢复后会自动重试兑换。', 'error')
+      return
+    }
+    if (decision && decision.confirmAuthorization) {
+      if (alreadyUsedConfirmationAttempted) {
+        terminateWithReapply('这份申请已经结束，请重新申请。')
+        return
+      }
+      alreadyUsedConfirmationAttempted = true
+      try {
+        const authStatus = contracts.normalizeAuthStatus(await api('/api/auth/status'))
+        if (authStatus.authorized) {
+          window.location.reload()
+          return
+        }
+      } catch {
+        // A failed one-time confirmation is terminal.
+      }
+      terminateWithReapply('未能确认这台设备已登录，请重新申请。')
+      return
+    }
+    terminateWithReapply(contracts.authErrorMessage(error && error.code))
   }
 
   function redeem(generation) {
-    if (!redeemPromise) redeemPromise = redeemOnce(generation)
-    return redeemPromise
+    return redeemRetry.run(
+      generation,
+      async () => {
+        if (!requestId || generation !== pollGeneration) throw new Error('AUTH_REQUEST_STALE')
+        const controller = new AbortController()
+        redeemController = controller
+        try {
+          const payload = await api(`/api/auth/device-requests/${encodeURIComponent(requestId)}/redeem`, {
+            method: 'POST',
+            body: '{}',
+            signal: controller.signal
+          })
+          if (payload.authorized !== true) {
+            throw Object.assign(new Error('AUTH_RESPONSE_INVALID'), {
+              code: 'AUTH_RESPONSE_INVALID', status: 400
+            })
+          }
+          return payload
+        } finally {
+          if (redeemController === controller) redeemController = null
+        }
+      },
+      (error) => contracts.pollErrorDecision(error),
+      (outcome, error, decision) => handleRedeemOutcome(outcome, error, decision, generation)
+    )
   }
 
   async function pollStatus(generation = pollGeneration) {
@@ -159,6 +211,9 @@
       // Server status is the only authority for pending and terminal transitions.
       requestStatus = contracts.normalizeRequestStatus(payload).status
       if (requestStatus === 'approved') {
+        pausePolling()
+        redeemRetry.activate(generation)
+        setLive('已批准，正在为这台设备建立家庭访问许可。', 'success')
         await redeem(generation)
         return
       }
@@ -207,7 +262,7 @@
         !Number.isSafeInteger(created.expiresAt)) throw new Error('AUTH_RESPONSE_INVALID')
       requestId = created.requestId
       requestStatus = 'pending'
-      redeemPromise = null
+      stopRedeem()
       alreadyUsedConfirmationAttempted = false
       networkFailures = 0
       pollGeneration += 1
@@ -225,9 +280,9 @@
 
   function resetRequest() {
     stopPolling()
+    stopRedeem()
     requestId = null
     requestStatus = null
-    redeemPromise = null
     alreadyUsedConfirmationAttempted = false
     byId('request-code').replaceChildren()
     byId('request-ticket').classList.add('hidden')
@@ -265,6 +320,7 @@
     window.addEventListener('beforeunload', () => {
       stopped = true
       stopPolling()
+      stopRedeem()
     })
   }
 
@@ -285,12 +341,14 @@
   function showDashboard() {
     stopped = true
     stopPolling()
+    stopRedeem()
     applyTopLevelState('dashboard')
   }
 
   function showUnavailable() {
     stopped = true
     stopPolling()
+    stopRedeem()
     applyTopLevelState('checking')
     byId('auth-checking-text').textContent = '暂时无法确认设备状态。为了保护家庭数据，页面没有继续加载。'
     const retry = byId('auth-retry')

@@ -24,17 +24,23 @@
   function createAdminSecurityState() {
     let csrfToken = null
     let restorePromise = null
+    let generation = 0
 
     function setCsrf(value) {
+      generation += 1
       csrfToken = typeof value === 'string' && value.length > 0 ? value : null
+      restorePromise = null
     }
 
     function clear() {
+      generation += 1
       csrfToken = null
+      restorePromise = null
     }
 
     function restore(loader) {
       if (restorePromise) return restorePromise
+      const restoreGeneration = generation
       let loaded
       try {
         loaded = loader()
@@ -43,23 +49,67 @@
       }
       restorePromise = Promise.resolve(loaded)
         .then((result) => {
+          if (generation !== restoreGeneration) throw new Error('ADMIN_CSRF_STALE')
           if (!result || typeof result.csrfToken !== 'string' || result.csrfToken.length === 0) {
             throw new Error('ADMIN_CSRF_INVALID')
           }
-          setCsrf(result.csrfToken)
+          csrfToken = result.csrfToken
           return result
         })
         .finally(() => {
-          restorePromise = null
+          if (restorePromise === currentPromise) restorePromise = null
         })
+      const currentPromise = restorePromise
       return restorePromise
     }
 
     return Object.freeze({ clear, getCsrf: () => csrfToken, restore, setCsrf })
   }
 
+  function createAdminSessionLifecycle() {
+    let active = false
+    let currentEpoch = 0
+    const controllers = new Set()
+
+    function invalidate() {
+      active = false
+      currentEpoch += 1
+      for (const controller of controllers) controller.abort()
+      controllers.clear()
+    }
+
+    function activate() {
+      invalidate()
+      active = true
+    }
+
+    function beginRequest() {
+      if (!active) throw new Error('ADMIN_EPOCH_INACTIVE')
+      const controller = new AbortController()
+      controllers.add(controller)
+      return Object.freeze({ controller, epoch: currentEpoch, signal: controller.signal })
+    }
+
+    function canCommit(ticket) {
+      return active && ticket && ticket.epoch === currentEpoch &&
+        ticket.signal.aborted === false && controllers.has(ticket.controller)
+    }
+
+    function commit(ticket, callback) {
+      if (!canCommit(ticket)) throw new Error('ADMIN_EPOCH_STALE')
+      return callback()
+    }
+
+    function finishRequest(ticket) {
+      if (ticket && ticket.controller) controllers.delete(ticket.controller)
+    }
+
+    return Object.freeze({ activate, beginRequest, commit, finishRequest, invalidate })
+  }
+
   return Object.freeze({
     approvedRequestDecision,
+    createAdminSessionLifecycle,
     createAdminSecurityState,
     mutationFailureDecision
   })

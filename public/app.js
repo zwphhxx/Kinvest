@@ -59,7 +59,7 @@ function percent(v) {
   return `${Number(v).toFixed(2)}%`
 }
 
-async function getJson(url, options = {}) {
+async function getJson(url, options = {}, commitCallback = (body) => body) {
   const ticket = lifecycle.beginRequest()
   try {
     let res
@@ -82,10 +82,7 @@ async function getJson(url, options = {}) {
       if (failure.code === 'AUTH_REQUIRED') enterGate()
       throw Object.assign(new Error('INVESTMENT_REQUEST_FAILED'), failure)
     }
-    if (!lifecycle.canCommit(ticket)) {
-      throw Object.assign(new Error('STALE_RESPONSE'), { code: 'STALE_RESPONSE' })
-    }
-    return body
+    return lifecycle.commit(ticket, () => commitCallback(body))
   } finally {
     lifecycle.finishRequest(ticket)
   }
@@ -111,6 +108,7 @@ function clearInvestmentState() {
   state.watchlist = []
   state.selectedCode = null
   state.currentCompany = null
+  state.financeMode = 'annual'
   for (const node of [
     el.watchlist,
     el.searchResults,
@@ -125,8 +123,19 @@ function clearInvestmentState() {
     el.newsList,
     el.macroTable
   ]) node.replaceChildren()
+  const searchInput = /** @type {HTMLInputElement} */ (el.searchInput)
+  const researchLink = /** @type {HTMLAnchorElement} */ (el.researchLink)
+  const refreshButton = /** @type {HTMLButtonElement} */ (el.refreshBtn)
+  searchInput.value = ''
+  el.searchHint.textContent = ''
+  researchLink.removeAttribute('href')
+  refreshButton.disabled = true
+  delete el.thermo.dataset.position
+  el.thermo.classList.remove('unavailable')
+  el.financeButtons.forEach((button, index) => button.classList.toggle('active', index === 0))
   el.companyContent.classList.add('hidden')
   el.companyEmpty.classList.remove('hidden')
+  el.companyEmpty.textContent = '选择左侧公司后，这里会展示行情、估值、财务、异常信号与来源事实。'
   el.globalStatus.textContent = '设备访问许可已失效。'
 }
 
@@ -412,25 +421,29 @@ function renderSearchResults(items) {
 }
 
 async function loadWatchlist() {
-  const data = await getJson('/api/watchlist')
-  state.watchlist = data.data
-  el.watchlist.innerHTML = ''
-  data.data.forEach((item) => {
-    renderWatchlistItem(item, el.watchlist, state.selectedCode)
+  return getJson('/api/watchlist', {}, (data) => {
+    state.watchlist = data.data
+    el.watchlist.innerHTML = ''
+    data.data.forEach((item) => {
+      renderWatchlistItem(item, el.watchlist, state.selectedCode)
+    })
+    renderGlobalStatus(data.data.length)
+    return data
   })
-  renderGlobalStatus(data.data.length)
 }
 
 async function loadCompany(code) {
-  const data = await getJson(`/api/company/${code}`)
-  state.currentCompany = data.data
-  renderCompany(data.data)
-  document.querySelectorAll('.watchlist-card').forEach((elNode) => {
-    if (elNode.textContent.includes(code)) {
-      elNode.classList.add('active')
-    } else {
-      elNode.classList.remove('active')
-    }
+  return getJson(`/api/company/${code}`, {}, (data) => {
+    state.currentCompany = data.data
+    renderCompany(data.data)
+    document.querySelectorAll('.watchlist-card').forEach((elNode) => {
+      if (elNode.textContent.includes(code)) {
+        elNode.classList.add('active')
+      } else {
+        elNode.classList.remove('active')
+      }
+    })
+    return data
   })
 }
 
@@ -440,9 +453,11 @@ async function doRefresh() {
     const data = await getJson(`/api/company/${state.currentCompany.securityCode}/refresh`, {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' }
+    }, (payload) => {
+      if (payload.success) renderCompany(payload.data)
+      return payload
     })
     if (data.success) {
-      renderCompany(data.data)
       await loadWatchlist()
     }
   } catch (err) {
@@ -460,8 +475,10 @@ function bindEvents() {
       return
     }
     await runInvestmentTask(async () => {
-      const data = await getJson(`/api/search?q=${encodeURIComponent(q)}`)
-      renderSearchResults(data.data)
+      await getJson(`/api/search?q=${encodeURIComponent(q)}`, {}, (data) => {
+        renderSearchResults(data.data)
+        return data
+      })
     }, el.searchHint)
   })
 

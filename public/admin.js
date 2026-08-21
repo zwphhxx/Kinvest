@@ -2,6 +2,7 @@
   const contracts = /** @type {any} */ (window).KinvestAuth
   const adminContracts = /** @type {any} */ (window).KinvestAdmin
   const securityState = adminContracts.createAdminSecurityState()
+  const sessionLifecycle = adminContracts.createAdminSessionLifecycle()
   const busy = new Set()
   const byId = (id) => document.getElementById(id)
 
@@ -22,10 +23,10 @@
 
   /**
    * @param {string} path
-   * @param {{ method?: string, body?: object, csrf?: boolean }} [options]
+   * @param {{ method?: string, body?: object, csrf?: boolean, signal?: AbortSignal }} [options]
    */
   async function api(path, options = {}) {
-    const { method = 'GET', body, csrf = false } = options
+    const { method = 'GET', body, csrf = false, signal } = options
     const headers = { Accept: 'application/json' }
     if (body !== undefined) headers['Content-Type'] = 'application/json'
     if (csrf) {
@@ -37,6 +38,7 @@
       method,
       credentials: 'same-origin',
       headers,
+      signal,
       ...(body === undefined ? {} : { body: JSON.stringify(body) })
     })
     const payload = await response.json().catch(() => ({}))
@@ -64,6 +66,7 @@
   }
 
   function clearAdminSensitiveState() {
+    sessionLifecycle.invalidate()
     securityState.clear()
     for (const id of ['admin-password', 'revoke-all-password', 'revoke-all-phrase']) {
       const input = /** @type {HTMLInputElement} */ (byId(id))
@@ -104,6 +107,7 @@
     if (error.code === 'ADMIN_CSRF_INVALID') {
       try {
         await restoreCsrf()
+        sessionLifecycle.activate()
         await refreshLists()
         setLive('操作凭证已更新，请重新执行刚才的操作。', 'error')
       } catch {
@@ -236,14 +240,25 @@
   }
 
   async function refreshLists() {
-    const [pending, devices, audit] = await Promise.all([
-      api('/api/admin/device-requests'),
-      api('/api/admin/devices'),
-      api('/api/admin/audit')
-    ])
-    renderPending(pending.data)
-    renderDevices(devices.data)
-    renderAudit(audit.data || {})
+    const ticket = sessionLifecycle.beginRequest()
+    try {
+      const requestOptions = { signal: ticket.signal }
+      const [pending, devices, audit] = await Promise.all([
+        api('/api/admin/device-requests', requestOptions),
+        api('/api/admin/devices', requestOptions),
+        api('/api/admin/audit', requestOptions)
+      ])
+      sessionLifecycle.commit(ticket, () => {
+        renderPending(pending.data)
+        renderDevices(devices.data)
+        renderAudit(audit.data || {})
+      })
+    } catch (error) {
+      if (error.name === 'AbortError' || error.message === 'ADMIN_EPOCH_STALE') return
+      throw error
+    } finally {
+      sessionLifecycle.finishRequest(ticket)
+    }
   }
 
   byId('admin-login-form').addEventListener('submit', async (event) => {
@@ -257,6 +272,7 @@
         method: 'POST', body: { password: passwordInput.value }
       })
       securityState.setCsrf(result.csrfToken)
+      sessionLifecycle.activate()
       passwordInput.value = ''
       showDesk()
       setLive('管理员会话已建立。', 'success')
@@ -300,6 +316,7 @@
   byId('admin-logout').addEventListener('click', async () => {
     const button = /** @type {HTMLButtonElement} */ (byId('admin-logout'))
     if (busy.has('logout')) return
+    sessionLifecycle.invalidate()
     setBusy('logout', button, true)
     try {
       await api('/api/admin/logout', { method: 'POST', body: {}, csrf: true })
@@ -316,6 +333,7 @@
   async function bootstrap() {
     try {
       await restoreCsrf()
+      sessionLifecycle.activate()
       showDesk()
       await refreshLists()
     } catch {
