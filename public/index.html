@@ -6,9 +6,51 @@
   <title>Kinvest 家庭投资看板</title>
   <link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 64 64'%3E%3Crect width='64' height='64' rx='14' fill='%230b7a6e'/%3E%3Cpath d='M17 14v36h8V36l15 14h11L31 31l18-17H38L25 28V14z' fill='white'/%3E%3C/svg%3E" />
   <link rel="stylesheet" href="/app.css" />
+  <link rel="stylesheet" href="/auth.css" />
 </head>
 <body>
-  <div class="shell">
+  <main id="auth-checking" class="checking-shell" role="status" aria-live="polite">
+    <div class="checking-mark" aria-hidden="true">K</div>
+    <p id="auth-checking-text">正在确认这台设备的家庭访问状态…</p>
+    <button id="auth-retry" class="auth-secondary hidden" type="button">重新检查</button>
+  </main>
+
+  <main id="auth-gate" class="auth-shell hidden" aria-labelledby="auth-title">
+    <section class="auth-context">
+      <p class="eyebrow">Kinvest / 家庭投资看板</p>
+      <h1 id="auth-title" class="auth-display">让重要数字，只在家人之间流动。</h1>
+      <p class="auth-copy">这台设备还没有家庭访问许可。给它起一个容易识别的名字，管理员确认后即可进入。这里不会要求你输入投资账户或云服务密钥。</p>
+      <div class="auth-assurance" aria-label="访问保护说明">
+        <span>设备单独审批</span><span>随时撤销</span><span>安全 Cookie</span>
+      </div>
+    </section>
+
+    <section class="access-ticket" aria-labelledby="ticket-title">
+      <p class="ticket-label">Family access ticket</p>
+      <h2 id="ticket-title">申请进入家庭看板</h2>
+      <p class="subline">申请码只在当前浏览器显示，请把它告诉家庭管理员。</p>
+      <form id="device-request-form">
+        <label class="auth-field" for="device-name">
+          <span>这台设备叫什么？</span>
+          <input id="device-name" name="deviceName" maxlength="40" autocomplete="off" placeholder="例如：客厅 iPad" required />
+        </label>
+        <button id="device-request-submit" class="auth-primary" type="submit">生成申请码</button>
+      </form>
+      <div id="request-ticket" class="hidden">
+        <div class="family-pass">
+          <span class="ticket-label">六位申请码</span>
+          <output id="request-code" tabindex="0" aria-label="六位设备申请码"></output>
+          <span id="request-expiry" class="admin-meta"></span>
+        </div>
+        <button id="copy-request-code" class="auth-secondary" type="button">复制申请码</button>
+      </div>
+      <p id="auth-live" class="auth-live" role="status" aria-live="polite" tabindex="-1">请给这台设备起一个家人容易识别的名称。</p>
+      <button id="request-again" class="auth-secondary hidden" type="button">重新申请</button>
+      <p class="auth-footnote">管理员请前往 <a href="/admin.html">设备审批台</a>。</p>
+    </section>
+  </main>
+
+  <div id="dashboard-shell" class="shell hidden">
     <header class="topbar">
       <div>
         <p class="eyebrow">家庭投资看板 v0.1（模拟）</p>
@@ -103,6 +145,8 @@
   <script src="/data-source-contract.js" defer></script>
   <script src="/finance-contract.js" defer></script>
   <script src="/valuation-position.js" defer></script>
+  <script src="/auth-contract.js" defer></script>
+  <script src="/auth-ui.js" defer></script>
   <script src="/app.js" defer></script>
 </body>
 </html>

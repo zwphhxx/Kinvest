@@ -26,8 +26,13 @@ async function runBuildArtifactsExist() {
   const fixturePath = path.join(repositoryRoot, 'server', 'data', 'build-leak.log')
   const expectedArtifacts = [
     'package.json',
+    'public/admin.html',
+    'public/admin.js',
     'public/app.css',
     'public/app.js',
+    'public/auth-contract.js',
+    'public/auth-ui.js',
+    'public/auth.css',
     'public/data-source-contract.js',
     'public/finance-contract.js',
     'public/index.html',

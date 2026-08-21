@@ -7,6 +7,8 @@ const state = {
 
 const financeContracts = /** @type {any} */ (window).KinvestFinance
 const valuationContracts = /** @type {any} */ (window).KinvestValuation
+const authContracts = /** @type {any} */ (window).KinvestAuth
+const authUi = /** @type {any} */ (window).KinvestAuthUi
 
 const el = {
   globalStatus: document.getElementById('global-status'),
@@ -56,12 +58,40 @@ function percent(v) {
 }
 
 async function getJson(url, options = {}) {
-  const res = await fetch(url, options)
+  const res = await fetch(url, { credentials: 'same-origin', ...options })
   if (!res.ok) {
     const body = await res.json().catch(() => ({}))
+    if (res.status === 401 && body.error === 'AUTH_REQUIRED') {
+      clearInvestmentState()
+      authUi.showGate()
+      throw new Error('访问许可已失效，请重新申请。')
+    }
     throw new Error(body.error || `请求失败：${res.status}`)
   }
   return res.json()
+}
+
+function clearInvestmentState() {
+  state.watchlist = []
+  state.selectedCode = null
+  state.currentCompany = null
+  for (const node of [
+    el.watchlist,
+    el.searchResults,
+    el.companyHead,
+    el.marketStatus,
+    el.marketData,
+    el.thermo,
+    el.financeTableWrap,
+    el.anomalyList,
+    el.breakdownTable,
+    el.announcementList,
+    el.newsList,
+    el.macroTable
+  ]) node.replaceChildren()
+  el.companyContent.classList.add('hidden')
+  el.companyEmpty.classList.remove('hidden')
+  el.globalStatus.textContent = '设备访问许可已失效。'
 }
 
 function renderGlobalStatus(companiesCount) {
@@ -395,6 +425,14 @@ function bindEvents() {
 }
 
 async function bootstrap() {
+  const authStatus = authContracts.normalizeAuthStatus(
+    await getJson('/api/auth/status', { credentials: 'same-origin' })
+  )
+  if (!authStatus.authorized) {
+    authUi.showGate()
+    return
+  }
+  authUi.showDashboard()
   bindEvents()
   await loadWatchlist()
   if (state.watchlist[0]) {
@@ -404,6 +442,6 @@ async function bootstrap() {
   }
 }
 
-bootstrap().catch((err) => {
-  el.globalStatus.textContent = `初始化失败：${err.message}`
+bootstrap().catch(() => {
+  authUi.showUnavailable()
 })
