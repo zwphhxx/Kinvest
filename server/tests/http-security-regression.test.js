@@ -298,27 +298,42 @@ class FakeServer extends EventEmitter {
 }
 
 async function testEnabledStartupCannotBypassTrustedProxyConfig() {
-  const invalid = [undefined, '', '[]', 'not-json', '["::ffff:127.0.0.1"]']
-  for (const serialized of invalid) {
-    const runtimeServer = new FakeServer()
-    const env = { KINVEST_ACCESS_CONTROL_MODE: 'device-approval' }
-    if (serialized !== undefined) {
-      env.KINVEST_TRUSTED_PROXY_ADDRESSES = serialized
+  const originalUmask = process.umask()
+  try {
+    const invalid = [undefined, '', '[]', 'not-json', '["::ffff:127.0.0.1"]']
+    for (const serialized of invalid) {
+      const runtimeServer = new FakeServer()
+      const env = { KINVEST_ACCESS_CONTROL_MODE: 'device-approval' }
+      if (serialized !== undefined) {
+        env.KINVEST_TRUSTED_PROXY_ADDRESSES = serialized
+      }
+      await assert.rejects(startServer({
+        env,
+        runtimeServer,
+        bootstrap: async () => ({ clear() {} }),
+        createAccessRuntime: () => ({
+          status: { mode: 'device-approval' },
+          adminAuth: {},
+          deviceApproval: {},
+          clear() {}
+        }),
+        processRef: new EventEmitter(),
+        logger: { log() {} }
+      }), { code: 'HTTP_SECURITY_CONFIG_INVALID' })
+      assert.equal(runtimeServer.listenCalls, 0)
     }
-    await assert.rejects(startServer({
-      env,
-      runtimeServer,
-      bootstrap: async () => ({ clear() {} }),
-      createAccessRuntime: () => ({
-        status: { mode: 'device-approval' },
-        adminAuth: {},
-        deviceApproval: {},
-        clear() {}
-      }),
-      processRef: new EventEmitter(),
-      logger: { log() {} }
-    }), { code: 'HTTP_SECURITY_CONFIG_INVALID' })
-    assert.equal(runtimeServer.listenCalls, 0)
+  } finally {
+    process.umask(originalUmask)
+  }
+}
+
+async function testStartupConfigurationDoesNotLeakProcessUmask() {
+  const originalUmask = process.umask()
+  try {
+    await testEnabledStartupCannotBypassTrustedProxyConfig()
+    assert.equal(process.umask(), originalUmask)
+  } finally {
+    process.umask(originalUmask)
   }
 }
 
@@ -328,7 +343,7 @@ async function run() {
   await testRefreshUsesInjectedOriginAndDisabledCompatibility()
   await testStrictJsonRejectsMalformedUtf8DuplicatesAndAbort()
   await testRedeemTerminalErrorsClearRequestCookie()
-  await testEnabledStartupCannotBypassTrustedProxyConfig()
+  await testStartupConfigurationDoesNotLeakProcessUmask()
 }
 
 module.exports = { run }
