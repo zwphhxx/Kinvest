@@ -157,9 +157,9 @@ async function start(runtime) {
   }))
   await new Promise((resolve, reject) => {
     server.once('error', reject)
-    server.listen(0, '127.0.0.1', resolve)
+    server.listen(0, '127.0.0.1', () => resolve())
   })
-  const address = server.address()
+  const address = /** @type {import('node:net').AddressInfo} */ (server.address())
   return {
     baseUrl: `http://127.0.0.1:${address.port}`,
     close: () => new Promise((resolve) => server.close(resolve))

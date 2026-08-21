@@ -27,14 +27,26 @@ async function startServer(runtime) {
   }))
   await new Promise((resolve, reject) => {
     server.once('error', reject)
-    server.listen(0, '127.0.0.1', resolve)
+    server.listen(0, '127.0.0.1', () => resolve())
   })
+  const address = /** @type {import('node:net').AddressInfo} */ (server.address())
   return {
-    baseUrl: `http://127.0.0.1:${server.address().port}`,
+    baseUrl: `http://127.0.0.1:${address.port}`,
     close: () => new Promise((resolve) => server.close(resolve))
   }
 }
 
+/**
+ * @param {string} baseUrl
+ * @param {string} pathname
+ * @param {{
+ *   method?: string,
+ *   cookie?: string,
+ *   csrf?: string,
+ *   body?: unknown,
+ *   proxy?: boolean
+ * }} [options]
+ */
 async function request(baseUrl, pathname, {
   method = 'GET',
   cookie,
@@ -42,6 +54,7 @@ async function request(baseUrl, pathname, {
   body,
   proxy = false
 } = {}) {
+  /** @type {Record<string, string>} */
   const headers = {}
   if (body !== undefined) {
     headers.origin = ORIGIN

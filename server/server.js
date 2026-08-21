@@ -375,6 +375,14 @@ function serveStatic(req, res, pathname) {
   })
 }
 
+/**
+ * @param {{
+ *   accessRuntime?: any,
+ *   now?: () => number,
+ *   publicOrigin?: string,
+ *   trustedProxyAddresses?: string[]
+ * }} [options]
+ */
 function createRequestHandler({
   accessRuntime,
   now = Date.now,

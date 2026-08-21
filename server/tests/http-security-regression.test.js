@@ -46,6 +46,14 @@ function createRuntime() {
   }
 }
 
+/**
+ * @param {{
+ *   status: {mode: string},
+ *   adminAuth?: any,
+ *   deviceApproval?: any
+ * }} [runtime]
+ * @param {string} [publicOrigin]
+ */
 async function start(runtime = createRuntime(), publicOrigin = ORIGIN) {
   const server = http.createServer(createRequestHandler({
     accessRuntime: runtime,
@@ -55,9 +63,9 @@ async function start(runtime = createRuntime(), publicOrigin = ORIGIN) {
   }))
   await new Promise((resolve, reject) => {
     server.once('error', reject)
-    server.listen(0, '127.0.0.1', resolve)
+    server.listen(0, '127.0.0.1', () => resolve())
   })
-  const address = server.address()
+  const address = /** @type {import('node:net').AddressInfo} */ (server.address())
   return {
     baseUrl: `http://127.0.0.1:${address.port}`,
     close: () => new Promise((resolve) => server.close(resolve))
@@ -221,7 +229,9 @@ async function testRefreshStrictMutationAndExactRoutes() {
 }
 
 async function parseBuffer(buffer) {
-  const req = new PassThrough()
+  const req = /** @type {PassThrough & {headers: Record<string, string>}} */ (
+    new PassThrough()
+  )
   req.headers = {
     'content-type': 'application/json',
     'content-length': String(buffer.length)
@@ -239,7 +249,9 @@ async function testStrictJsonRejectsMalformedUtf8DuplicatesAndAbort() {
     0x7b, 0x22, 0x78, 0x22, 0x3a, 0x22, 0xc3, 0x28, 0x22, 0x7d
   ])), { code: 'JSON_INVALID' })
 
-  const aborted = new PassThrough()
+  const aborted = /** @type {PassThrough & {headers: Record<string, string>}} */ (
+    new PassThrough()
+  )
   aborted.headers = { 'content-type': 'application/json' }
   const pending = parseStrictJsonBody(aborted)
   aborted.emit('aborted')
