@@ -4,7 +4,10 @@ const os = require('node:os')
 const path = require('node:path')
 const { DatabaseSync } = require('node:sqlite')
 const { DeviceAuthRepository } = require('../db/device-auth-repository')
-const { run: revokeAllDevices } = require('../cli/revoke-all-devices')
+const {
+  run: revokeAllDevices,
+  selectExecutableEffectiveUid
+} = require('../cli/revoke-all-devices')
 
 function expectCode(callback, expectedCode) {
   assert.throws(callback, (error) => {
@@ -33,40 +36,86 @@ function testNonRootFailsBeforeDatabaseOpen() {
   expectCode(() => revokeAllDevices({
     databasePath: '/definitely/not/opened/kinvest.sqlite',
     now: () => 100,
-    getuid: () => 501,
+    effectiveUid: () => 501,
     stdout: { write() { throw new Error('stdout must not be used') } }
   }), 'DEVICE_REVOKE_ROOT_REQUIRED')
 }
 
-function testMissingOrNonfunctionGetuidFailsBeforeDatabaseOpen() {
+function testMissingOrNonfunctionEffectiveUidFailsBeforeDatabaseOpen() {
   const directory = fs.mkdtempSync(path.join(os.tmpdir(), 'kinvest-no-root-'))
-  const cases = [null, 'root', 0]
-  for (const getuid of cases) {
-    const databasePath = path.join(directory, `case-${String(getuid)}.sqlite`)
+  const cases = [undefined, null, 'root', 0]
+  for (const effectiveUid of cases) {
+    const databasePath = path.join(directory, `case-${String(effectiveUid)}.sqlite`)
     expectCode(() => revokeAllDevices({
       databasePath,
       now: () => 100,
-      getuid,
+      effectiveUid,
       stdout: { write() {} }
     }), 'DEVICE_REVOKE_ROOT_REQUIRED')
     assert.strictEqual(fs.existsSync(databasePath), false)
   }
 
-  const originalGetuid = process.getuid
-  const undefinedDatabasePath = path.join(directory, 'undefined.sqlite')
-  try {
-    process.getuid = undefined
-    expectCode(() => revokeAllDevices({
-      databasePath: undefinedDatabasePath,
-      now: () => 100,
-      getuid: undefined,
-      stdout: { write() {} }
-    }), 'DEVICE_REVOKE_ROOT_REQUIRED')
-    assert.strictEqual(fs.existsSync(undefinedDatabasePath), false)
-  } finally {
-    process.getuid = originalGetuid
-    fs.rmSync(directory, { recursive: true, force: true })
-  }
+  fs.rmSync(directory, { recursive: true, force: true })
+}
+
+function testExecutableEffectiveUidPrefersEffectiveIdentity() {
+  let realUidCalls = 0
+  const selected = selectExecutableEffectiveUid({
+    geteuid: () => 501,
+    getuid: () => {
+      realUidCalls += 1
+      return 0
+    }
+  })
+  assert.strictEqual(selected(), 501)
+  assert.strictEqual(realUidCalls, 0)
+  assert.strictEqual(selectExecutableEffectiveUid({
+    getuid: () => 0
+  })(), 0)
+  assert.strictEqual(selectExecutableEffectiveUid({}), undefined)
+}
+
+function testInvalidDatabaseTargetsFailClosed() {
+  const directory = fs.mkdtempSync(path.join(os.tmpdir(), 'kinvest-db-target-'))
+  const realDatabasePath = path.join(directory, 'real.sqlite')
+  const database = new DatabaseSync(realDatabasePath)
+  const repository = new DeviceAuthRepository(database)
+  repository.initialize()
+  insertCredential(repository, 9, 100)
+  database.close()
+  fs.chmodSync(realDatabasePath, 0o600)
+
+  const missingPath = path.join(directory, 'missing.sqlite')
+  const relativePath = path.relative(process.cwd(), missingPath)
+  const symlinkPath = path.join(directory, 'linked.sqlite')
+  fs.symlinkSync(realDatabasePath, symlinkPath)
+  const directoryPath = path.join(directory, 'not-a-file')
+  fs.mkdirSync(directoryPath)
+
+  const expectInvalid = (databasePath) => expectCode(() => revokeAllDevices({
+    databasePath,
+    now: () => 200,
+    effectiveUid: () => 0,
+    stdout: { write() {} }
+  }), 'DEVICE_REVOKE_DATABASE_INVALID')
+
+  expectInvalid(missingPath)
+  assert.strictEqual(fs.existsSync(missingPath), false)
+  expectInvalid(relativePath)
+  assert.strictEqual(fs.existsSync(missingPath), false)
+  expectInvalid(symlinkPath)
+  expectInvalid(directoryPath)
+  fs.chmodSync(realDatabasePath, 0o644)
+  expectInvalid(realDatabasePath)
+
+  const verify = new DatabaseSync(realDatabasePath)
+  assert.strictEqual(Number(verify.prepare(`
+    SELECT COUNT(*) AS count
+    FROM device_credentials
+    WHERE revoked_at IS NOT NULL
+  `).get().count), 0)
+  verify.close()
+  fs.rmSync(directory, { recursive: true, force: true })
 }
 
 function testRootRevokesAllWithAuditAndSafeRepeat() {
@@ -79,12 +128,13 @@ function testRootRevokesAllWithAuditAndSafeRepeat() {
   insertCredential(setupRepository, 1, now)
   insertCredential(setupRepository, 2, now)
   setupDatabase.close()
+  fs.chmodSync(databasePath, 0o600)
 
   const output = []
   assert.strictEqual(revokeAllDevices({
     databasePath,
     now: () => now,
-    getuid: () => 0,
+    effectiveUid: () => 0,
     stdout: { write: (value) => output.push(String(value)) }
   }), 2)
   assert.strictEqual(output.join(''),
@@ -108,7 +158,7 @@ function testRootRevokesAllWithAuditAndSafeRepeat() {
   assert.strictEqual(revokeAllDevices({
     databasePath,
     now: () => now + 1,
-    getuid: () => 0,
+    effectiveUid: () => 0,
     stdout: { write: (value) => repeatOutput.push(String(value)) }
   }), 0)
   assert.strictEqual(repeatOutput.join(''),
@@ -127,7 +177,9 @@ function testRootRevokesAllWithAuditAndSafeRepeat() {
 
 async function run() {
   testNonRootFailsBeforeDatabaseOpen()
-  testMissingOrNonfunctionGetuidFailsBeforeDatabaseOpen()
+  testMissingOrNonfunctionEffectiveUidFailsBeforeDatabaseOpen()
+  testExecutableEffectiveUidPrefersEffectiveIdentity()
+  testInvalidDatabaseTargetsFailClosed()
   testRootRevokesAllWithAuditAndSafeRepeat()
 }
 

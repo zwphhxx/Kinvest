@@ -1,3 +1,4 @@
+const fs = require('node:fs')
 const path = require('node:path')
 const { DatabaseSync } = require('node:sqlite')
 const { DeviceAuthRepository } = require('../db/device-auth-repository')
@@ -7,6 +8,7 @@ const DEFAULT_DATABASE_PATH = path.join(__dirname, '../data/kinvest.sqlite')
 class DeviceRevokeError extends Error {
   constructor(code) {
     const messages = {
+      DEVICE_REVOKE_DATABASE_INVALID: 'The device database target is invalid',
       DEVICE_REVOKE_FAILED: 'Device revocation failed',
       DEVICE_REVOKE_ROOT_REQUIRED: 'Root privileges are required'
     }
@@ -16,22 +18,47 @@ class DeviceRevokeError extends Error {
   }
 }
 
+function selectExecutableEffectiveUid(processRef) {
+  if (processRef && typeof processRef.geteuid === 'function') {
+    return processRef.geteuid.bind(processRef)
+  }
+  if (processRef && typeof processRef.getuid === 'function') {
+    return processRef.getuid.bind(processRef)
+  }
+  return undefined
+}
+
+function assertValidDatabaseTarget(databasePath) {
+  if (typeof databasePath !== 'string' || !path.isAbsolute(databasePath)) {
+    throw new DeviceRevokeError('DEVICE_REVOKE_DATABASE_INVALID')
+  }
+  let stats
+  try {
+    stats = fs.lstatSync(databasePath)
+  } catch {
+    throw new DeviceRevokeError('DEVICE_REVOKE_DATABASE_INVALID')
+  }
+  if (stats.isSymbolicLink() || !stats.isFile() || (stats.mode & 0o077) !== 0) {
+    throw new DeviceRevokeError('DEVICE_REVOKE_DATABASE_INVALID')
+  }
+}
+
 function run({
   databasePath,
   now = Date.now,
-  getuid,
+  effectiveUid,
   stdout = process.stdout
 } = {}) {
-  if (typeof getuid !== 'function' || getuid() !== 0) {
+  if (typeof effectiveUid !== 'function' || effectiveUid() !== 0) {
     throw new DeviceRevokeError('DEVICE_REVOKE_ROOT_REQUIRED')
   }
 
   let database
   try {
-    if (typeof databasePath !== 'string' || databasePath.length === 0 ||
-      typeof now !== 'function' || !stdout || typeof stdout.write !== 'function') {
+    if (typeof now !== 'function' || !stdout || typeof stdout.write !== 'function') {
       throw new DeviceRevokeError('DEVICE_REVOKE_FAILED')
     }
+    assertValidDatabaseTarget(databasePath)
     database = new DatabaseSync(databasePath)
     const repository = new DeviceAuthRepository(database)
     repository.initialize()
@@ -63,7 +90,7 @@ if (require.main === module) {
   try {
     run({
       databasePath: process.env.KINVEST_DB_PATH || DEFAULT_DATABASE_PATH,
-      getuid: process.getuid
+      effectiveUid: selectExecutableEffectiveUid(process)
     })
   } catch (error) {
     const code = error instanceof DeviceRevokeError
@@ -76,5 +103,6 @@ if (require.main === module) {
 
 module.exports = {
   DeviceRevokeError,
-  run
+  run,
+  selectExecutableEffectiveUid
 }
