@@ -1,5 +1,8 @@
 const assert = require('assert')
 const crypto = require('crypto')
+const fs = require('node:fs')
+const os = require('node:os')
+const path = require('node:path')
 const { DatabaseSync } = require('node:sqlite')
 const {
   MockSecretProvider,
@@ -29,8 +32,8 @@ function createRandomSource() {
 }
 
 function createHarness(options = {}) {
-  const database = new DatabaseSync(':memory:')
-  const repository = new DeviceAuthRepository(database)
+  const database = options.database || new DatabaseSync(':memory:')
+  const repository = options.repository || new DeviceAuthRepository(database)
   repository.initialize()
 
   const clock = {
@@ -50,6 +53,21 @@ function createHarness(options = {}) {
   })
 
   return { clock, database, repository, secretProvider, service }
+}
+
+class InterleavingDeviceAuthRepository extends DeviceAuthRepository {
+  armBeforeNextTransaction(operation) {
+    this.beforeNextTransaction = operation
+  }
+
+  runInImmediateTransaction(operation) {
+    if (this.beforeNextTransaction) {
+      const interleave = this.beforeNextTransaction
+      this.beforeNextTransaction = null
+      interleave()
+    }
+    return super.runInImmediateTransaction(operation)
+  }
 }
 
 function createTrackingSecretProvider() {
@@ -827,12 +845,57 @@ function testHmacBuffersAreClearedAcrossAllPaths() {
   assertReturnedSecretsCleared(failureProvider)
 }
 
+function testAuthenticationRejectsCommittedRevocationBeforeCas() {
+  const directory = fs.mkdtempSync(path.join(os.tmpdir(), 'kinvest-auth-cas-'))
+  const databasePath = path.join(directory, 'device-auth.sqlite')
+  const primaryDatabase = new DatabaseSync(databasePath)
+  const secondaryDatabase = new DatabaseSync(databasePath)
+  const primaryRepository = new InterleavingDeviceAuthRepository(primaryDatabase)
+  const secondaryRepository = new DeviceAuthRepository(secondaryDatabase)
+  const revokeAll = (now) => secondaryRepository.runInImmediateTransaction(() => {
+    const count = secondaryRepository.revokeAllCredentials(now)
+    secondaryRepository.addAuditEvent(
+      'device_credentials_revoked_all',
+      now,
+      null,
+      { count }
+    )
+  })
+
+  try {
+    const ordinary = createHarness({
+      database: primaryDatabase,
+      repository: primaryRepository
+    })
+    const ordinaryCredential = issueDevice(ordinary).credential
+    primaryRepository.armBeforeNextTransaction(() =>
+      revokeAll(ordinary.clock.value))
+    expectCode(() => ordinary.service.authenticate(ordinaryCredential.token),
+      'TOKEN_INVALID')
+
+    const graceCredential = issueDevice(ordinary).credential
+    ordinary.service.setActiveHmacVersionId(VERSION_TWO)
+    ordinary.clock.value += 30 * DAY_MS
+    const replacement = ordinary.service.authenticate(graceCredential.token)
+    assert.strictEqual(replacement.rotated, true)
+    primaryRepository.armBeforeNextTransaction(() =>
+      revokeAll(ordinary.clock.value))
+    expectCode(() => ordinary.service.authenticate(graceCredential.token),
+      'TOKEN_INVALID')
+  } finally {
+    primaryDatabase.close()
+    secondaryDatabase.close()
+    fs.rmSync(directory, { recursive: true, force: true })
+  }
+}
+
 async function run() {
   testExpandMigrationIsIdempotentAndPreservesLegacyRows()
   testDeviceNameAndIpDigestValidation()
   testDeviceNameSurvivesRedemptionAndRotation()
   testSafeListingsDoNotExposeDigests()
   testHmacBuffersAreClearedAcrossAllPaths()
+  testAuthenticationRejectsCommittedRevocationBeforeCas()
   testSecretProviderContract()
   testRequestApprovalAndRedemption()
   testRequestExpiryAndAttemptLock()

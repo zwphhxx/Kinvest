@@ -326,6 +326,30 @@ class DeviceApprovalService {
         )) {
           throw new DeviceApprovalError('TOKEN_INVALID')
         }
+        const replacementIdleExpiresAt = Math.min(
+          now + TOKEN_IDLE_MS,
+          replacement.absoluteExpiresAt
+        )
+        const touched = this.repository.runInImmediateTransaction(() => {
+          const updated = this.repository.updateReplacementUseDuringGrace({
+            oldCredentialId: credential.credentialId,
+            replacementCredentialId: replacement.credentialId,
+            lastUsedAt: now,
+            idleExpiresAt: replacementIdleExpiresAt
+          })
+          if (!updated) return false
+          this.repository.addAuditEvent(
+            'device_credential_authenticated',
+            now,
+            replacement.credentialId,
+            {
+              credentialId: replacement.credentialId,
+              deviceId: replacement.deviceId
+            }
+          )
+          return true
+        })
+        if (!touched) throw new DeviceApprovalError('TOKEN_INVALID')
         return {
           authenticated: true,
           credentialId: credential.credentialId,
@@ -348,8 +372,12 @@ class DeviceApprovalService {
     }
 
     const idleExpiresAt = Math.min(now + TOKEN_IDLE_MS, credential.absoluteExpiresAt)
-    this.repository.runInImmediateTransaction(() => {
-      this.repository.updateCredentialUse(credential.credentialId, now, idleExpiresAt)
+    const touched = this.repository.runInImmediateTransaction(() => {
+      if (!this.repository.updateCredentialUse(
+        credential.credentialId,
+        now,
+        idleExpiresAt
+      )) return false
       this.repository.addAuditEvent(
         'device_credential_authenticated',
         now,
@@ -359,7 +387,9 @@ class DeviceApprovalService {
           deviceId: credential.deviceId
         }
       )
+      return true
     })
+    if (!touched) throw new DeviceApprovalError('TOKEN_INVALID')
     return {
       authenticated: true,
       credentialId: credential.credentialId,
@@ -558,7 +588,8 @@ class DeviceApprovalService {
         if (!this.repository.rotateCredential(
           credential.credentialId,
           issued.record,
-          graceExpiresAt
+          graceExpiresAt,
+          now
         )) {
           throw new DeviceApprovalError('TOKEN_REPLACED')
         }

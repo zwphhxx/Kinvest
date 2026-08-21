@@ -275,14 +275,56 @@ class DeviceAuthRepository {
   }
 
   updateCredentialUse(credentialId, lastUsedAt, idleExpiresAt) {
-    this.database.prepare(`
+    const result = this.database.prepare(`
       UPDATE device_credentials
       SET last_used_at = ?, idle_expires_at = ?
-      WHERE credential_id = ? AND revoked_at IS NULL
-    `).run(lastUsedAt, idleExpiresAt, credentialId)
+      WHERE credential_id = ?
+        AND revoked_at IS NULL
+        AND replacement_credential_id IS NULL
+        AND idle_expires_at > ?
+        AND absolute_expires_at > ?
+    `).run(lastUsedAt, idleExpiresAt, credentialId, lastUsedAt, lastUsedAt)
+    return Number(result.changes) === 1
   }
 
-  rotateCredential(oldCredentialId, replacement, graceExpiresAt) {
+  updateReplacementUseDuringGrace({
+    oldCredentialId,
+    replacementCredentialId,
+    lastUsedAt,
+    idleExpiresAt
+  }) {
+    const result = this.database.prepare(`
+      UPDATE device_credentials
+      SET last_used_at = ?, idle_expires_at = ?
+      WHERE credential_id = ?
+        AND revoked_at IS NULL
+        AND replacement_credential_id IS NULL
+        AND idle_expires_at > ?
+        AND absolute_expires_at > ?
+        AND EXISTS (
+          SELECT 1
+          FROM device_credentials AS old
+          WHERE old.credential_id = ?
+            AND old.revoked_at IS NULL
+            AND old.replacement_credential_id = ?
+            AND old.replacement_grace_expires_at > ?
+            AND old.absolute_expires_at > ?
+        )
+    `).run(
+      lastUsedAt,
+      idleExpiresAt,
+      replacementCredentialId,
+      lastUsedAt,
+      lastUsedAt,
+      oldCredentialId,
+      replacementCredentialId,
+      lastUsedAt,
+      lastUsedAt
+    )
+    return Number(result.changes) === 1
+  }
+
+  rotateCredential(oldCredentialId, replacement, graceExpiresAt, now) {
     const original = this.database.prepare(`
       SELECT device_name
       FROM device_credentials
@@ -294,7 +336,15 @@ class DeviceAuthRepository {
       WHERE credential_id = ?
         AND revoked_at IS NULL
         AND replacement_credential_id IS NULL
-    `).run(replacement.credentialId, graceExpiresAt, oldCredentialId)
+        AND idle_expires_at > ?
+        AND absolute_expires_at > ?
+    `).run(
+      replacement.credentialId,
+      graceExpiresAt,
+      oldCredentialId,
+      now,
+      now
+    )
     if (Number(changed.changes) !== 1) {
       return false
     }
