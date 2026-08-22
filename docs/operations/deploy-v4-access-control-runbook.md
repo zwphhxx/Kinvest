@@ -75,13 +75,20 @@ With no install journal, deploy-v3 still delegates to the old assets; deploy-v4
 delegates only after its complete asset closure exists. With a journal, both
 paths return `DEPLOY_INSTALL_INCOMPLETE` before executing any deploy asset.
 
-The installer creates `/var/lib/kinvest-deploy-gate` as root-owned `0755` and a
-persistent root-owned, deploy-group-owned `0640` `install.lock` before
-atomically installing the stable gate. The default group is the repository's
-existing forced-command user primary group, `kinvest-deploy`. A root operator
-may set the non-secret `KINVEST_DEPLOY_GATE_GROUP`, but installation rejects an
-invalid name, missing group, or group that does not contain the
-`kinvest-deploy` user.
+The installer requires both non-secret `KINVEST_DEPLOY_GATE_USER` and
+`KINVEST_DEPLOY_GATE_GROUP`; there are no guessed defaults. For the current
+Production host, set both to `lighthouse` only after read-only `getent` and `id`
+checks confirm that the `lighthouse` group exists and the `lighthouse` user is
+already a member. If its real primary or supplementary group differs, use that
+observed group instead. The installer never creates users or changes group
+membership.
+
+The installer creates `/var/lib/kinvest-deploy-gate` as
+`root:<KINVEST_DEPLOY_GATE_GROUP>` `0750`. The directory itself is the flock
+object; there is no replaceable lock file. The gate records the installed user,
+group, and numeric gid in a non-secret `0640` identity file. A later invocation
+must provide the same identity. A change is rejected with a stable error and
+requires a separately reviewed identity-migration procedure.
 
 The installer takes an exclusive gate lock before the shared private
 `deploy.lock` and holds both through gate installation, reconciliation,
@@ -99,9 +106,12 @@ after a timeout. A busy lock, unsafe metadata, missing group access,
 permission/stat failure, or root-owned `0644` `install-incomplete` marker produces
 `DEPLOY_INSTALL_INCOMPLETE` before sudo. The public marker contains only the
 fixed line `ACTIVE`; ordinary users can read it but cannot change or replace it.
-Only members of the trusted forced-command deployment group can open and hold
-the shared lock, and that group already controls Production deployment
-availability.
+Only members of the explicitly configured trusted forced-command deployment
+group can open the directory and hold its shared lock. That trusted principal
+already controls Production deployment availability. The Production workflow
+also compares protected secret `SSH_USER` with the non-secret
+`KINVEST_DEPLOY_GATE_USER` after approval and fails without printing either
+value when they differ.
 
 The subsequent v4 transaction includes the shared deployer, both v3 and v4
 contract paths, Compose, sudoers, and configuration. Before publishing
@@ -127,12 +137,13 @@ successful install removes and fsyncs the private journal first, then removes
 and fsyncs the public marker. The private journal remains root-only `0600` and
 its backup directory remains root-only `0700`.
 
-The installer tracks same-directory `.install-lock.XXXXXX` and
-`.install-incomplete.XXXXXX` files. Ordinary failure removes tracked files and
-fsyncs the public directory. On reentry it removes a SIGKILL orphan only when
-the basename is exact, it is a direct regular non-symlink child with one link,
-and owner/group/mode/content match the expected lock or marker contract. An
-unexpected owner, mode, symlink, malformed name, or additional hard link stops
+The installer tracks same-directory `.install-incomplete.XXXXXX` files.
+Ordinary failure removes only the exact inode it created when it remains a
+root-owned regular file with one link, then fsyncs the directory. On reentry,
+after taking the directory's exclusive lock, it removes a SIGKILL orphan only
+when the basename is exact and it is a direct root-owned regular non-symlink
+child with one link; partial mode or content is expected. An unexpected owner,
+symlink, malformed name, or additional hard link stops
 installation without deleting the suspicious file.
 
 If a protocol-v4 RESTORE has already switched runtime to a newly approved tmpfs

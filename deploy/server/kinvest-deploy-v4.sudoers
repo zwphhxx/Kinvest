@@ -1,1 +1,0 @@
-kinvest-deploy ALL=(root) NOPASSWD: /usr/local/sbin/deploy-kinvest-v4 ""

@@ -13,7 +13,7 @@ function writeExecutable(file, source) {
   fs.writeFileSync(file, source, { mode: 0o755 })
 }
 
-function fixture({ existing = true, replaceFailure = null, postFailure = false, rollbackPause = false, pauseBeforeGate = false, killAfterReplacement = null, killStage = '', failGateTemp = '', killGateTemp = '' } = {}) {
+function fixture({ existing = true, replaceFailure = null, postFailure = false, rollbackPause = false, pauseBeforeGate = false, killAfterReplacement = null, killStage = '', failGateTemp = '', killGateTemp = '', killGateTempStage = '' } = {}) {
   const base = fs.mkdtempSync(path.join(os.tmpdir(), 'kinvest-v4-installer-'))
   const sbin = path.join(base, 'sbin')
   const libexec = path.join(base, 'libexec')
@@ -64,11 +64,20 @@ exit 1
 [[ ! -d "\${INSTALLER_LOCK_DIR:-}" ]]
 `)
   writeExecutable(path.join(bin, 'getent'), `#!/usr/bin/env bash
-[[ "$1" == group && "$2" == kinvest-deploy ]] || exit 2
-printf 'kinvest-deploy:x:%s:\n' "${process.getgid()}"
+case "$1:$2:\${FAKE_IDENTITY_MODE:-}" in
+  passwd:lighthouse:missing-user) exit 2 ;;
+  group:lighthouse:missing-group) exit 2 ;;
+  passwd:lighthouse:*|passwd:alternate:*) printf '%s:x:%s:%s:Deploy:/nonexistent:/usr/sbin/nologin\n' "$2" "${Math.max(process.getuid(), 1)}" "${process.getgid()}" ;;
+  group:lighthouse:*) printf '%s:x:%s:\n' "$2" "${process.getgid()}" ;;
+  group:alternate:*) printf '%s:x:%s:\n' "$2" "${process.getgid() + 1}" ;;
+  *) exit 2 ;;
+esac
 `)
   writeExecutable(path.join(bin, 'id'), `#!/usr/bin/env bash
-if [[ "$1" == -G && "$2" == kinvest-deploy ]]; then printf '%s\n' "${process.getgid()}"; exit 0; fi
+if [[ "$1" == -G && ( "$2" == lighthouse || "$2" == alternate ) ]]; then
+  if [[ "\${FAKE_IDENTITY_MODE:-}" == membership-mismatch ]]; then printf '99999\n'; elif [[ "$2" == alternate ]]; then printf '%s\n' "${process.getgid() + 1}"; else printf '%s\n' "${process.getgid()}"; fi
+  exit 0
+fi
 exec /usr/bin/id "$@"
 `)
   writeExecutable(path.join(bin, 'sha256sum'), `#!/usr/bin/env bash
@@ -120,10 +129,14 @@ exec /bin/mv -f "\${args[@]}"
     .replace('[[ "$(id -u)" -eq 0 ]]', '[[ "${KINVEST_INSTALL_V4_TEST_ROOT:-}" == 1 ]]')
     .replaceAll('-o root -g root', `-o ${process.getuid()} -g ${process.getgid()}`)
     .replaceAll('chown root:root', `chown ${process.getuid()}:${process.getgid()}`)
+    .replaceAll('-o root -g "$GATE_GROUP"', `-o ${process.getuid()} -g ${process.getgid()}`)
+    .replaceAll('chown root:"$GATE_GROUP"', `chown ${process.getuid()}:${process.getgid()}`)
     .replace('fsync_file() {', `fsync_file() {
   printf 'file:%s\\n' "$1" >>'${fsyncTrace}'`)
     .replace('file_attributes() {', `file_attributes() {
   if [[ -n "\${FAKE_BAD_OWNER_PATH:-}" && "$1" == "$FAKE_BAD_OWNER_PATH" ]]; then printf '99999:99999:640\\n'; return; fi`)
+    .replace('gate_inode_identity() {', `gate_inode_identity() {
+  if [[ -n "\${FAKE_BAD_OWNER_PATH:-}" && "$1" == "$FAKE_BAD_OWNER_PATH" ]]; then printf '1:1:99999:1:1\\n'; return; fi`)
     .replace('fsync_directory() {', `fsync_directory() {
   printf 'dir:%s\\n' "$1" >>'${fsyncTrace}'`)
     .replace('publish_install_journal() {', `publish_install_journal() {
@@ -157,17 +170,24 @@ if [[ ! -e '${killMarker}' ]]; then : >'${killMarker}'; kill -KILL $$; fi`]
     const [point, replacement] = points[killStage]
     instrumented = instrumented.replace(point, () => replacement)
   }
-  for (const [kind, injection] of [['lock', failGateTemp], ['marker', failGateTemp]]) {
-    if (injection === kind) {
-      const point = kind === 'lock' ? '# gate-lock-temp-created' : '# gate-marker-temp-created'
-      instrumented = instrumented.replace(point, `${point}\n  return 1 # injected gate temp failure`)
-    }
+  if (failGateTemp === 'marker') {
+    const point = '# gate-marker-temp-created'
+    instrumented = instrumented.replace(point, `${point}\n  return 1 # injected gate temp failure`)
   }
-  for (const [kind, injection] of [['lock', killGateTemp], ['marker', killGateTemp]]) {
-    if (injection === kind) {
-      const point = kind === 'lock' ? '# gate-lock-temp-created' : '# gate-marker-temp-created'
-      instrumented = instrumented.replace(point, () => `${point}\n  if [[ ! -e '${killMarker}' ]]; then : >'${killMarker}'; kill -KILL $$; fi`)
+  if (killGateTemp === 'marker') {
+    const point = '# gate-marker-temp-created'
+    instrumented = instrumented.replace(point, () => `${point}\n  if [[ ! -e '${killMarker}' ]]; then : >'${killMarker}'; kill -KILL $$; fi`)
+  }
+  if (killGateTempStage) {
+    const points = {
+      created: '# gate-marker-temp-created',
+      written: '  printf \'%s\\n\' ACTIVE >"$gate_marker_temporary"',
+      owned: `  chown ${process.getuid()}:${process.getgid()} "$gate_marker_temporary"`,
+      mode: '  chmod 0640 "$gate_marker_temporary"',
+      durable: '  fsync_file "$gate_marker_temporary"'
     }
+    const point = points[killGateTempStage]
+    instrumented = instrumented.replace(point, () => `${point}\n  if [[ ! -e '${killMarker}' ]]; then : >'${killMarker}'; kill -KILL $$; fi`)
   }
   if (postFailure) {
     instrumented = instrumented.replace(
@@ -200,6 +220,8 @@ function installerEnvironment(context, overrides = {}) {
   return {
     ...process.env,
     KINVEST_INSTALL_V4_TEST_ROOT: '1',
+    KINVEST_DEPLOY_GATE_USER: 'lighthouse',
+    KINVEST_DEPLOY_GATE_GROUP: 'lighthouse',
     PATH: `${context.bin}:${process.env.PATH}`,
     REAL_SHA256SUM: spawnSync('which', ['sha256sum'], { encoding: 'utf8' }).stdout.trim(),
     FSYNC_TRACE: context.fsyncTrace,
@@ -218,8 +240,8 @@ function fixtureGateSource(context, source) {
   return source
     .replace("GATE_STATE_DIR='/var/lib/kinvest-deploy-gate'", `GATE_STATE_DIR='${context.gateStateDir}'`)
     .replace('/usr/bin/flock', path.join(context.bin, 'gate-flock'))
-    .replaceAll('info.st_uid != 0', `info.st_uid != ${process.getuid()}`)
-    .replaceAll('info.st_gid != 0', `info.st_gid != ${process.getgid()}`)
+    .replaceAll('directory_info.st_uid != 0', `directory_info.st_uid != ${process.getuid()}`)
+    .replaceAll('marker_info.st_uid != 0', `marker_info.st_uid != ${process.getuid()}`)
 }
 
 function waitFor(check, timeoutMs = 2000) {
@@ -280,23 +302,51 @@ function canWriteAs(info, uid, gid) {
 
 async function run() {
   assert.doesNotMatch(installerSource, /systemctl restart|docker compose|DEPLOY_V4_ENABLED/)
+  assert.doesNotMatch(installerSource, /install\.lock|\.install-lock\./)
+  assert.doesNotMatch(installerSource, /DEPLOY_USER='kinvest-deploy'/)
+  assert.match(installerSource, /KINVEST_DEPLOY_GATE_USER:-/)
+  assert.match(installerSource, /KINVEST_DEPLOY_GATE_GROUP:-/)
+  assert.equal(fs.existsSync(path.join(sourceDir, 'kinvest-deploy-v4.sudoers.in')), true)
+  assert.match(fs.readFileSync(path.join(sourceDir, 'kinvest-deploy-v4.sudoers.in'), 'utf8'), /@KINVEST_DEPLOY_GATE_USER@/)
+  assert.doesNotMatch(fs.readFileSync(path.join(sourceDir, 'kinvest-deploy-v4.sudoers.in'), 'utf8'), /kinvest-deploy/)
   assert.doesNotMatch(gateSource, /\/root\/docker\/kinvest/)
   assert.match(gateSource, /\/var\/lib\/kinvest-deploy-gate/)
   assert.doesNotMatch(gateSource, /timeout|sleep|retry/i)
+
+  const missingIdentity = fixture()
+  try {
+    const env = installerEnvironment(missingIdentity)
+    delete env.KINVEST_DEPLOY_GATE_USER
+    delete env.KINVEST_DEPLOY_GATE_GROUP
+    const result = spawnSync('bash', [missingIdentity.script, sourceDir], { encoding: 'utf8', env })
+    assert.notEqual(result.status, 0)
+    assert.match(result.stderr, /DEPLOY_V4_GATE_IDENTITY_REQUIRED/)
+  } finally {
+    fs.rmSync(missingIdentity.base, { recursive: true, force: true })
+  }
+
+  for (const mode of ['missing-user', 'missing-group', 'membership-mismatch']) {
+    const invalidIdentity = fixture()
+    try {
+      const result = execute(invalidIdentity, { FAKE_IDENTITY_MODE: mode })
+      assert.notEqual(result.status, 0, mode)
+      assert.match(result.stderr, /DEPLOY_V4_GATE_IDENTITY_INVALID/, mode)
+    } finally {
+      fs.rmSync(invalidIdentity.base, { recursive: true, force: true })
+    }
+  }
 
   const gatePermissionBase = fs.mkdtempSync(path.join(os.tmpdir(), 'kinvest-v4-gate-'))
   try {
     const publicState = path.join(gatePermissionBase, 'public')
     const privateState = path.join(gatePermissionBase, 'private')
-    const lock = path.join(publicState, 'install.lock')
     const marker = path.join(publicState, 'install-incomplete')
     const ready = path.join(gatePermissionBase, 'exclusive.ready')
     const bin = path.join(gatePermissionBase, 'bin')
-    fs.mkdirSync(publicState, { mode: 0o755 })
+    fs.mkdirSync(publicState, { mode: 0o750 })
     fs.mkdirSync(privateState, { mode: 0o700 })
     fs.mkdirSync(bin)
     fs.writeFileSync(path.join(privateState, 'install-v4.journal'), 'private\n', { mode: 0o600 })
-    fs.writeFileSync(lock, '', { mode: 0o640 })
     fs.chmodSync(privateState, 0o000)
     writeExecutable(path.join(bin, 'sudo'), '#!/bin/sh\nexit 0\n')
     writeExecutable(path.join(bin, 'flock'), `#!/usr/bin/env bash
@@ -330,30 +380,34 @@ PY
 
     const holder = spawn('python3', ['-c', [
       'import fcntl,os,sys,time',
-      'f=open(sys.argv[1], "r+")',
-      'fcntl.flock(f, fcntl.LOCK_EX)',
+      'fd=os.open(sys.argv[1], os.O_RDONLY | os.O_DIRECTORY)',
+      'fcntl.flock(fd, fcntl.LOCK_EX)',
       'open(sys.argv[2], "w").close()',
       'time.sleep(30)'
-    ].join(';'), lock, ready], { stdio: 'ignore' })
+    ].join(';'), publicState, ready], { stdio: 'ignore' })
     await waitFor(() => fs.existsSync(ready))
     const busy = spawnSync(gate, [], { encoding: 'utf8', env: gateEnv })
     assert.equal(busy.status, 76)
     assert.equal(busy.stderr, 'DEPLOY_INSTALL_INCOMPLETE\n')
-    fs.writeFileSync(marker, 'ACTIVE\n', { mode: 0o644 })
+    fs.writeFileSync(marker, 'ACTIVE\n', { mode: 0o640 })
     holder.kill('SIGKILL')
     await waitForExit(holder)
     const stale = spawnSync(gate, [], { encoding: 'utf8', env: gateEnv })
     assert.equal(stale.status, 76)
     assert.equal(stale.stderr, 'DEPLOY_INSTALL_INCOMPLETE\n')
 
-    const lockInfo = fs.statSync(lock)
+    const directoryInfo = fs.statSync(publicState)
     const markerInfo = fs.statSync(marker)
-    assert.equal(canWriteAs(lockInfo, uid + 1, gid + 1), false)
+    assert.equal(canWriteAs(directoryInfo, uid + 1, gid + 1), false)
     assert.equal(canWriteAs(markerInfo, uid + 1, gid + 1), false)
-    fs.chmodSync(lock, 0o666)
+    fs.chmodSync(publicState, 0o755)
     assert.equal(spawnSync(gate, [], { encoding: 'utf8', env: gateEnv }).status, 76)
-    fs.chmodSync(lock, 0o640)
+    fs.chmodSync(publicState, 0o750)
     fs.rmSync(marker)
+    const orphan = path.join(publicState, '.install-incomplete.AbC123')
+    fs.writeFileSync(orphan, 'partial', { mode: 0o600 })
+    assert.equal(spawnSync(gate, [], { encoding: 'utf8', env: gateEnv }).status, 76)
+    fs.rmSync(orphan)
     const reconciled = spawnSync(gate, [], { encoding: 'utf8', env: gateEnv })
     assert.equal(reconciled.status, 0, reconciled.stderr)
   } finally {
@@ -363,29 +417,26 @@ PY
 
   const legalTemps = fixture()
   try {
-    fs.mkdirSync(legalTemps.gateStateDir, { mode: 0o755 })
-    const legalLockTemp = path.join(legalTemps.gateStateDir, '.install-lock.AbC123')
+    fs.mkdirSync(legalTemps.gateStateDir, { mode: 0o750 })
     const legalMarkerTemp = path.join(legalTemps.gateStateDir, '.install-incomplete.XyZ789')
-    fs.writeFileSync(legalLockTemp, '', { mode: 0o640 })
-    fs.writeFileSync(legalMarkerTemp, 'ACTIVE\n', { mode: 0o644 })
+    fs.writeFileSync(legalMarkerTemp, 'partial', { mode: 0o600 })
     const result = execute(legalTemps)
     assert.equal(result.status, 0, result.stderr)
-    assert.equal(fs.existsSync(legalLockTemp), false)
     assert.equal(fs.existsSync(legalMarkerTemp), false)
   } finally {
     fs.rmSync(legalTemps.base, { recursive: true, force: true })
   }
 
-  for (const fault of ['symlink', 'wrong-mode', 'wrong-owner', 'hardlink']) {
+  for (const fault of ['symlink', 'wrong-owner', 'hardlink', 'malformed-name']) {
     const malicious = fixture()
     try {
-      fs.mkdirSync(malicious.gateStateDir, { mode: 0o755 })
-      const candidate = path.join(malicious.gateStateDir, '.install-lock.Bad123')
+      fs.mkdirSync(malicious.gateStateDir, { mode: 0o750 })
+      const candidate = path.join(malicious.gateStateDir, fault === 'malformed-name' ? '.install-incomplete.bad!' : '.install-incomplete.Bad123')
       const overrides = {}
       if (fault === 'symlink') {
         fs.symlinkSync('/dev/null', candidate)
       } else {
-        fs.writeFileSync(candidate, '', { mode: fault === 'wrong-mode' ? 0o666 : 0o640 })
+        fs.writeFileSync(candidate, '', { mode: 0o600 })
         if (fault === 'wrong-owner') overrides.FAKE_BAD_OWNER_PATH = candidate
         if (fault === 'hardlink') fs.linkSync(candidate, path.join(malicious.base, 'extra-hardlink'))
       }
@@ -398,7 +449,7 @@ PY
     }
   }
 
-  for (const kind of ['lock', 'marker']) {
+  for (const kind of ['marker']) {
     const failedTemp = fixture({ failGateTemp: kind })
     try {
       const result = execute(failedTemp)
@@ -414,12 +465,34 @@ PY
     try {
       const killed = execute(killedTemp)
       assert.equal(killed.signal, 'SIGKILL', `${kind}: status=${killed.status} stderr=${killed.stderr}`)
-      assert.ok(fs.readdirSync(killedTemp.gateStateDir).some((name) => name.startsWith(`.install-${kind === 'lock' ? 'lock' : 'incomplete'}.`)), kind)
+      assert.ok(fs.readdirSync(killedTemp.gateStateDir).some((name) => name.startsWith('.install-incomplete.')), kind)
       const resumed = execute(killedTemp)
       assert.equal(resumed.status, 0, resumed.stderr)
       assert.deepEqual(fs.readdirSync(killedTemp.gateStateDir).filter((name) => name.startsWith('.install-')), [], kind)
     } finally {
       fs.rmSync(killedTemp.base, { recursive: true, force: true })
+    }
+  }
+
+  for (const stage of ['created', 'written', 'owned', 'mode', 'durable']) {
+    const interrupted = fixture({ killGateTempStage: stage })
+    try {
+      const killed = execute(interrupted)
+      assert.equal(killed.signal, 'SIGKILL', stage)
+      assert.ok(fs.readdirSync(interrupted.gateStateDir).some((name) => name.startsWith('.install-incomplete.')), stage)
+      const gateHarness = path.join(interrupted.base, `temp-gate-${stage}`)
+      writeExecutable(gateHarness, fixtureGateSource(interrupted, fs.readFileSync(interrupted.gate, 'utf8')))
+      const blocked = spawnSync(gateHarness, [], {
+        encoding: 'utf8',
+        env: { ...process.env, PATH: `${interrupted.bin}:${process.env.PATH}`, SSH_ORIGINAL_COMMAND: 'deploy-v3' }
+      })
+      assert.equal(blocked.status, 76, stage)
+      assert.equal(blocked.stderr, 'DEPLOY_INSTALL_INCOMPLETE\n', stage)
+      const resumed = execute(interrupted)
+      assert.equal(resumed.status, 0, resumed.stderr)
+      assert.deepEqual(fs.readdirSync(interrupted.gateStateDir).filter((name) => name.startsWith('.install-incomplete.')), [], stage)
+    } finally {
+      fs.rmSync(interrupted.base, { recursive: true, force: true })
     }
   }
 
@@ -621,6 +694,9 @@ PY
     assert.equal(result.status, 0, result.stderr)
     for (const target of success.targets) assert.equal(fs.existsSync(target), true)
     assert.equal(fs.readFileSync(success.targets[2], 'utf8'), fs.readFileSync(success.targets[3], 'utf8'))
+    assert.equal(fs.readFileSync(success.targets[5], 'utf8'), 'lighthouse ALL=(root) NOPASSWD: /usr/local/sbin/deploy-kinvest-v4 ""\n')
+    assert.equal(fs.readFileSync(path.join(success.gateStateDir, 'identity'), 'utf8'), `user=lighthouse\ngroup=lighthouse\ngid=${process.getgid()}\n`)
+    assert.equal(fs.existsSync(path.join(success.gateStateDir, 'install.lock')), false)
     const trace = fs.readFileSync(success.fsyncTrace, 'utf8').trim().split('\n')
     assertDurableRenames(trace, '.kinvest-v4-install.')
     const publish = trace.indexOf('publish')
@@ -645,6 +721,19 @@ PY
     assert.doesNotMatch(result.stdout + result.stderr, /systemctl|docker compose|compose up/i)
   } finally {
     fs.rmSync(success.base, { recursive: true, force: true })
+  }
+
+  const identityReentry = fixture()
+  try {
+    assert.equal(execute(identityReentry).status, 0)
+    const mismatch = execute(identityReentry, {
+      KINVEST_DEPLOY_GATE_USER: 'alternate',
+      KINVEST_DEPLOY_GATE_GROUP: 'alternate'
+    })
+    assert.notEqual(mismatch.status, 0)
+    assert.match(mismatch.stderr, /DEPLOY_V4_GATE_IDENTITY_MISMATCH/)
+  } finally {
+    fs.rmSync(identityReentry.base, { recursive: true, force: true })
   }
 }
 

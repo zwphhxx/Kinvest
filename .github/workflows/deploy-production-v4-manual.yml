@@ -192,7 +192,8 @@ jobs:
         env:
           DEPLOY_HOST: ${{ vars.DEPLOY_HOST }}
           DEPLOY_PORT: ${{ vars.DEPLOY_PORT }}
-          DEPLOY_USER: ${{ vars.DEPLOY_USER }}
+          SSH_USER: ${{ secrets.SSH_USER }}
+          KINVEST_DEPLOY_GATE_USER: ${{ vars.KINVEST_DEPLOY_GATE_USER }}
           DEPLOY_SHA: ${{ needs.validate.outputs.commit_sha }}
           IMAGE_DIGEST: ${{ needs.validate.outputs.image_digest }}
           RELEASE_SCHEMA: ${{ needs.validate.outputs.release_record_schema_version }}
@@ -206,6 +207,14 @@ jobs:
           HMAC_MATERIAL: ${{ vars.TMPFS_BOOTSTRAP_ENABLED == 'true' && secrets.KINVEST_DEVICE_TOKEN_HMAC_KEY || '' }}
         run: |
           set -euo pipefail
+          if [[ -z "${SSH_USER-}" || -z "${KINVEST_DEPLOY_GATE_USER-}" || \
+                "$SSH_USER" != "$KINVEST_DEPLOY_GATE_USER" ]]; then
+            unset SSH_USER
+            printf '%s\n' 'KINVEST_DEPLOY_GATE_IDENTITY_MISMATCH' >&2
+            exit 76
+          fi
+          deploy_user="$KINVEST_DEPLOY_GATE_USER"
+          unset SSH_USER
           secret_admin_material="${ADMIN_MATERIAL-}"
           secret_hmac_material="${HMAC_MATERIAL-}"
           unset ADMIN_MATERIAL HMAC_MATERIAL
@@ -213,7 +222,7 @@ jobs:
           [[ "$DEPLOY_HOST" =~ ^[A-Za-z0-9.-]+$ ]]
           [[ "$DEPLOY_PORT" =~ ^[0-9]{1,5}$ ]]
           ((DEPLOY_PORT >= 1 && DEPLOY_PORT <= 65535))
-          [[ "$DEPLOY_USER" =~ ^[a-z_][a-z0-9_-]*$ ]]
+          [[ "$deploy_user" =~ ^[a-z_][a-z0-9_-]{0,31}$ ]]
           [[ "$DEPLOY_SHA" =~ ^[0-9a-f]{40}$ ]]
           [[ "$IMAGE_DIGEST" =~ ^sha256:[0-9a-f]{64}$ ]]
           [[ "$RELEASE_SCHEMA" == '2' ]]
@@ -279,7 +288,7 @@ jobs:
               -o LogLevel=ERROR \
               -i "$HOME/.ssh/id_ed25519" \
               -p "$DEPLOY_PORT" \
-              "$DEPLOY_USER@$DEPLOY_HOST" \
+              "$deploy_user@$DEPLOY_HOST" \
               'deploy-v4'
       - name: Verify public HTTPS health
         shell: bash

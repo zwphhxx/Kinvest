@@ -10,16 +10,17 @@ RUN_ROOT='/run'
 BACKUP_ROOT="$SERVER_ROOT/install-backups/deploy-v4"
 INSTALL_JOURNAL="$SERVER_ROOT/state/install-v4.journal"
 GATE_STATE_DIR='/var/lib/kinvest-deploy-gate'
-GATE_INSTALL_LOCK="$GATE_STATE_DIR/install.lock"
 GATE_INSTALL_MARKER="$GATE_STATE_DIR/install-incomplete"
+GATE_IDENTITY="$GATE_STATE_DIR/identity"
 GATE_ROOT_OWNER='0:0'
-GATE_GROUP="${KINVEST_DEPLOY_GATE_GROUP:-kinvest-deploy}"
-DEPLOY_USER='kinvest-deploy'
+GATE_USER="${KINVEST_DEPLOY_GATE_USER:-}"
+GATE_GROUP="${KINVEST_DEPLOY_GATE_GROUP:-}"
 GATE_GROUP_GID=''
+GATE_IDENTITY_CONTENT=''
 GATE_SOURCE="$SOURCE_DIR/kinvest-ssh-command-v3"
 GATE_TARGET="$LOCAL_SBIN/kinvest-ssh-command"
-GATE_EXPECTED_HASH='e709368d9fb11a2ade8f29a3dd4693b471c3d5e4e853b6c409ca3df7c8ae5d87'
-SOURCE_ASSETS=('deploy-kinvest-v4' 'deploy-kinvest-v3.sh' 'deploy-v3-contract.py' 'deploy-v3-contract.py' 'docker-compose-v3.yml' 'kinvest-deploy-v4.sudoers' 'access-control-network.conf.example')
+GATE_EXPECTED_HASH='c330b139bd73706c8962b1454113586958932b35b7bcd57bbe2d96d363a64695'
+SOURCE_ASSETS=('deploy-kinvest-v4' 'deploy-kinvest-v3.sh' 'deploy-v3-contract.py' 'deploy-v3-contract.py' 'docker-compose-v3.yml' 'kinvest-deploy-v4.sudoers.in' 'access-control-network.conf.example')
 TARGETS=("$LOCAL_SBIN/deploy-kinvest-v4" "$LOCAL_SBIN/deploy-kinvest-v3" "$LOCAL_LIBEXEC/kinvest-deploy-v4-contract" "$LOCAL_LIBEXEC/kinvest-deploy-v3-contract" "$SERVER_ROOT/docker-compose-v4.yml" "$SUDOERS_DIR/kinvest-deploy-v4" "$SERVER_ROOT/access-control-network.conf.example")
 MODES=('0755' '0755' '0755' '0755' '0644' '0440' '0600')
 EXPECTED_ASSET_HASHES=(
@@ -28,7 +29,7 @@ EXPECTED_ASSET_HASHES=(
   '68040b9177cc8d2bb929a351e289eee7e9c6e446fda447ceec12d9ad382afe23'
   '68040b9177cc8d2bb929a351e289eee7e9c6e446fda447ceec12d9ad382afe23'
   '7698dd619fb6a441763f85e4e35c819af55e431c6d0ac9c4b527930d07a644aa'
-  '3001cab7876d3d03b3188aa60f25450d0010ba272e2419b10a5da2fba9ad51cf'
+  'a0c9f70f81f3b734faaf17dddc2fc35286cb70f947298da29bc131bb5f3856e5'
   'cef9b242ad3de3c2134e2a4e7e1ae1693ce55cd63bb9ac9d65710ec796309594'
 )
 
@@ -44,54 +45,43 @@ fsync_file() {
   python3 -c 'import os,sys; descriptor=os.open(sys.argv[1],os.O_RDONLY|os.O_NOFOLLOW); os.fsync(descriptor); os.close(descriptor)' "$1"
 }
 
-gate_temp_link_count() {
-  python3 -c 'import os,sys; print(os.lstat(sys.argv[1]).st_nlink)' "$1"
+gate_inode_identity() {
+  python3 -c 'import os,stat,sys; v=os.lstat(sys.argv[1]); print(f"{v.st_dev}:{v.st_ino}:{v.st_uid}:{v.st_nlink}:{int(stat.S_ISREG(v.st_mode))}")' "$1"
 }
 
-validate_gate_temp() {
-  local candidate="$1" kind="$2" basename expected
+validate_reentry_gate_temp() {
+  local candidate="$1" basename identity
   [[ "$(dirname "$candidate")" == "$GATE_STATE_DIR" ]] || return 1
   basename="$(basename "$candidate")"
-  if [[ "$kind" == lock ]]; then
-    [[ "$basename" =~ ^\.install-lock\.[A-Za-z0-9]{6}$ ]] || return 1
-    expected="${GATE_ROOT_OWNER%%:*}:$GATE_GROUP_GID:640"
-  else
-    [[ "$basename" =~ ^\.install-incomplete\.[A-Za-z0-9]{6}$ ]] || return 1
-    expected="$GATE_ROOT_OWNER:644"
-  fi
+  [[ "$basename" =~ ^\.install-incomplete\.[A-Za-z0-9]{6}$ ]] || return 1
   [[ -f "$candidate" && ! -L "$candidate" ]] || return 1
-  [[ "$(file_attributes "$candidate")" == "$expected" && "$(gate_temp_link_count "$candidate")" == 1 ]] || return 1
-  if [[ "$kind" == lock ]]; then
-    [[ ! -s "$candidate" ]] || return 1
-  else
-    [[ "$(wc -c <"$candidate" | tr -d '[:space:]')" == 7 && "$(cat "$candidate")" == ACTIVE ]] || return 1
-  fi
+  identity="$(gate_inode_identity "$candidate")" || return 1
+  [[ "$identity" =~ ^[0-9]+:[0-9]+:${GATE_ROOT_OWNER%%:*}:1:1$ ]]
+}
+
+validate_tracked_gate_temp() {
+  local candidate="$1" expected_identity="$2"
+  validate_reentry_gate_temp "$candidate" || return 1
+  [[ "$(gate_inode_identity "$candidate")" == "$expected_identity" ]]
 }
 
 cleanup_tracked_gate_temporaries() {
   local removed='false'
-  if [[ -n "${gate_lock_temporary:-}" ]]; then
-    validate_gate_temp "$gate_lock_temporary" lock || return 1
-    rm -f "$gate_lock_temporary" || return 1
-    gate_lock_temporary=''
-    removed='true'
-  fi
   if [[ -n "${gate_marker_temporary:-}" ]]; then
-    validate_gate_temp "$gate_marker_temporary" marker || return 1
+    validate_tracked_gate_temp "$gate_marker_temporary" "$gate_marker_temporary_identity" || return 1
     rm -f "$gate_marker_temporary" || return 1
     gate_marker_temporary=''
+    gate_marker_temporary_identity=''
     removed='true'
   fi
   [[ "$removed" == false ]] || fsync_directory "$GATE_STATE_DIR"
 }
 
 reconcile_gate_temporaries() {
-  local candidate basename kind removed='false'
+  local candidate removed='false'
   shopt -s nullglob
-  for candidate in "$GATE_STATE_DIR"/.install-lock.* "$GATE_STATE_DIR"/.install-incomplete.*; do
-    basename="$(basename "$candidate")"
-    if [[ "$basename" == .install-lock.* ]]; then kind=lock; else kind=marker; fi
-    validate_gate_temp "$candidate" "$kind" || { shopt -u nullglob; return 1; }
+  for candidate in "$GATE_STATE_DIR"/.install-incomplete.*; do
+    validate_reentry_gate_temp "$candidate" || { shopt -u nullglob; return 1; }
     rm -f "$candidate" || { shopt -u nullglob; return 1; }
     removed='true'
   done
@@ -99,43 +89,54 @@ reconcile_gate_temporaries() {
   [[ "$removed" == false ]] || fsync_directory "$GATE_STATE_DIR"
 }
 
-resolve_gate_group() {
-  local record name password gid members extra deploy_groups
-  [[ "$GATE_GROUP" =~ ^[a-z_][a-z0-9_-]{0,31}$ ]] || return 1
-  record="$(getent group "$GATE_GROUP")" || return 1
-  [[ "$record" != *$'\n'* && "$record" != *$'\r'* ]] || return 1
-  IFS=: read -r name password gid members extra <<<"$record"
+resolve_gate_identity() {
+  local user_record group_record name password uid primary_gid gecos home shell extra gid members deploy_groups
+  [[ -n "$GATE_USER" && -n "$GATE_GROUP" ]] || fail 'DEPLOY_V4_GATE_IDENTITY_REQUIRED'
+  [[ "$GATE_USER" =~ ^[a-z_][a-z0-9_-]{0,31}$ && "$GATE_GROUP" =~ ^[a-z_][a-z0-9_-]{0,31}$ ]] || return 1
+  user_record="$(getent passwd "$GATE_USER")" || return 1
+  group_record="$(getent group "$GATE_GROUP")" || return 1
+  [[ "$user_record" != *$'\n'* && "$user_record" != *$'\r'* && "$group_record" != *$'\n'* && "$group_record" != *$'\r'* ]] || return 1
+  IFS=: read -r name password uid primary_gid gecos home shell extra <<<"$user_record"
+  [[ "$name" == "$GATE_USER" && "$uid" =~ ^[1-9][0-9]{0,9}$ && "$primary_gid" =~ ^[0-9]{1,10}$ && -z "$extra" ]] || return 1
+  IFS=: read -r name password gid members extra <<<"$group_record"
   [[ "$name" == "$GATE_GROUP" && -z "$extra" && "$gid" =~ ^[1-9][0-9]{0,9}$ ]] || return 1
-  deploy_groups=" $(id -G "$DEPLOY_USER") " || return 1
+  deploy_groups=" $(id -G "$GATE_USER") " || return 1
   [[ "$deploy_groups" == *" $gid "* ]] || return 1
   GATE_GROUP_GID="$gid"
+  GATE_IDENTITY_CONTENT="user=$GATE_USER"$'\n'"group=$GATE_GROUP"$'\n'"gid=$GATE_GROUP_GID"
 }
 
 validate_gate_marker() {
   [[ -f "$GATE_INSTALL_MARKER" && ! -L "$GATE_INSTALL_MARKER" ]] || return 1
-  [[ "$(file_attributes "$GATE_INSTALL_MARKER")" == "$GATE_ROOT_OWNER:644" ]] || return 1
+  [[ "$(file_attributes "$GATE_INSTALL_MARKER")" == "${GATE_ROOT_OWNER%%:*}:$GATE_GROUP_GID:640" ]] || return 1
   [[ "$(wc -c <"$GATE_INSTALL_MARKER" | tr -d '[:space:]')" == 7 ]] || return 1
   [[ "$(cat "$GATE_INSTALL_MARKER")" == ACTIVE ]]
 }
 
 prepare_gate_state() {
   if [[ -e "$GATE_STATE_DIR" || -L "$GATE_STATE_DIR" ]]; then
-    [[ -d "$GATE_STATE_DIR" && ! -L "$GATE_STATE_DIR" && "$(file_attributes "$GATE_STATE_DIR")" == "$GATE_ROOT_OWNER:755" ]] || return 1
+    [[ -d "$GATE_STATE_DIR" && ! -L "$GATE_STATE_DIR" ]] || return 1
+    [[ "$(file_attributes "$GATE_STATE_DIR")" =~ ^${GATE_ROOT_OWNER%%:*}:[0-9]+:750$ ]] || return 1
+    [[ "$(gate_inode_identity "$GATE_STATE_DIR")" =~ ^[0-9]+:[0-9]+:${GATE_ROOT_OWNER%%:*}:[2-9][0-9]*:0$ ]] || return 1
   else
-    install -d -o root -g root -m 0755 "$GATE_STATE_DIR" || return 1
+    install -d -o root -g "$GATE_GROUP" -m 0750 "$GATE_STATE_DIR" || return 1
     fsync_directory "$(dirname "$GATE_STATE_DIR")" || return 1
   fi
-  reconcile_gate_temporaries || fail 'DEPLOY_V4_GATE_TEMP_INVALID'
-  if [[ -e "$GATE_INSTALL_LOCK" || -L "$GATE_INSTALL_LOCK" ]]; then
-    [[ -f "$GATE_INSTALL_LOCK" && ! -L "$GATE_INSTALL_LOCK" && "$(file_attributes "$GATE_INSTALL_LOCK")" == "${GATE_ROOT_OWNER%%:*}:$GATE_GROUP_GID:640" ]] || return 1
+}
+
+validate_or_publish_gate_identity() {
+  local identity_temporary
+  if [[ -e "$GATE_IDENTITY" || -L "$GATE_IDENTITY" ]]; then
+    [[ -f "$GATE_IDENTITY" && ! -L "$GATE_IDENTITY" ]] || return 1
+    [[ "$(file_attributes "$GATE_IDENTITY")" == "${GATE_ROOT_OWNER%%:*}:$GATE_GROUP_GID:640" ]] || return 1
+    [[ "$(cat "$GATE_IDENTITY")" == "$GATE_IDENTITY_CONTENT" ]] || fail 'DEPLOY_V4_GATE_IDENTITY_MISMATCH'
   else
-    gate_lock_temporary="$(mktemp "$GATE_STATE_DIR/.install-lock.XXXXXX")" || return 1
-    chown "${GATE_ROOT_OWNER%%:*}:$GATE_GROUP_GID" "$gate_lock_temporary" || return 1
-    chmod 0640 "$gate_lock_temporary" || return 1
-    # gate-lock-temp-created
-    fsync_file "$gate_lock_temporary" || return 1
-    mv -fT "$gate_lock_temporary" "$GATE_INSTALL_LOCK" || return 1
-    gate_lock_temporary=''
+    identity_temporary="$(mktemp "$GATE_STATE_DIR/.identity.XXXXXX")" || return 1
+    printf '%s\n' "$GATE_IDENTITY_CONTENT" >"$identity_temporary" || return 1
+    chown root:"$GATE_GROUP" "$identity_temporary" || return 1
+    chmod 0640 "$identity_temporary" || return 1
+    fsync_file "$identity_temporary" || return 1
+    mv -fT "$identity_temporary" "$GATE_IDENTITY" || return 1
     fsync_directory "$GATE_STATE_DIR" || return 1
   fi
   if [[ -e "$GATE_INSTALL_MARKER" || -L "$GATE_INSTALL_MARKER" ]]; then
@@ -145,10 +146,11 @@ prepare_gate_state() {
 
 publish_public_marker() {
   gate_marker_temporary="$(mktemp "$GATE_STATE_DIR/.install-incomplete.XXXXXX")"
-  printf '%s\n' ACTIVE >"$gate_marker_temporary"
-  chown root:root "$gate_marker_temporary"
-  chmod 0644 "$gate_marker_temporary"
+  gate_marker_temporary_identity="$(gate_inode_identity "$gate_marker_temporary")"
   # gate-marker-temp-created
+  printf '%s\n' ACTIVE >"$gate_marker_temporary"
+  chown root:"$GATE_GROUP" "$gate_marker_temporary"
+  chmod 0640 "$gate_marker_temporary"
   fsync_file "$gate_marker_temporary"
   mv -fT "$gate_marker_temporary" "$GATE_INSTALL_MARKER"
   gate_marker_temporary=''
@@ -167,7 +169,7 @@ clear_public_marker() {
 [[ "$#" -eq 1 && "$SOURCE_DIR" == /* && -d "$SOURCE_DIR" && ! -L "$SOURCE_DIR" ]] || fail 'usage: install-deploy-v4.sh /absolute/canonical/source/dir' 2
 [[ "$(id -u)" -eq 0 ]] || fail 'deploy-v4 installation must run as root'
 [[ "$(realpath -e "$SOURCE_DIR")" == "$SOURCE_DIR" ]] || fail 'deploy-v4 source directory must be canonical'
-resolve_gate_group || fail 'DEPLOY_V4_GATE_GROUP_INVALID'
+resolve_gate_identity || fail 'DEPLOY_V4_GATE_IDENTITY_INVALID'
 
 for index in "${!SOURCE_ASSETS[@]}"; do
   source="$SOURCE_DIR/${SOURCE_ASSETS[$index]}"
@@ -178,7 +180,6 @@ bash -n "$SOURCE_DIR/deploy-kinvest-v4"
 bash -n "$SOURCE_DIR/deploy-kinvest-v3.sh"
 bash -n "$SOURCE_DIR/kinvest-ssh-command-v3"
 PYTHONDONTWRITEBYTECODE=1 python3 -m py_compile "$SOURCE_DIR/deploy-v3-contract.py"
-visudo -cf "$SOURCE_DIR/kinvest-deploy-v4.sudoers" >/dev/null
 [[ -f "$GATE_SOURCE" && ! -L "$GATE_SOURCE" ]] || fail 'invalid deploy-v4 forced-command gate'
 [[ "$(file_hash "$GATE_SOURCE")" == "$GATE_EXPECTED_HASH" ]] || fail 'untrusted deploy-v4 forced-command gate hash'
 
@@ -188,8 +189,8 @@ done
 install -d -o root -g root -m 0755 "$LOCAL_SBIN" "$LOCAL_LIBEXEC" "$SERVER_ROOT" "$SERVER_ROOT/state" "$SUDOERS_DIR"
 install -d -o root -g root -m 0700 "$BACKUP_ROOT"
 
-gate_lock_temporary=''
 gate_marker_temporary=''
+gate_marker_temporary_identity=''
 early_cleanup() {
   local result=$?
   trap - EXIT
@@ -198,10 +199,13 @@ early_cleanup() {
 }
 trap early_cleanup EXIT
 prepare_gate_state || fail 'DEPLOY_V4_GATE_STATE_INVALID'
-exec 8<"$GATE_INSTALL_LOCK"
+exec 8<"$GATE_STATE_DIR"
 flock -n 8 || fail 'another Kinvest installer is already running'
 exec 9>"$SERVER_ROOT/state/deploy.lock"
 flock -n 9 || fail 'another Kinvest deployment is already running'
+[[ "$(file_attributes "$GATE_STATE_DIR")" == "${GATE_ROOT_OWNER%%:*}:$GATE_GROUP_GID:750" ]] || fail 'DEPLOY_V4_GATE_IDENTITY_MISMATCH'
+reconcile_gate_temporaries || fail 'DEPLOY_V4_GATE_TEMP_INVALID'
+validate_or_publish_gate_identity || fail 'DEPLOY_V4_GATE_IDENTITY_INVALID'
 
 BACKUP_PRESENT=('')
 BACKUP_HASHES=('')
@@ -347,8 +351,15 @@ for index in "${!TARGETS[@]}"; do
     : >"$backup/$index.absent"
     chmod 0600 "$backup/$index.absent"
   fi
-  install -o root -g root -m "${MODES[$index]}" "$SOURCE_DIR/${SOURCE_ASSETS[$index]}" "$stage/$index"
-  [[ "$(file_hash "$stage/$index")" == "${EXPECTED_ASSET_HASHES[$index]}" ]] || fail "staged deploy-v4 hash mismatch: ${SOURCE_ASSETS[$index]}"
+  if [[ "$index" == 5 ]]; then
+    sed "s/@KINVEST_DEPLOY_GATE_USER@/$GATE_USER/g" "$SOURCE_DIR/${SOURCE_ASSETS[$index]}" >"$stage/$index"
+    chown root:root "$stage/$index"
+    chmod "${MODES[$index]}" "$stage/$index"
+    visudo -cf "$stage/$index" >/dev/null
+  else
+    install -o root -g root -m "${MODES[$index]}" "$SOURCE_DIR/${SOURCE_ASSETS[$index]}" "$stage/$index"
+    [[ "$(file_hash "$stage/$index")" == "${EXPECTED_ASSET_HASHES[$index]}" ]] || fail "staged deploy-v4 hash mismatch: ${SOURCE_ASSETS[$index]}"
+  fi
 done
 {
   printf '%s\n' kinvest-deploy-v4-install-backup-v1
@@ -415,7 +426,7 @@ fsync_target_directories
 for index in "${!TARGETS[@]}"; do
   target="${TARGETS[$index]}"
   [[ -f "$target" && ! -L "$target" ]] || fail "installed deploy-v4 target is unsafe: $target"
-  [[ "$(file_hash "$target")" == "${EXPECTED_ASSET_HASHES[$index]}" ]] || fail "installed deploy-v4 hash mismatch: $target"
+  [[ "$(file_hash "$target")" == "$(file_hash "$stage/$index")" ]] || fail "installed deploy-v4 hash mismatch: $target"
   [[ "$(file_attributes "$target")" == "$(file_attributes "$stage/$index")" ]] || fail "installed deploy-v4 attributes mismatch: $target"
 done
 bash -n "$LOCAL_SBIN/deploy-kinvest-v4"
@@ -423,7 +434,7 @@ bash -n "$LOCAL_SBIN/deploy-kinvest-v3"
 bash -n "$GATE_TARGET"
 PYTHONDONTWRITEBYTECODE=1 python3 -m py_compile "$LOCAL_LIBEXEC/kinvest-deploy-v4-contract"
 visudo -cf "$SUDOERS_DIR/kinvest-deploy-v4" >/dev/null
-sudo -n -U kinvest-deploy -l "$LOCAL_SBIN/deploy-kinvest-v4" >/dev/null
+sudo -n -U "$GATE_USER" -l "$LOCAL_SBIN/deploy-kinvest-v4" >/dev/null
 clear_install_journal
 transaction_committed='true'
 

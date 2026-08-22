@@ -47,7 +47,8 @@ async function run() {
         ...process.env,
         ADMIN_MATERIAL: secret.admin,
         HMAC_MATERIAL: secret.hmac,
-        DEPLOY_HOST: 'example.invalid', DEPLOY_PORT: '4334', DEPLOY_USER: 'kinvest-deploy',
+        SSH_USER: 'lighthouse', KINVEST_DEPLOY_GATE_USER: 'lighthouse',
+        DEPLOY_HOST: 'example.invalid', DEPLOY_PORT: '4334',
         DEPLOY_SHA: 'b'.repeat(40), IMAGE_DIGEST: `sha256:${'a'.repeat(64)}`,
         RELEASE_SCHEMA: '2', VERIFICATION_RUN_ID: '123', INTENT: 'FORWARD',
         TMPFS_BOOTSTRAP_ENABLED: 'true',
@@ -86,7 +87,34 @@ async function run() {
       assert.equal((result.stdout + result.stderr).includes(material), false)
     }
     assert.doesNotMatch(environment, /^(ADMIN_MATERIAL|HMAC_MATERIAL)=/m)
+    assert.doesNotMatch(environment, /^SSH_USER=/m)
     assert.equal(fs.readFileSync(githubEnv, 'utf8'), '')
+
+    const mismatch = spawnSync('bash', ['-c', stepScript('Deploy canonical payload with deploy-v4 stdin')], {
+      cwd: rootDir,
+      encoding: 'utf8',
+      env: {
+        ...process.env,
+        ADMIN_MATERIAL: secret.admin,
+        HMAC_MATERIAL: secret.hmac,
+        SSH_USER: 'review-secret-user', KINVEST_DEPLOY_GATE_USER: 'lighthouse',
+        DEPLOY_HOST: 'example.invalid', DEPLOY_PORT: '4334',
+        DEPLOY_SHA: 'b'.repeat(40), IMAGE_DIGEST: `sha256:${'a'.repeat(64)}`,
+        RELEASE_SCHEMA: '2', VERIFICATION_RUN_ID: '123', INTENT: 'FORWARD',
+        TMPFS_BOOTSTRAP_ENABLED: 'true',
+        TMPFS_ADMIN_PASSWORD_VERIFIER_VERSION_ID: 'v20260813-001',
+        TMPFS_DEVICE_TOKEN_HMAC_VERSION_ID: 'v20260813-002',
+        KINVEST_ACCESS_CONTROL_MODE: 'device-approval',
+        HOME: fixture, PATH: `${bin}:${process.env.PATH}`
+      }
+    })
+    assert.notEqual(mismatch.status, 0)
+    assert.equal(mismatch.stderr, 'KINVEST_DEPLOY_GATE_IDENTITY_MISMATCH\n')
+    assert.equal((mismatch.stdout + mismatch.stderr).includes('review-secret-user'), false)
+
+    assert.match(workflow, /SSH_USER: \$\{\{ secrets\.SSH_USER \}\}/)
+    assert.match(workflow, /KINVEST_DEPLOY_GATE_USER: \$\{\{ vars\.KINVEST_DEPLOY_GATE_USER \}\}/)
+    assert.doesNotMatch(workflow, /DEPLOY_USER: \$\{\{ vars\.DEPLOY_USER \}\}/)
 
     const prWorkflow = fs.readFileSync(path.join(rootDir, '.github/workflows/deploy.yml'), 'utf8')
     const containerBuild = prWorkflow.slice(prWorkflow.indexOf('  container-build:'), prWorkflow.indexOf('  publish:'))
