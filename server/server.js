@@ -11,10 +11,10 @@ const { isVerifiedDataBlock } = require('../public/data-source-contract')
 const { bootstrapSecrets } = require('./security/secret-bootstrap')
 const { createAccessControlRuntime } = require('./security/access-control-runtime')
 const {
-  closeDatabase: closeDatabaseConnection,
-  getDbPath,
+  closeDb,
+  closeTrackedDatabase,
   initializeRefreshDatabase,
-  openDbAtPath
+  openTrackedDb
 } = require('./db/refresh-db')
 const {
   HttpBoundaryError,
@@ -453,8 +453,9 @@ async function startServer({
   prepare = prepareApplication,
   bootstrap = bootstrapSecrets,
   createAccessRuntime = createAccessControlRuntime,
-  openDatabase = () => openDbAtPath(getDbPath()),
-  closeDatabase = closeDatabaseConnection,
+  openDatabase = openTrackedDb,
+  closeDatabase = closeTrackedDatabase,
+  closeApplicationDatabase = closeDb,
   initializeDatabase = initializeRefreshDatabase,
   createHttpHandler = createRequestHandler,
   runtimeServer,
@@ -487,7 +488,16 @@ async function startServer({
     processRef.removeListener('SIGTERM', handleSignal)
     processRef.removeListener('SIGINT', handleSignal)
     runtimeServer.removeListener('close', cleanup)
-    prepared.clear()
+    try {
+      prepared.clear()
+    } catch {
+      // Database cleanup must still run when another runtime cleanup fails.
+    }
+    try {
+      closeApplicationDatabase()
+    } catch {
+      // Shutdown cleanup is best-effort across every owned resource.
+    }
   }
   const handleSignal = () => {
     cleanup()

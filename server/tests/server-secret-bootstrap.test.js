@@ -1,5 +1,8 @@
 const assert = require('node:assert/strict')
 const { EventEmitter } = require('node:events')
+const fs = require('node:fs')
+const os = require('node:os')
+const path = require('node:path')
 
 class FakeServer extends EventEmitter {
   constructor() {
@@ -24,6 +27,63 @@ async function run() {
   const initialUmask = process.umask()
   try {
   const { runServerExecutable, startServer } = require('../server')
+  const {
+    closeDb,
+    getDbPath,
+    openDb,
+    setDbPath
+  } = require('../db/refresh-db')
+  const { getHealthState } = require('../services/health')
+
+  const originalDatabasePath = getDbPath()
+  const databaseDirectory = fs.mkdtempSync(path.join(
+    os.tmpdir(),
+    'kinvest-formal-db-'
+  ))
+  const formalDatabasePath = path.join(databaseDirectory, 'formal.sqlite')
+  const formalProcess = new EventEmitter()
+  const formalServer = new FakeServer()
+  let accessDatabase
+  try {
+    closeDb()
+    setDbPath(formalDatabasePath)
+    await startServer({
+      runtimeServer: formalServer,
+      bootstrap: async () => ({
+        status: Object.freeze({ mode: 'disabled', referenceCount: 0 }),
+        clear() {}
+      }),
+      createAccessRuntime: ({ openDatabase, initializeDatabase }) => {
+        accessDatabase = openDatabase()
+        initializeDatabase(accessDatabase)
+        return {
+          status: Object.freeze({ mode: 'disabled' }),
+          adminAuth: null,
+          deviceApproval: null,
+          clear() {
+            throw new Error('fixture access cleanup failure')
+          }
+        }
+      },
+      createHttpHandler: () => () => {},
+      processRef: formalProcess,
+      logger: { log() {} }
+    })
+
+    getHealthState()
+    const healthDatabase = openDb()
+    const sharedConnection = healthDatabase === accessDatabase
+    formalProcess.emit('SIGTERM')
+
+    assert.equal(sharedConnection, true)
+    assert.throws(() => accessDatabase.prepare('SELECT 1'))
+    assert.throws(() => healthDatabase.prepare('SELECT 1'))
+  } finally {
+    closeDb()
+    setDbPath(originalDatabasePath)
+    fs.rmSync(databaseDirectory, { recursive: true, force: true })
+  }
+
   const loggerFailureOrder = []
   const loggerFailureProcess = new EventEmitter()
   const loggerFailureServer = new FakeServer()

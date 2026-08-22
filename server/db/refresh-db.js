@@ -35,8 +35,23 @@ function openDbAtPath(databasePath) {
   return new DatabaseSync(databasePath)
 }
 
+function openTrackedDbAtPath(databasePath) {
+  if (db) return db
+  db = openDbAtPath(databasePath)
+  return db
+}
+
+function openTrackedDb() {
+  return openTrackedDbAtPath(currentDbPath)
+}
+
 function closeDatabase(database) {
   database.close()
+}
+
+function closeTrackedDatabase(database) {
+  if (db === database) db = null
+  closeDatabase(database)
 }
 
 function getDbPath() {
@@ -50,22 +65,19 @@ function setDbPath(nextPath) {
 
 function openDb() {
   if (db) return db
-  const database = openDbAtPath(currentDbPath)
+  const database = openTrackedDb()
   try {
     initializeRefreshDatabase(database)
-    db = database
     return db
   } catch (error) {
-    closeDatabase(database)
+    closeTrackedDatabase(database)
     throw error
   }
 }
 
 function closeDb() {
   if (!db) return
-  const database = db
-  db = null
-  closeDatabase(database)
+  closeTrackedDatabase(db)
 }
 
 function todayKey(date = new Date()) {
@@ -127,9 +139,12 @@ module.exports = {
   setDbPath,
   openDb,
   openDbAtPath,
+  openTrackedDb,
+  openTrackedDbAtPath,
   initializeRefreshDatabase,
   closeDb,
   closeDatabase,
+  closeTrackedDatabase,
   todayKey,
   getManualRefreshCount,
   incrementManualRefreshCount,

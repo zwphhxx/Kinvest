@@ -3,10 +3,9 @@ const {
   createAccessControlRuntime
 } = require('./security/access-control-runtime')
 const {
-  closeDatabase: closeDatabaseConnection,
-  getDbPath,
+  closeTrackedDatabase,
   initializeRefreshDatabase,
-  openDbAtPath
+  openTrackedDb
 } = require('./db/refresh-db')
 const { parseTrustedProxyAddresses } = require('./http/trusted-client')
 
@@ -48,8 +47,8 @@ async function prepareApplication({
   loadSecrets,
   signal,
   createAccessRuntime = createAccessControlRuntime,
-  openDatabase = () => openDbAtPath(getDbPath()),
-  closeDatabase = closeDatabaseConnection,
+  openDatabase = openTrackedDb,
+  closeDatabase = closeTrackedDatabase,
   initializeDatabase = initializeRefreshDatabase,
   createHandler = defaultCreateHandler
 } = {}) {
