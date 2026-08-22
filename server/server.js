@@ -16,7 +16,7 @@ const {
   createAuthHttpController,
   parseStrictJsonBody
 } = require('./http/auth-http')
-const { parseTrustedProxyAddresses } = require('./http/trusted-client')
+const { prepareApplication } = require('./pre-listen-preparation')
 
 const PORT = Number(process.env.PORT || 4173)
 const ROOT = path.join(__dirname, '..')
@@ -445,55 +445,33 @@ function stableStartupErrorCode(error) {
 /** @param {any} [options] */
 async function startServer({
   env = process.env,
+  prepare = prepareApplication,
   bootstrap = bootstrapSecrets,
   createAccessRuntime = createAccessControlRuntime,
   openDatabase = openDb,
   closeDatabase = closeDb,
+  createHttpHandler = createRequestHandler,
   runtimeServer,
   port = PORT,
   processRef = process,
   logger = console
 } = {}) {
   applyRuntimeFileCreationMask()
-  const secretRuntime = await bootstrap({ env })
-  let accessRuntime
+  const prepared = await prepare({
+    env,
+    bootstrap,
+    createAccessRuntime,
+    openDatabase,
+    closeDatabase,
+    createHandler: createHttpHandler
+  })
   try {
-    accessRuntime = createAccessRuntime({
-      env,
-      secretRuntime,
-      openDatabase,
-      closeDatabase
-    })
-  } catch (error) {
-    secretRuntime.clear()
-    throw error
-  }
-  let trustedProxyAddresses
-  try {
-    trustedProxyAddresses = parseTrustedProxyAddresses(
-      env.KINVEST_TRUSTED_PROXY_ADDRESSES,
-      { required: accessRuntime.status.mode === 'device-approval' }
-    )
+    if (!runtimeServer) runtimeServer = http.createServer(prepared.handler)
   } catch {
-    accessRuntime.clear()
-    secretRuntime.clear()
+    prepared.clear()
     throw Object.assign(new Error('HTTP security configuration invalid'), {
       code: 'HTTP_SECURITY_CONFIG_INVALID'
     })
-  }
-  if (!runtimeServer) {
-    try {
-      runtimeServer = http.createServer(createRequestHandler({
-        accessRuntime,
-        trustedProxyAddresses
-      }))
-    } catch {
-      accessRuntime.clear()
-      secretRuntime.clear()
-      throw Object.assign(new Error('HTTP security configuration invalid'), {
-        code: 'HTTP_SECURITY_CONFIG_INVALID'
-      })
-    }
   }
   let cleaned = false
   const cleanup = () => {
@@ -502,8 +480,7 @@ async function startServer({
     processRef.removeListener('SIGTERM', handleSignal)
     processRef.removeListener('SIGINT', handleSignal)
     runtimeServer.removeListener('close', cleanup)
-    accessRuntime.clear()
-    secretRuntime.clear()
+    prepared.clear()
   }
   const handleSignal = () => {
     cleanup()
@@ -575,6 +552,7 @@ module.exports = {
   apiResearch,
   applyRuntimeFileCreationMask,
   createRequestHandler,
+  prepareApplication,
   runServerExecutable,
   stableStartupErrorCode,
   startServer,

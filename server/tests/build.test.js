@@ -43,6 +43,7 @@ async function runBuildArtifactsExist() {
     'public/research.html',
     'public/research.js',
     'public/valuation-position.js',
+    'server/access-preflight.js',
     'server/adapters/ifindAdapter.js',
     'server/adapters/modelAdapter.js',
     'server/ai/model-quota.js',
@@ -55,6 +56,7 @@ async function runBuildArtifactsExist() {
     'server/domain/security-identity.js',
     'server/http/auth-http.js',
     'server/http/trusted-client.js',
+    'server/pre-listen-preparation.js',
     'server/secret-preflight.js',
     'server/security/access-control-runtime.js',
     'server/security/admin-auth.js',
@@ -99,6 +101,7 @@ async function runBuildArtifactsExist() {
       'tencentcloud-sdk-nodejs-common': '4.1.220',
       'tencentcloud-sdk-nodejs-ssm': '4.1.275'
     })
+    assert.equal(distPackage.scripts['access:preflight'], 'node server/access-preflight.js')
 
     const distServerPath = path.join(repositoryRoot, 'dist', 'server', 'server.js')
     delete require.cache[require.resolve(distServerPath)]

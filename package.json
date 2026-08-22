@@ -6,6 +6,7 @@
   "scripts": {
     "dev": "node server/server.js",
     "start": "node server/server.js",
+    "access:preflight": "node server/access-preflight.js",
     "test": "node server/tests/run-tests.js",
     "lint": "eslint server scripts public",
     "typecheck": "tsc -p jsconfig.json",

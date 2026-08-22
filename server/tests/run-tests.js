@@ -29,6 +29,7 @@ const tests = [
   require('./secret-bootstrap.test'),
   require('./server-secret-bootstrap.test'),
   require('./secret-preflight.test'),
+  require('./access-preflight.test'),
   require('./ssm-material-generator.test'),
   require('./docker-secret-bootstrap.test'),
   require('./metadata-firewall-contract.test'),

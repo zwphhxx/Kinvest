@@ -10,6 +10,7 @@ async function run() {
   assert.match(dockerfile, /npm ci --omit=dev --ignore-scripts/)
   assert.match(dockerfile, /COPY --from=runtime-dependencies \/app\/node_modules \.\/node_modules/)
   assert.match(dockerfile, /io\.kinvest\.secret-bootstrap="1"/)
+  assert.match(dockerfile, /io\.kinvest\.access-control\.contract="1"/)
   assert.match(
     dockerfile,
     /require\('tencentcloud-sdk-nodejs-ssm'\).*require\('tencentcloud-sdk-nodejs-common'\)/s

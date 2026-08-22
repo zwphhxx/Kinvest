@@ -37,7 +37,8 @@ FROM node:22-alpine AS runtime
 
 LABEL io.kinvest.schema.min="0" \
       io.kinvest.schema.max="0" \
-      io.kinvest.secret-bootstrap="1"
+      io.kinvest.secret-bootstrap="1" \
+      io.kinvest.access-control.contract="1"
 
 ENV NODE_ENV=production \
     PORT=4173 \
