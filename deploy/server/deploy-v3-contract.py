@@ -599,7 +599,7 @@ def state_from_text(raw: str) -> dict[str, Any]:
         if not line.startswith(prefix):
             fail("DEPLOY_V3_STATE_INVALID")
         item = line[len(prefix):]
-        if field in {"protocolVersion", "schemaVersion", "imageSchemaMin", "imageSchemaMax", "releaseRecordSchemaVersion"}:
+        if field in {"protocolVersion", "schemaVersion", "imageSchemaMin", "imageSchemaMax", "imageAccessControlContract", "releaseRecordSchemaVersion"}:
             if re.fullmatch(r"0|[1-9][0-9]*", item) is None:
                 fail("DEPLOY_V3_STATE_INVALID")
             value[field] = int(item)
@@ -1142,11 +1142,13 @@ def make_recovery_state(
             "accessControlMode", "imageAccessControlContract",
             "trustedProxyAddresses", "trustedProxyConfigChecksum",
         ])
-    if restore and any(
-        approved[field] != original[field]
-        for field in protected_fields
-    ):
+    if restore and any(approved[field] != original[field] for field in protected_fields):
         fail("RESTORE_STATE_MISMATCH")
+    if IS_V4 and not restore and any(
+        approved[field] != original[field]
+        for field in (*protected_fields, "secretBundleId")
+    ):
+        fail("RECOVERY_SECURITY_STATE_MISMATCH")
     recovered = {**original, **approved}
     if schema_version is not None:
         try:
@@ -1258,7 +1260,7 @@ def validate_network_config(path: Path) -> dict[str, Any]:
             or not stat.S_ISREG(info.st_mode)
             or path.is_symlink()
             or info.st_uid != expected_uid
-            or stat.S_IMODE(info.st_mode) & 0o022
+            or stat.S_IMODE(info.st_mode) != 0o600
             or info.st_size > 1024
         ):
             fail("DEPLOY_V4_PROXY_CONFIG_INVALID")

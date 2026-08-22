@@ -259,6 +259,21 @@ async function run() {
     assertV4Failure(restore, /^RESTORE_STATE_MISMATCH\n$/)
   }
 
+  const recoverySecurityMismatch = runContract('make-recovery-state', {
+    original: state(),
+    approved: {
+      secretProviderMode: 'disabled',
+      secretVersionIds: {},
+      secretMaterialFingerprints: {},
+      secretBundleId: 'none',
+      accessControlMode: 'disabled',
+      imageAccessControlContract: 1,
+      trustedProxyAddresses: [],
+      trustedProxyConfigChecksum: ''
+    }
+  })
+  assertV4Failure(recoverySecurityMismatch, /^RECOVERY_SECURITY_STATE_MISMATCH\n$/)
+
   const fixture = fs.mkdtempSync(path.join(os.tmpdir(), 'kinvest-access-network-'))
   try {
     const config = path.join(fixture, 'access-control-network.conf')
@@ -274,6 +289,13 @@ async function run() {
       network: 'web',
       trustedProxyAddresses: ['172.19.0.2']
     })
+    for (const mode of [0o644, 0o640, 0o400]) {
+      fs.chmodSync(config, mode)
+      assertV4Failure(runContract('validate-network-config', '', [config], {
+        KINVEST_V4_TEST_ROOT_UID: String(process.getuid())
+      }), /^DEPLOY_V4_PROXY_CONFIG_INVALID\n$/)
+    }
+    fs.chmodSync(config, 0o600)
     fs.appendFileSync(config, 'EXTRA=value\n')
     assertV4Failure(runContract('validate-network-config', '', [config], {
       KINVEST_V4_TEST_ROOT_UID: String(process.getuid())

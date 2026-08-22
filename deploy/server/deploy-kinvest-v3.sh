@@ -407,6 +407,22 @@ print(json.dumps({"approved": approved, "original": original}, ensure_ascii=True
 PY
 }
 
+make_recovery_envelope() {
+  local original="$1" output="$2"
+  python3 - "$original" >"$output" <<'PY'
+import json, sys
+with open(sys.argv[1], encoding="ascii") as stream:
+    original = json.load(stream)
+fields = (
+    "secretProviderMode", "secretVersionIds", "secretMaterialFingerprints",
+    "secretBundleId", "accessControlMode", "imageAccessControlContract",
+    "trustedProxyAddresses", "trustedProxyConfigChecksum",
+)
+approved = {key: original[key] for key in fields}
+print(json.dumps({"approved": approved, "original": original}, ensure_ascii=True, separators=(",", ":")))
+PY
+}
+
 prune_unreferenced_bundles() {
   local keep_id="$1" entry name
   [[ -e "$BUNDLE_ROOT" ]] || return 0
@@ -454,13 +470,21 @@ restore_previous_runtime() {
     envelope_file="$(mktemp "$RUN_ROOT/kinvest-v3.recovery-envelope.XXXXXX")"
     safe_runtime_file "$envelope_file" || return 1
     chmod 0600 "$envelope_file"
-    make_approved_envelope "$current_json" "$envelope_file" "$current_access_mode" "$current_access_contract" "$current_trusted_proxies" "$current_proxy_checksum" || return 1
+    if [[ "$DEPLOY_PROTOCOL" == 4 ]]; then
+      make_recovery_envelope "$current_json" "$envelope_file" || return 1
+    else
+      make_approved_envelope "$current_json" "$envelope_file" || return 1
+    fi
     recovery_state_file="$(mktemp "$RUN_ROOT/kinvest-v3.recovery-state.XXXXXX")"
     chmod 0600 "$recovery_state_file"
     if [[ "$intent" == RESTORE ]]; then
       "$CONTRACT" make-restore-state "$schema_after" "$restore_backup_path" "$restore_backup_checksum" <"$envelope_file" >"$recovery_state_file" || return 1
     else
-      "$CONTRACT" make-recovery-state "$schema_after" "$database_backup_path" "$database_backup_checksum" <"$envelope_file" >"$recovery_state_file" || return 1
+      if [[ "$DEPLOY_PROTOCOL" == 4 ]]; then
+        "$CONTRACT" make-recovery-state <"$envelope_file" >"$recovery_state_file" || return 1
+      else
+        "$CONTRACT" make-recovery-state "$schema_after" "$database_backup_path" "$database_backup_checksum" <"$envelope_file" >"$recovery_state_file" || return 1
+      fi
     fi
     "$CONTRACT" atomic-state "$CURRENT_STATE" <"$recovery_state_file" || return 1
   fi
@@ -474,8 +498,13 @@ restore_previous_runtime() {
     rm -f -- "$PREVIOUS_STATE" || return 1
   fi
   rm -f -- "$ATTEMPT_STATE" || return 1
-  candidate_bundle_keep='true'
-  prune_unreferenced_bundles "$candidate_bundle_id" || return 1
+  if [[ "$DEPLOY_PROTOCOL" == 4 ]]; then
+    candidate_bundle_keep='false'
+    prune_unreferenced_bundles "$current_bundle_id" || return 1
+  else
+    candidate_bundle_keep='true'
+    prune_unreferenced_bundles "$candidate_bundle_id" || return 1
+  fi
 }
 
 cleanup() {
