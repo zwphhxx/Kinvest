@@ -124,7 +124,19 @@ exit 127
 `)
   writeExecutable(path.join(bin, 'docker'), `#!/usr/bin/env bash
 set -euo pipefail
-printf 'docker %s\n' "$*" >>"$OPERATIONS"
+append_operation() {
+  local diagnostic="$1" saved_soft_limit append_status=0 restore_status=0
+  saved_soft_limit="$(ulimit -Sf)"
+  ulimit -Sf unlimited
+  if [[ "$(wc -c <"$OPERATIONS" | tr -d '[:space:]')" -gt 1024 && "$(ulimit -Sf)" != unlimited ]]; then
+    append_status=73
+  else
+    printf '%s\n' "$diagnostic" >>"$OPERATIONS" || append_status=$?
+  fi
+  ulimit -Sf "$saved_soft_limit" || restore_status=$?
+  [[ "$append_status" -eq 0 && "$restore_status" -eq 0 ]]
+}
+append_operation "docker $*"
 command="$1"; shift
 if [[ "$command" == image && "$1" == inspect ]]; then
   ref="$2"; format="$4"
@@ -194,10 +206,11 @@ if [[ "$command" == compose ]]; then
   if [[ "$all" == *" up "* ]]; then
     printf '%s' "$KINVEST_IMAGE" >"$ACTIVE_IMAGE"
     printf '%s' "$KINVEST_ACCESS_CONTROL_MODE" >"$ACTIVE_MODE"
-    printf 'compose up %s access=%s provider=%s versions=%s bundle=%s proxies=%s\n' \
+    printf -v compose_operation 'compose up %s access=%s provider=%s versions=%s bundle=%s proxies=%s' \
       "$KINVEST_IMAGE" "$KINVEST_ACCESS_CONTROL_MODE" "$KINVEST_SECRET_PROVIDER_MODE" \
       "$KINVEST_SECRET_VERSION_IDS" "$KINVEST_SECRET_BUNDLE_HOST_PATH" \
-      "$KINVEST_TRUSTED_PROXY_ADDRESSES" >>"$OPERATIONS"
+      "$KINVEST_TRUSTED_PROXY_ADDRESSES"
+    append_operation "$compose_operation"
     if [[ "$MIGRATED_SCHEMA" != 0 && "$KINVEST_IMAGE" == "$CANDIDATE_ID" ]]; then
       python3 -c 'import sqlite3,sys; c=sqlite3.connect(sys.argv[1]); c.execute("PRAGMA user_version=" + sys.argv[2]); c.commit(); c.close()' "$DATABASE_PATH" "$MIGRATED_SCHEMA"
     fi
@@ -205,7 +218,7 @@ if [[ "$command" == compose ]]; then
       : >"$FAILURE_MARKER"; exit 1
     fi
   else
-    printf 'compose down %s\n' "$KINVEST_IMAGE" >>"$OPERATIONS"
+    append_operation "compose down $KINVEST_IMAGE"
   fi
   exit 0
 fi
@@ -283,6 +296,7 @@ function createFixture({ failure, currentDevice = false, oldBundleMissing = fals
     .replace('def main(argv: list[str]) -> int:', 'def main(argv: list[str]) -> int:\n    with open(os.environ["CONTRACT_LOG"], "a", encoding="ascii") as stream: stream.write(" ".join(argv[1:]) + "\\n")')
   fs.writeFileSync(contract, instrumentedContract, { mode: 0o755 })
   let instrumentedDeployer = deployerSource
+    .replaceAll('ulimit -f 1', 'ulimit -Sf 1')
     .replace("ROOT='/root/docker/kinvest'", `ROOT='${serverRoot}'`)
     .replace("RUN_ROOT='/run'", `RUN_ROOT='${runRoot}'`)
     .replace("CONTRACT='/usr/local/libexec/kinvest-deploy-v3-contract'", `CONTRACT='${contract}'`)
@@ -448,6 +462,17 @@ function assertSuccessfulIntent(context, result, { imageId, imageDigest, commit,
 }
 
 async function run() {
+  assert.match(deployerSource, /ulimit -f 1/)
+  const oversizedDiagnostics = createFixture({ failure: 'none', currentDevice: false })
+  try {
+    fs.writeFileSync(oversizedDiagnostics.operations, Buffer.alloc(2048, 'x'))
+    assert.ok(fs.statSync(oversizedDiagnostics.operations).size > 1024)
+    const result = execute(oversizedDiagnostics, payload())
+    assert.equal(result.status, 0, result.stderr)
+  } finally {
+    spawnSync('/bin/rm', ['-rf', oversizedDiagnostics.base])
+  }
+
   for (const scenario of [
     { failure: 'compose', currentDevice: false },
     { failure: 'health', currentDevice: false },
