@@ -95,6 +95,40 @@ async function runBuildArtifactsExist() {
   assert.match(linuxSmoke, /process[.]platform[^\n]*linux/)
   assert.match(linuxSmoke, /runAccessPreflight/)
   assert.match(linuxSmoke, /KINVEST_ACCESS_PREFLIGHT_OK/)
+  const sourcePackageContract = JSON.parse(fs.readFileSync(
+    path.join(repositoryRoot, 'package.json'),
+    'utf8'
+  ))
+  const lockfileContract = JSON.parse(fs.readFileSync(
+    path.join(repositoryRoot, 'package-lock.json'),
+    'utf8'
+  ))
+  assert.equal(sourcePackageContract.engines.node, '>=22.16.0')
+  assert.equal(lockfileContract.packages[''].engines.node, '>=22.16.0')
+  assert.deepStrictEqual(dockerfile.match(/^FROM\b.*$/gm), [
+    'FROM node:22.16.0-alpine AS build',
+    'FROM build AS access-preflight-linux-smoke',
+    'FROM node:22.16.0-alpine AS github-tmpfs-provider-smoke',
+    'FROM node:22.16.0-alpine AS runtime-dependencies',
+    'FROM node:22.16.0-alpine AS runtime'
+  ])
+  const preflightSource = fs.readFileSync(
+    path.join(repositoryRoot, 'server', 'access-preflight.js'),
+    'utf8'
+  )
+  assert.doesNotMatch(preflightSource, /enableDefensive/)
+  assert.match(preflightSource, /new DatabaseSync/)
+  assert.match(preflightSource, /readOnly: true/)
+  assert.match(preflightSource, /PRAGMA query_only = ON/)
+  const deployWorkflow = fs.readFileSync(
+    path.join(repositoryRoot, '.github', 'workflows', 'deploy.yml'),
+    'utf8'
+  )
+  assert.equal(
+    Array.from(deployWorkflow.matchAll(/node-version: "22[.]16[.]0"/g)).length,
+    2
+  )
+  assert.doesNotMatch(deployWorkflow, /node-version: "22[.]13[.]0"/)
 
   try {
     fs.writeFileSync(fixturePath, 'build leak fixture\n')

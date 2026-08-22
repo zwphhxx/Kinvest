@@ -48,6 +48,32 @@ function sameIdentity(leftStat, rightStat) {
   return leftStat.dev === rightStat.dev && leftStat.ino === rightStat.ino
 }
 
+function sameFileState(leftStat, rightStat) {
+  return sameIdentity(leftStat, rightStat) &&
+    leftStat.size === rightStat.size &&
+    leftStat.mtimeMs === rightStat.mtimeMs &&
+    leftStat.ctimeMs === rightStat.ctimeMs
+}
+
+function linuxSourceDescriptorPath(descriptor) {
+  if (!Number.isSafeInteger(descriptor) || descriptor < 0) {
+    throw preflightError('ACCESS_PREFLIGHT_DATABASE_PATH_INVALID')
+  }
+  return `/proc/self/fd/${descriptor}`
+}
+
+function defaultSourceDescriptorPath(descriptor) {
+  if (process.platform === 'linux') {
+    return linuxSourceDescriptorPath(descriptor)
+  }
+  if (process.platform === 'darwin') return `/dev/fd/${descriptor}`
+  throw preflightError('ACCESS_PREFLIGHT_DATABASE_PATH_INVALID')
+}
+
+function defaultOpenSourceDatabase(descriptorPath, options) {
+  return new DatabaseSync(descriptorPath, options)
+}
+
 function defaultRemovePrivateDirectory(directory) {
   fs.rmSync(directory, { recursive: true, force: true })
 }
@@ -70,6 +96,8 @@ async function snapshotDatabaseToPrivateDirectory(
   sourcePath,
   anchoredStat,
   backupDatabase,
+  sourceDescriptorPath,
+  openSourceDatabase,
   removePrivateDirectory
 ) {
   const directory = fs.mkdtempSync(path.join(
@@ -80,9 +108,11 @@ async function snapshotDatabaseToPrivateDirectory(
   const databasePath = path.join(directory, 'candidate.sqlite')
   let sourceDatabase
   try {
-    sourceDatabase = new DatabaseSync(sourcePath, { readOnly: true })
-    const defensiveDatabase = /** @type {any} */ (sourceDatabase)
-    defensiveDatabase.enableDefensive(true)
+    sourceDatabase = openSourceDatabase(
+      sourceDescriptorPath(sourceDescriptor),
+      { readOnly: true }
+    )
+    sourceDatabase.exec('PRAGMA query_only = ON')
     const reboundStat = fs.lstatSync(sourcePath)
     if (!reboundStat.isFile() || reboundStat.isSymbolicLink() ||
       !sameIdentity(anchoredStat, reboundStat) ||
@@ -93,7 +123,7 @@ async function snapshotDatabaseToPrivateDirectory(
     sourceDatabase.close()
     sourceDatabase = undefined
     const finalSourceStat = fs.lstatSync(sourcePath)
-    if (!sameIdentity(anchoredStat, finalSourceStat) ||
+    if (!sameFileState(anchoredStat, finalSourceStat) ||
       !sameIdentity(anchoredStat, fs.fstatSync(sourceDescriptor))) {
       throw preflightError('ACCESS_PREFLIGHT_DATABASE_PATH_INVALID')
     }
@@ -125,6 +155,8 @@ async function snapshotDatabaseToPrivateDirectory(
 
 async function bindCandidateDatabase(databasePath, productionDatabasePath, {
   backupDatabase = backup,
+  sourceDescriptorPath = defaultSourceDescriptorPath,
+  openSourceDatabase = defaultOpenSourceDatabase,
   removePrivateDirectory = defaultRemovePrivateDirectory
 } = {}) {
   if (typeof databasePath !== 'string' || databasePath.length === 0) {
@@ -168,6 +200,8 @@ async function bindCandidateDatabase(databasePath, productionDatabasePath, {
       candidate,
       openedStat,
       backupDatabase,
+      sourceDescriptorPath,
+      openSourceDatabase,
       removePrivateDirectory
     )
     assertSidecarFree(candidate)
@@ -225,6 +259,8 @@ async function runAccessPreflight({
   createAccessRuntime,
   createHandler,
   backupDatabase = backup,
+  sourceDescriptorPath = defaultSourceDescriptorPath,
+  openSourceDatabase = defaultOpenSourceDatabase,
   removePrivateDirectory = defaultRemovePrivateDirectory,
   stdout = process.stdout,
   stderr = process.stderr,
@@ -252,7 +288,12 @@ async function runAccessPreflight({
     candidateDatabase = await bindCandidateDatabase(
       databasePath,
       productionDatabasePath,
-      { backupDatabase, removePrivateDirectory }
+      {
+        backupDatabase,
+        sourceDescriptorPath,
+        openSourceDatabase,
+        removePrivateDirectory
+      }
     )
     prepared = await prepare({
       env,
@@ -303,6 +344,7 @@ if (require.main === module) {
 }
 
 module.exports = {
+  linuxSourceDescriptorPath,
   runAccessPreflight,
   stableAccessPreflightErrorCode,
   successLine,

@@ -1,4 +1,4 @@
-FROM node:22-alpine AS build
+FROM node:22.16.0-alpine AS build
 
 WORKDIR /app
 
@@ -14,7 +14,7 @@ FROM build AS access-preflight-linux-smoke
 
 RUN node scripts/docker-access-preflight-linux-smoke.js
 
-FROM node:22-alpine AS github-tmpfs-provider-smoke
+FROM node:22.16.0-alpine AS github-tmpfs-provider-smoke
 
 WORKDIR /app
 
@@ -30,14 +30,14 @@ USER 10001:10001
 
 RUN node scripts/docker-github-tmpfs-smoke.js verify
 
-FROM node:22-alpine AS runtime-dependencies
+FROM node:22.16.0-alpine AS runtime-dependencies
 
 WORKDIR /app
 
 COPY package.json package-lock.json ./
 RUN npm ci --omit=dev --ignore-scripts && npm cache clean --force
 
-FROM node:22-alpine AS runtime
+FROM node:22.16.0-alpine AS runtime
 
 LABEL io.kinvest.schema.min="0" \
       io.kinvest.schema.max="0" \

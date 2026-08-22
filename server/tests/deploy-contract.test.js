@@ -374,11 +374,11 @@ async function run() {
   assert.deepEqual(
     dockerfile.match(/^FROM\b.*$/gm),
     [
-      'FROM node:22-alpine AS build',
+      'FROM node:22.16.0-alpine AS build',
       'FROM build AS access-preflight-linux-smoke',
-      'FROM node:22-alpine AS github-tmpfs-provider-smoke',
-      'FROM node:22-alpine AS runtime-dependencies',
-      'FROM node:22-alpine AS runtime'
+      'FROM node:22.16.0-alpine AS github-tmpfs-provider-smoke',
+      'FROM node:22.16.0-alpine AS runtime-dependencies',
+      'FROM node:22.16.0-alpine AS runtime'
     ]
   )
   assert.match(buildStage, /^RUN npm ci$/m)

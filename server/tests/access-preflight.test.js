@@ -703,6 +703,89 @@ async function testConcurrentSqliteSnapshot(tempDirectory) {
   source.close()
 }
 
+async function testDescriptorAnchorsSqliteOpen(tempDirectory) {
+  const {
+    linuxSourceDescriptorPath,
+    runAccessPreflight
+  } = require('../access-preflight')
+  assert.equal(linuxSourceDescriptorPath(17), '/proc/self/fd/17')
+  const productionPath = path.join(tempDirectory, 'descriptor-production.sqlite')
+  const candidatePath = path.join(tempDirectory, 'descriptor-candidate.sqlite')
+  const replacementPath = path.join(tempDirectory, 'descriptor-replacement.sqlite')
+  const anchoredPath = path.join(tempDirectory, 'descriptor-anchored.sqlite')
+  for (const [databasePath, marker] of [
+    [candidatePath, 'verified-inode'],
+    [replacementPath, 'replacement-inode']
+  ]) {
+    const database = new DatabaseSync(databasePath)
+    database.exec(`CREATE TABLE identity_marker (value TEXT NOT NULL)`)
+    database.prepare('INSERT INTO identity_marker VALUES (?)').run(marker)
+    database.close()
+  }
+  const candidateBefore = fs.readFileSync(candidatePath)
+  const replacementBefore = fs.readFileSync(replacementPath)
+  let openCalls = 0
+  let openedMarker
+  let snapshotMarker
+  const stdout = capture()
+  const stderr = capture()
+  const exitCode = await runAccessPreflight({
+    env: enabledEnv(productionPath),
+    databasePath: candidatePath,
+    sourceDescriptorPath: (descriptor) => `/dev/fd/${descriptor}`,
+    openSourceDatabase: (descriptorPath, options) => {
+      openCalls += 1
+      fs.renameSync(candidatePath, anchoredPath)
+      fs.renameSync(replacementPath, candidatePath)
+      let database
+      try {
+        database = new DatabaseSync(descriptorPath, options)
+        openedMarker = database.prepare(
+          'SELECT value FROM identity_marker'
+        ).get().value
+      } finally {
+        fs.renameSync(candidatePath, replacementPath)
+        fs.renameSync(anchoredPath, candidatePath)
+      }
+      return database
+    },
+    prepare: async ({ openDatabase, closeDatabase }) => {
+      const snapshot = openDatabase()
+      try {
+        snapshotMarker = snapshot.prepare(
+          'SELECT value FROM identity_marker'
+        ).get().value
+      } finally {
+        closeDatabase(snapshot)
+      }
+      return {
+        status: {
+          mode: 'device-approval',
+          references: 2,
+          database: 'ready',
+          proxy: 'ready'
+        },
+        clear() {}
+      }
+    },
+    stdout: stdout.stream,
+    stderr: stderr.stream,
+    processRef: new EventEmitter()
+  })
+
+  assert.equal(openCalls, 1)
+  assert.equal(openedMarker, 'verified-inode')
+  if (exitCode === 0) {
+    assert.equal(snapshotMarker, 'verified-inode')
+    assert.equal(stderr.value(), '')
+  } else {
+    assert.equal(stdout.value(), '')
+    assert.equal(stderr.value(), 'ACCESS_PREFLIGHT_DATABASE_PATH_INVALID\n')
+  }
+  assert.deepStrictEqual(fs.readFileSync(candidatePath), candidateBefore)
+  assert.deepStrictEqual(fs.readFileSync(replacementPath), replacementBefore)
+}
+
 async function testRealGithubTmpfsProviderChain(tempDirectory) {
   const { runAccessPreflight } = require('../access-preflight')
   const productionPath = path.join(tempDirectory, 'real-provider-production.sqlite')
@@ -957,6 +1040,7 @@ async function run() {
     await testRejectsWalSnapshotSidecars(tempDirectory)
     await testCleanupCompletesBeforeSuccessOutput(tempDirectory)
     await testConcurrentSqliteSnapshot(tempDirectory)
+    await testDescriptorAnchorsSqliteOpen(tempDirectory)
     await testRealGithubTmpfsProviderChain(tempDirectory)
     await testSignalCleanup(tempDirectory)
     await testSubprocessSignalCancellation(tempDirectory)
@@ -970,5 +1054,6 @@ module.exports = {
   run,
   testCleanupCompletesBeforeSuccessOutput,
   testConcurrentSqliteSnapshot,
+  testDescriptorAnchorsSqliteOpen,
   testRejectsWalSnapshotSidecars
 }

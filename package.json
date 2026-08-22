@@ -19,7 +19,7 @@
     "check": "npm run build && npm test && npm run lint && npm run typecheck"
   },
   "engines": {
-    "node": ">=22.13.0"
+    "node": ">=22.16.0"
   },
   "packageManager": "npm@11.12.1",
   "devDependencies": {
