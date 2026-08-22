@@ -7,6 +7,10 @@ const state = {
 
 const financeContracts = /** @type {any} */ (window).KinvestFinance
 const valuationContracts = /** @type {any} */ (window).KinvestValuation
+const authContracts = /** @type {any} */ (window).KinvestAuth
+const authUi = /** @type {any} */ (window).KinvestAuthUi
+const lifecycleContracts = /** @type {any} */ (window).KinvestAuthLifecycle
+const lifecycle = lifecycleContracts.createAuthorizedRequestLifecycle()
 
 const el = {
   globalStatus: document.getElementById('global-status'),
@@ -55,13 +59,99 @@ function percent(v) {
   return `${Number(v).toFixed(2)}%`
 }
 
-async function getJson(url, options = {}) {
-  const res = await fetch(url, options)
-  if (!res.ok) {
+async function getJson(url, options = {}, commitCallback = (body) => body) {
+  const ticket = lifecycle.beginRequest()
+  try {
+    let res
+    try {
+      res = await fetch(url, {
+        credentials: 'same-origin',
+        ...options,
+        signal: ticket.signal
+      })
+    } catch (error) {
+      if (error.name === 'AbortError') {
+        throw Object.assign(new Error('STALE_RESPONSE'), { code: 'STALE_RESPONSE' })
+      }
+      const failure = authContracts.classifyApiFailure(0, {})
+      throw Object.assign(new Error('INVESTMENT_REQUEST_FAILED'), failure)
+    }
     const body = await res.json().catch(() => ({}))
-    throw new Error(body.error || `请求失败：${res.status}`)
+    if (!res.ok) {
+      const failure = authContracts.classifyApiFailure(res.status, body)
+      if (failure.code === 'AUTH_REQUIRED') enterGate()
+      throw Object.assign(new Error('INVESTMENT_REQUEST_FAILED'), failure)
+    }
+    return lifecycle.commit(ticket, () => commitCallback(body))
+  } finally {
+    lifecycle.finishRequest(ticket)
   }
-  return res.json()
+}
+
+async function getAuthStatus() {
+  let response
+  try {
+    response = await fetch('/api/auth/status', { credentials: 'same-origin' })
+  } catch {
+    const failure = authContracts.classifyApiFailure(0, {})
+    throw Object.assign(new Error('AUTH_STATUS_FAILED'), failure)
+  }
+  const body = await response.json().catch(() => ({}))
+  if (!response.ok) {
+    const failure = authContracts.classifyApiFailure(response.status, body)
+    throw Object.assign(new Error('AUTH_STATUS_FAILED'), failure)
+  }
+  return authContracts.normalizeAuthStatus(body)
+}
+
+function clearInvestmentState() {
+  state.watchlist = []
+  state.selectedCode = null
+  state.currentCompany = null
+  state.financeMode = 'annual'
+  for (const node of [
+    el.watchlist,
+    el.searchResults,
+    el.companyHead,
+    el.marketStatus,
+    el.marketData,
+    el.thermo,
+    el.financeTableWrap,
+    el.anomalyList,
+    el.breakdownTable,
+    el.announcementList,
+    el.newsList,
+    el.macroTable
+  ]) node.replaceChildren()
+  const searchInput = /** @type {HTMLInputElement} */ (el.searchInput)
+  const researchLink = /** @type {HTMLAnchorElement} */ (el.researchLink)
+  const refreshButton = /** @type {HTMLButtonElement} */ (el.refreshBtn)
+  searchInput.value = ''
+  el.searchHint.textContent = ''
+  researchLink.removeAttribute('href')
+  refreshButton.disabled = true
+  delete el.thermo.dataset.position
+  el.thermo.classList.remove('unavailable')
+  el.financeButtons.forEach((button, index) => button.classList.toggle('active', index === 0))
+  el.companyContent.classList.add('hidden')
+  el.companyEmpty.classList.remove('hidden')
+  el.companyEmpty.textContent = '选择左侧公司后，这里会展示行情、估值、财务、异常信号与来源事实。'
+  el.globalStatus.textContent = '设备访问许可已失效。'
+}
+
+function enterGate() {
+  lifecycle.invalidate()
+  clearInvestmentState()
+  authUi.showGate()
+}
+
+async function runInvestmentTask(task, target = el.globalStatus) {
+  try {
+    await task()
+  } catch (error) {
+    if (error.code === 'STALE_RESPONSE' || error.name === 'AbortError') return
+    target.textContent = authContracts.authErrorMessage(error.code)
+  }
 }
 
 function renderGlobalStatus(companiesCount) {
@@ -79,7 +169,10 @@ function renderWatchlistItem(item, list, selectedCode) {
     <p class="muted">来源：${item.refreshState.marketLabel} / ${item.refreshState.autoRefreshCycleMinutes}分钟</p>
     <p class="hint">下次自动刷新：${formatDateTime(item.refreshState.nextAutoRefreshAt)}</p>
   `
-  card.addEventListener('click', () => loadCompany(item.securityCode))
+  card.addEventListener('click', () => runInvestmentTask(
+    () => loadCompany(item.securityCode),
+    el.companyEmpty
+  ))
   list.appendChild(card)
 }
 
@@ -316,7 +409,10 @@ function renderSearchResults(items) {
     const availability = item.configured === false ? ' · 未收录' : ''
     row.innerHTML = `<p><strong>${item.nameZh}（${item.securityCode}）</strong></p><p class="muted">${item.market} · ${item.symbol || ''}${aliases}${availability}</p>`
     if (item.configured !== false) {
-      row.addEventListener('click', () => loadCompany(item.securityCode))
+      row.addEventListener('click', () => runInvestmentTask(
+        () => loadCompany(item.securityCode),
+        el.companyEmpty
+      ))
     } else {
       row.setAttribute('aria-disabled', 'true')
     }
@@ -325,25 +421,29 @@ function renderSearchResults(items) {
 }
 
 async function loadWatchlist() {
-  const data = await getJson('/api/watchlist')
-  state.watchlist = data.data
-  el.watchlist.innerHTML = ''
-  data.data.forEach((item) => {
-    renderWatchlistItem(item, el.watchlist, state.selectedCode)
+  return getJson('/api/watchlist', {}, (data) => {
+    state.watchlist = data.data
+    el.watchlist.innerHTML = ''
+    data.data.forEach((item) => {
+      renderWatchlistItem(item, el.watchlist, state.selectedCode)
+    })
+    renderGlobalStatus(data.data.length)
+    return data
   })
-  renderGlobalStatus(data.data.length)
 }
 
 async function loadCompany(code) {
-  const data = await getJson(`/api/company/${code}`)
-  state.currentCompany = data.data
-  renderCompany(data.data)
-  document.querySelectorAll('.watchlist-card').forEach((elNode) => {
-    if (elNode.textContent.includes(code)) {
-      elNode.classList.add('active')
-    } else {
-      elNode.classList.remove('active')
-    }
+  return getJson(`/api/company/${code}`, {}, (data) => {
+    state.currentCompany = data.data
+    renderCompany(data.data)
+    document.querySelectorAll('.watchlist-card').forEach((elNode) => {
+      if (elNode.textContent.includes(code)) {
+        elNode.classList.add('active')
+      } else {
+        elNode.classList.remove('active')
+      }
+    })
+    return data
   })
 }
 
@@ -353,13 +453,17 @@ async function doRefresh() {
     const data = await getJson(`/api/company/${state.currentCompany.securityCode}/refresh`, {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' }
+    }, (payload) => {
+      if (payload.success) renderCompany(payload.data)
+      return payload
     })
     if (data.success) {
-      renderCompany(data.data)
       await loadWatchlist()
     }
   } catch (err) {
-    alert(err.message || '刷新失败')
+    if (err.code !== 'STALE_RESPONSE') {
+      el.globalStatus.textContent = authContracts.authErrorMessage(err.code)
+    }
   }
 }
 
@@ -370,8 +474,12 @@ function bindEvents() {
       el.searchResults.innerHTML = ''
       return
     }
-    const data = await getJson(`/api/search?q=${encodeURIComponent(q)}`)
-    renderSearchResults(data.data)
+    await runInvestmentTask(async () => {
+      await getJson(`/api/search?q=${encodeURIComponent(q)}`, {}, (data) => {
+        renderSearchResults(data.data)
+        return data
+      })
+    }, el.searchHint)
   })
 
   el.searchInput.addEventListener('keydown', (ev) => {
@@ -395,15 +503,28 @@ function bindEvents() {
 }
 
 async function bootstrap() {
-  bindEvents()
-  await loadWatchlist()
-  if (state.watchlist[0]) {
-    await loadCompany(state.watchlist[0].securityCode)
-  } else {
-    el.companyEmpty.textContent = '关注清单为空：请先搜索并手动添加公司。'
+  let authStatus
+  try {
+    authStatus = await getAuthStatus()
+  } catch {
+    authUi.showUnavailable()
+    return
   }
+  if (!authStatus.authorized) {
+    enterGate()
+    return
+  }
+  lifecycle.authorize()
+  authUi.showDashboard()
+  bindEvents()
+  await runInvestmentTask(async () => {
+    await loadWatchlist()
+    if (state.watchlist[0]) {
+      await loadCompany(state.watchlist[0].securityCode)
+    } else {
+      el.companyEmpty.textContent = '关注清单为空：请先搜索并手动添加公司。'
+    }
+  })
 }
 
-bootstrap().catch((err) => {
-  el.globalStatus.textContent = `初始化失败：${err.message}`
-})
+bootstrap()

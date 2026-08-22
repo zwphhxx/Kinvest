@@ -1,0 +1,83 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>Kinvest 家庭设备管理</title>
+  <link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 64 64'%3E%3Crect width='64' height='64' rx='14' fill='%230b7a6e'/%3E%3Cpath d='M17 14v36h8V36l15 14h11L31 31l18-17H38L25 28V14z' fill='white'/%3E%3C/svg%3E" />
+  <link rel="stylesheet" href="/app.css" />
+  <link rel="stylesheet" href="/auth.css" />
+</head>
+<body>
+  <main class="admin-shell">
+    <header class="admin-header">
+      <div>
+        <p class="eyebrow">Kinvest / 家庭访问</p>
+        <h1>设备审批台</h1>
+        <p class="subline">这里只管理谁可以进入，不展示任何家庭资产内容。</p>
+      </div>
+      <a class="chip" href="/">返回入口</a>
+    </header>
+
+    <section id="admin-login" class="admin-panel">
+      <p class="ticket-label">Administrator</p>
+      <h2>管理员登录</h2>
+      <p class="subline">密码只用于本次验证，不会保存在浏览器中。</p>
+      <form id="admin-login-form">
+        <label class="auth-field" for="admin-password">
+          <span>管理员密码</span>
+          <input id="admin-password" name="password" type="password" autocomplete="current-password" required />
+        </label>
+        <button id="admin-login-submit" class="auth-primary" type="submit">进入审批台</button>
+      </form>
+    </section>
+
+    <section id="admin-desk" class="hidden" aria-label="家庭设备审批管理">
+      <div class="admin-grid">
+        <section class="admin-panel">
+          <p class="ticket-label">Pending</p>
+          <h2>待审批申请</h2>
+          <div id="pending-requests" class="admin-list"></div>
+        </section>
+
+        <section class="admin-panel">
+          <p class="ticket-label">Approved</p>
+          <h2>已授权设备</h2>
+          <div id="approved-devices" class="admin-list"></div>
+        </section>
+
+        <section class="admin-panel admin-panel-wide">
+          <p class="ticket-label">Emergency</p>
+          <h2>紧急撤销全部设备</h2>
+          <p class="subline">需要重新输入管理员密码，并键入确认短语。撤销后所有家人都要重新申请。</p>
+          <form id="revoke-all-form" class="confirm-grid">
+            <label class="auth-field" for="revoke-all-phrase">
+              <span>输入“撤销全部设备”</span>
+              <input id="revoke-all-phrase" autocomplete="off" required />
+            </label>
+            <label class="auth-field" for="revoke-all-password">
+              <span>再次输入管理员密码</span>
+              <input id="revoke-all-password" type="password" autocomplete="current-password" required />
+            </label>
+            <button id="revoke-all-submit" class="auth-danger" type="submit">撤销全部</button>
+          </form>
+        </section>
+
+        <section class="admin-panel admin-panel-wide">
+          <p class="ticket-label">Audit</p>
+          <h2>安全记录</h2>
+          <div id="auth-audit" class="admin-list"></div>
+        </section>
+      </div>
+
+      <p><button id="admin-logout" class="auth-secondary" type="button">退出管理员</button></p>
+    </section>
+
+    <p id="admin-live" class="auth-live" role="status" aria-live="polite" tabindex="-1"></p>
+  </main>
+
+  <script src="/auth-contract.js" defer></script>
+  <script src="/admin-contract.js" defer></script>
+  <script src="/admin.js" defer></script>
+</body>
+</html>

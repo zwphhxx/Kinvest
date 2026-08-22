@@ -675,6 +675,10 @@ async function run() {
   ]) {
     assert.match(httpsServer, new RegExp(`^\\s*add_header ${header} always;$`, 'm'))
   }
+  assert.match(
+    httpsServer,
+    /^\s*add_header Content-Security-Policy "[^"]*object-src 'none'[^"]*" always;$/m
+  )
 
   assert.ok(httpsLocations.length >= 4, 'HTTPS virtual host must contain all application locations')
   for (const location of httpsLocations) {

@@ -1,5 +1,6 @@
 const params = new URLSearchParams(window.location.search)
 const requestedCode = params.get('code') || '9988.HK'
+let authorizationResolved = false
 
 function byId(id) {
   return document.getElementById(id)
@@ -33,7 +34,7 @@ function getResearchContracts() {
 }
 
 async function safeGet(url, contracts, options = {}) {
-  const response = await fetch(url, options)
+  const response = await fetch(url, { credentials: 'same-origin', ...options })
   return contracts.parseJsonResponse(response)
 }
 
@@ -44,6 +45,17 @@ function renderUnavailable(message) {
 
 async function loadResearch() {
   const researchContracts = getResearchContracts()
+  const authContracts = /** @type {any} */ (window).KinvestAuth
+  const authStatus = authContracts.normalizeAuthStatus(
+    await safeGet('/api/auth/status', researchContracts)
+  )
+  if (!authStatus.authorized) {
+    window.location.replace('/')
+    return
+  }
+  authorizationResolved = true
+  byId('research-checking').classList.add('hidden')
+  byId('research-content').classList.remove('hidden')
   const code = researchContracts.normalizeSecurityCode(requestedCode)
   if (!code) {
     renderUnavailable('证券代码格式无效')
@@ -89,6 +101,16 @@ async function loadResearch() {
   backLink.href = `/?code=${encodeURIComponent(code)}#company-content`
 }
 
-loadResearch().catch((err) => {
-  renderUnavailable(`加载失败：${err.message}`)
+byId('research-retry').addEventListener('click', () => window.location.reload())
+
+loadResearch().catch(() => {
+  if (authorizationResolved) {
+    renderUnavailable('研究内容暂时无法加载，请稍后重试。')
+    return
+  }
+  byId('research-content').classList.add('hidden')
+  byId('research-checking').classList.remove('hidden')
+  byId('research-checking-text').textContent = '暂时无法确认设备状态，研究内容没有加载。'
+  byId('research-retry').classList.remove('hidden')
+  byId('research-retry').focus()
 })
