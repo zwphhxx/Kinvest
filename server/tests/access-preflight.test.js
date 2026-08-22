@@ -211,6 +211,9 @@ async function testSharedPreparationAndSuccessfulPreflight(tempDirectory) {
   const snapshot = new DatabaseSync(snapshotPath)
   assert.equal(snapshot.prepare('PRAGMA application_id').get().application_id, 0x4B494E56)
   assert.equal(snapshot.prepare(
+    "SELECT COUNT(*) AS count FROM sqlite_master WHERE type = 'table' AND name = 'refresh_counters'"
+  ).get().count, 1)
+  assert.equal(snapshot.prepare(
     "SELECT COUNT(*) AS count FROM sqlite_master WHERE type = 'table' AND name = 'device_auth_requests'"
   ).get().count, 1)
   snapshot.close()
@@ -232,6 +235,32 @@ async function testSharedPreparationAndSuccessfulPreflight(tempDirectory) {
   )
   assert.equal(stderr.value(), '')
   assert.equal(successSecret.clearCount(), 1)
+}
+
+async function testRealOpenerChecksIdentityBeforeRefreshExpand(tempDirectory) {
+  const { prepareApplication } = require('../pre-listen-preparation')
+  const { closeDatabase, openDbAtPath } = require('../db/refresh-db')
+  const databasePath = path.join(tempDirectory, 'real-opener-wrong-identity.sqlite')
+  const setup = new DatabaseSync(databasePath)
+  setup.exec('PRAGMA application_id = 12345')
+  setup.close()
+  const before = fs.readFileSync(databasePath)
+  const secret = createSecretRuntime()
+
+  await assert.rejects(prepareApplication({
+    env: enabledEnv(path.join(tempDirectory, 'production.sqlite')),
+    bootstrap: async () => secret.runtime,
+    openDatabase: () => openDbAtPath(databasePath),
+    closeDatabase
+  }), (error) => assertCode(error, 'ACCESS_CONTROL_CONFIG_INVALID'))
+
+  assert.deepStrictEqual(fs.readFileSync(databasePath), before)
+  const inspection = new DatabaseSync(databasePath)
+  assert.deepStrictEqual(inspection.prepare(
+    "SELECT name FROM sqlite_master WHERE type = 'table' ORDER BY name"
+  ).all(), [])
+  inspection.close()
+  assert.equal(secret.clearCount(), 1)
 }
 
 async function testStableFailuresAndDatabaseClosure(tempDirectory) {
@@ -701,6 +730,7 @@ async function run() {
   ))
   try {
     await testSharedPreparationAndSuccessfulPreflight(tempDirectory)
+    await testRealOpenerChecksIdentityBeforeRefreshExpand(tempDirectory)
     await testStableFailuresAndDatabaseClosure(tempDirectory)
     await testDatabasePathIsolation(tempDirectory)
     await testRealGithubTmpfsProviderChain(tempDirectory)

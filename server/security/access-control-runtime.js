@@ -1,6 +1,7 @@
 const crypto = require('node:crypto')
 const { AdminAuthRepository } = require('../db/admin-auth-repository')
 const { DeviceAuthRepository } = require('../db/device-auth-repository')
+const { initializeRefreshDatabase } = require('../db/refresh-db')
 const {
   DeviceAuthDatabaseIdentityError,
   KINVEST_SQLITE_APPLICATION_ID,
@@ -123,6 +124,7 @@ function createAccessControlRuntime(/** @type {any} */ {
   database,
   openDatabase,
   closeDatabase,
+  initializeDatabase = initializeRefreshDatabase,
   now = Date.now,
   randomBytes = crypto.randomBytes
 } = {}) {
@@ -177,6 +179,7 @@ function createAccessControlRuntime(/** @type {any} */ {
     }
     if (!sharedDatabase) fail()
     assertDatabaseIdentity(sharedDatabase)
+    initializeDatabase(sharedDatabase)
     const adminRepository = new AdminAuthRepository(sharedDatabase)
     const deviceRepository = new DeviceAuthRepository(sharedDatabase)
     adminRepository.initialize()

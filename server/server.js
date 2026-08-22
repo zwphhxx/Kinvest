@@ -10,7 +10,12 @@ const { prepareFinanceRows } = require('../public/finance-contract')
 const { isVerifiedDataBlock } = require('../public/data-source-contract')
 const { bootstrapSecrets } = require('./security/secret-bootstrap')
 const { createAccessControlRuntime } = require('./security/access-control-runtime')
-const { closeDb, openDb } = require('./db/refresh-db')
+const {
+  closeDatabase: closeDatabaseConnection,
+  getDbPath,
+  initializeRefreshDatabase,
+  openDbAtPath
+} = require('./db/refresh-db')
 const {
   HttpBoundaryError,
   createAuthHttpController,
@@ -448,8 +453,9 @@ async function startServer({
   prepare = prepareApplication,
   bootstrap = bootstrapSecrets,
   createAccessRuntime = createAccessControlRuntime,
-  openDatabase = openDb,
-  closeDatabase = closeDb,
+  openDatabase = () => openDbAtPath(getDbPath()),
+  closeDatabase = closeDatabaseConnection,
+  initializeDatabase = initializeRefreshDatabase,
   createHttpHandler = createRequestHandler,
   runtimeServer,
   port = PORT,
@@ -463,6 +469,7 @@ async function startServer({
     createAccessRuntime,
     openDatabase,
     closeDatabase,
+    initializeDatabase,
     createHandler: createHttpHandler
   })
   try {

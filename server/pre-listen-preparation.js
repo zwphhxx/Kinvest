@@ -2,7 +2,12 @@ const { bootstrapSecrets } = require('./security/secret-bootstrap')
 const {
   createAccessControlRuntime
 } = require('./security/access-control-runtime')
-const { closeDb, openDb } = require('./db/refresh-db')
+const {
+  closeDatabase: closeDatabaseConnection,
+  getDbPath,
+  initializeRefreshDatabase,
+  openDbAtPath
+} = require('./db/refresh-db')
 const { parseTrustedProxyAddresses } = require('./http/trusted-client')
 
 function httpSecurityConfigurationError() {
@@ -43,8 +48,9 @@ async function prepareApplication({
   loadSecrets,
   signal,
   createAccessRuntime = createAccessControlRuntime,
-  openDatabase = openDb,
-  closeDatabase = closeDb,
+  openDatabase = () => openDbAtPath(getDbPath()),
+  closeDatabase = closeDatabaseConnection,
+  initializeDatabase = initializeRefreshDatabase,
   createHandler = defaultCreateHandler
 } = {}) {
   throwIfAborted(signal)
@@ -61,7 +67,8 @@ async function prepareApplication({
       env,
       secretRuntime,
       openDatabase,
-      closeDatabase
+      closeDatabase,
+      initializeDatabase
     })
   } catch (error) {
     clearRuntimes(null, secretRuntime)

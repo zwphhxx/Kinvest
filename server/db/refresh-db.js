@@ -32,13 +32,7 @@ function openDbAtPath(databasePath) {
   if (!fs.existsSync(dir)) {
     fs.mkdirSync(dir, { recursive: true })
   }
-  const database = new DatabaseSync(databasePath)
-  try {
-    return initializeRefreshDatabase(database)
-  } catch (error) {
-    database.close()
-    throw error
-  }
+  return new DatabaseSync(databasePath)
 }
 
 function closeDatabase(database) {
@@ -56,8 +50,15 @@ function setDbPath(nextPath) {
 
 function openDb() {
   if (db) return db
-  db = openDbAtPath(currentDbPath)
-  return db
+  const database = openDbAtPath(currentDbPath)
+  try {
+    initializeRefreshDatabase(database)
+    db = database
+    return db
+  } catch (error) {
+    closeDatabase(database)
+    throw error
+  }
 }
 
 function closeDb() {
@@ -126,6 +127,7 @@ module.exports = {
   setDbPath,
   openDb,
   openDbAtPath,
+  initializeRefreshDatabase,
   closeDb,
   closeDatabase,
   todayKey,
