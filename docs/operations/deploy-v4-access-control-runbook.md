@@ -75,13 +75,22 @@ With no install journal, deploy-v3 still delegates to the old assets; deploy-v4
 delegates only after its complete asset closure exists. With a journal, both
 paths return `DEPLOY_INSTALL_INCOMPLETE` before executing any deploy asset.
 
-The installer always acquires `install-v4.lock` before the shared `deploy.lock`
-and holds both through gate installation, reconciliation, transaction commit,
-and journal clearing. A deployment already holding `deploy.lock` therefore
-prevents the installer from reading or replacing any target asset. The stable
-gate probes only `install-v4.lock` without waiting; it fails closed even in the
-window before the install journal is published. The deployer continues to own
-the deploy lock itself, so there is no reverse lock acquisition path.
+The installer creates `/var/lib/kinvest-deploy-gate` as root-owned `0755` and a
+persistent root-owned `0644` `install.lock` before atomically installing the
+stable gate. It takes an exclusive lock there before the shared private
+`deploy.lock` and holds both through gate installation, reconciliation,
+transaction commit, and journal clearing. A deployment already holding
+`deploy.lock` therefore prevents the installer from reading or replacing any
+target asset. The deployer continues to own the deploy lock itself, so there is
+no reverse lock acquisition path.
+
+The forced-command gate never reads or stats the private `/root` journal or
+backup tree. As the ordinary SSH user it validates the public directory and
+lock owner, mode, type, and link count, opens the lock read-only, and requests a
+nonblocking shared lock. A busy lock, unsafe metadata, permission/stat failure,
+or root-owned `0644` `install-incomplete` marker produces
+`DEPLOY_INSTALL_INCOMPLETE` before sudo. The public marker contains only the
+fixed line `ACTIVE`; ordinary users can read it but cannot change or replace it.
 
 The subsequent v4 transaction includes the shared deployer, both v3 and v4
 contract paths, Compose, sudoers, and configuration. Before publishing
@@ -99,6 +108,13 @@ parent-directory fsync. Removing a target recorded as originally absent is
 followed by a parent-directory fsync. These calls establish the intended
 filesystem ordering for crash recovery; they do not claim protection from
 storage hardware or filesystems that falsely report completed flushes.
+
+The installer fsyncs and atomically publishes the public marker before the
+private journal rename. After SIGKILL, the released lock is therefore not enough
+to reopen deployment while a stale transaction may exist. Reconciliation or a
+successful install removes and fsyncs the private journal first, then removes
+and fsyncs the public marker. The private journal remains root-only `0600` and
+its backup directory remains root-only `0700`.
 
 If a protocol-v4 RESTORE has already switched runtime to a newly approved tmpfs
 bundle and post-switch acceptance fails, the marker remains even though the raw

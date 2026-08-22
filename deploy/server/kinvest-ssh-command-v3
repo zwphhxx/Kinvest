@@ -1,16 +1,62 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-INSTALL_JOURNAL='/root/docker/kinvest/state/install-v4.journal'
-INSTALL_LOCK="${INSTALL_JOURNAL%/*}/install-v4.lock"
-if ! /usr/bin/flock -n "$INSTALL_LOCK" true; then
+GATE_STATE_DIR='/var/lib/kinvest-deploy-gate'
+INSTALL_LOCK="$GATE_STATE_DIR/install.lock"
+INSTALL_MARKER="$GATE_STATE_DIR/install-incomplete"
+
+gate_incomplete() {
   printf '%s\n' 'DEPLOY_INSTALL_INCOMPLETE' >&2
   exit 76
-fi
-if [[ -e "$INSTALL_JOURNAL" || -L "$INSTALL_JOURNAL" ]]; then
-  printf '%s\n' 'DEPLOY_INSTALL_INCOMPLETE' >&2
-  exit 76
-fi
+}
+
+validate_gate_state() {
+  /usr/bin/python3 - "$GATE_STATE_DIR" "$INSTALL_LOCK" "$INSTALL_MARKER" <<'PY'
+import os, stat, sys
+
+directory, lock, marker = sys.argv[1:]
+try:
+    directory_info = os.lstat(directory)
+    lock_info = os.lstat(lock)
+    if (
+        not stat.S_ISDIR(directory_info.st_mode)
+        or stat.S_IMODE(directory_info.st_mode) != 0o755
+        or directory_info.st_uid != 0
+        or directory_info.st_gid != 0
+        or not stat.S_ISREG(lock_info.st_mode)
+        or stat.S_IMODE(lock_info.st_mode) != 0o644
+        or lock_info.st_uid != 0
+        or lock_info.st_gid != 0
+        or lock_info.st_nlink != 1
+    ):
+        raise OSError("unsafe gate state")
+    if os.path.lexists(marker):
+        marker_info = os.lstat(marker)
+        if (
+            not stat.S_ISREG(marker_info.st_mode)
+            or stat.S_IMODE(marker_info.st_mode) != 0o644
+            or marker_info.st_uid != 0
+            or marker_info.st_gid != 0
+            or marker_info.st_nlink != 1
+        ):
+            raise OSError("unsafe gate marker")
+        with open(marker, "rb") as stream:
+            if stream.read(8) != b"ACTIVE\n" or stream.read(1) != b"":
+                raise OSError("invalid gate marker")
+        print("ACTIVE")
+    else:
+        print("CLEAN")
+except OSError:
+    raise SystemExit(1)
+PY
+}
+
+gate_status="$(validate_gate_state)" || gate_incomplete
+[[ "$gate_status" == CLEAN ]] || gate_incomplete
+exec 8<"$INSTALL_LOCK" || gate_incomplete
+/usr/bin/flock -n -s 8 || gate_incomplete
+gate_status="$(validate_gate_state)" || gate_incomplete
+[[ "$gate_status" == CLEAN ]] || gate_incomplete
 
 if [[ "$#" -ne 0 ]]; then
   printf '%s\n' 'DEPLOY_V3_WRAPPER_ARGUMENTS_REJECTED' >&2

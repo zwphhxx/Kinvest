@@ -1164,7 +1164,10 @@ async function run() {
   try {
     const fakeBin = path.join(sshFixture, 'bin')
     const capture = path.join(sshFixture, 'capture')
+    const gateState = path.join(sshFixture, 'gate-state')
     fs.mkdirSync(fakeBin)
+    fs.mkdirSync(gateState, { mode: 0o755 })
+    fs.writeFileSync(path.join(gateState, 'install.lock'), '', { mode: 0o644 })
     writeExecutable(path.join(fakeBin, 'sudo'), '#!/bin/sh\n[ "$1" = -n ] && shift\nexec "$@"\n')
     writeExecutable(path.join(fakeBin, 'flock'), '#!/bin/sh\nexit 0\n')
     writeExecutable(capture, `#!/bin/sh\ncat > '${path.join(sshFixture, 'stdin')}'\n`)
@@ -1172,7 +1175,10 @@ async function run() {
     writeExecutable(
       wrapperPath,
       wrapper
+        .replace("GATE_STATE_DIR='/var/lib/kinvest-deploy-gate'", `GATE_STATE_DIR='${gateState}'`)
         .replace('/usr/bin/flock', path.join(fakeBin, 'flock'))
+        .replaceAll('info.st_uid != 0', `info.st_uid != ${process.getuid()}`)
+        .replaceAll('info.st_gid != 0', `info.st_gid != ${process.getgid()}`)
         .replace('/usr/local/sbin/deploy-kinvest-v3', capture)
         .replace('/usr/local/sbin/deploy-kinvest', capture)
     )

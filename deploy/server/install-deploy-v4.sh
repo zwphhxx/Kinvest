@@ -9,9 +9,13 @@ SUDOERS_DIR='/etc/sudoers.d'
 RUN_ROOT='/run'
 BACKUP_ROOT="$SERVER_ROOT/install-backups/deploy-v4"
 INSTALL_JOURNAL="$SERVER_ROOT/state/install-v4.journal"
+GATE_STATE_DIR='/var/lib/kinvest-deploy-gate'
+GATE_INSTALL_LOCK="$GATE_STATE_DIR/install.lock"
+GATE_INSTALL_MARKER="$GATE_STATE_DIR/install-incomplete"
+GATE_OWNER='0:0'
 GATE_SOURCE="$SOURCE_DIR/kinvest-ssh-command-v3"
 GATE_TARGET="$LOCAL_SBIN/kinvest-ssh-command"
-GATE_EXPECTED_HASH='22831d2ac664e9d384d2b5fedc63d090fa4cfe1fc8a5608e851260cb32e00081'
+GATE_EXPECTED_HASH='b13b9232e6ae40f8641b0a641516ef55f3ed4e3068067446c0b1aeb59430664d'
 SOURCE_ASSETS=('deploy-kinvest-v4' 'deploy-kinvest-v3.sh' 'deploy-v3-contract.py' 'deploy-v3-contract.py' 'docker-compose-v3.yml' 'kinvest-deploy-v4.sudoers' 'access-control-network.conf.example')
 TARGETS=("$LOCAL_SBIN/deploy-kinvest-v4" "$LOCAL_SBIN/deploy-kinvest-v3" "$LOCAL_LIBEXEC/kinvest-deploy-v4-contract" "$LOCAL_LIBEXEC/kinvest-deploy-v3-contract" "$SERVER_ROOT/docker-compose-v4.yml" "$SUDOERS_DIR/kinvest-deploy-v4" "$SERVER_ROOT/access-control-network.conf.example")
 MODES=('0755' '0755' '0755' '0755' '0644' '0440' '0600')
@@ -37,6 +41,55 @@ fsync_file() {
   python3 -c 'import os,sys; descriptor=os.open(sys.argv[1],os.O_RDONLY|os.O_NOFOLLOW); os.fsync(descriptor); os.close(descriptor)' "$1"
 }
 
+validate_gate_marker() {
+  [[ -f "$GATE_INSTALL_MARKER" && ! -L "$GATE_INSTALL_MARKER" ]] || return 1
+  [[ "$(file_attributes "$GATE_INSTALL_MARKER")" == "$GATE_OWNER:644" ]] || return 1
+  [[ "$(wc -c <"$GATE_INSTALL_MARKER" | tr -d '[:space:]')" == 7 ]] || return 1
+  [[ "$(cat "$GATE_INSTALL_MARKER")" == ACTIVE ]]
+}
+
+prepare_gate_state() {
+  local lock_temporary
+  if [[ -e "$GATE_STATE_DIR" || -L "$GATE_STATE_DIR" ]]; then
+    [[ -d "$GATE_STATE_DIR" && ! -L "$GATE_STATE_DIR" && "$(file_attributes "$GATE_STATE_DIR")" == "$GATE_OWNER:755" ]] || return 1
+  else
+    install -d -o root -g root -m 0755 "$GATE_STATE_DIR" || return 1
+    fsync_directory "$(dirname "$GATE_STATE_DIR")" || return 1
+  fi
+  if [[ -e "$GATE_INSTALL_LOCK" || -L "$GATE_INSTALL_LOCK" ]]; then
+    [[ -f "$GATE_INSTALL_LOCK" && ! -L "$GATE_INSTALL_LOCK" && "$(file_attributes "$GATE_INSTALL_LOCK")" == "$GATE_OWNER:644" ]] || return 1
+  else
+    lock_temporary="$(mktemp "$GATE_STATE_DIR/.install-lock.XXXXXX")" || return 1
+    install -o root -g root -m 0644 /dev/null "$lock_temporary" || return 1
+    fsync_file "$lock_temporary" || return 1
+    mv -fT "$lock_temporary" "$GATE_INSTALL_LOCK" || return 1
+    fsync_directory "$GATE_STATE_DIR" || return 1
+  fi
+  if [[ -e "$GATE_INSTALL_MARKER" || -L "$GATE_INSTALL_MARKER" ]]; then
+    validate_gate_marker || return 1
+  fi
+}
+
+publish_public_marker() {
+  local marker_temporary
+  marker_temporary="$(mktemp "$GATE_STATE_DIR/.install-incomplete.XXXXXX")"
+  printf '%s\n' ACTIVE >"$marker_temporary"
+  chown root:root "$marker_temporary"
+  chmod 0644 "$marker_temporary"
+  fsync_file "$marker_temporary"
+  mv -fT "$marker_temporary" "$GATE_INSTALL_MARKER"
+  fsync_directory "$GATE_STATE_DIR"
+  validate_gate_marker
+}
+
+clear_public_marker() {
+  if [[ -e "$GATE_INSTALL_MARKER" || -L "$GATE_INSTALL_MARKER" ]]; then
+    validate_gate_marker || return 1
+    rm -f "$GATE_INSTALL_MARKER" || return 1
+    fsync_directory "$GATE_STATE_DIR" || return 1
+  fi
+}
+
 [[ "$#" -eq 1 && "$SOURCE_DIR" == /* && -d "$SOURCE_DIR" && ! -L "$SOURCE_DIR" ]] || fail 'usage: install-deploy-v4.sh /absolute/canonical/source/dir' 2
 [[ "$(id -u)" -eq 0 ]] || fail 'deploy-v4 installation must run as root'
 [[ "$(realpath -e "$SOURCE_DIR")" == "$SOURCE_DIR" ]] || fail 'deploy-v4 source directory must be canonical'
@@ -60,7 +113,8 @@ done
 install -d -o root -g root -m 0755 "$LOCAL_SBIN" "$LOCAL_LIBEXEC" "$SERVER_ROOT" "$SERVER_ROOT/state" "$SUDOERS_DIR"
 install -d -o root -g root -m 0700 "$BACKUP_ROOT"
 
-exec 8>"$SERVER_ROOT/state/install-v4.lock"
+prepare_gate_state || fail 'DEPLOY_V4_GATE_STATE_INVALID'
+exec 8<"$GATE_INSTALL_LOCK"
 flock -n 8 || fail 'another Kinvest installer is already running'
 exec 9>"$SERVER_ROOT/state/deploy.lock"
 flock -n 9 || fail 'another Kinvest deployment is already running'
@@ -73,6 +127,7 @@ stage=''
 temporary=''
 transaction_started='false'
 transaction_committed='false'
+public_marker_published='false'
 
 load_backup() {
   local candidate="$1" line present hash attributes extra line_count index manifest_index
@@ -160,6 +215,8 @@ install_forced_command_gate() {
 clear_install_journal() {
   rm -f "$INSTALL_JOURNAL"
   fsync_directory "$SERVER_ROOT/state"
+  clear_public_marker
+  public_marker_published='false'
 }
 
 if [[ -e "$INSTALL_JOURNAL" || -L "$INSTALL_JOURNAL" ]]; then
@@ -179,6 +236,8 @@ if [[ -e "$INSTALL_JOURNAL" || -L "$INSTALL_JOURNAL" ]]; then
   BACKUP_HASHES=('')
   BACKUP_ATTRIBUTES=('')
   backup=''
+elif [[ -e "$GATE_INSTALL_MARKER" || -L "$GATE_INSTALL_MARKER" ]]; then
+  clear_public_marker || fail 'DEPLOY_V4_INSTALL_RECONCILE_FAILED'
 fi
 
 install_forced_command_gate # stable-gate-commit
@@ -228,6 +287,8 @@ cleanup() {
   if [[ "$transaction_started" == true && "$transaction_committed" != true ]]; then
     rollback_targets || rollback_ok='false'
     if [[ "$rollback_ok" == true ]]; then clear_install_journal || rollback_ok='false'; fi
+  elif [[ "$public_marker_published" == true && ! -e "$INSTALL_JOURNAL" && ! -L "$INSTALL_JOURNAL" ]]; then
+    clear_public_marker || rollback_ok='false'
   fi
   rm -f "$temporary"
   rm -rf "$stage"
@@ -244,6 +305,8 @@ trap 'exit 143' TERM
 
 publish_install_journal() {
   local journal_temporary
+  publish_public_marker
+  public_marker_published='true'
   journal_temporary="$(mktemp "$SERVER_ROOT/state/.install-v4-journal.XXXXXX")"
   printf 'backup=%s\n' "$backup" >"$journal_temporary"
   chmod 0600 "$journal_temporary"
