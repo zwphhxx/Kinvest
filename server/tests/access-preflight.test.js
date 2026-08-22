@@ -1007,6 +1007,7 @@ async function testSubprocessSignalCancellation(tempDirectory) {
       productionPath,
       markerPath
     ], {
+      env: { ...process.env, NODE_NO_WARNINGS: '1' },
       stdio: ['ignore', 'pipe', 'pipe']
     })
     let stdout = ''

@@ -5,6 +5,7 @@ const { bootstrapSecrets } = require('../../security/secret-bootstrap')
 const databasePath = process.argv[2]
 const productionDatabasePath = process.argv[3]
 const markerPath = process.argv[4]
+process.emitWarning('access-preflight pending worker fixture', 'ExperimentalWarning')
 const versionConfig = JSON.stringify({
   adminPasswordVerifier: 'v20260822-001',
   deviceTokenHmac: {
