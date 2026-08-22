@@ -76,8 +76,14 @@ delegates only after its complete asset closure exists. With a journal, both
 paths return `DEPLOY_INSTALL_INCOMPLETE` before executing any deploy asset.
 
 The installer creates `/var/lib/kinvest-deploy-gate` as root-owned `0755` and a
-persistent root-owned `0644` `install.lock` before atomically installing the
-stable gate. It takes an exclusive lock there before the shared private
+persistent root-owned, deploy-group-owned `0640` `install.lock` before
+atomically installing the stable gate. The default group is the repository's
+existing forced-command user primary group, `kinvest-deploy`. A root operator
+may set the non-secret `KINVEST_DEPLOY_GATE_GROUP`, but installation rejects an
+invalid name, missing group, or group that does not contain the
+`kinvest-deploy` user.
+
+The installer takes an exclusive gate lock before the shared private
 `deploy.lock` and holds both through gate installation, reconciliation,
 transaction commit, and journal clearing. A deployment already holding
 `deploy.lock` therefore prevents the installer from reading or replacing any
@@ -86,11 +92,16 @@ no reverse lock acquisition path.
 
 The forced-command gate never reads or stats the private `/root` journal or
 backup tree. As the ordinary SSH user it validates the public directory and
-lock owner, mode, type, and link count, opens the lock read-only, and requests a
-nonblocking shared lock. A busy lock, unsafe metadata, permission/stat failure,
-or root-owned `0644` `install-incomplete` marker produces
+lock owner, group, mode, type, and link count. The lock group must be in the
+process effective primary or supplementary groups before the gate opens it
+read-only and requests a nonblocking shared lock. A busy lock is never ignored
+after a timeout. A busy lock, unsafe metadata, missing group access,
+permission/stat failure, or root-owned `0644` `install-incomplete` marker produces
 `DEPLOY_INSTALL_INCOMPLETE` before sudo. The public marker contains only the
 fixed line `ACTIVE`; ordinary users can read it but cannot change or replace it.
+Only members of the trusted forced-command deployment group can open and hold
+the shared lock, and that group already controls Production deployment
+availability.
 
 The subsequent v4 transaction includes the shared deployer, both v3 and v4
 contract paths, Compose, sudoers, and configuration. Before publishing
@@ -115,6 +126,14 @@ to reopen deployment while a stale transaction may exist. Reconciliation or a
 successful install removes and fsyncs the private journal first, then removes
 and fsyncs the public marker. The private journal remains root-only `0600` and
 its backup directory remains root-only `0700`.
+
+The installer tracks same-directory `.install-lock.XXXXXX` and
+`.install-incomplete.XXXXXX` files. Ordinary failure removes tracked files and
+fsyncs the public directory. On reentry it removes a SIGKILL orphan only when
+the basename is exact, it is a direct regular non-symlink child with one link,
+and owner/group/mode/content match the expected lock or marker contract. An
+unexpected owner, mode, symlink, malformed name, or additional hard link stops
+installation without deleting the suspicious file.
 
 If a protocol-v4 RESTORE has already switched runtime to a newly approved tmpfs
 bundle and post-switch acceptance fails, the marker remains even though the raw

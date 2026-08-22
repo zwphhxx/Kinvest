@@ -12,10 +12,13 @@ INSTALL_JOURNAL="$SERVER_ROOT/state/install-v4.journal"
 GATE_STATE_DIR='/var/lib/kinvest-deploy-gate'
 GATE_INSTALL_LOCK="$GATE_STATE_DIR/install.lock"
 GATE_INSTALL_MARKER="$GATE_STATE_DIR/install-incomplete"
-GATE_OWNER='0:0'
+GATE_ROOT_OWNER='0:0'
+GATE_GROUP="${KINVEST_DEPLOY_GATE_GROUP:-kinvest-deploy}"
+DEPLOY_USER='kinvest-deploy'
+GATE_GROUP_GID=''
 GATE_SOURCE="$SOURCE_DIR/kinvest-ssh-command-v3"
 GATE_TARGET="$LOCAL_SBIN/kinvest-ssh-command"
-GATE_EXPECTED_HASH='b13b9232e6ae40f8641b0a641516ef55f3ed4e3068067446c0b1aeb59430664d'
+GATE_EXPECTED_HASH='e709368d9fb11a2ade8f29a3dd4693b471c3d5e4e853b6c409ca3df7c8ae5d87'
 SOURCE_ASSETS=('deploy-kinvest-v4' 'deploy-kinvest-v3.sh' 'deploy-v3-contract.py' 'deploy-v3-contract.py' 'docker-compose-v3.yml' 'kinvest-deploy-v4.sudoers' 'access-control-network.conf.example')
 TARGETS=("$LOCAL_SBIN/deploy-kinvest-v4" "$LOCAL_SBIN/deploy-kinvest-v3" "$LOCAL_LIBEXEC/kinvest-deploy-v4-contract" "$LOCAL_LIBEXEC/kinvest-deploy-v3-contract" "$SERVER_ROOT/docker-compose-v4.yml" "$SUDOERS_DIR/kinvest-deploy-v4" "$SERVER_ROOT/access-control-network.conf.example")
 MODES=('0755' '0755' '0755' '0755' '0644' '0440' '0600')
@@ -41,28 +44,98 @@ fsync_file() {
   python3 -c 'import os,sys; descriptor=os.open(sys.argv[1],os.O_RDONLY|os.O_NOFOLLOW); os.fsync(descriptor); os.close(descriptor)' "$1"
 }
 
+gate_temp_link_count() {
+  python3 -c 'import os,sys; print(os.lstat(sys.argv[1]).st_nlink)' "$1"
+}
+
+validate_gate_temp() {
+  local candidate="$1" kind="$2" basename expected
+  [[ "$(dirname "$candidate")" == "$GATE_STATE_DIR" ]] || return 1
+  basename="$(basename "$candidate")"
+  if [[ "$kind" == lock ]]; then
+    [[ "$basename" =~ ^\.install-lock\.[A-Za-z0-9]{6}$ ]] || return 1
+    expected="${GATE_ROOT_OWNER%%:*}:$GATE_GROUP_GID:640"
+  else
+    [[ "$basename" =~ ^\.install-incomplete\.[A-Za-z0-9]{6}$ ]] || return 1
+    expected="$GATE_ROOT_OWNER:644"
+  fi
+  [[ -f "$candidate" && ! -L "$candidate" ]] || return 1
+  [[ "$(file_attributes "$candidate")" == "$expected" && "$(gate_temp_link_count "$candidate")" == 1 ]] || return 1
+  if [[ "$kind" == lock ]]; then
+    [[ ! -s "$candidate" ]] || return 1
+  else
+    [[ "$(wc -c <"$candidate" | tr -d '[:space:]')" == 7 && "$(cat "$candidate")" == ACTIVE ]] || return 1
+  fi
+}
+
+cleanup_tracked_gate_temporaries() {
+  local removed='false'
+  if [[ -n "${gate_lock_temporary:-}" ]]; then
+    validate_gate_temp "$gate_lock_temporary" lock || return 1
+    rm -f "$gate_lock_temporary" || return 1
+    gate_lock_temporary=''
+    removed='true'
+  fi
+  if [[ -n "${gate_marker_temporary:-}" ]]; then
+    validate_gate_temp "$gate_marker_temporary" marker || return 1
+    rm -f "$gate_marker_temporary" || return 1
+    gate_marker_temporary=''
+    removed='true'
+  fi
+  [[ "$removed" == false ]] || fsync_directory "$GATE_STATE_DIR"
+}
+
+reconcile_gate_temporaries() {
+  local candidate basename kind removed='false'
+  shopt -s nullglob
+  for candidate in "$GATE_STATE_DIR"/.install-lock.* "$GATE_STATE_DIR"/.install-incomplete.*; do
+    basename="$(basename "$candidate")"
+    if [[ "$basename" == .install-lock.* ]]; then kind=lock; else kind=marker; fi
+    validate_gate_temp "$candidate" "$kind" || { shopt -u nullglob; return 1; }
+    rm -f "$candidate" || { shopt -u nullglob; return 1; }
+    removed='true'
+  done
+  shopt -u nullglob
+  [[ "$removed" == false ]] || fsync_directory "$GATE_STATE_DIR"
+}
+
+resolve_gate_group() {
+  local record name password gid members extra deploy_groups
+  [[ "$GATE_GROUP" =~ ^[a-z_][a-z0-9_-]{0,31}$ ]] || return 1
+  record="$(getent group "$GATE_GROUP")" || return 1
+  [[ "$record" != *$'\n'* && "$record" != *$'\r'* ]] || return 1
+  IFS=: read -r name password gid members extra <<<"$record"
+  [[ "$name" == "$GATE_GROUP" && -z "$extra" && "$gid" =~ ^[1-9][0-9]{0,9}$ ]] || return 1
+  deploy_groups=" $(id -G "$DEPLOY_USER") " || return 1
+  [[ "$deploy_groups" == *" $gid "* ]] || return 1
+  GATE_GROUP_GID="$gid"
+}
+
 validate_gate_marker() {
   [[ -f "$GATE_INSTALL_MARKER" && ! -L "$GATE_INSTALL_MARKER" ]] || return 1
-  [[ "$(file_attributes "$GATE_INSTALL_MARKER")" == "$GATE_OWNER:644" ]] || return 1
+  [[ "$(file_attributes "$GATE_INSTALL_MARKER")" == "$GATE_ROOT_OWNER:644" ]] || return 1
   [[ "$(wc -c <"$GATE_INSTALL_MARKER" | tr -d '[:space:]')" == 7 ]] || return 1
   [[ "$(cat "$GATE_INSTALL_MARKER")" == ACTIVE ]]
 }
 
 prepare_gate_state() {
-  local lock_temporary
   if [[ -e "$GATE_STATE_DIR" || -L "$GATE_STATE_DIR" ]]; then
-    [[ -d "$GATE_STATE_DIR" && ! -L "$GATE_STATE_DIR" && "$(file_attributes "$GATE_STATE_DIR")" == "$GATE_OWNER:755" ]] || return 1
+    [[ -d "$GATE_STATE_DIR" && ! -L "$GATE_STATE_DIR" && "$(file_attributes "$GATE_STATE_DIR")" == "$GATE_ROOT_OWNER:755" ]] || return 1
   else
     install -d -o root -g root -m 0755 "$GATE_STATE_DIR" || return 1
     fsync_directory "$(dirname "$GATE_STATE_DIR")" || return 1
   fi
+  reconcile_gate_temporaries || fail 'DEPLOY_V4_GATE_TEMP_INVALID'
   if [[ -e "$GATE_INSTALL_LOCK" || -L "$GATE_INSTALL_LOCK" ]]; then
-    [[ -f "$GATE_INSTALL_LOCK" && ! -L "$GATE_INSTALL_LOCK" && "$(file_attributes "$GATE_INSTALL_LOCK")" == "$GATE_OWNER:644" ]] || return 1
+    [[ -f "$GATE_INSTALL_LOCK" && ! -L "$GATE_INSTALL_LOCK" && "$(file_attributes "$GATE_INSTALL_LOCK")" == "${GATE_ROOT_OWNER%%:*}:$GATE_GROUP_GID:640" ]] || return 1
   else
-    lock_temporary="$(mktemp "$GATE_STATE_DIR/.install-lock.XXXXXX")" || return 1
-    install -o root -g root -m 0644 /dev/null "$lock_temporary" || return 1
-    fsync_file "$lock_temporary" || return 1
-    mv -fT "$lock_temporary" "$GATE_INSTALL_LOCK" || return 1
+    gate_lock_temporary="$(mktemp "$GATE_STATE_DIR/.install-lock.XXXXXX")" || return 1
+    chown "${GATE_ROOT_OWNER%%:*}:$GATE_GROUP_GID" "$gate_lock_temporary" || return 1
+    chmod 0640 "$gate_lock_temporary" || return 1
+    # gate-lock-temp-created
+    fsync_file "$gate_lock_temporary" || return 1
+    mv -fT "$gate_lock_temporary" "$GATE_INSTALL_LOCK" || return 1
+    gate_lock_temporary=''
     fsync_directory "$GATE_STATE_DIR" || return 1
   fi
   if [[ -e "$GATE_INSTALL_MARKER" || -L "$GATE_INSTALL_MARKER" ]]; then
@@ -71,13 +144,14 @@ prepare_gate_state() {
 }
 
 publish_public_marker() {
-  local marker_temporary
-  marker_temporary="$(mktemp "$GATE_STATE_DIR/.install-incomplete.XXXXXX")"
-  printf '%s\n' ACTIVE >"$marker_temporary"
-  chown root:root "$marker_temporary"
-  chmod 0644 "$marker_temporary"
-  fsync_file "$marker_temporary"
-  mv -fT "$marker_temporary" "$GATE_INSTALL_MARKER"
+  gate_marker_temporary="$(mktemp "$GATE_STATE_DIR/.install-incomplete.XXXXXX")"
+  printf '%s\n' ACTIVE >"$gate_marker_temporary"
+  chown root:root "$gate_marker_temporary"
+  chmod 0644 "$gate_marker_temporary"
+  # gate-marker-temp-created
+  fsync_file "$gate_marker_temporary"
+  mv -fT "$gate_marker_temporary" "$GATE_INSTALL_MARKER"
+  gate_marker_temporary=''
   fsync_directory "$GATE_STATE_DIR"
   validate_gate_marker
 }
@@ -93,6 +167,7 @@ clear_public_marker() {
 [[ "$#" -eq 1 && "$SOURCE_DIR" == /* && -d "$SOURCE_DIR" && ! -L "$SOURCE_DIR" ]] || fail 'usage: install-deploy-v4.sh /absolute/canonical/source/dir' 2
 [[ "$(id -u)" -eq 0 ]] || fail 'deploy-v4 installation must run as root'
 [[ "$(realpath -e "$SOURCE_DIR")" == "$SOURCE_DIR" ]] || fail 'deploy-v4 source directory must be canonical'
+resolve_gate_group || fail 'DEPLOY_V4_GATE_GROUP_INVALID'
 
 for index in "${!SOURCE_ASSETS[@]}"; do
   source="$SOURCE_DIR/${SOURCE_ASSETS[$index]}"
@@ -113,6 +188,15 @@ done
 install -d -o root -g root -m 0755 "$LOCAL_SBIN" "$LOCAL_LIBEXEC" "$SERVER_ROOT" "$SERVER_ROOT/state" "$SUDOERS_DIR"
 install -d -o root -g root -m 0700 "$BACKUP_ROOT"
 
+gate_lock_temporary=''
+gate_marker_temporary=''
+early_cleanup() {
+  local result=$?
+  trap - EXIT
+  cleanup_tracked_gate_temporaries || result=1
+  exit "$result"
+}
+trap early_cleanup EXIT
 prepare_gate_state || fail 'DEPLOY_V4_GATE_STATE_INVALID'
 exec 8<"$GATE_INSTALL_LOCK"
 flock -n 8 || fail 'another Kinvest installer is already running'
@@ -292,6 +376,7 @@ cleanup() {
   fi
   rm -f "$temporary"
   rm -rf "$stage"
+  cleanup_tracked_gate_temporaries || rollback_ok='false'
   if [[ "$rollback_ok" != true ]]; then
     printf 'deploy-v4 rollback failed; recovery backup preserved at %s\n' "$backup" >&2
     result=1

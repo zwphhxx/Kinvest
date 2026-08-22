@@ -1167,7 +1167,7 @@ async function run() {
     const gateState = path.join(sshFixture, 'gate-state')
     fs.mkdirSync(fakeBin)
     fs.mkdirSync(gateState, { mode: 0o755 })
-    fs.writeFileSync(path.join(gateState, 'install.lock'), '', { mode: 0o644 })
+    fs.writeFileSync(path.join(gateState, 'install.lock'), '', { mode: 0o640 })
     writeExecutable(path.join(fakeBin, 'sudo'), '#!/bin/sh\n[ "$1" = -n ] && shift\nexec "$@"\n')
     writeExecutable(path.join(fakeBin, 'flock'), '#!/bin/sh\nexit 0\n')
     writeExecutable(capture, `#!/bin/sh\ncat > '${path.join(sshFixture, 'stdin')}'\n`)
