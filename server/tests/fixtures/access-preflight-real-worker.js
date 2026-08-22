@@ -7,6 +7,7 @@ const {
 const databasePath = process.argv[2]
 const productionDatabasePath = process.argv[3]
 const bundlePath = process.argv[4]
+process.emitWarning('access-preflight real worker fixture', 'ExperimentalWarning')
 
 runAccessPreflight({
   env: process.env,

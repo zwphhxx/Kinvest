@@ -1061,6 +1061,7 @@ function testExecutableOutputContract(tempDirectory) {
       timeout: 5000,
       env: {
         ...process.env,
+        NODE_NO_WARNINGS: '1',
         ...realProviderEnv(productionPath)
       }
     })
@@ -1084,6 +1085,7 @@ function testExecutableOutputContract(tempDirectory) {
       timeout: 5000,
       env: {
         ...process.env,
+        NODE_NO_WARNINGS: '1',
         ...realProviderEnv(productionPath),
         KINVEST_TRUSTED_PROXY_ADDRESSES: proxyConfiguration
       }
