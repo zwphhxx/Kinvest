@@ -49,8 +49,7 @@ function sameIdentity(leftStat, rightStat) {
 }
 
 function sameFileState(leftStat, rightStat) {
-  return sameIdentity(leftStat, rightStat) &&
-    leftStat.size === rightStat.size &&
+  return leftStat.size === rightStat.size &&
     leftStat.mtimeMs === rightStat.mtimeMs &&
     leftStat.ctimeMs === rightStat.ctimeMs
 }
@@ -114,18 +113,26 @@ async function snapshotDatabaseToPrivateDirectory(
     )
     sourceDatabase.exec('PRAGMA query_only = ON')
     const reboundStat = fs.lstatSync(sourcePath)
+    const reboundDescriptorStat = fs.fstatSync(sourceDescriptor)
     if (!reboundStat.isFile() || reboundStat.isSymbolicLink() ||
       !sameIdentity(anchoredStat, reboundStat) ||
-      !sameIdentity(anchoredStat, fs.fstatSync(sourceDescriptor))) {
+      !sameIdentity(anchoredStat, reboundDescriptorStat) ||
+      !sameFileState(anchoredStat, reboundStat) ||
+      !sameFileState(anchoredStat, reboundDescriptorStat)) {
       throw preflightError('ACCESS_PREFLIGHT_DATABASE_PATH_INVALID')
     }
     await backupDatabase(sourceDatabase, databasePath)
     sourceDatabase.close()
     sourceDatabase = undefined
     const finalSourceStat = fs.lstatSync(sourcePath)
-    if (!sameFileState(anchoredStat, finalSourceStat) ||
-      !sameIdentity(anchoredStat, fs.fstatSync(sourceDescriptor))) {
+    const finalDescriptorStat = fs.fstatSync(sourceDescriptor)
+    if (!sameIdentity(anchoredStat, finalSourceStat) ||
+      !sameIdentity(anchoredStat, finalDescriptorStat)) {
       throw preflightError('ACCESS_PREFLIGHT_DATABASE_PATH_INVALID')
+    }
+    if (!sameFileState(anchoredStat, finalSourceStat) ||
+      !sameFileState(anchoredStat, finalDescriptorStat)) {
+      throw preflightError('ACCESS_PREFLIGHT_DATABASE_SNAPSHOT_INVALID')
     }
     assertSidecarFree(sourcePath)
     const destinationStat = fs.lstatSync(databasePath)
