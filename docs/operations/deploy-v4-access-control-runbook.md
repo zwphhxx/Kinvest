@@ -9,8 +9,10 @@ post-switch access acceptance. State and logs contain no secret material.
 ## Required approval sequence
 
 1. Install the reviewed v4 assets with `install-deploy-v4.sh`. Installation
-   takes a root-only backup and does not enable a gate, restart a service, alter
-   Docker networking, or run Compose.
+   first atomically publishes the backward-compatible forced-command gate, then
+   takes a root-only backup and installs the complete v3/v4 asset closure. It
+   does not enable v4, restart a service, alter Docker networking, or run
+   Compose.
 2. Set Production `KINVEST_ACCESS_CONTROL_MODE=disabled`, temporarily approve
    `DEPLOY_V4_ENABLED=true`, and run a v4 disabled baseline. This writes v5 state
    with an empty trusted-proxy list.
@@ -44,20 +46,42 @@ required to survive a restart.
 
 Before changing `attempt.state`, `previous.state`, or `current.state`, the
 deployer fsyncs `state/deploy-transaction.journal`. It contains only the exact
-non-secret state before-images, absent markers, protocol version, stage, and a
-target digest. A normal verified automatic recovery replays those before-images
-before deleting the journal. If a process or host dies, the next invocation
-replays the journal, leaves `deploy-incomplete.marker`, and exits with
+non-secret state before-images, absent markers, protocol version, stage, target
+digest, verified database-backup path/checksum, and candidate schema range. A
+normal verified automatic recovery replays those before-images before deleting
+the journal. If a process or host dies, the next invocation replays the journal,
+preserves the database recovery references in `deploy-incomplete.marker`, and exits with
 `DEPLOY_INCOMPLETE_RESTORE_REQUIRED`. Subsequent FORWARD or ROLLBACK requests
 fail with `DEPLOY_RESTORE_REQUIRED`; only a fully accepted RESTORE clears the
 marker. Do not delete either file manually.
 
-The v4 installer uses `state/install-v4.journal` and a root-only full backup.
-While it is active the forced-command wrapper is disabled or returns
-`DEPLOY_INSTALL_INCOMPLETE`. Re-run the same reviewed installer to reconcile an
-interrupted installation. It restores the complete old target set first and
+RESTORE reads the production SQLite `PRAGMA user_version` before proceeding. If
+the current image supports that schema, an exact RESTORE may complete and clear
+the marker. Otherwise it stops with `ROLLBACK_REQUIRES_DB_RESTORE` and preserves
+the backup path and checksum. Database restoration remains a separate manual,
+approved operation; deploy-v4 never restores the persistent database itself.
+
+The v4 installer first installs one backward-compatible journal-aware gate by
+fsyncing a temporary file, atomically renaming it, and fsyncing its directory.
+With no install journal, deploy-v3 still delegates to the old assets; deploy-v4
+delegates only after its complete asset closure exists. With a journal, both
+paths return `DEPLOY_INSTALL_INCOMPLETE` before executing any deploy asset.
+
+The subsequent v4 transaction includes the shared deployer, both v3 and v4
+contract paths, Compose, sudoers, and configuration. Before publishing
+`state/install-v4.journal`, every backup file, backup manifest, backup directory,
+and parent directory is fsynced. After install or rollback renames, every target
+parent directory is fsynced before the journal is cleared; its parent directory
+is fsynced again after clearing. Re-run the same reviewed installer to reconcile
+an interrupted installation: it restores the complete old target set first and
 then starts a new transaction. Installation and reconciliation never restart a
 service or invoke Compose.
+
+If a protocol-v4 RESTORE has already switched runtime to a newly approved tmpfs
+bundle and post-switch acceptance fails, the marker remains even though the raw
+protocol-v4 state bytes are restored. FORWARD and ROLLBACK stay blocked; retry
+the exact RESTORE with an approved new bundle. Successful retry updates only the
+bundle identifier and clears the marker.
 
 The device-approval candidate receives only a consistent SQLite backup in
 `/run`, never the production database. It has no network, runs as UID 10001,

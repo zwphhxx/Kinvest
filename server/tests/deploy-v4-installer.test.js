@@ -12,7 +12,7 @@ function writeExecutable(file, source) {
   fs.writeFileSync(file, source, { mode: 0o755 })
 }
 
-function fixture({ existing = true, replaceFailure = null, postFailure = false, rollbackPause = false, killAfterReplacement = null } = {}) {
+function fixture({ existing = true, replaceFailure = null, postFailure = false, rollbackPause = false, killAfterReplacement = null, killStage = '' } = {}) {
   const base = fs.mkdtempSync(path.join(os.tmpdir(), 'kinvest-v4-installer-'))
   const sbin = path.join(base, 'sbin')
   const libexec = path.join(base, 'libexec')
@@ -26,6 +26,7 @@ function fixture({ existing = true, replaceFailure = null, postFailure = false, 
   const rollbackMarker = path.join(base, 'rollback.started')
   const rollbackRelease = path.join(base, 'rollback.release')
   const killMarker = path.join(base, 'kill.once')
+  const fsyncTrace = path.join(base, 'fsync.trace')
   for (const directory of [sbin, libexec, serverRoot, path.join(serverRoot, 'state'), sudoers, runRoot, bin]) {
     fs.mkdirSync(directory, { recursive: true })
   }
@@ -54,11 +55,12 @@ exec "$REAL_SHA256SUM" "$@"
   writeExecutable(path.join(bin, 'realpath'), '#!/bin/sh\n[ "${1:-}" = -e ] && shift\nprintf \'%s\\n\' "$1"\n')
   writeExecutable(path.join(bin, 'mv'), '#!/usr/bin/env bash\nargs=()\nfor arg in "$@"; do [[ "$arg" == -fT ]] || args+=("$arg"); done\nexec /bin/mv -f "${args[@]}"\n')
 
+  const gate = path.join(sbin, 'kinvest-ssh-command')
   const targets = [
     path.join(sbin, 'deploy-kinvest-v4'),
     path.join(sbin, 'deploy-kinvest-v3'),
-    path.join(sbin, 'kinvest-ssh-command'),
     path.join(libexec, 'kinvest-deploy-v4-contract'),
+    path.join(libexec, 'kinvest-deploy-v3-contract'),
     path.join(serverRoot, 'docker-compose-v4.yml'),
     path.join(sudoers, 'kinvest-deploy-v4'),
     path.join(serverRoot, 'access-control-network.conf.example')
@@ -67,6 +69,7 @@ exec "$REAL_SHA256SUM" "$@"
     for (let index = 0; index < targets.length; index += 1) {
       fs.writeFileSync(targets[index], `old-${index}\n`, { mode: 0o700 })
     }
+    writeExecutable(gate, '#!/bin/sh\n[ -e "' + path.join(serverRoot, 'state/install-v4.journal') + '" ] && exit 76\nexec sudo -n /usr/local/sbin/deploy-kinvest-v3\n')
   }
 
   let instrumented = installerSource
@@ -77,6 +80,14 @@ exec "$REAL_SHA256SUM" "$@"
     .replace("RUN_ROOT='/run'", `RUN_ROOT='${runRoot}'`)
     .replace('[[ "$(id -u)" -eq 0 ]]', '[[ "${KINVEST_INSTALL_V4_TEST_ROOT:-}" == 1 ]]')
     .replaceAll('-o root -g root', `-o ${process.getuid()} -g ${process.getgid()}`)
+    .replace('fsync_file() {', `fsync_file() {
+  printf 'file:%s\\n' "$1" >>'${fsyncTrace}'`)
+    .replace('fsync_directory() {', `fsync_directory() {
+  printf 'dir:%s\\n' "$1" >>'${fsyncTrace}'`)
+    .replace('publish_install_journal() {', `publish_install_journal() {
+  printf 'publish\\n' >>'${fsyncTrace}'`)
+    .replace('clear_install_journal() {', `clear_install_journal() {
+  printf 'clear\\n' >>'${fsyncTrace}'`)
   if (replaceFailure !== null) {
     instrumented = instrumented.replace(
       '  mv -fT "$temporary" "${TARGETS[$index]}"',
@@ -89,6 +100,18 @@ exec "$REAL_SHA256SUM" "$@"
       () => `  mv -fT "$temporary" "\${TARGETS[$index]}"
   if [[ "$index" == '${killAfterReplacement}' && ! -e '${killMarker}' ]]; then : >'${killMarker}'; kill -KILL $$; fi`
     )
+  }
+  if (killStage) {
+    const points = {
+      'before-gate': ['install_forced_command_gate # stable-gate-commit', `if [[ ! -e '${killMarker}' ]]; then : >'${killMarker}'; kill -KILL $$; fi
+install_forced_command_gate # stable-gate-commit`],
+      'after-gate': ['install_forced_command_gate # stable-gate-commit', `install_forced_command_gate # stable-gate-commit
+if [[ ! -e '${killMarker}' ]]; then : >'${killMarker}'; kill -KILL $$; fi`],
+      'after-journal': ['publish_install_journal # install-journal-commit', `publish_install_journal # install-journal-commit
+if [[ ! -e '${killMarker}' ]]; then : >'${killMarker}'; kill -KILL $$; fi`]
+    }
+    const [point, replacement] = points[killStage]
+    instrumented = instrumented.replace(point, () => replacement)
   }
   if (postFailure) {
     instrumented = instrumented.replace(
@@ -106,7 +129,7 @@ exec "$REAL_SHA256SUM" "$@"
   }
   const script = path.join(base, 'installer.sh')
   writeExecutable(script, instrumented)
-  return { base, bin, eventLog, lockDir, lockRelease, rollbackMarker, rollbackRelease, script, serverRoot, targets }
+  return { base, bin, eventLog, fsyncTrace, gate, lockDir, lockRelease, rollbackMarker, rollbackRelease, script, serverRoot, targets }
 }
 
 function installerEnvironment(context, overrides = {}) {
@@ -209,6 +232,27 @@ async function run() {
     fs.rmSync(signalled.base, { recursive: true, force: true })
   }
 
+  for (const killStage of ['before-gate', 'after-gate', 'after-journal']) {
+    const interrupted = fixture({ killStage })
+    try {
+      const killed = execute(interrupted)
+      assert.equal(killed.signal, 'SIGKILL', killStage)
+      const journal = path.join(interrupted.serverRoot, 'state/install-v4.journal')
+      assert.equal(fs.existsSync(journal), killStage === 'after-journal', killStage)
+      if (killStage === 'after-gate') {
+        const delegated = spawnSync(interrupted.gate, [], {
+          encoding: 'utf8', env: { ...process.env, PATH: `${interrupted.bin}:${process.env.PATH}`, SSH_ORIGINAL_COMMAND: 'deploy-v3' }
+        })
+        assert.equal(delegated.status, 0, delegated.stderr)
+      }
+      const resumed = execute(interrupted)
+      assert.equal(resumed.status, 0, resumed.stderr)
+      assert.equal(fs.existsSync(journal), false)
+    } finally {
+      fs.rmSync(interrupted.base, { recursive: true, force: true })
+    }
+  }
+
   for (let index = 0; index < 7; index += 1) {
     const interrupted = fixture({ killAfterReplacement: index })
     try {
@@ -216,12 +260,12 @@ async function run() {
       assert.equal(killed.signal, 'SIGKILL', `replacement ${index}`)
       const journal = path.join(interrupted.serverRoot, 'state/install-v4.journal')
       assert.equal(fs.existsSync(journal), true, `replacement ${index}`)
-      if ((fs.statSync(interrupted.targets[2]).mode & 0o111) === 0) {
-        const blocked = spawnSync(interrupted.targets[2], [], { encoding: 'utf8', env: { ...process.env, SSH_ORIGINAL_COMMAND: 'deploy-v4' } })
+      if ((fs.statSync(interrupted.gate).mode & 0o111) === 0) {
+        const blocked = spawnSync(interrupted.gate, [], { encoding: 'utf8', env: { ...process.env, SSH_ORIGINAL_COMMAND: 'deploy-v4' } })
         assert.notEqual(blocked.status, 0, `replacement ${index}`)
       } else {
         const wrapperHarness = path.join(interrupted.base, 'wrapper-harness')
-        writeExecutable(wrapperHarness, fs.readFileSync(interrupted.targets[2], 'utf8').replace('/root/docker/kinvest/state/install-v4.journal', journal))
+        writeExecutable(wrapperHarness, fs.readFileSync(interrupted.gate, 'utf8').replace('/root/docker/kinvest/state/install-v4.journal', journal))
         const blocked = spawnSync(wrapperHarness, [], {
           encoding: 'utf8',
           env: { ...process.env, PATH: `${interrupted.bin}:${process.env.PATH}`, SSH_ORIGINAL_COMMAND: 'deploy-v4' }
@@ -272,6 +316,16 @@ async function run() {
     const result = execute(success)
     assert.equal(result.status, 0, result.stderr)
     for (const target of success.targets) assert.equal(fs.existsSync(target), true)
+    assert.equal(fs.readFileSync(success.targets[2], 'utf8'), fs.readFileSync(success.targets[3], 'utf8'))
+    const trace = fs.readFileSync(success.fsyncTrace, 'utf8').trim().split('\n')
+    const publish = trace.indexOf('publish')
+    const clear = trace.lastIndexOf('clear')
+    assert.ok(publish > 0 && clear > publish)
+    assert.ok(trace.slice(0, publish).some((line) => /file:.*manifest\.txt$/.test(line)))
+    assert.ok(trace.slice(0, publish).some((line) => /dir:.*kinvest-deploy-v4-backup\./.test(line)))
+    for (const directory of new Set(success.targets.map((target) => path.dirname(target)))) {
+      assert.ok(trace.slice(publish + 1, clear).includes(`dir:${directory}`), directory)
+    }
     assert.doesNotMatch(result.stdout + result.stderr, /systemctl|docker compose|compose up/i)
   } finally {
     fs.rmSync(success.base, { recursive: true, force: true })

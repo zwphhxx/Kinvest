@@ -23,6 +23,13 @@ case "${SSH_ORIGINAL_COMMAND:-}" in
     exec sudo -n /usr/local/sbin/deploy-kinvest-v3
     ;;
   deploy-v4)
+    if [[ ! -x /usr/local/sbin/deploy-kinvest-v4 \
+      || ! -x /usr/local/sbin/deploy-kinvest-v3 \
+      || ! -x /usr/local/libexec/kinvest-deploy-v4-contract \
+      || ! -x /usr/local/libexec/kinvest-deploy-v3-contract ]]; then
+      printf '%s\n' 'DEPLOY_V4_ASSETS_MISSING' >&2
+      exit 69
+    fi
     exec sudo -n /usr/local/sbin/deploy-kinvest-v4
     ;;
   *)

@@ -495,7 +495,10 @@ restore_previous_runtime() {
   verify_public_health || return 1
   if [[ "$DEPLOY_PROTOCOL" == 4 ]]; then verify_access_behavior "$current_access_mode" || return 1; fi
 
-  if [[ "$intent" != RESTORE || "$current_protocol_version" != 5 ]]; then
+  if [[ "$DEPLOY_PROTOCOL" == 4 && "$intent" == RESTORE && "$current_protocol_version" != 5 ]]; then
+    journal_status="$("$CONTRACT" reconcile-deploy-journal "$DEPLOY_JOURNAL" "$CURRENT_STATE" "$PREVIOUS_STATE" "$ATTEMPT_STATE" "$INCOMPLETE_MARKER")" || return 1
+    [[ "$journal_status" == RECONCILED ]] || return 1
+  elif [[ "$intent" != RESTORE || "$current_protocol_version" != 5 ]]; then
     journal_status="$("$CONTRACT" reconcile-deploy-journal "$DEPLOY_JOURNAL" "$CURRENT_STATE" "$PREVIOUS_STATE" "$ATTEMPT_STATE")" || return 1
     [[ "$journal_status" == RECONCILED ]] || return 1
   elif [[ "$current_was_legacy" == true ]]; then
@@ -514,7 +517,7 @@ restore_previous_runtime() {
     recovery_state_file="$(mktemp "$RUN_ROOT/kinvest-v3.recovery-state.XXXXXX")"
     chmod 0600 "$recovery_state_file"
     if [[ "$intent" == RESTORE ]]; then
-      "$CONTRACT" make-restore-state "$schema_after" "$restore_backup_path" "$restore_backup_checksum" <"$envelope_file" >"$recovery_state_file" || return 1
+      "$CONTRACT" make-restore-state "$schema_after" "$recovery_schema_min" "$recovery_schema_max" "$restore_backup_path" "$restore_backup_checksum" <"$envelope_file" >"$recovery_state_file" || return 1
     else
       if [[ "$DEPLOY_PROTOCOL" == 4 ]]; then
         "$CONTRACT" make-recovery-state <"$envelope_file" >"$recovery_state_file" || return 1
@@ -769,7 +772,7 @@ else
 fi
 
 schema_before="$(read_schema_version)" || fail DEPLOY_V3_SCHEMA_READ_FAILED
-if [[ "$DEPLOY_PROTOCOL" == 4 && "$intent" == RESTORE && "$schema_before" != "$current_schema_version" ]]; then
+if [[ "$DEPLOY_PROTOCOL" == 4 && "$intent" == RESTORE && "$incomplete_status" != ACTIVE && "$schema_before" != "$current_schema_version" ]]; then
   fail RESTORE_SCHEMA_MISMATCH
 fi
 target_schema_min="$(read_image_label "$runtime_image_id" io.kinvest.schema.min)" || fail DEPLOY_V3_IMAGE_CAPABILITY_INVALID
@@ -781,7 +784,7 @@ if [[ "$DEPLOY_PROTOCOL" == 4 ]]; then
   [[ "$target_access_contract" == 1 ]] || fail DEPLOY_V4_IMAGE_ACCESS_CONTRACT_INVALID
 fi
 [[ "$target_schema_min" =~ ^[0-9]+$ && "$target_schema_max" =~ ^[0-9]+$ && "$target_schema_min" -le "$target_schema_max" && "$target_bootstrap" == 1 ]] || fail DEPLOY_V3_IMAGE_CAPABILITY_INVALID
-[[ "$schema_before" -ge "$target_schema_min" && "$schema_before" -le "$target_schema_max" ]] || fail ROLLBACK_REQUIRES_DB_RESTORE
+[[ "$schema_before" -ge "$target_schema_min" && "$schema_before" -le "$target_schema_max" ]] || fail ROLLBACK_REQUIRES_DB_RESTORE 75
 
 available_recovery_id="$(inspect_image_id "$recovery_image_id")" || fail ROLLBACK_REQUIRES_DB_RESTORE
 [[ "$available_recovery_id" == "$recovery_image_id" ]] || fail ROLLBACK_REQUIRES_DB_RESTORE
@@ -898,7 +901,7 @@ if [[ "$intent" == RESTORE ]]; then
   envelope_file="$(mktemp "$RUN_ROOT/kinvest-v3.restore-envelope.XXXXXX")"
   chmod 0600 "$envelope_file"
   make_approved_envelope "$current_json" "$envelope_file" "$current_access_mode" "$current_access_contract" "$current_trusted_proxies" "$current_proxy_checksum"
-  "$CONTRACT" make-restore-state "$schema_before" "$restore_backup_path" "$restore_backup_checksum" <"$envelope_file" >"$candidate_state_file"
+  "$CONTRACT" make-restore-state "$schema_before" "$target_schema_min" "$target_schema_max" "$restore_backup_path" "$restore_backup_checksum" <"$envelope_file" >"$candidate_state_file"
 else
   started_at="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
   if [[ "$DEPLOY_PROTOCOL" == 4 ]]; then
@@ -913,7 +916,7 @@ else
 fi
 
 target_summary="$(printf '%s\n' "$intent|$target_digest|$target_commit|$target_access_mode" | sha256sum | awk '{print $1}')"
-"$CONTRACT" begin-deploy-journal "$DEPLOY_JOURNAL" "$CURRENT_STATE" "$PREVIOUS_STATE" "$ATTEMPT_STATE" "$target_summary"
+"$CONTRACT" begin-deploy-journal "$DEPLOY_JOURNAL" "$CURRENT_STATE" "$PREVIOUS_STATE" "$ATTEMPT_STATE" "$candidate_state_file" "$target_summary"
 transaction_started='true'
 "$CONTRACT" atomic-state "$ATTEMPT_STATE" <"$candidate_state_file"
 "$CONTRACT" advance-deploy-journal "$DEPLOY_JOURNAL" attempt-written
@@ -928,10 +931,10 @@ compose_up "$runtime_image_id" "$target_provider" "$target_versions" "$candidate
 "$CONTRACT" advance-deploy-journal "$DEPLOY_JOURNAL" compose-finished
 wait_for_container "$runtime_image_id" || fail DEPLOY_V3_HEALTH_FAILED
 schema_after="$(read_schema_version)" || fail DEPLOY_V3_SCHEMA_READ_FAILED
-if [[ "$DEPLOY_PROTOCOL" == 4 && "$intent" == RESTORE && "$schema_after" != "$current_schema_version" ]]; then
+if [[ "$DEPLOY_PROTOCOL" == 4 && "$intent" == RESTORE && "$incomplete_status" != ACTIVE && "$schema_after" != "$current_schema_version" ]]; then
   fail RESTORE_SCHEMA_MISMATCH
 fi
-[[ "$schema_after" -ge "$target_schema_min" && "$schema_after" -le "$target_schema_max" ]] || fail ROLLBACK_REQUIRES_DB_RESTORE
+[[ "$schema_after" -ge "$target_schema_min" && "$schema_after" -le "$target_schema_max" ]] || fail ROLLBACK_REQUIRES_DB_RESTORE 75
 verify_public_health || fail DEPLOY_V3_PUBLIC_HEALTH_FAILED
 if [[ "$DEPLOY_PROTOCOL" == 4 ]]; then
   verify_access_behavior "$target_access_mode" || fail DEPLOY_V4_ACCESS_ACCEPTANCE_FAILED
@@ -950,7 +953,7 @@ if [[ "$intent" != RESTORE ]]; then
   fi
 else
   make_approved_envelope "$current_json" "$envelope_file" "$current_access_mode" "$current_access_contract" "$current_trusted_proxies" "$current_proxy_checksum"
-  "$CONTRACT" make-restore-state "$schema_after" "$restore_backup_path" "$restore_backup_checksum" <"$envelope_file" >"$candidate_state_file"
+  "$CONTRACT" make-restore-state "$schema_after" "$target_schema_min" "$target_schema_max" "$restore_backup_path" "$restore_backup_checksum" <"$envelope_file" >"$candidate_state_file"
 fi
 candidate_bundle_keep='true'
 "$CONTRACT" advance-deploy-journal "$DEPLOY_JOURNAL" before-current

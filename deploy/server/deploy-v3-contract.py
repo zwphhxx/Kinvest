@@ -1019,13 +1019,23 @@ def load_deploy_journal(destination: Path) -> dict[str, Any] | None:
     finally:
         if descriptor is not None:
             os.close(descriptor)
-    value = require_exact_keys(value, {"format", "originalProtocolVersion", "slots", "stage", "targetSummary"}, "DEPLOY_JOURNAL_INVALID")
+    value = require_exact_keys(value, {
+        "beforeImageSummary", "databaseBackupChecksum", "databaseBackupPath", "format",
+        "originalProtocolVersion", "slots", "stage", "targetSchemaMax",
+        "targetSchemaMin", "targetSchemaVersion", "targetSummary",
+    }, "DEPLOY_JOURNAL_INVALID")
     if (
         raw != (canonical_json(value) + "\n").encode("ascii")
         or value["format"] != DEPLOY_JOURNAL_FORMAT
         or type(value["originalProtocolVersion"]) is not int
         or value["originalProtocolVersion"] not in {3, 4, 5}
         or value["stage"] not in DEPLOY_JOURNAL_STAGES
+        or not isinstance(value["beforeImageSummary"], str)
+        or FINGERPRINT_PATTERN.fullmatch(value["beforeImageSummary"]) is None
+        or type(value["targetSchemaVersion"]) is not int
+        or type(value["targetSchemaMin"]) is not int
+        or type(value["targetSchemaMax"]) is not int
+        or not value["targetSchemaMin"] <= value["targetSchemaVersion"] <= value["targetSchemaMax"]
         or not isinstance(value["targetSummary"], str)
         or FINGERPRINT_PATTERN.fullmatch(value["targetSummary"]) is None
         or not isinstance(value["slots"], list)
@@ -1053,6 +1063,19 @@ def load_deploy_journal(destination: Path) -> dict[str, Any] | None:
             fail("DEPLOY_JOURNAL_INVALID")
     if {slot["name"] for slot in value["slots"]} != {"current.state", "previous.state", "attempt.state"}:
         fail("DEPLOY_JOURNAL_INVALID")
+    before_summary = hashlib.sha256(canonical_json([
+        {"existed": slot["existed"], "name": slot["name"], "sha256": slot["sha256"]}
+        for slot in value["slots"]
+    ]).encode("ascii")).hexdigest()
+    if before_summary != value["beforeImageSummary"]:
+        fail("DEPLOY_JOURNAL_INVALID")
+    backup_path = value["databaseBackupPath"]
+    backup_checksum = value["databaseBackupChecksum"]
+    if (backup_path, backup_checksum) != ("none", "none") and (
+        not isinstance(backup_path, str) or not backup_path.startswith("/")
+        or not isinstance(backup_checksum, str) or FINGERPRINT_PATTERN.fullmatch(backup_checksum) is None
+    ):
+        fail("DEPLOY_JOURNAL_INVALID")
     current = next(slot for slot in value["slots"] if slot["name"] == "current.state")
     if not current["existed"]:
         fail("DEPLOY_JOURNAL_INVALID")
@@ -1062,10 +1085,14 @@ def load_deploy_journal(destination: Path) -> dict[str, Any] | None:
     return value
 
 
-def begin_deploy_journal(journal: Path, slots: list[Path], target_summary: str) -> None:
+def begin_deploy_journal(journal: Path, slots: list[Path], candidate_path: Path, target_summary: str) -> None:
     if journal.exists() or journal.is_symlink() or FINGERPRINT_PATTERN.fullmatch(target_summary) is None:
         fail("DEPLOY_JOURNAL_ACTIVE")
     before = [deploy_journal_slot(slot) for slot in slots]
+    try:
+        candidate = validate_state(json.loads(candidate_path.read_text(encoding="ascii")))
+    except (OSError, UnicodeError, ValueError):
+        fail("DEPLOY_JOURNAL_INVALID")
     current = next(slot for slot in before if slot["name"] == "current.state")
     if not current["existed"]:
         fail("DEPLOY_JOURNAL_INVALID")
@@ -1073,11 +1100,21 @@ def begin_deploy_journal(journal: Path, slots: list[Path], target_summary: str) 
     match = re.match(rb"protocolVersion=([345])\n", current_raw)
     if match is None:
         fail("DEPLOY_JOURNAL_INVALID")
+    before_summary = hashlib.sha256(canonical_json([
+        {"existed": slot["existed"], "name": slot["name"], "sha256": slot["sha256"]}
+        for slot in before
+    ]).encode("ascii")).hexdigest()
     write_deploy_journal(journal, {
+        "beforeImageSummary": before_summary,
+        "databaseBackupChecksum": candidate["databaseBackupChecksum"],
+        "databaseBackupPath": candidate["databaseBackupPath"],
         "format": DEPLOY_JOURNAL_FORMAT,
         "originalProtocolVersion": int(match.group(1)),
         "slots": before,
         "stage": "before-attempt",
+        "targetSchemaMax": candidate["imageSchemaMax"],
+        "targetSchemaMin": candidate["imageSchemaMin"],
+        "targetSchemaVersion": candidate["schemaVersion"],
         "targetSummary": target_summary,
     })
 
@@ -1092,8 +1129,14 @@ def advance_deploy_journal(journal: Path, stage: str) -> None:
 
 def write_incomplete_marker(destination: Path, journal_value: dict[str, Any]) -> None:
     value = {
+        "beforeImageSummary": journal_value["beforeImageSummary"],
+        "databaseBackupChecksum": journal_value["databaseBackupChecksum"],
+        "databaseBackupPath": journal_value["databaseBackupPath"],
         "format": "kinvest-deploy-incomplete-v1",
         "stage": journal_value["stage"],
+        "targetSchemaMax": journal_value["targetSchemaMax"],
+        "targetSchemaMin": journal_value["targetSchemaMin"],
+        "targetSchemaVersion": journal_value["targetSchemaVersion"],
         "targetSummary": journal_value["targetSummary"],
     }
     write_deploy_journal(destination, value)
@@ -1114,13 +1157,29 @@ def load_incomplete_marker(destination: Path) -> bool:
         value = json.loads(raw.decode("ascii"))
     except (OSError, UnicodeError, ValueError):
         fail("DEPLOY_INCOMPLETE_MARKER_INVALID")
-    value = require_exact_keys(value, {"format", "stage", "targetSummary"}, "DEPLOY_INCOMPLETE_MARKER_INVALID")
+    value = require_exact_keys(value, {
+        "beforeImageSummary", "databaseBackupChecksum", "databaseBackupPath", "format",
+        "stage", "targetSchemaMax", "targetSchemaMin", "targetSchemaVersion", "targetSummary",
+    }, "DEPLOY_INCOMPLETE_MARKER_INVALID")
     if (
         raw != (canonical_json(value) + "\n").encode("ascii")
         or value["format"] != "kinvest-deploy-incomplete-v1"
         or value["stage"] not in DEPLOY_JOURNAL_STAGES
+        or not isinstance(value["beforeImageSummary"], str)
+        or FINGERPRINT_PATTERN.fullmatch(value["beforeImageSummary"]) is None
+        or type(value["targetSchemaVersion"]) is not int
+        or type(value["targetSchemaMin"]) is not int
+        or type(value["targetSchemaMax"]) is not int
+        or not value["targetSchemaMin"] <= value["targetSchemaVersion"] <= value["targetSchemaMax"]
         or not isinstance(value["targetSummary"], str)
         or FINGERPRINT_PATTERN.fullmatch(value["targetSummary"]) is None
+    ):
+        fail("DEPLOY_INCOMPLETE_MARKER_INVALID")
+    backup_path = value["databaseBackupPath"]
+    backup_checksum = value["databaseBackupChecksum"]
+    if (backup_path, backup_checksum) != ("none", "none") and (
+        not isinstance(backup_path, str) or not backup_path.startswith("/")
+        or not isinstance(backup_checksum, str) or FINGERPRINT_PATTERN.fullmatch(backup_checksum) is None
     ):
         fail("DEPLOY_INCOMPLETE_MARKER_INVALID")
     return True
@@ -1359,6 +1418,8 @@ def make_recovery_state(
     schema_version: str | None = None,
     backup_path: str | None = None,
     backup_checksum: str | None = None,
+    image_minimum: str | None = None,
+    image_maximum: str | None = None,
 ) -> dict[str, Any]:
     value = require_exact_keys(value, {"original", "approved"}, "DEPLOY_V3_RECOVERY_STATE_INVALID")
     original = validate_state(value["original"])
@@ -1386,6 +1447,12 @@ def make_recovery_state(
             fail("DEPLOY_V3_RECOVERY_STATE_INVALID")
         recovered["databaseBackupPath"] = backup_path
         recovered["databaseBackupChecksum"] = backup_checksum
+    if image_minimum is not None and image_maximum is not None:
+        try:
+            recovered["imageSchemaMin"] = int(image_minimum)
+            recovered["imageSchemaMax"] = int(image_maximum)
+        except ValueError:
+            fail("DEPLOY_V3_RECOVERY_STATE_INVALID")
     return validate_state(recovered)
 
 
@@ -1649,13 +1716,15 @@ def main(argv: list[str]) -> int:
         )
         sys.stdout.write(canonical_json(result) + "\n")
         return 0
-    if command == "make-restore-state" and len(argv) in {2, 5}:
+    if command == "make-restore-state" and len(argv) in {2, 5, 7}:
         result = make_recovery_state(
             read_json_stdin(),
             restore=True,
-            schema_version=argv[2] if len(argv) == 5 else None,
-            backup_path=argv[3] if len(argv) == 5 else None,
-            backup_checksum=argv[4] if len(argv) == 5 else None,
+            schema_version=argv[2] if len(argv) in {5, 7} else None,
+            backup_path=argv[5] if len(argv) == 7 else (argv[3] if len(argv) == 5 else None),
+            backup_checksum=argv[6] if len(argv) == 7 else (argv[4] if len(argv) == 5 else None),
+            image_minimum=argv[3] if len(argv) == 7 else None,
+            image_maximum=argv[4] if len(argv) == 7 else None,
         )
         sys.stdout.write(canonical_json(result) + "\n")
         return 0
@@ -1665,8 +1734,8 @@ def main(argv: list[str]) -> int:
     if command == "reconcile-atomic-state" and len(argv) == 3:
         reconcile_atomic_state(Path(argv[2]))
         return 0
-    if command == "begin-deploy-journal" and len(argv) == 7:
-        begin_deploy_journal(Path(argv[2]), [Path(argv[3]), Path(argv[4]), Path(argv[5])], argv[6])
+    if command == "begin-deploy-journal" and len(argv) == 8:
+        begin_deploy_journal(Path(argv[2]), [Path(argv[3]), Path(argv[4]), Path(argv[5])], Path(argv[6]), argv[7])
         return 0
     if command == "advance-deploy-journal" and len(argv) == 4:
         advance_deploy_journal(Path(argv[2]), argv[3])

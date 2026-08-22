@@ -136,7 +136,9 @@ if [[ "$command" == image && "$1" == inspect ]]; then
   esac
   case "$format" in
     *RepoDigests*) printf '["%s"]\n' "$digest" ;;
-    *io.kinvest.schema.min*|*io.kinvest.schema.max*) echo 0 ;;
+    *io.kinvest.schema.min*) echo 0 ;;
+    *io.kinvest.schema.max*)
+      if [[ "$image" == "$CURRENT_ID" ]]; then echo "$RECOVERY_SCHEMA_MAX"; else echo "$CANDIDATE_SCHEMA_MAX"; fi ;;
     *io.kinvest.secret-bootstrap*|*io.kinvest.access-control.contract*) echo 1 ;;
     *) echo "$image" ;;
   esac
@@ -188,6 +190,9 @@ if [[ "$command" == compose ]]; then
       "$KINVEST_IMAGE" "$KINVEST_ACCESS_CONTROL_MODE" "$KINVEST_SECRET_PROVIDER_MODE" \
       "$KINVEST_SECRET_VERSION_IDS" "$KINVEST_SECRET_BUNDLE_HOST_PATH" \
       "$KINVEST_TRUSTED_PROXY_ADDRESSES" >>"$OPERATIONS"
+    if [[ "$MIGRATED_SCHEMA" != 0 && "$KINVEST_IMAGE" == "$CANDIDATE_ID" ]]; then
+      python3 -c 'import sqlite3,sys; c=sqlite3.connect(sys.argv[1]); c.execute("PRAGMA user_version=" + sys.argv[2]); c.commit(); c.close()' "$DATABASE_PATH" "$MIGRATED_SCHEMA"
+    fi
     if [[ ( "$FAILURE" == compose && "$KINVEST_IMAGE" == "$CANDIDATE_ID" || "$FAILURE" == restore-compose && "$KINVEST_IMAGE" == "$CURRENT_ID" ) && ! -e "$FAILURE_MARKER" ]]; then
       : >"$FAILURE_MARKER"; exit 1
     fi
@@ -219,7 +224,7 @@ if [[ " $* " == *" %{content_type} "* ]]; then printf '%s %s' "$code" "$content_
 `)
 }
 
-function createFixture({ failure, currentDevice = false, oldBundleMissing = false, legacyProtocol4 = false, crashStage = '' }) {
+function createFixture({ failure, currentDevice = false, oldBundleMissing = false, legacyProtocol4 = false, crashStage = '', migratedSchema = 0, recoverySchemaMax = 0 }) {
   const base = fs.mkdtempSync(path.join(os.tmpdir(), 'kinvest-v4-executor-'))
   const serverRoot = path.join(base, 'server')
   const runRoot = path.join(base, 'run')
@@ -315,7 +320,7 @@ function createFixture({ failure, currentDevice = false, oldBundleMissing = fals
   }
   if (oldBundleMissing) fs.rmSync(currentBundle, { recursive: true, force: true })
   fakeCommands(bin)
-  return { base, bin, contract, contractLog, deployer, compose, current, currentText, previousText, bundleRoot, stateDir, activeImage, activeMode, operations, preflights, failureMarker, authMarker, crashMarker, failure }
+  return { base, bin, contract, contractLog, deployer, compose, current, currentText, previousText, bundleRoot, stateDir, activeImage, activeMode, operations, preflights, failureMarker, authMarker, crashMarker, database, failure, migratedSchema, recoverySchemaMax }
 }
 
 function executorEnv(context, protocol = '4') {
@@ -334,7 +339,11 @@ function executorEnv(context, protocol = '4') {
       FAILURE: context.failure, FAILURE_MARKER: context.failureMarker, AUTH_MARKER: context.authMarker,
       CRASH_MARKER: context.crashMarker,
       OFFLINE_ATTESTATION: path.join(context.base, 'offline-attestation'),
-      CONTRACT_LOG: context.contractLog
+      CONTRACT_LOG: context.contractLog,
+      DATABASE_PATH: context.database,
+      MIGRATED_SCHEMA: String(context.migratedSchema),
+      RECOVERY_SCHEMA_MAX: String(context.recoverySchemaMax),
+      CANDIDATE_SCHEMA_MAX: context.migratedSchema ? '1' : '0'
   }
 }
 
@@ -578,6 +587,68 @@ async function run() {
     } finally {
       spawnSync('/bin/rm', ['-rf', crashed.base])
     }
+  }
+
+  for (const recoverySchemaMax of [1, 0]) {
+    const migratedCrash = createFixture({
+      failure: 'none', legacyProtocol4: true, crashStage: 'compose', migratedSchema: 1, recoverySchemaMax
+    })
+    try {
+      const request = payload({ mode: 'disabled', provider: 'disabled' })
+      const killed = execute(migratedCrash, request)
+      assert.equal(killed.signal, 'SIGKILL')
+      const reconciled = execute(migratedCrash, request)
+      assert.equal(reconciled.stderr, 'DEPLOY_INCOMPLETE_RESTORE_REQUIRED\n')
+      const markerPath = path.join(migratedCrash.stateDir, 'deploy-incomplete.marker')
+      const marker = JSON.parse(fs.readFileSync(markerPath, 'utf8'))
+      assert.match(marker.databaseBackupPath, /\.sqlite$/)
+      assert.equal(marker.databaseBackupChecksum, crypto.createHash('sha256').update(fs.readFileSync(marker.databaseBackupPath)).digest('hex'))
+      assert.equal(marker.targetSchemaVersion, 0)
+      assert.equal(marker.targetSchemaMin, 0)
+      assert.equal(marker.targetSchemaMax, 1)
+
+      const restore = execute(migratedCrash, payload({
+        intent: 'RESTORE', digest: identities.currentDigest, commit: identities.currentCommit,
+        mode: 'disabled', provider: 'disabled'
+      }))
+      if (recoverySchemaMax === 1) {
+        assert.equal(restore.status, 0, restore.stderr)
+        assert.equal(parsedState(migratedCrash, 'current.state').schemaVersion, 1)
+        assert.equal(fs.existsSync(markerPath), false)
+      } else {
+        assert.equal(restore.status, 75)
+        assert.match(restore.stderr, /ROLLBACK_REQUIRES_DB_RESTORE/)
+        assert.equal(fs.existsSync(markerPath), true)
+        assert.deepEqual(JSON.parse(fs.readFileSync(markerPath, 'utf8')), marker)
+      }
+    } finally {
+      spawnSync('/bin/rm', ['-rf', migratedCrash.base])
+    }
+  }
+
+  const legacyRestoreFailure = createFixture({
+    failure: 'restore-compose', currentDevice: true, oldBundleMissing: true, legacyProtocol4: true
+  })
+  try {
+    const restoreRequest = payload({
+      intent: 'RESTORE', digest: identities.currentDigest, commit: identities.currentCommit,
+      mode: 'disabled', material: currentMaterial
+    })
+    const failed = execute(legacyRestoreFailure, restoreRequest)
+    assert.notEqual(failed.status, 0)
+    assert.equal(fs.readFileSync(path.join(legacyRestoreFailure.stateDir, 'current.state'), 'utf8'), legacyRestoreFailure.currentText)
+    const marker = path.join(legacyRestoreFailure.stateDir, 'deploy-incomplete.marker')
+    assert.equal(fs.existsSync(marker), true)
+    const blocked = execute(legacyRestoreFailure, payload())
+    assert.match(blocked.stderr, /DEPLOY_RESTORE_REQUIRED/)
+    const retried = execute(legacyRestoreFailure, restoreRequest)
+    assert.equal(retried.status, 0, retried.stderr)
+    assert.equal(fs.existsSync(marker), false)
+    const restored = parsedState(legacyRestoreFailure, 'current.state')
+    assert.equal(restored.secretProviderMode, 'github-tmpfs-v1')
+    assert.notEqual(restored.secretBundleId, legacyRestoreFailure.current.secretBundleId)
+  } finally {
+    spawnSync('/bin/rm', ['-rf', legacyRestoreFailure.base])
   }
 
   const installGuard = createFixture({ failure: 'none' })
