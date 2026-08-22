@@ -3,7 +3,7 @@ const crypto = require('node:crypto')
 const fs = require('node:fs')
 const os = require('node:os')
 const path = require('node:path')
-const { spawnSync } = require('node:child_process')
+const { spawn, spawnSync } = require('node:child_process')
 
 const rootDir = path.resolve(__dirname, '../..')
 const deployerSource = fs.readFileSync(path.join(rootDir, 'deploy/server/deploy-kinvest-v3.sh'), 'utf8')
@@ -183,7 +183,10 @@ if [[ "$command" == compose ]]; then
   if [[ "$all" == *" up "* ]]; then
     printf '%s' "$KINVEST_IMAGE" >"$ACTIVE_IMAGE"
     printf '%s' "$KINVEST_ACCESS_CONTROL_MODE" >"$ACTIVE_MODE"
-    printf 'compose up %s %s\n' "$KINVEST_IMAGE" "$KINVEST_ACCESS_CONTROL_MODE" >>"$OPERATIONS"
+    printf 'compose up %s access=%s provider=%s versions=%s bundle=%s proxies=%s\n' \
+      "$KINVEST_IMAGE" "$KINVEST_ACCESS_CONTROL_MODE" "$KINVEST_SECRET_PROVIDER_MODE" \
+      "$KINVEST_SECRET_VERSION_IDS" "$KINVEST_SECRET_BUNDLE_HOST_PATH" \
+      "$KINVEST_TRUSTED_PROXY_ADDRESSES" >>"$OPERATIONS"
     if [[ "$FAILURE" == compose && "$KINVEST_IMAGE" == "$CANDIDATE_ID" && ! -e "$FAILURE_MARKER" ]]; then
       : >"$FAILURE_MARKER"; exit 1
     fi
@@ -295,10 +298,8 @@ function createFixture({ failure, currentDevice = false }) {
   return { base, bin, contract, contractLog, deployer, compose, current, currentText, previousText, bundleRoot, stateDir, activeImage, activeMode, operations, preflights, failureMarker, authMarker, failure }
 }
 
-function execute(context, input, protocol = '4') {
-  return spawnSync('bash', [context.deployer], {
-    encoding: 'utf8', input,
-    env: {
+function executorEnv(context, protocol = '4') {
+  return {
       ...process.env,
       PATH: `${context.bin}:${process.env.PATH}`,
       KINVEST_DEPLOY_PROTOCOL: protocol,
@@ -311,9 +312,15 @@ function execute(context, input, protocol = '4') {
       ACTIVE_IMAGE: context.activeImage, ACTIVE_MODE: context.activeMode,
       OPERATIONS: context.operations, PREFLIGHTS: context.preflights,
       FAILURE: context.failure, FAILURE_MARKER: context.failureMarker, AUTH_MARKER: context.authMarker,
-      OFFLINE_ATTESTATION: path.join(context.base, 'offline-attestation')
-      , CONTRACT_LOG: context.contractLog
-    }
+      OFFLINE_ATTESTATION: path.join(context.base, 'offline-attestation'),
+      CONTRACT_LOG: context.contractLog
+  }
+}
+
+function execute(context, input, protocol = '4') {
+  return spawnSync('bash', [context.deployer], {
+    encoding: 'utf8', input,
+    env: executorEnv(context, protocol)
   })
 }
 
@@ -327,9 +334,19 @@ function assertRecovered(context, result) {
   const bundles = fs.readdirSync(context.bundleRoot).sort()
   assert.deepEqual(bundles, [context.current.secretBundleId === 'none' ? 'disabled' : context.current.secretBundleId])
   const operations = fs.readFileSync(context.operations, 'utf8')
-  assert.match(
-    operations,
-    new RegExp(`compose up ${identities.currentId} ${context.current.accessControlMode}`),
+  const expectedVersions = JSON.stringify(context.current.secretVersionIds)
+  const expectedBundle = path.join(context.bundleRoot, context.current.secretBundleId === 'none' ? 'disabled' : context.current.secretBundleId)
+  const recoveryCompose = [
+    `compose up ${identities.currentId}`,
+    `access=${context.current.accessControlMode}`,
+    `provider=${context.current.secretProviderMode}`,
+    `versions=${expectedVersions}`,
+    `bundle=${expectedBundle}`,
+    `proxies=${JSON.stringify(context.current.trustedProxyAddresses)}`
+  ].join(' ')
+  assert.equal(
+    operations.split('\n').includes(recoveryCompose),
+    true,
     `${result.stderr}\n${operations}\n${fs.readFileSync(context.preflights, 'utf8')}\n${fs.readFileSync(context.contractLog, 'utf8')}`
   )
   const combined = result.stdout + result.stderr + operations
@@ -379,10 +396,13 @@ async function run() {
       const result = execute(context, payload())
       assertRecovered(context, result)
       const preflights = fs.readFileSync(context.preflights, 'utf8')
+      const operations = fs.readFileSync(context.operations, 'utf8')
       assert.match(preflights, new RegExp(`preflight secret ${identities.candidateId}`))
       assert.match(preflights, new RegExp(`preflight secret ${identities.currentId}`))
       assert.match(preflights, new RegExp(`preflight access ${identities.candidateId}`))
       if (scenario.currentDevice) assert.match(preflights, new RegExp(`preflight access ${identities.currentId}`))
+      assert.match(operations, /docker inspect --format \{\{\.State\.Running\}\} nginx/)
+      assert.match(operations, /docker inspect --format \{\{with index \.NetworkSettings\.Networks "web"\}\}\{\{\.IPAddress\}\}\{\{end\}\} nginx/)
     } finally {
       spawnSync('/bin/rm', ['-rf', context.base])
     }
@@ -442,8 +462,29 @@ async function run() {
   const guard = createFixture({ failure: 'none' })
   try {
     const sentinel = 'SECRET_SENTINEL_MUST_NOT_BE_READ'
-    const result = execute(guard, sentinel, '3')
-    assert.notEqual(result.status, 0)
+    const result = await new Promise((resolve, reject) => {
+      const child = spawn('bash', [guard.deployer], {
+        env: executorEnv(guard, '3'),
+        stdio: ['pipe', 'pipe', 'pipe']
+      })
+      let stdout = ''
+      let stderr = ''
+      child.stdout.setEncoding('utf8')
+      child.stderr.setEncoding('utf8')
+      child.stdout.on('data', (chunk) => { stdout += chunk })
+      child.stderr.on('data', (chunk) => { stderr += chunk })
+      child.stdin.write(sentinel)
+      const timer = setTimeout(() => {
+        child.kill('SIGKILL')
+        reject(new Error('state5 guard blocked reading an open stdin'))
+      }, 1000)
+      child.on('exit', (code) => {
+        clearTimeout(timer)
+        child.stdin.destroy()
+        resolve({ code, stdout, stderr })
+      })
+    })
+    assert.notEqual(result.code, 0)
     assert.equal(result.stderr, 'DEPLOY_V3_PROTOCOL_RETIRED\n')
     assert.equal((result.stdout + result.stderr).includes(sentinel), false)
     assert.equal(fs.readFileSync(guard.preflights, 'utf8'), '')

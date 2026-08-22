@@ -47,6 +47,10 @@ for directory in "$LOCAL_SBIN" "$LOCAL_LIBEXEC" "$SERVER_ROOT" "$SERVER_ROOT/sta
 done
 install -d -o root -g root -m 0755 "$LOCAL_SBIN" "$LOCAL_LIBEXEC" "$SERVER_ROOT" "$SERVER_ROOT/state" "$SUDOERS_DIR"
 install -d -o root -g root -m 0700 "$BACKUP_ROOT"
+
+exec 9>"$SERVER_ROOT/state/deploy.lock"
+flock -n 9 || fail 'another Kinvest deployment is already running'
+
 for target in "${TARGETS[@]}"; do
   [[ ! -L "$target" && ( ! -e "$target" || -f "$target" ) ]] || fail "unsafe deploy-v4 target: $target"
 done
@@ -120,6 +124,7 @@ rollback_targets() {
 cleanup() {
   local result=$?
   trap - EXIT
+  trap '' HUP INT TERM
   set +e
   if [[ "$transaction_started" == true && "$transaction_committed" != true ]]; then
     if ! rollback_targets; then
@@ -136,8 +141,6 @@ trap 'exit 129' HUP
 trap 'exit 130' INT
 trap 'exit 143' TERM
 
-exec 9>"$SERVER_ROOT/state/deploy.lock"
-flock -n 9 || fail 'another Kinvest deployment is already running'
 transaction_started='true'
 for index in "${!TARGETS[@]}"; do
   temporary="$(mktemp "$(dirname "${TARGETS[$index]}")/.kinvest-v4-install.XXXXXX")"

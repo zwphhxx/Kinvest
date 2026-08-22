@@ -36,6 +36,8 @@ async function run() {
     const payloadFile = path.join(fixture, 'payload')
     const argsFile = path.join(fixture, 'args')
     const envFile = path.join(fixture, 'env')
+    const githubEnv = path.join(fixture, 'github-env')
+    fs.writeFileSync(githubEnv, '')
     fs.writeFileSync(path.join(bin, 'ssh'), '#!/bin/sh\nprintf \'%s\\n\' "$@" >"$ARGS_FILE"\n/usr/bin/env >"$ENV_FILE"\ncat >"$PAYLOAD_FILE"\n', { mode: 0o755 })
     const secret = secretMaterial()
     const result = spawnSync('bash', ['-c', stepScript('Deploy canonical payload with deploy-v4 stdin')], {
@@ -53,6 +55,7 @@ async function run() {
         TMPFS_DEVICE_TOKEN_HMAC_VERSION_ID: 'v20260813-002',
         KINVEST_ACCESS_CONTROL_MODE: 'device-approval',
         ARGS_FILE: argsFile, ENV_FILE: envFile, PAYLOAD_FILE: payloadFile,
+        GITHUB_ENV: githubEnv,
         HOME: fixture, PATH: `${bin}:${process.env.PATH}`
       }
     })
@@ -62,6 +65,16 @@ async function run() {
     const lines = fs.readFileSync(payloadFile, 'utf8').trimEnd().split('\n')
     assert.equal(lines.length, 13)
     assert.equal(lines[0], 'KINVEST_DEPLOY_V4')
+    assert.equal(lines[1], 'FORWARD')
+    assert.equal(lines[2], `ghcr.io/zwphhxx/kinvest@sha256:${'a'.repeat(64)}`)
+    assert.equal(lines[3], 'b'.repeat(40))
+    assert.equal(lines[4], '{"artifactSource":"ghcr-public","releaseRecordSchemaVersion":2,"verificationRunId":"123"}')
+    assert.equal(lines[5], '{"host":"ghcr.io","mode":"ghcr-public","repository":"ghcr.io/zwphhxx/kinvest"}')
+    assert.equal(lines[6], 'github-tmpfs-v1')
+    assert.equal(lines[7], 'v20260813-001')
+    assert.equal(lines[8], 'v20260813-002')
+    assert.equal(lines[9] === secret.admin, true)
+    assert.equal(lines[10] === secret.hmac, true)
     assert.equal(lines[11], '{"accessControlMode":"device-approval","schemaVersion":1}')
     assert.equal(lines[12], 'EOF')
     const args = fs.readFileSync(argsFile, 'utf8')
@@ -72,7 +85,8 @@ async function run() {
       assert.equal(environment.includes(material), false)
       assert.equal((result.stdout + result.stderr).includes(material), false)
     }
-    assert.doesNotMatch(environment, /^(ADMIN_MATERIAL|HMAC_MATERIAL|GITHUB_ENV)=/m)
+    assert.doesNotMatch(environment, /^(ADMIN_MATERIAL|HMAC_MATERIAL)=/m)
+    assert.equal(fs.readFileSync(githubEnv, 'utf8'), '')
 
     const prWorkflow = fs.readFileSync(path.join(rootDir, '.github/workflows/deploy.yml'), 'utf8')
     const containerBuild = prWorkflow.slice(prWorkflow.indexOf('  container-build:'), prWorkflow.indexOf('  publish:'))
