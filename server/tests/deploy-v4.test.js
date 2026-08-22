@@ -165,11 +165,27 @@ async function run() {
   for (const invalid of [
     { ...state(), extra: true },
     state({ imageAccessControlContract: 2 }),
+    state({ imageAccessControlContract: true }),
+    state({ schemaVersion: false }),
+    state({ releaseRecordSchemaVersion: true }),
     state({ trustedProxyAddresses: ['172.19.0.2', '172.19.0.2'] }),
     state({ trustedProxyAddresses: ['172.19.0.0/16'] }),
     state({ trustedProxyAddresses: [], accessControlMode: 'device-approval' }),
     state({ trustedProxyConfigChecksum: '', accessControlMode: 'device-approval' })
   ]) assertV4Failure(runContract('canonical-state', invalid), /^DEPLOY_V4_STATE_INVALID\n$/)
+
+  assertV4Failure(runContract('validate-payload', payload({
+    policy: '{"accessControlMode":"disabled","schemaVersion":true}'
+  })), /^DEPLOY_V4_POLICY_INVALID\n$/)
+  assertV4Failure(runContract('validate-payload', payload({
+    provenance: '{"artifactSource":"ghcr-public","releaseRecordSchemaVersion":true,"verificationRunId":"123"}'
+  })), /^DEPLOY_V3_PROVENANCE_INVALID\n$/)
+  const booleanAdmin = Buffer.from(JSON.stringify({
+    digest: Buffer.alloc(32, 1).toString('base64url'),
+    format: 'kinvest-admin-scrypt-v1', n: true, p: 1, r: 8,
+    salt: Buffer.alloc(16, 2).toString('base64url')
+  })).toString('base64url')
+  assert.notEqual(runContract('validate-payload', payload({ admin: booleanAdmin })).status, 0)
 
   const legacyV4 = { ...state({
     protocolVersion: 4,
@@ -323,7 +339,7 @@ async function run() {
   assert.match(deployer, /KINVEST_TRUSTED_PROXY_ADDRESSES/)
   assert.match(deployer, /server\/access-preflight\.js/)
   assert.match(deployer, /current_bundle_path="\$BUNDLE_ROOT\/\$current_bundle_id"/)
-  assert.match(deployer, /run_secret_preflight "\$recovery_image_id" "\$current_provider" "\$current_versions" "\$current_bundle_path"/)
+  assert.match(deployer, /run_secret_preflight "\$recovery_image_id" "\$current_provider" "\$current_versions" "\$recovery_bundle_path"/)
   assert.match(deployer, /recovery_bundle="\$current_bundle_path"/)
   assert.match(deployer, /\$intent" == RESTORE[\s\S]*schema_before" != "\$current_schema_version"[\s\S]*RESTORE_SCHEMA_MISMATCH/)
   assert.match(deployer, /sqlite3[\s\S]*\.backup|source\.backup\(destination\)/)

@@ -165,6 +165,7 @@ if [[ "$command" == run ]]; then
   [[ "$all" == *"$CANDIDATE_ID"* ]] && image="$CANDIDATE_ID"
   [[ "$all" == *"$CURRENT_ID"* ]] && image="$CURRENT_ID"
   [[ "$all" == *"$PREVIOUS_ID"* ]] && image="$PREVIOUS_ID"
+  if [[ "$FAILURE" == preflight ]]; then exit 1; fi
   if [[ "$all" == *server/access-preflight.js* ]]; then
     printf 'preflight access %s %s\n' "$image" "$all" >>"$PREFLIGHTS"
     echo 'KINVEST_ACCESS_PREFLIGHT_OK mode=device-approval references=2 database=ready proxy=ready'
@@ -187,7 +188,7 @@ if [[ "$command" == compose ]]; then
       "$KINVEST_IMAGE" "$KINVEST_ACCESS_CONTROL_MODE" "$KINVEST_SECRET_PROVIDER_MODE" \
       "$KINVEST_SECRET_VERSION_IDS" "$KINVEST_SECRET_BUNDLE_HOST_PATH" \
       "$KINVEST_TRUSTED_PROXY_ADDRESSES" >>"$OPERATIONS"
-    if [[ "$FAILURE" == compose && "$KINVEST_IMAGE" == "$CANDIDATE_ID" && ! -e "$FAILURE_MARKER" ]]; then
+    if [[ ( "$FAILURE" == compose && "$KINVEST_IMAGE" == "$CANDIDATE_ID" || "$FAILURE" == restore-compose && "$KINVEST_IMAGE" == "$CURRENT_ID" ) && ! -e "$FAILURE_MARKER" ]]; then
       : >"$FAILURE_MARKER"; exit 1
     fi
   else
@@ -207,16 +208,18 @@ done
 if [[ "$url" == */api/health ]]; then echo '{"status":"ok","service":"kinvest"}'; exit 0; fi
 mode="$(cat "$ACTIVE_MODE")"; active="$(cat "$ACTIVE_IMAGE")"
 if [[ "$url" == */api/watchlist ]]; then
-  if [[ "$mode" == disabled ]]; then body='{"success":true}'; code=200
+  if [[ "$FAILURE" == malformed && "$active" == "$CANDIDATE_ID" ]]; then body='<html>catchall</html>'; code=200; content_type='text/html'
+  elif [[ "$mode" == disabled ]]; then body='{"success":true,"data":[]}'; code=200; content_type='application/json; charset=utf-8'
   elif [[ "$FAILURE" == auth && "$active" == "$CANDIDATE_ID" && ! -e "$AUTH_MARKER" ]]; then
-    : >"$AUTH_MARKER"; body='{"error":"BROKEN"}'; code=401
-  else body='{"error":"AUTH_REQUIRED"}'; code=401; fi
-else body='{"authorized":false}'; code=200; fi
-printf '%s' "$body" >"$out"; printf '%s' "$code"
+    : >"$AUTH_MARKER"; body='{"error":"BROKEN"}'; code=401; content_type='application/json'
+  else body='{"error":"AUTH_REQUIRED"}'; code=401; content_type='application/json'; fi
+else body='{"authorized":false}'; code=200; content_type='application/json'; fi
+printf '%s' "$body" >"$out"
+if [[ " $* " == *" %{content_type} "* ]]; then printf '%s %s' "$code" "$content_type"; else printf '%s' "$code"; fi
 `)
 }
 
-function createFixture({ failure, currentDevice = false }) {
+function createFixture({ failure, currentDevice = false, oldBundleMissing = false, legacyProtocol4 = false, crashStage = '' }) {
   const base = fs.mkdtempSync(path.join(os.tmpdir(), 'kinvest-v4-executor-'))
   const serverRoot = path.join(base, 'server')
   const runRoot = path.join(base, 'run')
@@ -238,6 +241,7 @@ function createFixture({ failure, currentDevice = false }) {
   const failureMarker = path.join(base, 'failure.marker')
   const authMarker = path.join(base, 'auth.marker')
   const contractLog = path.join(base, 'contract.log')
+  const crashMarker = path.join(base, 'crash.marker')
   fs.writeFileSync(compose, 'services: {}\n')
   fs.writeFileSync(path.join(serverRoot, 'docker-compose-v3.yml'), 'services: {}\n')
   fs.writeFileSync(metadata, 'KINVEST_METADATA_NETWORK=test\n')
@@ -261,13 +265,23 @@ function createFixture({ failure, currentDevice = false }) {
     .replace('backup_path.startswith("/root/docker/kinvest/backups/")', `backup_path.startswith("${path.join(serverRoot, 'backups')}/")`)
     .replace('def main(argv: list[str]) -> int:', 'def main(argv: list[str]) -> int:\n    with open(os.environ["CONTRACT_LOG"], "a", encoding="ascii") as stream: stream.write(" ".join(argv[1:]) + "\\n")')
   fs.writeFileSync(contract, instrumentedContract, { mode: 0o755 })
-  const instrumentedDeployer = deployerSource
+  let instrumentedDeployer = deployerSource
     .replace("ROOT='/root/docker/kinvest'", `ROOT='${serverRoot}'`)
     .replace("RUN_ROOT='/run'", `RUN_ROOT='${runRoot}'`)
     .replace("CONTRACT='/usr/local/libexec/kinvest-deploy-v3-contract'", `CONTRACT='${contract}'`)
     .replace("OFFLINE_IMAGE_ATTESTATION='/usr/local/libexec/kinvest-offline-image-attestation'", `OFFLINE_IMAGE_ATTESTATION='${offline}'`)
     .replace("METADATA_NETWORK_CONFIG='/etc/kinvest/metadata-network.conf'", `METADATA_NETWORK_CONFIG='${metadata}'`)
     .replace("ACCESS_NETWORK_CONFIG='/etc/kinvest/access-control-network.conf'", `ACCESS_NETWORK_CONFIG='${network}'`)
+  if (crashStage) {
+    const crashPoints = {
+      attempt: '"$CONTRACT" atomic-state "$ATTEMPT_STATE" <"$candidate_state_file"',
+      previous: '  "$CONTRACT" atomic-state "$PREVIOUS_STATE" <"$current_json"',
+      compose: 'compose_up "$runtime_image_id" "$target_provider" "$target_versions" "$candidate_bundle_path" "$target_access_mode" "$target_trusted_proxies" >/dev/null || fail DEPLOY_V3_COMPOSE_FAILED',
+      commit: '"$CONTRACT" atomic-state "$CURRENT_STATE" <"$candidate_state_file"'
+    }
+    const point = crashPoints[crashStage]
+    instrumentedDeployer = instrumentedDeployer.replace(point, () => `${point}\nif [[ ! -e "$CRASH_MARKER" ]]; then : >"$CRASH_MARKER"; kill -KILL $$; fi`)
+  }
   fs.writeFileSync(deployer, instrumentedDeployer, { mode: 0o755 })
 
   const database = path.join(serverRoot, 'data/kinvest.sqlite')
@@ -276,17 +290,22 @@ function createFixture({ failure, currentDevice = false }) {
   const current = state({ device: currentDevice })
   if (currentDevice) current.trustedProxyConfigChecksum = crypto.createHash('sha256').update(networkBytes).digest('hex')
   const previous = state({ image: 'previous', device: false })
-  function writeState(name, value) {
+  function writeState(name, value, protocol = '4') {
     const rendered = spawnSync('python3', [contract, 'canonical-state'], {
       encoding: 'utf8', input: JSON.stringify(value),
-      env: { ...process.env, KINVEST_DEPLOY_PROTOCOL: '4', CONTRACT_LOG: contractLog }
+      env: { ...process.env, KINVEST_DEPLOY_PROTOCOL: protocol, CONTRACT_LOG: contractLog }
     })
     assert.equal(rendered.status, 0, rendered.stderr)
     fs.writeFileSync(path.join(stateDir, name), rendered.stdout, { mode: 0o600 })
     return rendered.stdout
   }
-  const currentText = writeState('current.state', current)
-  const previousText = writeState('previous.state', previous)
+  function legacy(value) {
+    const result = { ...value, protocolVersion: 4 }
+    for (const field of ['accessControlMode', 'imageAccessControlContract', 'trustedProxyAddresses', 'trustedProxyConfigChecksum']) delete result[field]
+    return result
+  }
+  const currentText = legacyProtocol4 ? writeState('current.state', legacy(current), '3') : writeState('current.state', current)
+  const previousText = legacyProtocol4 ? writeState('previous.state', legacy(previous), '3') : writeState('previous.state', previous)
   const currentBundle = currentDevice ? path.join(bundleRoot, current.secretBundleId) : path.join(bundleRoot, 'disabled')
   fs.mkdirSync(currentBundle)
   if (currentDevice) {
@@ -294,8 +313,9 @@ function createFixture({ failure, currentDevice = false }) {
       fs.writeFileSync(path.join(currentBundle, name), 'fixture\n')
     }
   }
+  if (oldBundleMissing) fs.rmSync(currentBundle, { recursive: true, force: true })
   fakeCommands(bin)
-  return { base, bin, contract, contractLog, deployer, compose, current, currentText, previousText, bundleRoot, stateDir, activeImage, activeMode, operations, preflights, failureMarker, authMarker, failure }
+  return { base, bin, contract, contractLog, deployer, compose, current, currentText, previousText, bundleRoot, stateDir, activeImage, activeMode, operations, preflights, failureMarker, authMarker, crashMarker, failure }
 }
 
 function executorEnv(context, protocol = '4') {
@@ -312,6 +332,7 @@ function executorEnv(context, protocol = '4') {
       ACTIVE_IMAGE: context.activeImage, ACTIVE_MODE: context.activeMode,
       OPERATIONS: context.operations, PREFLIGHTS: context.preflights,
       FAILURE: context.failure, FAILURE_MARKER: context.failureMarker, AUTH_MARKER: context.authMarker,
+      CRASH_MARKER: context.crashMarker,
       OFFLINE_ATTESTATION: path.join(context.base, 'offline-attestation'),
       CONTRACT_LOG: context.contractLog
   }
@@ -457,6 +478,129 @@ async function run() {
     })
   } finally {
     spawnSync('/bin/rm', ['-rf', restore.base])
+  }
+
+  const restoreStableFields = [
+    'imageDigest', 'runtimeImageId', 'commit', 'schemaVersion', 'imageSchemaMin', 'imageSchemaMax',
+    'secretProviderMode', 'secretVersionIds', 'secretMaterialFingerprints', 'accessControlMode',
+    'imageAccessControlContract', 'trustedProxyAddresses', 'trustedProxyConfigChecksum',
+    'releaseRecordSchemaVersion', 'verificationRunId', 'artifactSource', 'databaseBackupPath',
+    'databaseBackupChecksum', 'deployedAt'
+  ]
+  for (const failure of ['none', 'restore-compose']) {
+    const restartedRestore = createFixture({ failure, currentDevice: true, oldBundleMissing: true })
+    try {
+      const oldBundlePath = path.join(restartedRestore.bundleRoot, restartedRestore.current.secretBundleId)
+      const result = execute(restartedRestore, payload({
+        intent: 'RESTORE', digest: identities.currentDigest, commit: identities.currentCommit,
+        material: currentMaterial
+      }))
+      if (failure === 'none') assert.equal(result.status, 0, result.stderr)
+      else assert.notEqual(result.status, 0)
+      const restored = parsedState(restartedRestore, 'current.state')
+      for (const field of restoreStableFields) assert.deepEqual(restored[field], restartedRestore.current[field], field)
+      assert.notEqual(restored.secretBundleId, restartedRestore.current.secretBundleId)
+      const candidatePath = path.join(restartedRestore.bundleRoot, restored.secretBundleId)
+      assert.equal(fs.existsSync(candidatePath), true)
+      const evidence = fs.readFileSync(restartedRestore.preflights, 'utf8') + fs.readFileSync(restartedRestore.operations, 'utf8')
+      assert.equal(evidence.includes(oldBundlePath), false)
+      assert.equal(evidence.includes(candidatePath), true)
+    } finally {
+      spawnSync('/bin/rm', ['-rf', restartedRestore.base])
+    }
+  }
+
+  const restorePreflightFailure = createFixture({ failure: 'preflight', currentDevice: true, oldBundleMissing: true })
+  try {
+    const result = execute(restorePreflightFailure, payload({
+      intent: 'RESTORE', digest: identities.currentDigest, commit: identities.currentCommit,
+      material: currentMaterial
+    }))
+    assert.notEqual(result.status, 0)
+    assert.equal(fs.readFileSync(path.join(restorePreflightFailure.stateDir, 'current.state'), 'utf8'), restorePreflightFailure.currentText)
+    assert.equal(fs.readFileSync(path.join(restorePreflightFailure.stateDir, 'previous.state'), 'utf8'), restorePreflightFailure.previousText)
+    assert.equal(fs.existsSync(path.join(restorePreflightFailure.stateDir, 'attempt.state')), false)
+    assert.equal(fs.readFileSync(restorePreflightFailure.operations, 'utf8').includes('compose up'), false)
+    assert.equal(fs.readFileSync(restorePreflightFailure.preflights, 'utf8').includes(path.join(restorePreflightFailure.bundleRoot, restorePreflightFailure.current.secretBundleId)), false)
+  } finally {
+    spawnSync('/bin/rm', ['-rf', restorePreflightFailure.base])
+  }
+
+  const malformedDisabled = createFixture({ failure: 'malformed', currentDevice: false })
+  try {
+    const result = execute(malformedDisabled, payload({ mode: 'disabled' }))
+    assert.notEqual(result.status, 0)
+    assert.match(result.stderr, /DEPLOY_V4_ACCESS_ACCEPTANCE_FAILED/)
+    const runtimeNames = fs.readdirSync(path.join(malformedDisabled.base, 'run'))
+    assert.equal(runtimeNames.some((name) => /watchlist|auth-status|public-health/.test(name)), false, runtimeNames.join(','))
+  } finally {
+    spawnSync('/bin/rm', ['-rf', malformedDisabled.base])
+  }
+
+  for (const crashStage of ['attempt', 'previous', 'compose', 'commit']) {
+    const crashed = createFixture({ failure: 'none', legacyProtocol4: true, crashStage })
+    try {
+      const disabledPayload = payload({ mode: 'disabled', provider: 'disabled' })
+      const first = execute(crashed, disabledPayload)
+      assert.equal(first.signal, 'SIGKILL', `${crashStage}: ${first.stderr}`)
+      const journal = path.join(crashed.stateDir, 'deploy-transaction.journal')
+      assert.equal(fs.existsSync(journal), true, crashStage)
+      const journalBytes = fs.readFileSync(journal, 'utf8')
+      assert.equal(journalBytes.includes(candidateMaterial.admin), false)
+      assert.equal(journalBytes.includes(candidateMaterial.hmac), false)
+
+      const reconciled = execute(crashed, disabledPayload)
+      assert.notEqual(reconciled.status, 0, crashStage)
+      assert.equal(reconciled.stderr, 'DEPLOY_INCOMPLETE_RESTORE_REQUIRED\n', crashStage)
+      assert.equal(fs.readFileSync(path.join(crashed.stateDir, 'current.state'), 'utf8'), crashed.currentText, crashStage)
+      assert.equal(fs.readFileSync(path.join(crashed.stateDir, 'previous.state'), 'utf8'), crashed.previousText, crashStage)
+      assert.equal(fs.existsSync(path.join(crashed.stateDir, 'attempt.state')), false, crashStage)
+      assert.equal(fs.existsSync(journal), false, crashStage)
+      const incomplete = path.join(crashed.stateDir, 'deploy-incomplete.marker')
+      assert.equal(fs.existsSync(incomplete), true, crashStage)
+
+      const blockedForward = execute(crashed, disabledPayload)
+      assert.notEqual(blockedForward.status, 0, crashStage)
+      assert.match(blockedForward.stderr, /DEPLOY_RESTORE_REQUIRED/, crashStage)
+      assert.equal(fs.readFileSync(crashed.operations, 'utf8').split('\n').filter((line) => line.startsWith('compose up')).length <= 1, true, crashStage)
+
+      const v3 = execute(crashed, '', '3')
+      assert.notEqual(v3.status, 0, crashStage)
+      assert.doesNotMatch(v3.stderr, /DEPLOY_V3_PROTOCOL_RETIRED/, crashStage)
+      assert.match(v3.stderr, /DEPLOY_V3_PAYLOAD_REJECTED/, crashStage)
+
+      const restored = execute(crashed, payload({
+        intent: 'RESTORE', digest: identities.currentDigest, commit: identities.currentCommit,
+        mode: 'disabled', provider: 'disabled'
+      }))
+      assert.equal(restored.status, 0, `${crashStage}: ${restored.stderr}`)
+      assert.equal(fs.existsSync(incomplete), false, crashStage)
+    } finally {
+      spawnSync('/bin/rm', ['-rf', crashed.base])
+    }
+  }
+
+  const installGuard = createFixture({ failure: 'none' })
+  try {
+    fs.writeFileSync(path.join(installGuard.stateDir, 'install-v4.journal'), 'incomplete\n', { mode: 0o600 })
+    const result = await new Promise((resolve, reject) => {
+      const child = spawn('bash', [installGuard.deployer], {
+        env: executorEnv(installGuard, '4'),
+        stdio: ['pipe', 'pipe', 'pipe']
+      })
+      let stdout = ''; let stderr = ''
+      child.stdout.setEncoding('utf8'); child.stderr.setEncoding('utf8')
+      child.stdout.on('data', (chunk) => { stdout += chunk })
+      child.stderr.on('data', (chunk) => { stderr += chunk })
+      child.stdin.write('SECRET_SENTINEL_MUST_NOT_BE_READ')
+      const timer = setTimeout(() => { child.kill('SIGKILL'); reject(new Error('install journal guard read stdin')) }, 1000)
+      child.on('exit', (code) => { clearTimeout(timer); child.stdin.destroy(); resolve({ code, stdout, stderr }) })
+    })
+    assert.equal(result.code, 76)
+    assert.equal(result.stderr, 'DEPLOY_INSTALL_INCOMPLETE\n')
+    assert.equal(result.stdout, '')
+  } finally {
+    spawnSync('/bin/rm', ['-rf', installGuard.base])
   }
 
   const guard = createFixture({ failure: 'none' })

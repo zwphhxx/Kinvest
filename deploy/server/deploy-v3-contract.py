@@ -148,6 +148,9 @@ def validate_admin_material(raw: str) -> bytearray:
         )
         if (
             value["format"] != "kinvest-admin-scrypt-v1"
+            or type(value["n"]) is not int
+            or type(value["p"]) is not int
+            or type(value["r"]) is not int
             or value["n"] != 65536
             or value["p"] != 1
             or value["r"] != 8
@@ -278,6 +281,7 @@ def read_payload(stream: Any = sys.stdin.buffer) -> tuple[dict[str, Any], bytear
     )
     if (
         provenance["artifactSource"] != "ghcr-public"
+        or type(provenance["releaseRecordSchemaVersion"]) is not int
         or provenance["releaseRecordSchemaVersion"] != 2
         or not isinstance(provenance["verificationRunId"], str)
         or re.fullmatch(r"[0-9]{1,20}", provenance["verificationRunId"]) is None
@@ -301,7 +305,7 @@ def read_payload(stream: Any = sys.stdin.buffer) -> tuple[dict[str, Any], bytear
         {"accessControlMode", "schemaVersion"},
         "DEPLOY_V4_POLICY_INVALID" if IS_V4 else "DEPLOY_V3_POLICY_INVALID",
     )
-    if policy["schemaVersion"] != 1 or policy["accessControlMode"] not in {"disabled", "device-approval"}:
+    if type(policy["schemaVersion"]) is not int or policy["schemaVersion"] != 1 or policy["accessControlMode"] not in {"disabled", "device-approval"}:
         fail("DEPLOY_V4_POLICY_INVALID" if IS_V4 else "DEPLOY_V3_POLICY_INVALID")
 
     admin_material = None
@@ -463,8 +467,8 @@ def validate_state(value: Any) -> dict[str, Any]:
     if COMMIT_PATTERN.fullmatch(value["commit"]) is None:
         fail("DEPLOY_V3_STATE_INVALID")
     for field in ("schemaVersion", "imageSchemaMin", "imageSchemaMax"):
-        if not isinstance(value[field], int) or value[field] < 0:
-            fail("DEPLOY_V3_STATE_INVALID")
+        if type(value[field]) is not int or value[field] < 0:
+            fail(code)
     if not value["imageSchemaMin"] <= value["schemaVersion"] <= value["imageSchemaMax"]:
         fail("DEPLOY_V3_STATE_INVALID")
     provider = value["secretProviderMode"]
@@ -477,8 +481,8 @@ def validate_state(value: Any) -> dict[str, Any]:
             fail("DEPLOY_V3_STATE_INVALID")
     elif BUNDLE_ID_PATTERN.fullmatch(value["secretBundleId"]) is None:
         fail("DEPLOY_V3_STATE_INVALID")
-    if value["releaseRecordSchemaVersion"] != 2:
-        fail("DEPLOY_V3_STATE_INVALID")
+    if type(value["releaseRecordSchemaVersion"]) is not int or value["releaseRecordSchemaVersion"] != 2:
+        fail(code)
     if not isinstance(value["verificationRunId"], str) or re.fullmatch(
         r"[0-9]{1,20}", value["verificationRunId"]
     ) is None:
@@ -506,7 +510,7 @@ def validate_state(value: Any) -> dict[str, Any]:
         contract = value["imageAccessControlContract"]
         proxies = value["trustedProxyAddresses"]
         checksum = value["trustedProxyConfigChecksum"]
-        if mode not in {"disabled", "device-approval"} or contract not in {0, 1}:
+        if mode not in {"disabled", "device-approval"} or type(contract) is not int or contract not in {0, 1}:
             fail(code)
         if not isinstance(proxies, list) or len(set(proxies)) != len(proxies):
             fail(code)
@@ -909,9 +913,9 @@ def reconcile_atomic_state(destination: Path) -> None:
     if (
         value["format"] != ATOMIC_RECOVERY_FORMAT
         or not isinstance(value["destinationExisted"], bool)
-        or not isinstance(value["uid"], int)
-        or not isinstance(value["gid"], int)
-        or not isinstance(value["mode"], int)
+        or type(value["uid"]) is not int
+        or type(value["gid"]) is not int
+        or type(value["mode"]) is not int
         or value["mode"] != 0o600
         or FINGERPRINT_PATTERN.fullmatch(value["sha256"]) is None
         or FINGERPRINT_PATTERN.fullmatch(value["newSha256"]) is None
@@ -946,6 +950,231 @@ def reconcile_atomic_state(destination: Path) -> None:
         fsync_directory(destination.parent)
     except OSError:
         fail("DEPLOY_V3_ATOMIC_RECOVERY_INVALID")
+
+
+DEPLOY_JOURNAL_FORMAT = "kinvest-deploy-transaction-v1"
+DEPLOY_JOURNAL_STAGES = {
+    "before-attempt", "attempt-written", "before-previous", "previous-written",
+    "before-compose", "compose-finished", "before-current", "current-written",
+}
+
+
+def deploy_journal_slot(destination: Path) -> dict[str, Any]:
+    original = read_existing_atomic_target(destination, "DEPLOY_JOURNAL_INVALID")
+    raw = original["bytes"]
+    if original["exists"]:
+        try:
+            text = raw.decode("ascii")
+        except UnicodeError:
+            fail("DEPLOY_JOURNAL_INVALID")
+        if not text.startswith(("protocolVersion=3\n", "protocolVersion=4\n", "protocolVersion=5\n")):
+            fail("DEPLOY_JOURNAL_INVALID")
+    return {
+        "existed": original["exists"],
+        "gid": original["gid"],
+        "mode": original["mode"],
+        "name": destination.name,
+        "sha256": hashlib.sha256(raw).hexdigest(),
+        "uid": original["uid"],
+        "valueBase64": base64.b64encode(raw).decode("ascii"),
+    }
+
+
+def write_deploy_journal(destination: Path, value: dict[str, Any]) -> None:
+    validate_atomic_destination(destination, "DEPLOY_JOURNAL_INVALID")
+    encoded = (canonical_json(value) + "\n").encode("ascii")
+    temporary = None
+    try:
+        temporary = write_temporary(destination.parent, ".deploy-journal.", encoded)
+        os.replace(temporary, destination)
+        temporary = None
+        fsync_directory(destination.parent)
+    except OSError:
+        fail("DEPLOY_JOURNAL_WRITE_FAILED")
+    finally:
+        if temporary is not None:
+            try:
+                os.unlink(temporary)
+            except OSError:
+                pass
+
+
+def load_deploy_journal(destination: Path) -> dict[str, Any] | None:
+    validate_atomic_destination(destination, "DEPLOY_JOURNAL_INVALID")
+    try:
+        info = destination.lstat()
+    except FileNotFoundError:
+        return None
+    except OSError:
+        fail("DEPLOY_JOURNAL_INVALID")
+    if not stat.S_ISREG(info.st_mode) or stat.S_IMODE(info.st_mode) != 0o600 or info.st_uid != os.geteuid() or info.st_size > 512 * 1024:
+        fail("DEPLOY_JOURNAL_INVALID")
+    descriptor = None
+    try:
+        descriptor = os.open(destination, os.O_RDONLY | os.O_NOFOLLOW)
+        raw = os.read(descriptor, 512 * 1024 + 1)
+        value = json.loads(raw.decode("ascii"))
+    except (OSError, UnicodeError, ValueError):
+        fail("DEPLOY_JOURNAL_INVALID")
+    finally:
+        if descriptor is not None:
+            os.close(descriptor)
+    value = require_exact_keys(value, {"format", "originalProtocolVersion", "slots", "stage", "targetSummary"}, "DEPLOY_JOURNAL_INVALID")
+    if (
+        raw != (canonical_json(value) + "\n").encode("ascii")
+        or value["format"] != DEPLOY_JOURNAL_FORMAT
+        or type(value["originalProtocolVersion"]) is not int
+        or value["originalProtocolVersion"] not in {3, 4, 5}
+        or value["stage"] not in DEPLOY_JOURNAL_STAGES
+        or not isinstance(value["targetSummary"], str)
+        or FINGERPRINT_PATTERN.fullmatch(value["targetSummary"]) is None
+        or not isinstance(value["slots"], list)
+        or len(value["slots"]) != 3
+    ):
+        fail("DEPLOY_JOURNAL_INVALID")
+    for slot in value["slots"]:
+        slot = require_exact_keys(slot, {"existed", "gid", "mode", "name", "sha256", "uid", "valueBase64"}, "DEPLOY_JOURNAL_INVALID")
+        if (
+            slot["name"] not in {"current.state", "previous.state", "attempt.state"}
+            or not isinstance(slot["existed"], bool)
+            or type(slot["gid"]) is not int
+            or type(slot["mode"]) is not int
+            or type(slot["uid"]) is not int
+            or slot["mode"] != 0o600
+            or FINGERPRINT_PATTERN.fullmatch(slot["sha256"]) is None
+            or not isinstance(slot["valueBase64"], str)
+        ):
+            fail("DEPLOY_JOURNAL_INVALID")
+        try:
+            decoded = base64.b64decode(slot["valueBase64"], validate=True)
+        except (ValueError, binascii.Error):
+            fail("DEPLOY_JOURNAL_INVALID")
+        if hashlib.sha256(decoded).hexdigest() != slot["sha256"] or (not slot["existed"] and decoded != b""):
+            fail("DEPLOY_JOURNAL_INVALID")
+    if {slot["name"] for slot in value["slots"]} != {"current.state", "previous.state", "attempt.state"}:
+        fail("DEPLOY_JOURNAL_INVALID")
+    current = next(slot for slot in value["slots"] if slot["name"] == "current.state")
+    if not current["existed"]:
+        fail("DEPLOY_JOURNAL_INVALID")
+    current_raw = base64.b64decode(current["valueBase64"], validate=True)
+    if not current_raw.startswith(f"protocolVersion={value['originalProtocolVersion']}\n".encode("ascii")):
+        fail("DEPLOY_JOURNAL_INVALID")
+    return value
+
+
+def begin_deploy_journal(journal: Path, slots: list[Path], target_summary: str) -> None:
+    if journal.exists() or journal.is_symlink() or FINGERPRINT_PATTERN.fullmatch(target_summary) is None:
+        fail("DEPLOY_JOURNAL_ACTIVE")
+    before = [deploy_journal_slot(slot) for slot in slots]
+    current = next(slot for slot in before if slot["name"] == "current.state")
+    if not current["existed"]:
+        fail("DEPLOY_JOURNAL_INVALID")
+    current_raw = base64.b64decode(current["valueBase64"], validate=True)
+    match = re.match(rb"protocolVersion=([345])\n", current_raw)
+    if match is None:
+        fail("DEPLOY_JOURNAL_INVALID")
+    write_deploy_journal(journal, {
+        "format": DEPLOY_JOURNAL_FORMAT,
+        "originalProtocolVersion": int(match.group(1)),
+        "slots": before,
+        "stage": "before-attempt",
+        "targetSummary": target_summary,
+    })
+
+
+def advance_deploy_journal(journal: Path, stage: str) -> None:
+    value = load_deploy_journal(journal)
+    if value is None or stage not in DEPLOY_JOURNAL_STAGES:
+        fail("DEPLOY_JOURNAL_INVALID")
+    value["stage"] = stage
+    write_deploy_journal(journal, value)
+
+
+def write_incomplete_marker(destination: Path, journal_value: dict[str, Any]) -> None:
+    value = {
+        "format": "kinvest-deploy-incomplete-v1",
+        "stage": journal_value["stage"],
+        "targetSummary": journal_value["targetSummary"],
+    }
+    write_deploy_journal(destination, value)
+
+
+def load_incomplete_marker(destination: Path) -> bool:
+    validate_atomic_destination(destination, "DEPLOY_INCOMPLETE_MARKER_INVALID")
+    try:
+        info = destination.lstat()
+    except FileNotFoundError:
+        return False
+    except OSError:
+        fail("DEPLOY_INCOMPLETE_MARKER_INVALID")
+    if not stat.S_ISREG(info.st_mode) or stat.S_IMODE(info.st_mode) != 0o600 or info.st_uid != os.geteuid() or info.st_size > 4096:
+        fail("DEPLOY_INCOMPLETE_MARKER_INVALID")
+    try:
+        raw = destination.read_bytes()
+        value = json.loads(raw.decode("ascii"))
+    except (OSError, UnicodeError, ValueError):
+        fail("DEPLOY_INCOMPLETE_MARKER_INVALID")
+    value = require_exact_keys(value, {"format", "stage", "targetSummary"}, "DEPLOY_INCOMPLETE_MARKER_INVALID")
+    if (
+        raw != (canonical_json(value) + "\n").encode("ascii")
+        or value["format"] != "kinvest-deploy-incomplete-v1"
+        or value["stage"] not in DEPLOY_JOURNAL_STAGES
+        or not isinstance(value["targetSummary"], str)
+        or FINGERPRINT_PATTERN.fullmatch(value["targetSummary"]) is None
+    ):
+        fail("DEPLOY_INCOMPLETE_MARKER_INVALID")
+    return True
+
+
+def clear_incomplete_marker(destination: Path) -> None:
+    if not load_incomplete_marker(destination):
+        return
+    try:
+        destination.unlink()
+        fsync_directory(destination.parent)
+    except OSError:
+        fail("DEPLOY_INCOMPLETE_MARKER_INVALID")
+
+
+def reconcile_deploy_journal(journal: Path, slots: list[Path], incomplete_marker: Path | None = None) -> bool:
+    value = load_deploy_journal(journal)
+    if value is None:
+        return False
+    by_name = {slot.name: slot for slot in slots}
+    if set(by_name) != {"current.state", "previous.state", "attempt.state"}:
+        fail("DEPLOY_JOURNAL_INVALID")
+    try:
+        for saved in value["slots"]:
+            destination = by_name[saved["name"]]
+            decoded = base64.b64decode(saved["valueBase64"], validate=True)
+            if saved["existed"]:
+                temporary = write_temporary(destination.parent, f".{destination.name}.journal-restore.", decoded, saved["mode"], saved["uid"], saved["gid"])
+                try:
+                    os.replace(temporary, destination)
+                except Exception:
+                    os.unlink(temporary)
+                    raise
+            else:
+                destination.unlink(missing_ok=True)
+        fsync_directory(journal.parent)
+        if incomplete_marker is not None:
+            write_incomplete_marker(incomplete_marker, value)
+        journal.unlink()
+        fsync_directory(journal.parent)
+    except OSError:
+        fail("DEPLOY_JOURNAL_RECONCILE_FAILED")
+    return True
+
+
+def commit_deploy_journal(journal: Path) -> None:
+    if load_deploy_journal(journal) is None:
+        fail("DEPLOY_JOURNAL_INVALID")
+    try:
+        fsync_directory(journal.parent)
+        journal.unlink()
+        fsync_directory(journal.parent)
+    except OSError:
+        fail("DEPLOY_JOURNAL_COMMIT_FAILED")
 
 
 def read_version_ledger(destination: Path) -> dict[str, dict[str, str]]:
@@ -1381,7 +1610,7 @@ def main(argv: list[str]) -> int:
         item = value[argv[2]]
         if isinstance(item, (dict, list)):
             sys.stdout.write(canonical_json(item) + "\n")
-        elif isinstance(item, (str, int)) and "\n" not in str(item) and "\r" not in str(item):
+        elif (isinstance(item, str) or type(item) is int) and "\n" not in str(item) and "\r" not in str(item):
             sys.stdout.write(str(item) + "\n")
         else:
             fail("DEPLOY_V3_FIELD_INVALID")
@@ -1435,6 +1664,29 @@ def main(argv: list[str]) -> int:
         return 0
     if command == "reconcile-atomic-state" and len(argv) == 3:
         reconcile_atomic_state(Path(argv[2]))
+        return 0
+    if command == "begin-deploy-journal" and len(argv) == 7:
+        begin_deploy_journal(Path(argv[2]), [Path(argv[3]), Path(argv[4]), Path(argv[5])], argv[6])
+        return 0
+    if command == "advance-deploy-journal" and len(argv) == 4:
+        advance_deploy_journal(Path(argv[2]), argv[3])
+        return 0
+    if command == "reconcile-deploy-journal" and len(argv) in {6, 7}:
+        reconciled = reconcile_deploy_journal(
+            Path(argv[2]),
+            [Path(argv[3]), Path(argv[4]), Path(argv[5])],
+            Path(argv[6]) if len(argv) == 7 else None,
+        )
+        sys.stdout.write("RECONCILED\n" if reconciled else "CLEAN\n")
+        return 0
+    if command == "commit-deploy-journal" and len(argv) == 3:
+        commit_deploy_journal(Path(argv[2]))
+        return 0
+    if command == "check-incomplete-marker" and len(argv) == 3:
+        sys.stdout.write("ACTIVE\n" if load_incomplete_marker(Path(argv[2])) else "CLEAN\n")
+        return 0
+    if command == "clear-incomplete-marker" and len(argv) == 3:
+        clear_incomplete_marker(Path(argv[2]))
         return 0
     if command == "remove-bundle" and len(argv) == 3:
         remove_bundle(argv[2])

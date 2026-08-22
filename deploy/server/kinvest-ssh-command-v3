@@ -1,6 +1,12 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
+INSTALL_JOURNAL='/root/docker/kinvest/state/install-v4.journal'
+if [[ -e "$INSTALL_JOURNAL" || -L "$INSTALL_JOURNAL" ]]; then
+  printf '%s\n' 'DEPLOY_INSTALL_INCOMPLETE' >&2
+  exit 76
+fi
+
 if [[ "$#" -ne 0 ]]; then
   printf '%s\n' 'DEPLOY_V3_WRAPPER_ARGUMENTS_REJECTED' >&2
   exit 2

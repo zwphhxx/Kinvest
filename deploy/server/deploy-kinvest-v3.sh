@@ -22,6 +22,9 @@ CURRENT_STATE="$STATE/current.state"
 PREVIOUS_STATE="$STATE/previous.state"
 ATTEMPT_STATE="$STATE/attempt.state"
 VERSION_LEDGER="$STATE/secret-version-ledger.json"
+DEPLOY_JOURNAL="$STATE/deploy-transaction.journal"
+INCOMPLETE_MARKER="$STATE/deploy-incomplete.marker"
+INSTALL_JOURNAL="$STATE/install-v4.journal"
 PUBLIC_HEALTH_URL='https://dearmina.cn/api/health'
 BUNDLE_ROOT="$RUN_ROOT/kinvest-secrets"
 METADATA_NETWORK_CONFIG='/etc/kinvest/metadata-network.conf'
@@ -43,6 +46,17 @@ install -d -m 0700 -- "$STATE" "$BACKUP_DIR"
 
 exec 9>"$STATE/deploy.lock"
 flock -n 9 || fail DEPLOY_V3_LOCKED
+
+if [[ -e "$INSTALL_JOURNAL" || -L "$INSTALL_JOURNAL" ]]; then
+  fail DEPLOY_INSTALL_INCOMPLETE 76
+fi
+
+for atomic_target in "$CURRENT_STATE" "$PREVIOUS_STATE" "$ATTEMPT_STATE" "$VERSION_LEDGER"; do
+  "$CONTRACT" reconcile-atomic-state "$atomic_target"
+done
+journal_status="$("$CONTRACT" reconcile-deploy-journal "$DEPLOY_JOURNAL" "$CURRENT_STATE" "$PREVIOUS_STATE" "$ATTEMPT_STATE" "$INCOMPLETE_MARKER")" || fail DEPLOY_JOURNAL_INVALID
+[[ "$journal_status" == CLEAN ]] || fail DEPLOY_INCOMPLETE_RESTORE_REQUIRED 76
+incomplete_status="$("$CONTRACT" check-incomplete-marker "$INCOMPLETE_MARKER")" || fail DEPLOY_INCOMPLETE_MARKER_INVALID
 
 if [[ "$DEPLOY_PROTOCOL" == 3 && -f "$CURRENT_STATE" && "$(head -n 1 "$CURRENT_STATE")" == 'protocolVersion=5' ]]; then
   fail DEPLOY_V3_PROTOCOL_RETIRED
@@ -86,6 +100,7 @@ current_was_legacy='false'
 previous_was_legacy='false'
 recovery_error=''
 current_schema_version=''
+current_protocol_version=''
 restore_backup_path='none'
 restore_backup_checksum='none'
 last_preflight_legacy_failure='false'
@@ -99,6 +114,7 @@ target_access_mode='disabled'
 target_access_contract='0'
 target_trusted_proxies='[]'
 target_proxy_checksum=''
+response_files=('')
 
 safe_runtime_file() {
   [[ -n "$1" && "$1" == "$RUN_ROOT"/kinvest-v3.* ]]
@@ -165,7 +181,9 @@ wait_for_container() {
 }
 
 verify_public_health() {
+  local health_file
   health_file="$(mktemp "$RUN_ROOT/kinvest-v3.public-health.XXXXXX")"
+  response_files+=("$health_file")
   chmod 0600 "$health_file"
   curl -fsS --max-time 15 "$PUBLIC_HEALTH_URL" >"$health_file" || return 1
   python3 - "$health_file" <<'PY'
@@ -178,13 +196,23 @@ PY
 }
 
 verify_access_behavior() {
-  local mode="$1" watch_body watch_status auth_body auth_status
+  local mode="$1" watch_body watch_result watch_status watch_type auth_body auth_result auth_status auth_type
   watch_body="$(mktemp "$RUN_ROOT/kinvest-v3.watchlist.XXXXXX")"
   auth_body="$(mktemp "$RUN_ROOT/kinvest-v3.auth-status.XXXXXX")"
+  response_files+=("$watch_body" "$auth_body")
   chmod 0600 "$watch_body" "$auth_body"
-  watch_status="$(curl -sS --max-time 15 -o "$watch_body" -w '%{http_code}' https://dearmina.cn/api/watchlist)" || return 1
+  watch_result="$(curl -sS --max-time 15 -o "$watch_body" -w '%{http_code} %{content_type}' https://dearmina.cn/api/watchlist)" || return 1
+  read -r watch_status watch_type <<<"$watch_result"
+  [[ "$watch_type" == application/json || "$watch_type" == application/json\;* ]] || return 1
   if [[ "$mode" == disabled ]]; then
     [[ "$watch_status" == 200 ]] || return 1
+    python3 - "$watch_body" <<'PY' || return 1
+import json, sys
+with open(sys.argv[1], encoding="utf-8") as stream:
+    value = json.load(stream)
+if type(value) is not dict or set(value) != {"success", "data"} or value["success"] is not True or type(value["data"]) is not list:
+    raise SystemExit(1)
+PY
   else
     [[ "$watch_status" == 401 ]] || return 1
     python3 - "$watch_body" <<'PY' || return 1
@@ -194,8 +222,10 @@ with open(sys.argv[1], encoding="utf-8") as stream:
 if value != {"error": "AUTH_REQUIRED"}:
     raise SystemExit(1)
 PY
-    auth_status="$(curl -sS --max-time 15 -o "$auth_body" -w '%{http_code}' https://dearmina.cn/api/auth/status)" || return 1
+    auth_result="$(curl -sS --max-time 15 -o "$auth_body" -w '%{http_code} %{content_type}' https://dearmina.cn/api/auth/status)" || return 1
+    read -r auth_status auth_type <<<"$auth_result"
     [[ "$auth_status" == 200 ]] || return 1
+    [[ "$auth_type" == application/json || "$auth_type" == application/json\;* ]] || return 1
     python3 - "$auth_body" <<'PY' || return 1
 import json, sys
 with open(sys.argv[1], encoding="utf-8") as stream:
@@ -204,7 +234,6 @@ if value != {"authorized": False}:
     raise SystemExit(1)
 PY
   fi
-  rm -f -- "$watch_body" "$auth_body"
 }
 
 create_access_snapshot() {
@@ -444,7 +473,9 @@ restore_previous_runtime() {
   [[ "$transaction_started" == true && -n "$recovery_image_id" ]] || return 1
   recovery_provider="$current_provider"
   recovery_versions="$current_versions"
-  if [[ "$DEPLOY_PROTOCOL" == 4 ]]; then
+  if [[ "$DEPLOY_PROTOCOL" == 4 && "$intent" == RESTORE ]]; then
+    recovery_bundle="$candidate_bundle_path"
+  elif [[ "$DEPLOY_PROTOCOL" == 4 ]]; then
     recovery_bundle="$current_bundle_path"
   else
     recovery_bundle="$candidate_bundle_path"
@@ -464,13 +495,18 @@ restore_previous_runtime() {
   verify_public_health || return 1
   if [[ "$DEPLOY_PROTOCOL" == 4 ]]; then verify_access_behavior "$current_access_mode" || return 1; fi
 
-  if [[ "$current_was_legacy" == true ]]; then
+  if [[ "$intent" != RESTORE || "$current_protocol_version" != 5 ]]; then
+    journal_status="$("$CONTRACT" reconcile-deploy-journal "$DEPLOY_JOURNAL" "$CURRENT_STATE" "$PREVIOUS_STATE" "$ATTEMPT_STATE")" || return 1
+    [[ "$journal_status" == RECONCILED ]] || return 1
+  elif [[ "$current_was_legacy" == true ]]; then
     "$CONTRACT" atomic-legacy-state "$CURRENT_STATE" <"$current_original_file" || return 1
   else
     envelope_file="$(mktemp "$RUN_ROOT/kinvest-v3.recovery-envelope.XXXXXX")"
     safe_runtime_file "$envelope_file" || return 1
     chmod 0600 "$envelope_file"
-    if [[ "$DEPLOY_PROTOCOL" == 4 ]]; then
+    if [[ "$DEPLOY_PROTOCOL" == 4 && "$intent" == RESTORE ]]; then
+      make_approved_envelope "$current_json" "$envelope_file" "$current_access_mode" "$current_access_contract" "$current_trusted_proxies" "$current_proxy_checksum" || return 1
+    elif [[ "$DEPLOY_PROTOCOL" == 4 ]]; then
       make_recovery_envelope "$current_json" "$envelope_file" || return 1
     else
       make_approved_envelope "$current_json" "$envelope_file" || return 1
@@ -488,19 +524,25 @@ restore_previous_runtime() {
     fi
     "$CONTRACT" atomic-state "$CURRENT_STATE" <"$recovery_state_file" || return 1
   fi
-  if [[ "$previous_state_existed" == true ]]; then
-    if [[ "$previous_was_legacy" == true ]]; then
-      "$CONTRACT" atomic-legacy-state "$PREVIOUS_STATE" <"$previous_original_file" || return 1
+  if [[ "$intent" == RESTORE && "$current_protocol_version" == 5 ]]; then
+    if [[ "$previous_state_existed" == true ]]; then
+      if [[ "$previous_was_legacy" == true ]]; then
+        "$CONTRACT" atomic-legacy-state "$PREVIOUS_STATE" <"$previous_original_file" || return 1
+      else
+        "$CONTRACT" atomic-state "$PREVIOUS_STATE" <"$previous_json" || return 1
+      fi
     else
-      "$CONTRACT" atomic-state "$PREVIOUS_STATE" <"$previous_json" || return 1
+      rm -f -- "$PREVIOUS_STATE" || return 1
     fi
-  else
-    rm -f -- "$PREVIOUS_STATE" || return 1
+    rm -f -- "$ATTEMPT_STATE" || return 1
+    "$CONTRACT" commit-deploy-journal "$DEPLOY_JOURNAL" || return 1
   fi
-  rm -f -- "$ATTEMPT_STATE" || return 1
-  if [[ "$DEPLOY_PROTOCOL" == 4 ]]; then
+  if [[ "$intent" != RESTORE ]]; then
     candidate_bundle_keep='false'
     prune_unreferenced_bundles "$current_bundle_id" || return 1
+  elif [[ "$DEPLOY_PROTOCOL" == 4 ]]; then
+    candidate_bundle_keep='true'
+    prune_unreferenced_bundles "$candidate_bundle_id" || return 1
   else
     candidate_bundle_keep='true'
     prune_unreferenced_bundles "$candidate_bundle_id" || return 1
@@ -530,6 +572,9 @@ cleanup() {
     "$preflight_stderr" "$health_file"; do
     if safe_runtime_file "$item"; then rm -f -- "$item"; fi
   done
+  for item in "${response_files[@]}"; do
+    if safe_runtime_file "$item"; then rm -f -- "$item"; fi
+  done
   rm -f -- "$access_snapshot" "$network_json"
   exit "$status"
 }
@@ -540,10 +585,6 @@ trap 'on_signal 129' HUP
 trap 'on_signal 130' INT
 trap 'on_signal 143' TERM
 
-for atomic_target in "$CURRENT_STATE" "$PREVIOUS_STATE" "$ATTEMPT_STATE" "$VERSION_LEDGER"; do
-  "$CONTRACT" reconcile-atomic-state "$atomic_target"
-done
-
 prepared_file="$(mktemp "$RUN_ROOT/kinvest-v3.prepared.XXXXXX")"
 chmod 0600 "$prepared_file"
 if ! "$CONTRACT" prepare >"$prepared_file"; then
@@ -552,6 +593,9 @@ fi
 
 json_field() { "$CONTRACT" json-field "$2" <"$1"; }
 intent="$(json_field "$prepared_file" intent)"
+if [[ "$incomplete_status" == ACTIVE && "$intent" != RESTORE ]]; then
+  fail DEPLOY_RESTORE_REQUIRED 76
+fi
 request_provider="$(json_field "$prepared_file" secretProviderMode)"
 request_versions="$(json_field "$prepared_file" secretVersionIds)"
 request_fingerprints="$(json_field "$prepared_file" secretMaterialFingerprints)"
@@ -575,6 +619,7 @@ chmod 0600 "$current_json"
 current_original_file="$(mktemp "$RUN_ROOT/kinvest-v3.current-original.XXXXXX")"
 chmod 0600 "$current_original_file"
 cp -- "$CURRENT_STATE" "$current_original_file"
+current_protocol_version="$(sed -n '1s/^protocolVersion=//p' "$current_original_file")"
 if [[ "$(head -n 1 "$current_original_file")" == protocolVersion=3 ]]; then
   current_was_legacy='true'
 fi
@@ -590,6 +635,10 @@ if [[ "$current_provider" == github-tmpfs-v1 ]]; then
   current_bundle_path="$BUNDLE_ROOT/$current_bundle_id"
 else
   current_bundle_path="$BUNDLE_ROOT/disabled"
+fi
+recovery_bundle_path="$current_bundle_path"
+if [[ "$DEPLOY_PROTOCOL" == 4 && "$intent" == RESTORE ]]; then
+  recovery_bundle_path="$candidate_bundle_path"
 fi
 if [[ "$DEPLOY_PROTOCOL" == 4 ]]; then
   current_access_mode="$(json_field "$current_json" accessControlMode)"
@@ -765,7 +814,7 @@ legacy_disabled_recovery_preflight_allowed() {
 
 run_secret_preflight "$runtime_image_id" "$target_provider" "$target_versions" "$candidate_bundle_path" || fail DEPLOY_V3_PREFLIGHT_FAILED
 if [[ "$DEPLOY_PROTOCOL" == 4 ]]; then
-  run_secret_preflight "$recovery_image_id" "$current_provider" "$current_versions" "$current_bundle_path" || fail DEPLOY_V4_RECOVERY_PREFLIGHT_FAILED
+  run_secret_preflight "$recovery_image_id" "$current_provider" "$current_versions" "$recovery_bundle_path" || fail DEPLOY_V4_RECOVERY_PREFLIGHT_FAILED
 elif ! run_secret_preflight "$recovery_image_id" "$request_provider" "$request_versions" "$candidate_bundle_path"; then
   if [[ "$last_preflight_legacy_failure" != true ]] || \
     ! legacy_disabled_recovery_preflight_allowed || \
@@ -777,7 +826,7 @@ if [[ "$DEPLOY_PROTOCOL" == 4 && "$target_access_mode" == device-approval ]]; th
   create_access_snapshot || fail DEPLOY_V4_ACCESS_SNAPSHOT_FAILED
   run_access_preflight "$runtime_image_id" "$target_provider" "$target_versions" "$candidate_bundle_path" "$target_access_mode" "$target_trusted_proxies" || fail DEPLOY_V4_ACCESS_PREFLIGHT_FAILED
   if [[ "$current_access_mode" == device-approval ]]; then
-    run_access_preflight "$recovery_image_id" "$current_provider" "$current_versions" "$current_bundle_path" "$current_access_mode" "$current_trusted_proxies" || fail DEPLOY_V4_RECOVERY_ACCESS_PREFLIGHT_FAILED
+    run_access_preflight "$recovery_image_id" "$current_provider" "$current_versions" "$recovery_bundle_path" "$current_access_mode" "$current_trusted_proxies" || fail DEPLOY_V4_RECOVERY_ACCESS_PREFLIGHT_FAILED
   fi
 fi
 "$CONTRACT" ledger-commit "$VERSION_LEDGER" <"$prepared_file"
@@ -863,13 +912,20 @@ else
   fi
 fi
 
-"$CONTRACT" atomic-state "$ATTEMPT_STATE" <"$candidate_state_file"
+target_summary="$(printf '%s\n' "$intent|$target_digest|$target_commit|$target_access_mode" | sha256sum | awk '{print $1}')"
+"$CONTRACT" begin-deploy-journal "$DEPLOY_JOURNAL" "$CURRENT_STATE" "$PREVIOUS_STATE" "$ATTEMPT_STATE" "$target_summary"
 transaction_started='true'
+"$CONTRACT" atomic-state "$ATTEMPT_STATE" <"$candidate_state_file"
+"$CONTRACT" advance-deploy-journal "$DEPLOY_JOURNAL" attempt-written
 if [[ "$intent" != RESTORE ]]; then
+  "$CONTRACT" advance-deploy-journal "$DEPLOY_JOURNAL" before-previous
   "$CONTRACT" atomic-state "$PREVIOUS_STATE" <"$current_json"
+  "$CONTRACT" advance-deploy-journal "$DEPLOY_JOURNAL" previous-written
 fi
 
+"$CONTRACT" advance-deploy-journal "$DEPLOY_JOURNAL" before-compose
 compose_up "$runtime_image_id" "$target_provider" "$target_versions" "$candidate_bundle_path" "$target_access_mode" "$target_trusted_proxies" >/dev/null || fail DEPLOY_V3_COMPOSE_FAILED
+"$CONTRACT" advance-deploy-journal "$DEPLOY_JOURNAL" compose-finished
 wait_for_container "$runtime_image_id" || fail DEPLOY_V3_HEALTH_FAILED
 schema_after="$(read_schema_version)" || fail DEPLOY_V3_SCHEMA_READ_FAILED
 if [[ "$DEPLOY_PROTOCOL" == 4 && "$intent" == RESTORE && "$schema_after" != "$current_schema_version" ]]; then
@@ -897,9 +953,15 @@ else
   "$CONTRACT" make-restore-state "$schema_after" "$restore_backup_path" "$restore_backup_checksum" <"$envelope_file" >"$candidate_state_file"
 fi
 candidate_bundle_keep='true'
+"$CONTRACT" advance-deploy-journal "$DEPLOY_JOURNAL" before-current
 "$CONTRACT" atomic-state "$CURRENT_STATE" <"$candidate_state_file"
-current_committed='true'
+"$CONTRACT" advance-deploy-journal "$DEPLOY_JOURNAL" current-written
 rm -f -- "$ATTEMPT_STATE" || fail DEPLOY_V3_CLEANUP_PENDING 71
+"$CONTRACT" commit-deploy-journal "$DEPLOY_JOURNAL" || fail DEPLOY_V3_CLEANUP_PENDING 71
+if [[ "$incomplete_status" == ACTIVE ]]; then
+  "$CONTRACT" clear-incomplete-marker "$INCOMPLETE_MARKER" || fail DEPLOY_V3_CLEANUP_PENDING 71
+fi
+current_committed='true'
 prune_unreferenced_bundles "$candidate_bundle_id" || fail DEPLOY_V3_CLEANUP_PENDING 71
 deployment_succeeded='true'
 

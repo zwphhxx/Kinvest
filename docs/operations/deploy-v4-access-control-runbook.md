@@ -33,8 +33,36 @@ incompatible target or recovery fails before persistent database backup,
 attempt state, Compose down, or switching. Emergency protection removal is not
 a deploy-v4 operation and requires a separately reviewed incident change.
 
+RESTORE is also the tmpfs secret rehydration path after a host restart. The
+approved payload must reproduce the recorded provider, VersionIds, material
+fingerprints, image, schema, access mode, and trusted proxy. Preflight and
+Compose use the newly approved candidate bundle; a successful RESTORE changes
+only `secretBundleId`. The old `/run/kinvest-secrets/<bundle>` directory is not
+required to survive a restart.
+
+## Crash recovery boundary
+
+Before changing `attempt.state`, `previous.state`, or `current.state`, the
+deployer fsyncs `state/deploy-transaction.journal`. It contains only the exact
+non-secret state before-images, absent markers, protocol version, stage, and a
+target digest. A normal verified automatic recovery replays those before-images
+before deleting the journal. If a process or host dies, the next invocation
+replays the journal, leaves `deploy-incomplete.marker`, and exits with
+`DEPLOY_INCOMPLETE_RESTORE_REQUIRED`. Subsequent FORWARD or ROLLBACK requests
+fail with `DEPLOY_RESTORE_REQUIRED`; only a fully accepted RESTORE clears the
+marker. Do not delete either file manually.
+
+The v4 installer uses `state/install-v4.journal` and a root-only full backup.
+While it is active the forced-command wrapper is disabled or returns
+`DEPLOY_INSTALL_INCOMPLETE`. Re-run the same reviewed installer to reconcile an
+interrupted installation. It restores the complete old target set first and
+then starts a new transaction. Installation and reconciliation never restart a
+service or invoke Compose.
+
 The device-approval candidate receives only a consistent SQLite backup in
 `/run`, never the production database. It has no network, runs as UID 10001,
 uses a read-only root filesystem, drops all capabilities, and mounts the tmpfs
 secret bundle and snapshot read-only. Activation requires the exact access
-preflight output and post-switch anonymous 401/200 behavior.
+preflight output and post-switch anonymous 401/200 behavior. Disabled acceptance
+requires an `application/json` watchlist response with exactly `success: true`
+and an array `data`; HTML catchalls and malformed JSON fail recovery-safe.
