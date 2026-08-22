@@ -9,7 +9,18 @@ stdout_file="$fixture/stdout"
 stderr_file="$fixture/stderr"
 candidate="$fixture/candidate.sqlite"
 bundle="$fixture/secrets"
-cleanup() { rm -rf -- "$fixture"; }
+cleanup() {
+  local status=$? cleanup_script
+  trap - EXIT HUP INT TERM
+  cleanup_script='const fs=require("node:fs");const target="/fixture/secrets";if(fs.existsSync(target)){fs.chmodSync(target,0o700);fs.rmSync(target,{recursive:true,force:true})}'
+  if [[ -e "$bundle" ]]; then
+    docker run --rm --platform linux/amd64 --user 0:0 --read-only --cap-drop ALL \
+      --security-opt no-new-privileges:true --network none --volume "$fixture:/fixture" \
+      --entrypoint node "$image" -e "$cleanup_script" > /dev/null 2>&1 || status=1
+  fi
+  rm -rf -- "$fixture" || status=1
+  return "$status"
+}
 trap cleanup EXIT HUP INT TERM
 chmod 0755 "$fixture"
 

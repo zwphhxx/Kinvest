@@ -2331,10 +2331,11 @@ function run() {
   assert.equal(spawnSync('bash', ['-n', accessPreflightSmokePath], { encoding: 'utf8' }).status, 0)
   assert.equal(
     (accessPreflightSmoke.match(/--platform linux\/amd64/g) || []).length,
-    2,
-    'fixture preparation and the common runtime cases must each pin the production platform'
+    3,
+    'fixture preparation, runtime cases, and privileged cleanup must each pin the production platform'
   )
   for (const fragment of [
+    'docker run --rm --platform linux/amd64 --user 0:0 --read-only --cap-drop ALL',
     'docker run --rm --platform linux/amd64 --user 0:0',
     'run --rm --platform linux/amd64 --user 10001:10001',
     '--user 10001:10001', '--read-only', '--cap-drop ALL',
@@ -2349,6 +2350,74 @@ function run() {
   ]) assert.match(accessPreflightSmoke, new RegExp(fragment.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')))
   for (const negative of ['missing-candidate-argument', 'candidate-equals-production', 'missing-tmpfs', 'insufficient-tmpfs']) {
     assert.match(accessPreflightSmoke, new RegExp(negative))
+  }
+  const cleanupHarnessRoot = fs.mkdtempSync(path.join(require('node:os').tmpdir(), 'kinvest-runtime-smoke-cleanup-'))
+  const cleanupHarnessBin = path.join(cleanupHarnessRoot, 'bin')
+  const cleanupFixtureLog = path.join(cleanupHarnessRoot, 'fixture.log')
+  fs.mkdirSync(cleanupHarnessBin)
+  const cleanupHarnessDocker = path.join(cleanupHarnessBin, 'docker')
+  fs.writeFileSync(cleanupHarnessDocker, `#!/usr/bin/env node
+const fs = require('node:fs')
+const path = require('node:path')
+const args = process.argv.slice(2)
+const volume = args.find((argument) => argument.endsWith(':/fixture'))
+const fixture = volume ? volume.slice(0, -'/fixture'.length - 1) : ''
+if (args.includes('/fixture/prepare.js')) {
+  fs.appendFileSync(process.env.KINVEST_SMOKE_FIXTURE_LOG, fixture + '\\n')
+  fs.mkdirSync(path.join(fixture, 'secrets'), { recursive: true })
+  fs.writeFileSync(path.join(fixture, 'candidate.sqlite'), 'fixture')
+  fs.writeFileSync(path.join(fixture, 'secrets', 'manifest.json'), '{}')
+  fs.chmodSync(path.join(fixture, 'secrets'), 0o550)
+  process.exit(0)
+}
+if (args.some((argument) => argument.includes('const target="/fixture/secrets"'))) {
+  const protectedBundle = path.join(fixture, 'secrets')
+  fs.chmodSync(protectedBundle, 0o750)
+  fs.rmSync(protectedBundle, { recursive: true, force: true })
+  process.exit(0)
+}
+const candidate = args.at(-1)
+const production = (args.find((argument) => argument.startsWith('KINVEST_DB_PATH=')) || '').slice('KINVEST_DB_PATH='.length)
+const tmpfsIndex = args.indexOf('--tmpfs')
+const tmpfs = tmpfsIndex === -1 ? '' : args[tmpfsIndex + 1]
+if (candidate !== '/preflight/candidate.sqlite') {
+  process.stderr.write('ACCESS_PREFLIGHT_DATABASE_PATH_REQUIRED\\n')
+  process.exit(1)
+}
+if (candidate === production || !tmpfs) {
+  process.stderr.write('ACCESS_PREFLIGHT_DATABASE_PATH_INVALID\\n')
+  process.exit(1)
+}
+if (tmpfs.includes('size=1m')) {
+  process.stderr.write('ACCESS_PREFLIGHT_DATABASE_SNAPSHOT_INVALID\\n')
+  process.exit(1)
+}
+process.stdout.write('KINVEST_ACCESS_PREFLIGHT_OK mode=device-approval references=2 database=ready proxy=ready\\n')
+`, { mode: 0o755 })
+  try {
+    /** @type {NodeJS.ProcessEnv} */
+    const cleanupEnvironment = {
+      ...process.env,
+      KINVEST_SMOKE_FIXTURE_LOG: cleanupFixtureLog,
+      PATH: `${cleanupHarnessBin}:${process.env.PATH}`
+    }
+    delete cleanupEnvironment.DOCKER_DEFAULT_PLATFORM
+    const cleanupResult = spawnSync('bash', [accessPreflightSmokePath, 'kinvest:test-cleanup'], {
+      encoding: 'utf8',
+      env: cleanupEnvironment
+    })
+    assert.equal(cleanupResult.status, 0, cleanupResult.stderr)
+    assert.equal(cleanupResult.stdout, 'KINVEST_ACCESS_PREFLIGHT_RUNTIME_SMOKE_OK\n')
+    assert.equal(cleanupResult.stderr, '')
+    const protectedFixture = fs.readFileSync(cleanupFixtureLog, 'utf8').trim()
+    assert.equal(fs.existsSync(protectedFixture), false, 'cleanup must remove a fixture containing a mode-0550 secret bundle')
+  } finally {
+    if (fs.existsSync(cleanupFixtureLog)) {
+      const protectedFixture = fs.readFileSync(cleanupFixtureLog, 'utf8').trim()
+      const protectedBundle = path.join(protectedFixture, 'secrets')
+      if (fs.existsSync(protectedBundle)) fs.chmodSync(protectedBundle, 0o750)
+    }
+    fs.rmSync(cleanupHarnessRoot, { recursive: true, force: true })
   }
   const containerBuildJob = workflow.match(/^ {2}container-build:\n[\s\S]*?(?=^ {2}[a-z][a-z-]+:)/m)?.[0] || ''
   assert.match(containerBuildJob, /^ {10}load: true$/m)
