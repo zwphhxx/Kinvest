@@ -6,8 +6,11 @@ const os = require('node:os')
 const path = require('node:path')
 
 const rootDir = path.resolve(__dirname, '../..')
-const transactionalInstallerTimeoutMs = 30_000
-const transactionalInstallerNestedTimeoutSeconds = 20
+// The full suite can leave this process near 30 seconds under scheduler load; this
+// outer budget is intentionally larger than the nested deadlock guard below.
+const transactionalInstallerOuterSchedulingBudgetMs = 60_000
+const transactionalInstallerInnerDeadlockGuardSeconds = 20
+const transactionalInstallerForcedInnerDeadlockGuardSeconds = 0.05
 
 function read(relativePath) {
   return fs.readFileSync(path.join(rootDir, relativePath), 'utf8')
@@ -814,6 +817,7 @@ exec "$KINVEST_REAL_PYTHON" "$@"
     KINVEST_REAL_SHASUM: realShasum,
     PATH: `${fakeBin}:${process.env.PATH}`
   }
+  const startedAt = Date.now()
   const result = deploymentOwnsLock
     ? spawnSync(realPython, ['-c', `
 import fcntl
@@ -830,7 +834,9 @@ with open(sys.argv[3], "a+b") as lock_file:
             stdout=subprocess.PIPE,
             stderr=subprocess.PIPE,
             text=True,
-            timeout=${forceInnerTimeout ? 0.05 : transactionalInstallerNestedTimeoutSeconds},
+            timeout=${forceInnerTimeout
+              ? transactionalInstallerForcedInnerDeadlockGuardSeconds
+              : transactionalInstallerInnerDeadlockGuardSeconds},
         )
     except subprocess.TimeoutExpired:
         sys.stderr.write("KINVEST_TEST_NESTED_TIMEOUT\\n")
@@ -841,12 +847,12 @@ raise SystemExit(completed.returncode)
 `, installerPath, sourceDir, deployLock], {
         encoding: 'utf8',
         env: installerEnvironment,
-        timeout: transactionalInstallerTimeoutMs
+        timeout: transactionalInstallerOuterSchedulingBudgetMs
       })
     : spawnSync('bash', [installerPath, sourceDir], {
     encoding: 'utf8',
     env: installerEnvironment,
-    timeout: transactionalInstallerTimeoutMs
+    timeout: transactionalInstallerOuterSchedulingBudgetMs
   })
 
   return {
@@ -858,6 +864,7 @@ raise SystemExit(completed.returncode)
     originals,
     result,
     runDir,
+    elapsedMs: Date.now() - startedAt,
     targets
   }
 }
@@ -866,7 +873,7 @@ function assertTransactionalFixtureCompleted(result, scenario) {
   assert.notEqual(
     result.error?.code,
     'ETIMEDOUT',
-    `${scenario}: transactional installer fixture exceeded ${transactionalInstallerTimeoutMs}ms`
+    `${scenario}: transactional installer fixture exceeded ${transactionalInstallerOuterSchedulingBudgetMs}ms`
   )
   assert.equal(result.signal, null, `${scenario}: transactional installer fixture was terminated by ${result.signal}`)
   assert.notEqual(result.status, 124, `${scenario}: nested transactional installer subprocess timed out`)
@@ -878,6 +885,11 @@ function assertTransactionalFixtureCompleted(result, scenario) {
 }
 
 async function run() {
+  assert.equal(
+    transactionalInstallerOuterSchedulingBudgetMs,
+    60_000,
+    'outer transactional fixture budget must leave scheduler margin above the nested deadlock guard'
+  )
   const wrapper = read('deploy/server/kinvest-ssh-command-v2')
   const deploy = read('deploy/server/deploy-kinvest-v2.sh')
   const installer = read('deploy/server/install-deploy-v2.sh')
@@ -1127,6 +1139,10 @@ async function run() {
     )
     assert.equal(forcedInnerTimeout.result.status, 124)
     assert.match(forcedInnerTimeout.result.stderr, /KINVEST_TEST_NESTED_TIMEOUT/)
+    assert.ok(
+      forcedInnerTimeout.elapsedMs < 5_000,
+      `forced inner deadlock guard must fail quickly; elapsed=${forcedInnerTimeout.elapsedMs}ms`
+    )
   } finally {
     forcedInnerTimeout.cleanup()
   }
