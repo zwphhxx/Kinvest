@@ -12,7 +12,7 @@ bundle="$fixture/secrets"
 cleanup() {
   local status=$? cleanup_script
   trap - EXIT HUP INT TERM
-  cleanup_script='const fs=require("node:fs");const target="/fixture/secrets";if(fs.existsSync(target)){fs.chmodSync(target,0o700);fs.rmSync(target,{recursive:true,force:true})}'
+  cleanup_script='const fs=require("node:fs"),path=require("node:path");const target="/fixture/secrets";if(fs.existsSync(target)){fs.chmodSync(target,0o700);for(const entry of fs.readdirSync(target)){fs.rmSync(path.join(target,entry),{recursive:true,force:true})}fs.chmodSync(target,0o755)}'
   if [[ -e "$bundle" ]]; then
     docker run --rm --platform linux/amd64 --user 0:0 --read-only --cap-drop ALL \
       --security-opt no-new-privileges:true --network none --volume "$fixture:/fixture" \

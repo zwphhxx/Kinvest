@@ -2334,6 +2334,20 @@ function run() {
     3,
     'fixture preparation, runtime cases, and privileged cleanup must each pin the production platform'
   )
+  const cleanupInlineScript = accessPreflightSmoke.match(/^ {2}cleanup_script='([^'\n]+)'$/m)?.[1] || ''
+  assert.notEqual(cleanupInlineScript, '', 'runtime smoke must define its constrained bundle cleanup script')
+  assert.doesNotMatch(
+    cleanupInlineScript,
+    /rmSync\(target\b/,
+    'cleanup container must not unlink the root-owned bundle from its runner-owned parent'
+  )
+  assert.match(cleanupInlineScript, /for\(const entry of fs[.]readdirSync\(target\)\)/)
+  assert.match(cleanupInlineScript, /fs[.]rmSync\(path[.]join\(target,entry\),\{recursive:true,force:true\}\)/)
+  assert.match(
+    cleanupInlineScript,
+    /fs[.]chmodSync\(target,0o755\)/,
+    'cleanup container must leave the empty bundle traversable so the runner can unlink it via the parent'
+  )
   for (const fragment of [
     'docker run --rm --platform linux/amd64 --user 0:0 --read-only --cap-drop ALL',
     'docker run --rm --platform linux/amd64 --user 0:0',
@@ -2373,7 +2387,10 @@ if (args.includes('/fixture/prepare.js')) {
 if (args.some((argument) => argument.includes('const target="/fixture/secrets"'))) {
   const protectedBundle = path.join(fixture, 'secrets')
   fs.chmodSync(protectedBundle, 0o750)
-  fs.rmSync(protectedBundle, { recursive: true, force: true })
+  for (const entry of fs.readdirSync(protectedBundle)) {
+    fs.rmSync(path.join(protectedBundle, entry), { recursive: true, force: true })
+  }
+  fs.chmodSync(protectedBundle, 0o755)
   process.exit(0)
 }
 const candidate = args.at(-1)
