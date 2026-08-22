@@ -124,19 +124,19 @@ exit 127
 `)
   writeExecutable(path.join(bin, 'docker'), `#!/usr/bin/env bash
 set -euo pipefail
-append_operation() {
-  local diagnostic="$1" saved_soft_limit append_status=0 restore_status=0
+append_diagnostic() {
+  local file="$1" diagnostic="$2" saved_soft_limit append_status=0 restore_status=0
   saved_soft_limit="$(ulimit -Sf)"
   ulimit -Sf unlimited
-  if [[ "$(wc -c <"$OPERATIONS" | tr -d '[:space:]')" -gt 1024 && "$(ulimit -Sf)" != unlimited ]]; then
+  if [[ "$(wc -c <"$file" | tr -d '[:space:]')" -gt 1024 && "$(ulimit -Sf)" != unlimited ]]; then
     append_status=73
   else
-    printf '%s\n' "$diagnostic" >>"$OPERATIONS" || append_status=$?
+    printf '%s\n' "$diagnostic" >>"$file" || append_status=$?
   fi
   ulimit -Sf "$saved_soft_limit" || restore_status=$?
   [[ "$append_status" -eq 0 && "$restore_status" -eq 0 ]]
 }
-append_operation "docker $*"
+append_diagnostic "$OPERATIONS" "docker $*"
 command="$1"; shift
 if [[ "$command" == image && "$1" == inspect ]]; then
   ref="$2"; format="$4"
@@ -189,10 +189,10 @@ if [[ "$command" == run ]]; then
     [[ "$all" =~ --volume[[:space:]][^[:space:]]+:\${candidate_path}:ro([[:space:]]|$) ]] || exit 64
     [[ " $all " == *" server/access-preflight.js $candidate_path "* ]] || exit 64
     [[ "$candidate_path" != "$production_path" ]] || exit 64
-    printf 'preflight access %s %s\n' "$image" "$all" >>"$PREFLIGHTS"
+    append_diagnostic "$PREFLIGHTS" "preflight access $image $all"
     echo 'KINVEST_ACCESS_PREFLIGHT_OK mode=device-approval references=2 database=ready proxy=ready'
   else
-    printf 'preflight secret %s %s\n' "$image" "$all" >>"$PREFLIGHTS"
+    append_diagnostic "$PREFLIGHTS" "preflight secret $image $all"
     if [[ "$all" == *KINVEST_SECRET_PROVIDER_MODE=disabled* ]]; then
       echo 'KINVEST_SECRET_PREFLIGHT_OK mode=disabled references=0'
     else
@@ -210,7 +210,7 @@ if [[ "$command" == compose ]]; then
       "$KINVEST_IMAGE" "$KINVEST_ACCESS_CONTROL_MODE" "$KINVEST_SECRET_PROVIDER_MODE" \
       "$KINVEST_SECRET_VERSION_IDS" "$KINVEST_SECRET_BUNDLE_HOST_PATH" \
       "$KINVEST_TRUSTED_PROXY_ADDRESSES"
-    append_operation "$compose_operation"
+    append_diagnostic "$OPERATIONS" "$compose_operation"
     if [[ "$MIGRATED_SCHEMA" != 0 && "$KINVEST_IMAGE" == "$CANDIDATE_ID" ]]; then
       python3 -c 'import sqlite3,sys; c=sqlite3.connect(sys.argv[1]); c.execute("PRAGMA user_version=" + sys.argv[2]); c.commit(); c.close()' "$DATABASE_PATH" "$MIGRATED_SCHEMA"
     fi
@@ -218,7 +218,7 @@ if [[ "$command" == compose ]]; then
       : >"$FAILURE_MARKER"; exit 1
     fi
   else
-    append_operation "compose down $KINVEST_IMAGE"
+    append_diagnostic "$OPERATIONS" "compose down $KINVEST_IMAGE"
   fi
   exit 0
 fi
@@ -466,7 +466,9 @@ async function run() {
   const oversizedDiagnostics = createFixture({ failure: 'none', currentDevice: false })
   try {
     fs.writeFileSync(oversizedDiagnostics.operations, Buffer.alloc(2048, 'x'))
+    fs.writeFileSync(oversizedDiagnostics.preflights, Buffer.alloc(2048, 'x'))
     assert.ok(fs.statSync(oversizedDiagnostics.operations).size > 1024)
+    assert.ok(fs.statSync(oversizedDiagnostics.preflights).size > 1024)
     const result = execute(oversizedDiagnostics, payload())
     assert.equal(result.status, 0, result.stderr)
   } finally {
