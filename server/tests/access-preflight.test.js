@@ -1,4 +1,6 @@
 const assert = require('node:assert/strict')
+const { spawn, spawnSync } = require('node:child_process')
+const crypto = require('node:crypto')
 const { EventEmitter } = require('node:events')
 const fs = require('node:fs')
 const http = require('node:http')
@@ -10,6 +12,10 @@ const {
   generateAdminPasswordVerifier,
   generateDeviceHmacSecret
 } = require('../security/secret-bootstrap-contract')
+const { bootstrapSecrets } = require('../security/secret-bootstrap')
+const {
+  createGithubTmpfsSecretLoaderForTest
+} = require('./support/load-github-tmpfs-provider-for-test')
 
 const ADMIN_VERSION = 'v20260822-001'
 const HMAC_VERSION = 'v20260822-002'
@@ -35,6 +41,72 @@ function enabledEnv(productionDatabasePath) {
     KINVEST_SECRET_VERSION_IDS: VERSION_CONFIG,
     KINVEST_TRUSTED_PROXY_ADDRESSES: '["127.0.0.1"]',
     KINVEST_DB_PATH: productionDatabasePath
+  }
+}
+
+function realProviderEnv(productionDatabasePath) {
+  return {
+    ...enabledEnv(productionDatabasePath),
+    KINVEST_SECRET_PROVIDER_MODE: 'github-tmpfs-v1',
+    KINVEST_SECRET_BUNDLE_PATH: '/run/secrets/kinvest'
+  }
+}
+
+function sha256(value) {
+  return crypto.createHash('sha256').update(value).digest('hex')
+}
+
+/**
+ * @param {string} root
+ * @param {{missing?: string, manifestVersion?: string, adminMaterial?: Buffer, hmacMaterial?: Buffer}} [options]
+ */
+function createRealBundle(root, {
+  missing,
+  manifestVersion = ADMIN_VERSION,
+  adminMaterial = Buffer.from(JSON.stringify({
+    digest: Buffer.alloc(32, 31).toString('base64url'),
+    format: 'kinvest-admin-scrypt-v1',
+    n: 65536,
+    p: 1,
+    r: 8,
+    salt: Buffer.alloc(16, 32).toString('base64url')
+  })),
+  hmacMaterial = Buffer.from(Buffer.alloc(32, 33).toString('base64url'))
+} = {}) {
+  const bundlePath = path.join(root, 'github-tmpfs-bundle')
+  fs.mkdirSync(bundlePath, { mode: 0o700 })
+  const files = new Map([
+    ['admin-password-verifier', adminMaterial],
+    ['device-token-hmac-key', hmacMaterial]
+  ])
+  for (const [name, material] of files) {
+    if (missing === name) continue
+    fs.writeFileSync(path.join(bundlePath, name), material, { mode: 0o440 })
+  }
+  fs.writeFileSync(path.join(bundlePath, 'manifest.json'), JSON.stringify({
+    format: 'kinvest-github-tmpfs-v1',
+    adminPasswordVerifier: {
+      file: 'admin-password-verifier',
+      versionId: manifestVersion,
+      sha256: sha256(adminMaterial)
+    },
+    deviceTokenHmac: {
+      file: 'device-token-hmac-key',
+      versionId: manifestVersion === ADMIN_VERSION ? HMAC_VERSION : manifestVersion,
+      sha256: sha256(hmacMaterial)
+    }
+  }), { mode: 0o440 })
+  for (const name of fs.readdirSync(bundlePath)) {
+    fs.chmodSync(path.join(bundlePath, name), 0o440)
+  }
+  fs.chmodSync(bundlePath, 0o550)
+  return {
+    bundlePath,
+    loadSecrets: createGithubTmpfsSecretLoaderForTest({
+      bundlePath,
+      expectedUid: process.getuid(),
+      expectedGid: process.getgid()
+    })
   }
 }
 
@@ -81,6 +153,11 @@ function createSecretRuntime(options = {}) {
 function assertCode(error, expectedCode) {
   assert.equal(error && error.code, expectedCode)
   return true
+}
+
+function createEmptyDatabase(databasePath) {
+  const database = new DatabaseSync(databasePath)
+  database.close()
 }
 
 async function testSharedPreparationAndSuccessfulPreflight(tempDirectory) {
@@ -183,6 +260,7 @@ async function testStableFailuresAndDatabaseClosure(tempDirectory) {
     const stdout = capture()
     const stderr = capture()
     const databasePath = path.join(tempDirectory, `${fixture.name}.sqlite`)
+    createEmptyDatabase(databasePath)
     assert.equal(await runAccessPreflight({
       env: enabledEnv(productionPath),
       databasePath,
@@ -243,6 +321,7 @@ async function testStableFailuresAndDatabaseClosure(tempDirectory) {
   const identityDatabase = new DatabaseSync(identityPath)
   identityDatabase.exec('PRAGMA application_id = 12345')
   identityDatabase.close()
+  const identityBefore = fs.readFileSync(identityPath)
   const corruptPath = path.join(tempDirectory, 'corrupt.sqlite')
   fs.writeFileSync(corruptPath, 'not a sqlite database; password=fixture')
 
@@ -263,6 +342,9 @@ async function testStableFailuresAndDatabaseClosure(tempDirectory) {
       const reopened = new DatabaseSync(databasePath)
       reopened.close()
     })
+    if (databasePath === identityPath) {
+      assert.deepStrictEqual(fs.readFileSync(identityPath), identityBefore)
+    }
   }
 
   const rawFailingDatabase = new DatabaseSync(':memory:')
@@ -306,6 +388,145 @@ async function testStableFailuresAndDatabaseClosure(tempDirectory) {
   assert.equal(samePathErr.value(), 'ACCESS_PREFLIGHT_DATABASE_PATH_INVALID\n')
 }
 
+async function testDatabasePathIsolation(tempDirectory) {
+  const { runAccessPreflight } = require('../access-preflight')
+  const productionPath = path.join(tempDirectory, 'isolation-production.sqlite')
+  const production = new DatabaseSync(productionPath)
+  production.exec("CREATE TABLE production_marker (value TEXT NOT NULL); INSERT INTO production_marker VALUES ('unchanged')")
+  production.close()
+  const productionBefore = fs.readFileSync(productionPath)
+
+  const missingPath = path.join(tempDirectory, 'missing-candidate.sqlite')
+  const realParent = path.join(tempDirectory, 'real-parent')
+  const aliasParent = path.join(tempDirectory, 'alias-parent')
+  fs.mkdirSync(realParent)
+  const parentCandidate = path.join(realParent, 'candidate.sqlite')
+  createEmptyDatabase(parentCandidate)
+  fs.symlinkSync(realParent, aliasParent, 'dir')
+  const fileTarget = path.join(tempDirectory, 'file-target.sqlite')
+  const fileAlias = path.join(tempDirectory, 'file-alias.sqlite')
+  createEmptyDatabase(fileTarget)
+  fs.symlinkSync(fileTarget, fileAlias)
+
+  for (const databasePath of [
+    missingPath,
+    path.join(aliasParent, 'candidate.sqlite'),
+    fileAlias
+  ]) {
+    let bootstrapCalls = 0
+    const stdout = capture()
+    const stderr = capture()
+    assert.equal(await runAccessPreflight({
+      env: enabledEnv(productionPath),
+      databasePath,
+      bootstrap: async () => {
+        bootstrapCalls += 1
+        return createSecretRuntime().runtime
+      },
+      stdout: stdout.stream,
+      stderr: stderr.stream,
+      processRef: new EventEmitter()
+    }), 1)
+    assert.equal(bootstrapCalls, 0)
+    assert.equal(stdout.value(), '')
+    assert.equal(stderr.value(), 'ACCESS_PREFLIGHT_DATABASE_PATH_INVALID\n')
+  }
+
+  const replacementPath = path.join(tempDirectory, 'replacement-candidate.sqlite')
+  fs.copyFileSync(productionPath, replacementPath)
+  const replacementStdout = capture()
+  const replacementStderr = capture()
+  assert.equal(await runAccessPreflight({
+    env: enabledEnv(productionPath),
+    databasePath: replacementPath,
+    bootstrap: async () => {
+      fs.rmSync(replacementPath)
+      fs.linkSync(productionPath, replacementPath)
+      return createSecretRuntime().runtime
+    },
+    stdout: replacementStdout.stream,
+    stderr: replacementStderr.stream,
+    processRef: new EventEmitter()
+  }), 0)
+  assert.equal(
+    replacementStdout.value(),
+    'KINVEST_ACCESS_PREFLIGHT_OK mode=device-approval references=2 database=ready proxy=ready\n'
+  )
+  assert.equal(replacementStderr.value(), '')
+  assert.deepStrictEqual(fs.readFileSync(productionPath), productionBefore)
+}
+
+async function testRealGithubTmpfsProviderChain(tempDirectory) {
+  const { runAccessPreflight } = require('../access-preflight')
+  const productionPath = path.join(tempDirectory, 'real-provider-production.sqlite')
+  const cases = [
+    {
+      name: 'success',
+      expectedExit: 0,
+      expectedStdout: 'KINVEST_ACCESS_PREFLIGHT_OK mode=device-approval references=2 database=ready proxy=ready\n',
+      expectedStderr: ''
+    },
+    {
+      name: 'missing-secret',
+      bundle: { missing: 'device-token-hmac-key' },
+      expectedExit: 1,
+      expectedStdout: '',
+      expectedStderr: 'GITHUB_TMPFS_BUNDLE_INVALID\n'
+    },
+    {
+      name: 'version-mismatch',
+      bundle: { manifestVersion: 'v20260822-099' },
+      expectedExit: 1,
+      expectedStdout: '',
+      expectedStderr: 'GITHUB_TMPFS_BUNDLE_INVALID\n'
+    },
+    {
+      name: 'invalid-admin',
+      bundle: { adminMaterial: Buffer.from('invalid-admin-material-marker') },
+      expectedExit: 1,
+      expectedStdout: '',
+      expectedStderr: 'SECRET_MATERIAL_INVALID\n'
+    },
+    {
+      name: 'invalid-hmac',
+      bundle: { hmacMaterial: Buffer.from('invalid-hmac-material-marker') },
+      expectedExit: 1,
+      expectedStdout: '',
+      expectedStderr: 'SECRET_MATERIAL_INVALID\n'
+    }
+  ]
+
+  for (const fixture of cases) {
+    const fixtureRoot = path.join(tempDirectory, `real-provider-${fixture.name}`)
+    fs.mkdirSync(fixtureRoot)
+    const bundle = createRealBundle(fixtureRoot, fixture.bundle)
+    const candidatePath = path.join(fixtureRoot, 'candidate.sqlite')
+    createEmptyDatabase(candidatePath)
+    const stdout = capture()
+    const stderr = capture()
+    try {
+      assert.equal(await runAccessPreflight({
+        env: realProviderEnv(productionPath),
+        databasePath: candidatePath,
+        bootstrap: bootstrapSecrets,
+        loadSecrets: bundle.loadSecrets,
+        stdout: stdout.stream,
+        stderr: stderr.stream,
+        processRef: new EventEmitter()
+      }), fixture.expectedExit, fixture.name)
+      assert.equal(stdout.value(), fixture.expectedStdout, fixture.name)
+      assert.equal(stderr.value(), fixture.expectedStderr, fixture.name)
+      assert.equal(
+        /material-marker|v20260822-099|127\.0\.0\.1/.test(stderr.value()),
+        false,
+        fixture.name
+      )
+    } finally {
+      fs.chmodSync(bundle.bundlePath, 0o700)
+    }
+  }
+}
+
 async function testSignalCleanup(tempDirectory) {
   const { runAccessPreflight } = require('../access-preflight')
   const processRef = new EventEmitter()
@@ -318,6 +539,7 @@ async function testSignalCleanup(tempDirectory) {
     throw new Error('preparation did not start')
   }
   let clearCount = 0
+  createEmptyDatabase(path.join(tempDirectory, 'snapshot-signal.sqlite'))
   const running = runAccessPreflight({
     env: enabledEnv(path.join(tempDirectory, 'production-signal.sqlite')),
     databasePath: path.join(tempDirectory, 'snapshot-signal.sqlite'),
@@ -349,6 +571,124 @@ async function testSignalCleanup(tempDirectory) {
   assert.equal(processRef.listenerCount('SIGINT'), 0)
 }
 
+async function waitForMarker(markerPath, child) {
+  for (let attempt = 0; attempt < 100; attempt += 1) {
+    if (fs.existsSync(markerPath)) return
+    if (child.exitCode !== null || child.signalCode !== null) break
+    await new Promise((resolve) => setTimeout(resolve, 20))
+  }
+  assert.fail('pending preflight worker did not reach bootstrap')
+}
+
+async function testSubprocessSignalCancellation(tempDirectory) {
+  const workerPath = path.join(
+    __dirname,
+    'fixtures',
+    'access-preflight-pending-worker.js'
+  )
+  for (const signal of /** @type {NodeJS.Signals[]} */ (['SIGTERM', 'SIGINT'])) {
+    const candidatePath = path.join(tempDirectory, `signal-${signal}.sqlite`)
+    const productionPath = path.join(tempDirectory, `signal-${signal}-production.sqlite`)
+    const markerPath = path.join(tempDirectory, `signal-${signal}.marker`)
+    createEmptyDatabase(candidatePath)
+    const child = spawn(process.execPath, [
+      workerPath,
+      candidatePath,
+      productionPath,
+      markerPath
+    ], {
+      stdio: ['ignore', 'pipe', 'pipe']
+    })
+    let stdout = ''
+    let stderr = ''
+    child.stdout.setEncoding('utf8')
+    child.stderr.setEncoding('utf8')
+    child.stdout.on('data', (chunk) => { stdout += chunk })
+    child.stderr.on('data', (chunk) => { stderr += chunk })
+    await waitForMarker(markerPath, child)
+    assert.equal(fs.readFileSync(markerPath, 'utf8'), 'allocated\n')
+    const exit = new Promise((resolve) => child.once('exit', (code, exitSignal) => {
+      resolve({ code, signal: exitSignal })
+    }))
+    child.kill(signal)
+    const result = await Promise.race([
+      exit,
+      new Promise((resolve) => setTimeout(() => resolve(null), 1500))
+    ])
+    if (!result) {
+      child.kill('SIGKILL')
+      await exit
+      assert.fail(`${signal} preflight did not exit promptly`)
+    }
+    assert.deepStrictEqual(result, { code: 1, signal: null })
+    assert.equal(stdout, '')
+    assert.equal(stderr, 'ACCESS_PREFLIGHT_INTERRUPTED\n')
+    assert.equal(fs.readFileSync(markerPath, 'utf8'), 'cleared\n')
+  }
+}
+
+function testExecutableOutputContract(tempDirectory) {
+  const workerPath = path.join(
+    __dirname,
+    'fixtures',
+    'access-preflight-real-worker.js'
+  )
+  const fixtureRoot = path.join(tempDirectory, 'executable-real-provider')
+  const productionPath = path.join(fixtureRoot, 'production.sqlite')
+  fs.mkdirSync(fixtureRoot)
+  const bundle = createRealBundle(fixtureRoot)
+  try {
+    const successCandidate = path.join(fixtureRoot, 'success.sqlite')
+    createEmptyDatabase(successCandidate)
+    const success = spawnSync(process.execPath, [
+      workerPath,
+      successCandidate,
+      productionPath,
+      bundle.bundlePath
+    ], {
+      encoding: 'utf8',
+      timeout: 5000,
+      env: {
+        ...process.env,
+        ...realProviderEnv(productionPath)
+      }
+    })
+    assert.equal(success.status, 0)
+    assert.equal(
+      success.stdout,
+      'KINVEST_ACCESS_PREFLIGHT_OK mode=device-approval references=2 database=ready proxy=ready\n'
+    )
+    assert.equal(success.stderr, '')
+
+    const failureCandidate = path.join(fixtureRoot, 'failure.sqlite')
+    createEmptyDatabase(failureCandidate)
+    const proxyConfiguration = '["203.0.113.8","203.0.113.8"]'
+    const failure = spawnSync(process.execPath, [
+      workerPath,
+      failureCandidate,
+      productionPath,
+      bundle.bundlePath
+    ], {
+      encoding: 'utf8',
+      timeout: 5000,
+      env: {
+        ...process.env,
+        ...realProviderEnv(productionPath),
+        KINVEST_TRUSTED_PROXY_ADDRESSES: proxyConfiguration
+      }
+    })
+    assert.equal(failure.status, 1)
+    assert.equal(failure.stdout, '')
+    assert.equal(failure.stderr, 'HTTP_SECURITY_CONFIG_INVALID\n')
+    assert.equal(failure.stderr.includes(proxyConfiguration), false)
+    assert.equal(failure.stderr.includes(ADMIN_VERSION), false)
+    assert.equal(failure.stderr.includes(HMAC_VERSION), false)
+    assert.equal(failure.stderr.includes('RequestId'), false)
+  } finally {
+    fs.chmodSync(bundle.bundlePath, 0o700)
+  }
+}
+
 async function run() {
   const preparationPath = path.resolve(__dirname, '../pre-listen-preparation.js')
   assert.equal(
@@ -356,11 +696,17 @@ async function run() {
     true,
     'shared pre-listen preparation entry must exist'
   )
-  const tempDirectory = fs.mkdtempSync(path.join(os.tmpdir(), 'kinvest-access-preflight-'))
+  const tempDirectory = fs.realpathSync(fs.mkdtempSync(
+    path.join(os.tmpdir(), 'kinvest-access-preflight-')
+  ))
   try {
     await testSharedPreparationAndSuccessfulPreflight(tempDirectory)
     await testStableFailuresAndDatabaseClosure(tempDirectory)
+    await testDatabasePathIsolation(tempDirectory)
+    await testRealGithubTmpfsProviderChain(tempDirectory)
     await testSignalCleanup(tempDirectory)
+    await testSubprocessSignalCancellation(tempDirectory)
+    testExecutableOutputContract(tempDirectory)
   } finally {
     fs.rmSync(tempDirectory, { recursive: true, force: true })
   }

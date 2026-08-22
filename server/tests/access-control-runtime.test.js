@@ -290,12 +290,64 @@ function testConfigurationFailuresAreStableAndFailClosed() {
   }
 }
 
+function testIdentityIsCheckedBeforeSchemaMutation() {
+  const directory = fs.mkdtempSync(path.join(os.tmpdir(), 'kinvest-identity-order-'))
+  const databasePath = path.join(directory, 'wrong-identity.sqlite')
+  try {
+    const setup = new DatabaseSync(databasePath)
+    setup.exec('PRAGMA application_id = 12345')
+    setup.close()
+    const before = fs.readFileSync(databasePath)
+    expectCode(() => createAccessControlRuntime({
+      env: enabledEnv(),
+      secretRuntime: createSecretRuntime().runtime,
+      openDatabase: () => new DatabaseSync(databasePath),
+      closeDatabase: (database) => database.close()
+    }), 'ACCESS_CONTROL_CONFIG_INVALID')
+    assert.deepStrictEqual(fs.readFileSync(databasePath), before)
+  } finally {
+    fs.rmSync(directory, { recursive: true, force: true })
+  }
+}
+
+function testClearContinuesAcrossResourceFailures() {
+  const database = new DatabaseSync(':memory:')
+  let closeCount = 0
+  let adminClearCount = 0
+  let deviceClearCount = 0
+  const runtime = createAccessControlRuntime({
+    env: enabledEnv(),
+    secretRuntime: createSecretRuntime().runtime,
+    openDatabase: () => database,
+    closeDatabase(value) {
+      assert.equal(value, database)
+      closeCount += 1
+      value.close()
+    }
+  })
+  runtime.adminAuth.clear = () => {
+    adminClearCount += 1
+    throw new Error('sensitive admin cleanup failure')
+  }
+  runtime.deviceApproval.clear = () => {
+    deviceClearCount += 1
+    throw new Error('sensitive device cleanup failure')
+  }
+  assert.doesNotThrow(() => runtime.clear())
+  assert.doesNotThrow(() => runtime.clear())
+  assert.equal(adminClearCount, 1)
+  assert.equal(deviceClearCount, 1)
+  assert.equal(closeCount, 1)
+}
+
 async function run() {
   testDisabledAvoidsSecretsAndDatabase()
   testEnabledComposesWorkingServicesAndClearsMaterial()
   testOwnedDatabaseClosesOnceAndFailureCloses()
   testRefreshDatabaseCanCloseAndReopen()
   testConfigurationFailuresAreStableAndFailClosed()
+  testIdentityIsCheckedBeforeSchemaMutation()
+  testClearContinuesAcrossResourceFailures()
 }
 
 module.exports = { run }

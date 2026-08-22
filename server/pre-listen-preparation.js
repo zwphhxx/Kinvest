@@ -28,16 +28,33 @@ function clearRuntimes(accessRuntime, secretRuntime) {
   }
 }
 
+function throwIfAborted(signal) {
+  if (!signal || !signal.aborted) return
+  if (signal.reason instanceof Error) throw signal.reason
+  throw Object.assign(new Error('Application preparation interrupted'), {
+    code: 'ACCESS_PREFLIGHT_INTERRUPTED'
+  })
+}
+
 /** @param {any} [options] */
 async function prepareApplication({
   env = process.env,
   bootstrap = bootstrapSecrets,
+  loadSecrets,
+  signal,
   createAccessRuntime = createAccessControlRuntime,
   openDatabase = openDb,
   closeDatabase = closeDb,
   createHandler = defaultCreateHandler
 } = {}) {
-  const secretRuntime = await bootstrap({ env })
+  throwIfAborted(signal)
+  const secretRuntime = await bootstrap({ env, loadSecrets, signal })
+  try {
+    throwIfAborted(signal)
+  } catch (error) {
+    clearRuntimes(null, secretRuntime)
+    throw error
+  }
   let accessRuntime
   try {
     accessRuntime = createAccessRuntime({
