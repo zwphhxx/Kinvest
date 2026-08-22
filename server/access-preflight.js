@@ -1,6 +1,7 @@
 const fs = require('node:fs')
 const os = require('node:os')
 const path = require('node:path')
+const { DatabaseSync, backup } = require('node:sqlite')
 const {
   closeDatabase,
   getDbPath,
@@ -64,8 +65,11 @@ function assertSidecarFree(databasePath) {
   }
 }
 
-function copyDescriptorToPrivateDatabase(
+async function snapshotDatabaseToPrivateDirectory(
   sourceDescriptor,
+  sourcePath,
+  anchoredStat,
+  backupDatabase,
   removePrivateDirectory
 ) {
   const directory = fs.mkdtempSync(path.join(
@@ -74,53 +78,53 @@ function copyDescriptorToPrivateDatabase(
   ))
   fs.chmodSync(directory, 0o700)
   const databasePath = path.join(directory, 'candidate.sqlite')
-  let destinationDescriptor
-  const scratch = Buffer.alloc(64 * 1024)
+  let sourceDatabase
   try {
-    destinationDescriptor = fs.openSync(
-      databasePath,
-      fs.constants.O_CREAT | fs.constants.O_EXCL | fs.constants.O_WRONLY,
-      0o600
-    )
-    let position = 0
-    while (true) {
-      const bytesRead = fs.readSync(
-        sourceDescriptor,
-        scratch,
-        0,
-        scratch.length,
-        position
-      )
-      if (bytesRead === 0) break
-      let written = 0
-      while (written < bytesRead) {
-        written += fs.writeSync(
-          destinationDescriptor,
-          scratch,
-          written,
-          bytesRead - written
-        )
-      }
-      position += bytesRead
+    sourceDatabase = new DatabaseSync(sourcePath, { readOnly: true })
+    const defensiveDatabase = /** @type {any} */ (sourceDatabase)
+    defensiveDatabase.enableDefensive(true)
+    const reboundStat = fs.lstatSync(sourcePath)
+    if (!reboundStat.isFile() || reboundStat.isSymbolicLink() ||
+      !sameIdentity(anchoredStat, reboundStat) ||
+      !sameIdentity(anchoredStat, fs.fstatSync(sourceDescriptor))) {
+      throw preflightError('ACCESS_PREFLIGHT_DATABASE_PATH_INVALID')
     }
-    fs.fsyncSync(destinationDescriptor)
-    fs.closeSync(destinationDescriptor)
-    destinationDescriptor = undefined
+    await backupDatabase(sourceDatabase, databasePath)
+    sourceDatabase.close()
+    sourceDatabase = undefined
+    const finalSourceStat = fs.lstatSync(sourcePath)
+    if (!sameIdentity(anchoredStat, finalSourceStat) ||
+      !sameIdentity(anchoredStat, fs.fstatSync(sourceDescriptor))) {
+      throw preflightError('ACCESS_PREFLIGHT_DATABASE_PATH_INVALID')
+    }
+    assertSidecarFree(sourcePath)
+    const destinationStat = fs.lstatSync(databasePath)
+    if (!destinationStat.isFile() || destinationStat.isSymbolicLink() ||
+      destinationStat.nlink !== 1) {
+      throw preflightError('ACCESS_PREFLIGHT_DATABASE_SNAPSHOT_INVALID')
+    }
+    fs.chmodSync(databasePath, 0o600)
+    assertSidecarFree(databasePath)
     return { databasePath, directory }
   } catch (error) {
-    if (destinationDescriptor !== undefined) {
-      try { fs.closeSync(destinationDescriptor) } catch {
-        // The private directory is removed below even if descriptor close fails.
+    if (sourceDatabase) {
+      try { sourceDatabase.close() } catch {
+        // The private directory is still removed below.
       }
     }
-    removePrivateDirectory(directory)
-    throw error
-  } finally {
-    scratch.fill(0)
+    try { removePrivateDirectory(directory) } catch {
+      // Preserve the stable snapshot or path error.
+    }
+    if (error && typeof error === 'object' && 'code' in error && (
+      error.code === 'ACCESS_PREFLIGHT_DATABASE_PATH_INVALID' ||
+      error.code === 'ACCESS_PREFLIGHT_DATABASE_SNAPSHOT_INVALID'
+    )) throw error
+    throw preflightError('ACCESS_PREFLIGHT_DATABASE_SNAPSHOT_INVALID')
   }
 }
 
-function bindCandidateDatabase(databasePath, productionDatabasePath, {
+async function bindCandidateDatabase(databasePath, productionDatabasePath, {
+  backupDatabase = backup,
   removePrivateDirectory = defaultRemovePrivateDirectory
 } = {}) {
   if (typeof databasePath !== 'string' || databasePath.length === 0) {
@@ -159,8 +163,11 @@ function bindCandidateDatabase(databasePath, productionDatabasePath, {
       sameIdentity(openedStat, fs.statSync(production))) {
       throw preflightError('ACCESS_PREFLIGHT_DATABASE_PATH_INVALID')
     }
-    privateCopy = copyDescriptorToPrivateDatabase(
+    privateCopy = await snapshotDatabaseToPrivateDirectory(
       sourceDescriptor,
+      candidate,
+      openedStat,
+      backupDatabase,
       removePrivateDirectory
     )
     assertSidecarFree(candidate)
@@ -190,6 +197,7 @@ function bindCandidateDatabase(databasePath, productionDatabasePath, {
     if (error && typeof error === 'object' &&
       'code' in error && (
         error.code === 'ACCESS_PREFLIGHT_DATABASE_PATH_REQUIRED' ||
+        error.code === 'ACCESS_PREFLIGHT_DATABASE_PATH_INVALID' ||
         error.code === 'ACCESS_PREFLIGHT_DATABASE_SNAPSHOT_INVALID'
       )) {
       throw error
@@ -216,6 +224,7 @@ async function runAccessPreflight({
   loadSecrets,
   createAccessRuntime,
   createHandler,
+  backupDatabase = backup,
   removePrivateDirectory = defaultRemovePrivateDirectory,
   stdout = process.stdout,
   stderr = process.stderr,
@@ -240,10 +249,10 @@ async function runAccessPreflight({
   let resultLine
   let failure
   try {
-    candidateDatabase = bindCandidateDatabase(
+    candidateDatabase = await bindCandidateDatabase(
       databasePath,
       productionDatabasePath,
-      { removePrivateDirectory }
+      { backupDatabase, removePrivateDirectory }
     )
     prepared = await prepare({
       env,

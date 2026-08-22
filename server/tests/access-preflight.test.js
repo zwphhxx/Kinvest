@@ -6,7 +6,7 @@ const fs = require('node:fs')
 const http = require('node:http')
 const os = require('node:os')
 const path = require('node:path')
-const { DatabaseSync } = require('node:sqlite')
+const { DatabaseSync, backup } = require('node:sqlite')
 const {
   ADMIN_SECRET_NAME,
   generateAdminPasswordVerifier,
@@ -354,7 +354,10 @@ async function testStableFailuresAndDatabaseClosure(tempDirectory) {
   const corruptPath = path.join(tempDirectory, 'corrupt.sqlite')
   fs.writeFileSync(corruptPath, 'not a sqlite database; password=fixture')
 
-  for (const databasePath of [identityPath, corruptPath]) {
+  for (const [databasePath, expectedError] of [
+    [identityPath, 'ACCESS_CONTROL_CONFIG_INVALID'],
+    [corruptPath, 'ACCESS_PREFLIGHT_DATABASE_SNAPSHOT_INVALID']
+  ]) {
     const stdout = capture()
     const stderr = capture()
     assert.equal(await runAccessPreflight({
@@ -366,7 +369,7 @@ async function testStableFailuresAndDatabaseClosure(tempDirectory) {
       processRef: new EventEmitter()
     }), 1)
     assert.equal(stdout.value(), '')
-    assert.equal(stderr.value(), 'ACCESS_CONTROL_CONFIG_INVALID\n')
+    assert.equal(stderr.value(), `${expectedError}\n`)
     assert.doesNotThrow(() => {
       const reopened = new DatabaseSync(databasePath)
       reopened.close()
@@ -569,6 +572,137 @@ async function testCleanupCompletesBeforeSuccessOutput(tempDirectory) {
   assert.equal(stderr.value().includes(sensitiveMarker), false)
 }
 
+async function testConcurrentSqliteSnapshot(tempDirectory) {
+  const { runAccessPreflight } = require('../access-preflight')
+  const productionPath = path.join(tempDirectory, 'concurrent-production.sqlite')
+  const candidatePath = path.join(tempDirectory, 'concurrent-candidate.sqlite')
+  const candidate = new DatabaseSync(candidatePath)
+  candidate.exec(`
+    CREATE TABLE snapshot_state (
+      id INTEGER PRIMARY KEY CHECK (id = 1),
+      generation INTEGER NOT NULL,
+      expected_count INTEGER NOT NULL
+    );
+    CREATE TABLE snapshot_rows (
+      generation INTEGER NOT NULL,
+      value TEXT NOT NULL
+    );
+    INSERT INTO snapshot_state VALUES (1, 1, 1000);
+    WITH RECURSIVE sequence(value) AS (
+      SELECT 1 UNION ALL SELECT value + 1 FROM sequence WHERE value < 1000
+    )
+    INSERT INTO snapshot_rows
+      SELECT 1, printf('%08d-%s', value, hex(randomblob(1024))) FROM sequence;
+  `)
+  candidate.close()
+
+  let backupCalls = 0
+  let writerRan = false
+  let sawWalSidecar = false
+  let sourceAfterWriter
+  /** @type {{generation: number, expected_count: number} | undefined} */
+  let snapshotState
+  /** @type {Array<{generation: number, count: number}> | undefined} */
+  let snapshotCounts
+  const stdout = capture()
+  const stderr = capture()
+  const exitCode = await runAccessPreflight({
+    env: enabledEnv(productionPath),
+    databasePath: candidatePath,
+    backupDatabase: async (source, destination) => {
+      backupCalls += 1
+      await backup(source, destination, {
+        rate: 1,
+        progress() {
+          if (writerRan) return 1
+          writerRan = true
+          const writer = new DatabaseSync(candidatePath)
+          writer.exec(`
+            PRAGMA journal_mode = WAL;
+            PRAGMA wal_autocheckpoint = 0;
+            BEGIN IMMEDIATE;
+            UPDATE snapshot_state
+              SET generation = 2, expected_count = 1200 WHERE id = 1;
+            DELETE FROM snapshot_rows;
+            WITH RECURSIVE sequence(value) AS (
+              SELECT 1 UNION ALL SELECT value + 1 FROM sequence WHERE value < 1200
+            )
+            INSERT INTO snapshot_rows
+              SELECT 2, printf('%08d-%s', value, hex(randomblob(1024))) FROM sequence;
+            COMMIT;
+            PRAGMA wal_checkpoint(TRUNCATE);
+          `)
+          sawWalSidecar = fs.existsSync(`${candidatePath}-wal`)
+          writer.close()
+          sourceAfterWriter = fs.readFileSync(candidatePath)
+          return 1
+        }
+      })
+    },
+    prepare: async ({ openDatabase, closeDatabase }) => {
+      const snapshot = openDatabase()
+      try {
+        snapshotState = snapshot.prepare(
+          'SELECT generation, expected_count FROM snapshot_state WHERE id = 1'
+        ).get()
+        snapshotCounts = snapshot.prepare(`
+          SELECT generation, COUNT(*) AS count
+          FROM snapshot_rows
+          GROUP BY generation
+          ORDER BY generation
+        `).all()
+      } finally {
+        closeDatabase(snapshot)
+      }
+      return {
+        status: {
+          mode: 'device-approval',
+          references: 2,
+          database: 'ready',
+          proxy: 'ready'
+        },
+        clear() {}
+      }
+    },
+    stdout: stdout.stream,
+    stderr: stderr.stream,
+    processRef: new EventEmitter()
+  })
+
+  assert.equal(backupCalls, 1)
+  assert.equal(writerRan, true)
+  assert.equal(sawWalSidecar, true)
+  if (exitCode === 0) {
+    assert.ok(snapshotState)
+    assert.ok(snapshotCounts)
+    assert.equal(stderr.value(), '')
+    assert.equal(snapshotCounts.length, 1)
+    assert.equal(snapshotCounts[0].generation, snapshotState.generation)
+    assert.equal(snapshotCounts[0].count, snapshotState.expected_count)
+    assert.equal(
+      (snapshotState.generation === 1 && snapshotState.expected_count === 1000) ||
+      (snapshotState.generation === 2 && snapshotState.expected_count === 1200),
+      true
+    )
+  } else {
+    assert.equal(stdout.value(), '')
+    assert.equal(
+      stderr.value(),
+      'ACCESS_PREFLIGHT_DATABASE_SNAPSHOT_INVALID\n'
+    )
+  }
+  assert.ok(sourceAfterWriter)
+  assert.deepStrictEqual(fs.readFileSync(candidatePath), sourceAfterWriter)
+  const source = new DatabaseSync(candidatePath, { readOnly: true })
+  const sourceState = source.prepare(
+    'SELECT generation, expected_count FROM snapshot_state'
+  ).get()
+  assert.equal(sourceState.generation, 2)
+  assert.equal(sourceState.expected_count, 1200)
+  assert.equal(source.prepare('SELECT COUNT(*) AS count FROM snapshot_rows').get().count, 1200)
+  source.close()
+}
+
 async function testRealGithubTmpfsProviderChain(tempDirectory) {
   const { runAccessPreflight } = require('../access-preflight')
   const productionPath = path.join(tempDirectory, 'real-provider-production.sqlite')
@@ -664,8 +798,11 @@ async function testSignalCleanup(tempDirectory) {
     stderr: stderr.stream,
     processRef
   })
-  processRef.emit('SIGTERM')
+  for (let attempt = 0; attempt < 100 && !preparationStarted; attempt += 1) {
+    await new Promise((resolve) => setTimeout(resolve, 5))
+  }
   assert.equal(preparationStarted, true)
+  processRef.emit('SIGTERM')
   resolvePreparation({
     status: {
       mode: 'device-approval',
@@ -819,6 +956,7 @@ async function run() {
     await testDatabasePathIsolation(tempDirectory)
     await testRejectsWalSnapshotSidecars(tempDirectory)
     await testCleanupCompletesBeforeSuccessOutput(tempDirectory)
+    await testConcurrentSqliteSnapshot(tempDirectory)
     await testRealGithubTmpfsProviderChain(tempDirectory)
     await testSignalCleanup(tempDirectory)
     await testSubprocessSignalCancellation(tempDirectory)
@@ -831,5 +969,6 @@ async function run() {
 module.exports = {
   run,
   testCleanupCompletesBeforeSuccessOutput,
+  testConcurrentSqliteSnapshot,
   testRejectsWalSnapshotSidecars
 }

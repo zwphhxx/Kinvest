@@ -28,6 +28,13 @@ class CvmSsmSecretProviderError extends Error {
   }
 }
 
+class CvmSsmDeadlineError extends Error {
+  constructor() {
+    super('The CVM SSM operation deadline was reached')
+    this.name = 'CvmSsmDeadlineError'
+  }
+}
+
 class LoadedSecretProvider {
   #entries
 
@@ -90,6 +97,10 @@ function isValidTemporaryCredentials(credentials, now) {
 }
 
 function abortError(signal, fallbackCode) {
+  if (signal && signal.aborted &&
+    signal.reason instanceof CvmSsmDeadlineError) {
+    return new CvmSsmSecretProviderError(fallbackCode)
+  }
   if (signal && signal.aborted && signal.reason instanceof Error) {
     return signal.reason
   }
@@ -106,9 +117,10 @@ function createOperationSignal(parentSignal, deadlineMs) {
     if (parentSignal.aborted) relayAbort()
     else parentSignal.addEventListener('abort', relayAbort, { once: true })
   }
-  const timer = setTimeout(() => controller.abort(
-    new CvmSsmSecretProviderError('TEMPORARY_CREDENTIALS_REQUIRED')
-  ), deadlineMs)
+  const timer = setTimeout(
+    () => controller.abort(new CvmSsmDeadlineError()),
+    deadlineMs
+  )
   if (typeof timer.unref === 'function') timer.unref()
   return {
     signal: controller.signal,

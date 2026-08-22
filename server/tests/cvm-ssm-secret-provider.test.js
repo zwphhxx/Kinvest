@@ -205,6 +205,23 @@ async function testAbortAndDeadlinePropagation() {
   const ssmResult = await delayedResult(ssmPending)
   assert.equal(ssmResult.status, 'rejected')
   assert.equal(ssmResult.error.code, 'ACCESS_PREFLIGHT_INTERRUPTED')
+
+  const sensitiveRequestMarker = 'request-id-sensitive-marker'
+  const ssmDeadlineResult = await delayedResult(loadCvmSsmSecrets({
+    references: [{ secretName: SECRET_NAME, versionId: 'v20260802-001' }],
+    roleName: 'KinvestProdRole',
+    deadlineMs: 25,
+    metadataRequest: async () => JSON.stringify(metadataPayload()),
+    clientFactory: () => ({
+      getSecretValue: () => new Promise(() => {})
+    }),
+    now: () => NOW
+  }))
+  assert.equal(ssmDeadlineResult.status, 'rejected')
+  assert.equal(ssmDeadlineResult.error.code, 'SSM_SECRET_LOAD_FAILED')
+  assert.equal(ssmDeadlineResult.error.message.includes(sensitiveRequestMarker), false)
+  assert.equal(ssmDeadlineResult.error.message.includes('ssm.tencentcloudapi.com'), false)
+  assert.equal(ssmDeadlineResult.error.message.includes('temporary-key'), false)
 }
 
 async function run() {
