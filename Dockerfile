@@ -1,4 +1,4 @@
-FROM node:22-alpine AS build
+FROM node:22.16.0-alpine AS build
 
 WORKDIR /app
 
@@ -10,7 +10,11 @@ COPY server ./server
 COPY scripts ./scripts
 RUN npm run build
 
-FROM node:22-alpine AS github-tmpfs-provider-smoke
+FROM build AS access-preflight-linux-smoke
+
+RUN node scripts/docker-access-preflight-linux-smoke.js
+
+FROM node:22.16.0-alpine AS github-tmpfs-provider-smoke
 
 WORKDIR /app
 
@@ -26,18 +30,19 @@ USER 10001:10001
 
 RUN node scripts/docker-github-tmpfs-smoke.js verify
 
-FROM node:22-alpine AS runtime-dependencies
+FROM node:22.16.0-alpine AS runtime-dependencies
 
 WORKDIR /app
 
 COPY package.json package-lock.json ./
 RUN npm ci --omit=dev --ignore-scripts && npm cache clean --force
 
-FROM node:22-alpine AS runtime
+FROM node:22.16.0-alpine AS runtime
 
 LABEL io.kinvest.schema.min="0" \
       io.kinvest.schema.max="0" \
-      io.kinvest.secret-bootstrap="1"
+      io.kinvest.secret-bootstrap="1" \
+      io.kinvest.access-control.contract="1"
 
 ENV NODE_ENV=production \
     PORT=4173 \
@@ -48,12 +53,18 @@ RUN addgroup -g 10001 -S kinvest && \
 
 WORKDIR /app
 
+RUN install -d -o root -g root -m 0755 /preflight && \
+    install -d -o root -g root -m 0711 /run/secrets
+
 COPY --from=runtime-dependencies /app/node_modules ./node_modules
 COPY --from=build --chown=10001:10001 /app/dist ./
 COPY --from=github-tmpfs-provider-smoke /tmp/kinvest-github-tmpfs-smoke-ok /tmp/kinvest-github-tmpfs-smoke-ok
+COPY --from=access-preflight-linux-smoke /tmp/kinvest-access-preflight-linux-smoke-ok /tmp/kinvest-access-preflight-linux-smoke-ok
 
 RUN test -f /tmp/kinvest-github-tmpfs-smoke-ok && \
+    test -f /tmp/kinvest-access-preflight-linux-smoke-ok && \
     rm -f /tmp/kinvest-github-tmpfs-smoke-ok && \
+    rm -f /tmp/kinvest-access-preflight-linux-smoke-ok && \
     node -e "require('tencentcloud-sdk-nodejs-ssm'); require('tencentcloud-sdk-nodejs-common'); require('./server/security/github-tmpfs-secret-provider')"
 
 USER 10001:10001

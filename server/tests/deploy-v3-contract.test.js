@@ -442,7 +442,7 @@ async function run() {
   assert.match(wrapper, /deploy-v3\)/)
   assert.match(wrapper, /exec sudo -n \/usr\/local\/sbin\/deploy-kinvest/)
   assert.match(wrapper, /exec sudo -n \/usr\/local\/sbin\/deploy-kinvest-v3/)
-  assert.doesNotMatch(wrapper, /digest|material|docker|eval/)
+  assert.doesNotMatch(wrapper.replace('/root/docker/kinvest/state/install-v4.journal', ''), /digest|material|docker|eval/)
 
   const valid = validate(payload())
   assert.equal(valid.status, 0)
@@ -843,8 +843,7 @@ async function run() {
     assert.notEqual(stateCommitFailure.result.status, 0)
     assert.equal(fs.existsSync(path.join(stateCommitFailure.stateDir, 'attempt.state')), false)
     const recovered = fs.readFileSync(path.join(stateCommitFailure.stateDir, 'current.state'), 'utf8')
-    assert.match(recovered, new RegExp(`^runtimeImageId=sha256:${'2'.repeat(64)}$`, 'm'))
-    assert.match(recovered, /^secretProviderMode=github-tmpfs-v1$/m)
+    assert.equal(recovered, stateText())
     assert.equal(fs.readFileSync(stateCommitFailure.activeImage, 'utf8'), `sha256:${'2'.repeat(64)}`)
   } finally {
     stateCommitFailure.cleanup()
@@ -887,9 +886,7 @@ async function run() {
   try {
     assert.notEqual(compatibleAfterMigration.result.status, 0)
     const recovered = fs.readFileSync(path.join(compatibleAfterMigration.stateDir, 'current.state'), 'utf8')
-    assert.match(recovered, /^schemaVersion=1$/m)
-    assert.match(recovered, /^databaseBackupPath=\/.+\.sqlite$/m)
-    assert.match(recovered, /^databaseBackupChecksum=[0-9a-f]{64}$/m)
+    assert.equal(recovered, stateText({ imageSchemaMax: 1 }))
     assert.equal(fs.existsSync(path.join(compatibleAfterMigration.stateDir, 'attempt.state')), false)
   } finally {
     compatibleAfterMigration.cleanup()
@@ -1149,14 +1146,7 @@ async function run() {
     try {
       assert.notEqual(failedSwitch.result.status, 0)
       const recoveredState = fs.readFileSync(path.join(failedSwitch.stateDir, 'current.state'), 'utf8')
-      assert.match(recoveredState, new RegExp(`^runtimeImageId=sha256:${'2'.repeat(64)}$`, 'm'))
-      assert.match(recoveredState, /^secretProviderMode=github-tmpfs-v1$/m)
-      assert.match(recoveredState, new RegExp(`^secretVersionIds=${metadata.versions.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')}$`, 'm'))
-      assert.match(recoveredState, /^secretBundleId=[0-9a-f]{32}$/m)
-      assert.match(recoveredState, /^schemaVersion=0$/m)
-      assert.match(recoveredState, /^releaseRecordSchemaVersion=2$/m)
-      assert.match(recoveredState, /^databaseBackupPath=\/.+\.sqlite$/m)
-      assert.match(recoveredState, /^databaseBackupChecksum=[0-9a-f]{64}$/m)
+      assert.equal(recoveredState, stateText())
       assert.equal(fs.existsSync(path.join(failedSwitch.stateDir, 'attempt.state')), false)
       if (failureMode.healthFailure) {
         assert.equal(
@@ -1164,11 +1154,7 @@ async function run() {
           `sha256:${'2'.repeat(64)}`
         )
       }
-      assert.deepEqual(fs.readdirSync(failedSwitch.runRoot), ['kinvest-secrets'])
-      const retainedBundles = fs.readdirSync(path.join(failedSwitch.runRoot, 'kinvest-secrets'))
-      assert.equal(retainedBundles.length, 1)
-      assert.match(retainedBundles[0], /^[0-9a-f]{32}$/)
-      assert.match(recoveredState, new RegExp(`^secretBundleId=${retainedBundles[0]}$`, 'm'))
+      assert.equal(fs.existsSync(path.join(failedSwitch.runRoot, 'kinvest-secrets')), false)
     } finally {
       failedSwitch.cleanup()
     }
@@ -1178,13 +1164,20 @@ async function run() {
   try {
     const fakeBin = path.join(sshFixture, 'bin')
     const capture = path.join(sshFixture, 'capture')
+    const gateState = path.join(sshFixture, 'gate-state')
     fs.mkdirSync(fakeBin)
+    fs.mkdirSync(gateState, { mode: 0o750 })
     writeExecutable(path.join(fakeBin, 'sudo'), '#!/bin/sh\n[ "$1" = -n ] && shift\nexec "$@"\n')
+    writeExecutable(path.join(fakeBin, 'flock'), '#!/bin/sh\nexit 0\n')
     writeExecutable(capture, `#!/bin/sh\ncat > '${path.join(sshFixture, 'stdin')}'\n`)
     const wrapperPath = path.join(sshFixture, 'wrapper')
     writeExecutable(
       wrapperPath,
       wrapper
+        .replace("GATE_STATE_DIR='/var/lib/kinvest-deploy-gate'", `GATE_STATE_DIR='${gateState}'`)
+        .replace('/usr/bin/flock', path.join(fakeBin, 'flock'))
+        .replaceAll('directory_info.st_uid != 0', `directory_info.st_uid != ${process.getuid()}`)
+        .replaceAll('marker_info.st_uid != 0', `marker_info.st_uid != ${process.getuid()}`)
         .replace('/usr/local/sbin/deploy-kinvest-v3', capture)
         .replace('/usr/local/sbin/deploy-kinvest', capture)
     )

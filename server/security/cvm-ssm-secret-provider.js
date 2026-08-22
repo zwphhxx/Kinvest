@@ -10,6 +10,7 @@ const METADATA_IP = '169.254.0.23'
 const METADATA_HOST = 'metadata.tencentyun.com'
 const METADATA_TIMEOUT_MS = 1500
 const METADATA_MAX_BYTES = 16 * 1024
+const CVM_SSM_LOAD_DEADLINE_MS = 5000
 const MAX_VERSIONS_PER_SECRET = 10
 const ROLE_NAME_PATTERN = /^[A-Za-z0-9+=,.@_-]{1,64}$/
 
@@ -24,6 +25,13 @@ class CvmSsmSecretProviderError extends Error {
     super(messages[code] || 'SSM bootstrap failed')
     this.name = 'CvmSsmSecretProviderError'
     this.code = code
+  }
+}
+
+class CvmSsmDeadlineError extends Error {
+  constructor() {
+    super('The CVM SSM operation deadline was reached')
+    this.name = 'CvmSsmDeadlineError'
   }
 }
 
@@ -88,19 +96,118 @@ function isValidTemporaryCredentials(credentials, now) {
     expiresAt > now + 60_000)
 }
 
+function abortError(signal, fallbackCode) {
+  if (signal && signal.aborted &&
+    signal.reason instanceof CvmSsmDeadlineError) {
+    return new CvmSsmSecretProviderError(fallbackCode)
+  }
+  if (signal && signal.aborted && signal.reason instanceof Error) {
+    return signal.reason
+  }
+  return new CvmSsmSecretProviderError(fallbackCode)
+}
+
+function createOperationSignal(parentSignal, deadlineMs) {
+  const controller = new AbortController()
+  const relayAbort = () => controller.abort(abortError(
+    parentSignal,
+    'SSM_SECRET_LOAD_FAILED'
+  ))
+  if (parentSignal) {
+    if (parentSignal.aborted) relayAbort()
+    else parentSignal.addEventListener('abort', relayAbort, { once: true })
+  }
+  const timer = setTimeout(
+    () => controller.abort(new CvmSsmDeadlineError()),
+    deadlineMs
+  )
+  if (typeof timer.unref === 'function') timer.unref()
+  return {
+    signal: controller.signal,
+    clear() {
+      clearTimeout(timer)
+      if (parentSignal) parentSignal.removeEventListener('abort', relayAbort)
+    }
+  }
+}
+
+function awaitAbortable(startOperation, signal) {
+  if (signal.aborted) return Promise.reject(abortError(
+    signal,
+    'SSM_SECRET_LOAD_FAILED'
+  ))
+  return new Promise((resolve, reject) => {
+    let settled = false
+    const settle = (callback, value) => {
+      if (settled) return
+      settled = true
+      signal.removeEventListener('abort', handleAbort)
+      callback(value)
+    }
+    const handleAbort = () => settle(
+      reject,
+      abortError(signal, 'SSM_SECRET_LOAD_FAILED')
+    )
+    signal.addEventListener('abort', handleAbort, { once: true })
+    let operation
+    try {
+      operation = startOperation()
+    } catch (error) {
+      settle(reject, error)
+      return
+    }
+    Promise.resolve(operation).then(
+      (value) => settle(resolve, value),
+      (error) => settle(reject, error)
+    )
+  })
+}
+
 /**
- * @param {{host: string, path: string, timeoutMs: number, maxBytes: number}} options
+ * @param {{host: string, path: string, timeoutMs: number, maxBytes: number, signal?: AbortSignal}} options
  * @param {(options: any, onResponse: (response: any) => void) => any} [requestFactory]
  */
 function requestCvmMetadata(
-  { host, path, timeoutMs, maxBytes },
+  { host, path, timeoutMs, maxBytes, signal },
   requestFactory = http.request
 ) {
   return new Promise((resolve, reject) => {
-    const rejectSanitized = () => {
-      reject(new CvmSsmSecretProviderError('TEMPORARY_CREDENTIALS_REQUIRED'))
+    let settled = false
+    let request
+    const cleanup = () => {
+      if (signal) signal.removeEventListener('abort', handleAbort)
     }
-    const request = requestFactory({
+    const rejectOnce = (error) => {
+      if (settled) return
+      settled = true
+      cleanup()
+      reject(error)
+    }
+    const resolveOnce = (value) => {
+      if (settled) return
+      settled = true
+      cleanup()
+      resolve(value)
+    }
+    const rejectSanitized = () => {
+      rejectOnce(signal && signal.aborted
+        ? abortError(signal, 'TEMPORARY_CREDENTIALS_REQUIRED')
+        : new CvmSsmSecretProviderError('TEMPORARY_CREDENTIALS_REQUIRED'))
+    }
+    const handleAbort = () => {
+      const error = abortError(signal, 'TEMPORARY_CREDENTIALS_REQUIRED')
+      if (request && typeof request.destroy === 'function') {
+        try { request.destroy(error) } catch {
+          // Rejection below remains the stable cancellation result.
+        }
+      }
+      rejectOnce(error)
+    }
+    if (signal && signal.aborted) {
+      rejectOnce(abortError(signal, 'TEMPORARY_CREDENTIALS_REQUIRED'))
+      return
+    }
+    request = requestFactory({
       host,
       port: 80,
       path,
@@ -127,7 +234,7 @@ function requestCvmMetadata(
         chunks.push(chunk)
       })
       response.on('end', () => {
-        resolve(Buffer.concat(chunks).toString('utf8'))
+        resolveOnce(Buffer.concat(chunks).toString('utf8'))
       })
       response.on('error', rejectSanitized)
     })
@@ -135,11 +242,12 @@ function requestCvmMetadata(
       request.destroy(new CvmSsmSecretProviderError('TEMPORARY_CREDENTIALS_REQUIRED'))
     })
     request.on('error', rejectSanitized)
+    if (signal) signal.addEventListener('abort', handleAbort, { once: true })
     request.end()
   })
 }
 
-async function loadTemporaryCredentials({ roleName, metadataRequest, now }) {
+async function loadTemporaryCredentials({ roleName, metadataRequest, now, signal }) {
   if (!ROLE_NAME_PATTERN.test(roleName)) {
     throw new CvmSsmSecretProviderError('SSM_BOOTSTRAP_INVALID')
   }
@@ -149,10 +257,15 @@ async function loadTemporaryCredentials({ roleName, metadataRequest, now }) {
       host: METADATA_IP,
       path: '/latest/meta-data/cam/security-credentials/' + encodeURIComponent(roleName),
       timeoutMs: METADATA_TIMEOUT_MS,
-      maxBytes: METADATA_MAX_BYTES
+      maxBytes: METADATA_MAX_BYTES,
+      signal
     })
     payload = JSON.parse(body)
   } catch {
+    if (signal.aborted) throw abortError(
+      signal,
+      'TEMPORARY_CREDENTIALS_REQUIRED'
+    )
     throw new CvmSsmSecretProviderError('TEMPORARY_CREDENTIALS_REQUIRED')
   }
   const expiredTime = Number(payload && payload.ExpiredTime) * 1000
@@ -183,11 +296,13 @@ async function loadTemporaryCredentials({ roleName, metadataRequest, now }) {
  * @param {object} [options]
  * @param {Array<{secretName: string, versionId: string}>} [options.references]
  * @param {string} [options.roleName]
- * @param {(request: {host: string, path: string, timeoutMs: number, maxBytes: number}) => Promise<string>} [options.metadataRequest]
- * @param {(input: {region: string, credentials: {secretId: string, secretKey: string, token: string, expiresAt: string}}) => {getSecretValue: (input: {SecretName: string, VersionId: string}) => Promise<{SecretName?: string, VersionId?: string, SecretString?: string}>}} [options.clientFactory]
+ * @param {(request: {host: string, path: string, timeoutMs: number, maxBytes: number, signal?: AbortSignal}) => Promise<string>} [options.metadataRequest]
+ * @param {(input: {region: string, credentials: {secretId: string, secretKey: string, token: string, expiresAt: string}}) => {getSecretValue: (input: {SecretName: string, VersionId: string}, options?: {signal?: AbortSignal}) => Promise<{SecretName?: string, VersionId?: string, SecretString?: string}>}} [options.clientFactory]
  * @param {string} [options.region]
  * @param {() => number} [options.now]
  * @param {(event: string, metadata: {loadedCount: number, region: string}) => void} [options.audit]
+ * @param {AbortSignal} [options.signal]
+ * @param {number} [options.deadlineMs]
  */
 async function loadCvmSsmSecrets({
   references,
@@ -196,71 +311,91 @@ async function loadCvmSsmSecrets({
   clientFactory = createTencentSsmClient,
   region = REGION,
   now = Date.now,
-  audit = () => {}
+  audit = () => {},
+  signal,
+  deadlineMs = CVM_SSM_LOAD_DEADLINE_MS
 } = {}) {
   if (region !== REGION ||
     typeof roleName !== 'string' ||
     typeof metadataRequest !== 'function' ||
     typeof clientFactory !== 'function' ||
     typeof now !== 'function' ||
-    typeof audit !== 'function') {
+    typeof audit !== 'function' ||
+    (signal !== undefined && (!signal ||
+      typeof signal.addEventListener !== 'function')) ||
+    !Number.isSafeInteger(deadlineMs) || deadlineMs < 1 || deadlineMs > 30_000) {
     throw new CvmSsmSecretProviderError('SSM_BOOTSTRAP_INVALID')
   }
   const normalizedReferences = normalizeReferences(references)
-  const credentials = await loadTemporaryCredentials({
-    roleName,
-    metadataRequest,
-    now
-  })
-
-  let client
+  const operation = createOperationSignal(signal, deadlineMs)
   try {
-    client = clientFactory({ region, credentials })
-  } catch {
-    throw new CvmSsmSecretProviderError('SSM_CLIENT_UNAVAILABLE')
-  }
-  if (!client || typeof client.getSecretValue !== 'function') {
-    throw new CvmSsmSecretProviderError('SSM_CLIENT_UNAVAILABLE')
-  }
+    const credentials = await loadTemporaryCredentials({
+      roleName,
+      metadataRequest,
+      now,
+      signal: operation.signal
+    })
 
-  const entries = new Map()
-  try {
-    for (const [referenceIndex, reference] of normalizedReferences.entries()) {
-      if (!isValidTemporaryCredentials(credentials, now())) {
-        throw new CvmSsmSecretProviderError('TEMPORARY_CREDENTIALS_REQUIRED')
-      }
-      const response = await client.getSecretValue({
-        SecretName: reference.secretName,
-        VersionId: reference.versionId
-      })
-      const validResponse = response &&
-        response.SecretName === reference.secretName &&
-        response.VersionId === reference.versionId &&
-        typeof response.SecretString === 'string' &&
-        response.SecretString.length > 0
-      if (!validResponse) {
-        throw new CvmSsmSecretProviderError('SSM_SECRET_LOAD_FAILED')
-      }
-      entries.set(
-        reference.secretName + ':' + reference.versionId,
-        Buffer.from(response.SecretString)
-      )
-      audit('ssm_secret_version_loaded', {
-        loadedCount: referenceIndex + 1,
-        region
-      })
+    let client
+    try {
+      client = clientFactory({ region, credentials })
+    } catch {
+      throw new CvmSsmSecretProviderError('SSM_CLIENT_UNAVAILABLE')
     }
-  } catch (error) {
-    for (const value of entries.values()) value.fill(0)
-    entries.clear()
-    if (error instanceof CvmSsmSecretProviderError) throw error
-    throw new CvmSsmSecretProviderError('SSM_SECRET_LOAD_FAILED')
+    if (!client || typeof client.getSecretValue !== 'function') {
+      throw new CvmSsmSecretProviderError('SSM_CLIENT_UNAVAILABLE')
+    }
+
+    const entries = new Map()
+    try {
+      for (const [referenceIndex, reference] of normalizedReferences.entries()) {
+        if (operation.signal.aborted) throw abortError(
+          operation.signal,
+          'SSM_SECRET_LOAD_FAILED'
+        )
+        if (!isValidTemporaryCredentials(credentials, now())) {
+          throw new CvmSsmSecretProviderError('TEMPORARY_CREDENTIALS_REQUIRED')
+        }
+        const response = await awaitAbortable(() => client.getSecretValue({
+          SecretName: reference.secretName,
+          VersionId: reference.versionId
+        }, { signal: operation.signal }), operation.signal)
+        const validResponse = response &&
+          response.SecretName === reference.secretName &&
+          response.VersionId === reference.versionId &&
+          typeof response.SecretString === 'string' &&
+          response.SecretString.length > 0
+        if (!validResponse) {
+          throw new CvmSsmSecretProviderError('SSM_SECRET_LOAD_FAILED')
+        }
+        entries.set(
+          reference.secretName + ':' + reference.versionId,
+          Buffer.from(response.SecretString)
+        )
+        audit('ssm_secret_version_loaded', {
+          loadedCount: referenceIndex + 1,
+          region
+        })
+      }
+    } catch (error) {
+      for (const value of entries.values()) value.fill(0)
+      entries.clear()
+      if (operation.signal.aborted) throw abortError(
+        operation.signal,
+        'SSM_SECRET_LOAD_FAILED'
+      )
+      if (error instanceof CvmSsmSecretProviderError) throw error
+      throw new CvmSsmSecretProviderError('SSM_SECRET_LOAD_FAILED')
+    }
+    return new LoadedSecretProvider(entries)
+  } finally {
+    operation.clear()
   }
-  return new LoadedSecretProvider(entries)
 }
 
 module.exports = {
   CvmSsmSecretProviderError,
+  CVM_SSM_LOAD_DEADLINE_MS,
   LoadedSecretProvider,
   MAX_VERSIONS_PER_SECRET,
   METADATA_IP,

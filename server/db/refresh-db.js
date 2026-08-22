@@ -6,23 +6,8 @@ const DEFAULT_DB = path.join(__dirname, '../data/kinvest.sqlite')
 let currentDbPath = process.env.KINVEST_DB_PATH || DEFAULT_DB
 let db = null
 
-function getDbPath() {
-  return currentDbPath
-}
-
-function setDbPath(nextPath) {
-  currentDbPath = nextPath
-  db = null
-}
-
-function openDb() {
-  if (db) return db
-  const dir = path.dirname(currentDbPath)
-  if (!fs.existsSync(dir)) {
-    fs.mkdirSync(dir, { recursive: true })
-  }
-  db = new DatabaseSync(currentDbPath)
-  db.exec(`
+function initializeRefreshDatabase(database) {
+  database.exec(`
     CREATE TABLE IF NOT EXISTS refresh_counters (
       code TEXT NOT NULL,
       date TEXT NOT NULL,
@@ -39,14 +24,60 @@ function openDb() {
       message TEXT
     );
   `)
+  return database
+}
+
+function openDbAtPath(databasePath) {
+  const dir = path.dirname(databasePath)
+  if (!fs.existsSync(dir)) {
+    fs.mkdirSync(dir, { recursive: true })
+  }
+  return new DatabaseSync(databasePath)
+}
+
+function openTrackedDbAtPath(databasePath) {
+  if (db) return db
+  db = openDbAtPath(databasePath)
   return db
+}
+
+function openTrackedDb() {
+  return openTrackedDbAtPath(currentDbPath)
+}
+
+function closeDatabase(database) {
+  database.close()
+}
+
+function closeTrackedDatabase(database) {
+  if (db === database) db = null
+  closeDatabase(database)
+}
+
+function getDbPath() {
+  return currentDbPath
+}
+
+function setDbPath(nextPath) {
+  currentDbPath = nextPath
+  db = null
+}
+
+function openDb() {
+  if (db) return db
+  const database = openTrackedDb()
+  try {
+    initializeRefreshDatabase(database)
+    return db
+  } catch (error) {
+    closeTrackedDatabase(database)
+    throw error
+  }
 }
 
 function closeDb() {
   if (!db) return
-  const database = db
-  db = null
-  database.close()
+  closeTrackedDatabase(db)
 }
 
 function todayKey(date = new Date()) {
@@ -107,7 +138,13 @@ module.exports = {
   getDbPath,
   setDbPath,
   openDb,
+  openDbAtPath,
+  openTrackedDb,
+  openTrackedDbAtPath,
+  initializeRefreshDatabase,
   closeDb,
+  closeDatabase,
+  closeTrackedDatabase,
   todayKey,
   getManualRefreshCount,
   incrementManualRefreshCount,

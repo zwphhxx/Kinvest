@@ -5,6 +5,8 @@ const repositoryRoot = path.resolve(__dirname, '..')
 const distDirectory = path.join(repositoryRoot, 'dist')
 const runtimeFiles = [
   'server/server.js',
+  'server/access-preflight.js',
+  'server/pre-listen-preparation.js',
   'server/adapters/modelAdapter.js',
   'server/ai/model-quota.js',
   'server/ai/research-safety.js',
@@ -67,7 +69,8 @@ const distPackageJson = {
   engines: packageJson.engines,
   dependencies: packageJson.dependencies,
   scripts: {
-    start: packageJson.scripts.start
+    start: packageJson.scripts.start,
+    'access:preflight': packageJson.scripts['access:preflight']
   }
 }
 

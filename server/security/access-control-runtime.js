@@ -1,6 +1,12 @@
 const crypto = require('node:crypto')
 const { AdminAuthRepository } = require('../db/admin-auth-repository')
 const { DeviceAuthRepository } = require('../db/device-auth-repository')
+const { initializeRefreshDatabase } = require('../db/refresh-db')
+const {
+  DeviceAuthDatabaseIdentityError,
+  KINVEST_SQLITE_APPLICATION_ID,
+  readApplicationId
+} = require('../db/database-identity')
 const { AdminAuthService } = require('./admin-auth')
 const { DeviceApprovalService } = require('./device-approval')
 const {
@@ -95,12 +101,30 @@ function createRestrictedDeviceHmacProvider(secretRuntime, activeVersionId) {
   })
 }
 
+function assertDatabaseIdentity(database) {
+  const applicationId = readApplicationId(database)
+  if (applicationId !== 0 && applicationId !== KINVEST_SQLITE_APPLICATION_ID) {
+    throw new DeviceAuthDatabaseIdentityError()
+  }
+}
+
+function clearBestEffort(...operations) {
+  for (const operation of operations) {
+    try {
+      operation()
+    } catch {
+      // Every owned security resource must still receive cleanup.
+    }
+  }
+}
+
 function createAccessControlRuntime(/** @type {any} */ {
   env = process.env,
   secretRuntime,
   database,
   openDatabase,
   closeDatabase,
+  initializeDatabase = initializeRefreshDatabase,
   now = Date.now,
   randomBytes = crypto.randomBytes
 } = {}) {
@@ -114,6 +138,7 @@ function createAccessControlRuntime(/** @type {any} */ {
   let requestIpDigestKey
   let requestCodeDigestKey
   let adminAuth
+  let deviceApproval
   let sharedDatabase
   let ownsDatabase = false
   let databaseClosed = false
@@ -153,6 +178,8 @@ function createAccessControlRuntime(/** @type {any} */ {
       ownsDatabase = true
     }
     if (!sharedDatabase) fail()
+    assertDatabaseIdentity(sharedDatabase)
+    initializeDatabase(sharedDatabase)
     const adminRepository = new AdminAuthRepository(sharedDatabase)
     const deviceRepository = new DeviceAuthRepository(sharedDatabase)
     adminRepository.initialize()
@@ -164,7 +191,7 @@ function createAccessControlRuntime(/** @type {any} */ {
       now,
       randomBytes
     })
-    const deviceApproval = new DeviceApprovalService({
+    deviceApproval = new DeviceApprovalService({
       repository: deviceRepository,
       secretProvider: createRestrictedDeviceHmacProvider(
         secretRuntime,
@@ -186,18 +213,19 @@ function createAccessControlRuntime(/** @type {any} */ {
       clear() {
         if (cleared) return
         cleared = true
-        adminAuth.clear()
-        deviceApproval.clear()
-        closeOwnedDatabase()
+        clearBestEffort(
+          () => adminAuth.clear(),
+          () => deviceApproval.clear(),
+          closeOwnedDatabase
+        )
       }
     })
   } catch (error) {
-    if (adminAuth) adminAuth.clear()
-    try {
-      closeOwnedDatabase()
-    } catch {
-      // Preserve the stable access-control startup failure.
-    }
+    clearBestEffort(
+      () => { if (adminAuth) adminAuth.clear() },
+      () => { if (deviceApproval) deviceApproval.clear() },
+      closeOwnedDatabase
+    )
     if (error instanceof AccessControlRuntimeError) throw error
     fail()
   } finally {

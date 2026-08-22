@@ -28,6 +28,12 @@ class SecretBootstrapRuntimeError extends Error {
   }
 }
 
+function throwIfAborted(signal) {
+  if (!signal || !signal.aborted) return
+  if (signal.reason instanceof Error) throw signal.reason
+  throw new SecretBootstrapRuntimeError('SECRET_MATERIAL_LOAD_FAILED')
+}
+
 /** @param {Record<string, string | undefined>} env */
 function parseEnvironmentConfig(env) {
   const hasMode = Object.prototype.hasOwnProperty.call(env, 'KINVEST_SECRET_PROVIDER_MODE')
@@ -96,20 +102,23 @@ function createRuntime(provider, status) {
 /**
  * @param {object} [options]
  * @param {Record<string, string | undefined>} [options.env]
- * @param {(options: {references: SecretReference[], roleName?: string, bundlePath?: string}) => Promise<SecretProviderLike>} [options.loadSecrets]
+ * @param {(options: {references: SecretReference[], roleName?: string, bundlePath?: string, signal?: AbortSignal}) => Promise<SecretProviderLike>} [options.loadSecrets]
  * @param {(provider: SecretProviderLike, config: any) => Promise<SecretRuntimeStatus>} [options.validateMaterial]
+ * @param {AbortSignal} [options.signal]
  * @returns {Promise<SecretRuntime>}
  */
 async function bootstrapSecrets({
   env = process.env,
   loadSecrets,
-  validateMaterial = validateLoadedSecretMaterial
+  validateMaterial = validateLoadedSecretMaterial,
+  signal
 } = {}) {
   if (!env || typeof env !== 'object' ||
     (loadSecrets !== undefined && typeof loadSecrets !== 'function') ||
     typeof validateMaterial !== 'function') {
     throw new SecretBootstrapRuntimeError('SECRET_BOOTSTRAP_CONFIG_INVALID')
   }
+  throwIfAborted(signal)
   const config = parseEnvironmentConfig(env)
   if (config.providerMode === 'disabled') {
     return createRuntime(null, { mode: 'disabled', referenceCount: 0 })
@@ -125,14 +134,23 @@ async function bootstrapSecrets({
       : loadSecrets
           ? { references: config.references, bundlePath: config.bundlePath }
           : { references: config.references }
+    if (signal && (loadSecrets || config.providerMode === 'cvm-ssm')) {
+      loaderOptions.signal = signal
+    }
     provider = await loader(loaderOptions)
+    throwIfAborted(signal)
     const validatedStatus = await validateMaterial(provider, config)
+    throwIfAborted(signal)
     return createRuntime(provider, {
       ...validatedStatus,
       mode: config.providerMode
     })
   } catch (error) {
-    if (provider && typeof provider.clear === 'function') provider.clear()
+    if (provider && typeof provider.clear === 'function') {
+      try { provider.clear() } catch {
+        // Preserve the original stable bootstrap failure.
+      }
+    }
     throw error
   }
 }

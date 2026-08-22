@@ -1,5 +1,9 @@
 const assert = require('node:assert/strict')
 const { EventEmitter } = require('node:events')
+const fs = require('node:fs')
+const http = require('node:http')
+const os = require('node:os')
+const path = require('node:path')
 
 class FakeServer extends EventEmitter {
   constructor() {
@@ -20,10 +24,179 @@ class FakeServer extends EventEmitter {
   }
 }
 
+async function testAsyncInFlightShutdown() {
+  const { startServer } = require('../server')
+  const processRef = new EventEmitter()
+  const events = []
+  let releaseRequest = () => {}
+  let requestStartedResolve = () => {}
+  const requestStarted = new Promise((resolve) => {
+    requestStartedResolve = () => resolve()
+  })
+  const requestBlocker = new Promise((resolve) => {
+    releaseRequest = () => resolve()
+  })
+  const runtimeServer = http.createServer(async (_request, response) => {
+    events.push('request-started')
+    requestStartedResolve()
+    await requestBlocker
+    response.end('ok')
+  })
+  await startServer({
+    runtimeServer,
+    port: 0,
+    prepare: async () => ({
+      handler() {},
+      clear() { events.push('runtime-cleanup') }
+    }),
+    closeApplicationDatabase: () => events.push('database-cleanup'),
+    shutdownTimeoutMs: 1000,
+    processRef,
+    logger: { log() {} }
+  })
+  const closeCompleted = new Promise((resolve) => runtimeServer.once('close', resolve))
+  const runtimeAddress = runtimeServer.address()
+  assert.ok(runtimeAddress && typeof runtimeAddress === 'object')
+  const responseCompleted = new Promise((resolve, reject) => {
+    const request = http.get({
+      host: '127.0.0.1',
+      port: runtimeAddress.port,
+      path: '/in-flight'
+    }, (response) => {
+      response.resume()
+      response.once('end', resolve)
+    })
+    request.once('error', reject)
+  })
+  try {
+    await requestStarted
+    processRef.emit('SIGTERM')
+    await new Promise((resolve) => setTimeout(resolve, 25))
+    assert.deepStrictEqual(events, ['request-started'])
+    releaseRequest()
+    await responseCompleted
+    await closeCompleted
+    assert.deepStrictEqual(events, [
+      'request-started',
+      'runtime-cleanup',
+      'database-cleanup'
+    ])
+  } finally {
+    releaseRequest()
+    if (runtimeServer.listening) {
+      await new Promise((resolve) => runtimeServer.close(resolve))
+    }
+  }
+
+  const forcedProcess = new EventEmitter()
+  const forcedEvents = []
+  let forcedRequestStartedResolve = () => {}
+  const forcedRequestStarted = new Promise((resolve) => {
+    forcedRequestStartedResolve = () => resolve()
+  })
+  const forcedServer = http.createServer(() => {
+    forcedEvents.push('request-started')
+    forcedRequestStartedResolve()
+  })
+  await startServer({
+    runtimeServer: forcedServer,
+    port: 0,
+    prepare: async () => ({
+      handler() {},
+      clear() { forcedEvents.push('runtime-cleanup') }
+    }),
+    closeApplicationDatabase: () => forcedEvents.push('database-cleanup'),
+    shutdownTimeoutMs: 25,
+    processRef: forcedProcess,
+    logger: { log() {} }
+  })
+  const forcedClosed = new Promise((resolve) => forcedServer.once('close', resolve))
+  const forcedAddress = forcedServer.address()
+  assert.ok(forcedAddress && typeof forcedAddress === 'object')
+  const forcedRequest = http.get({
+    host: '127.0.0.1',
+    port: forcedAddress.port,
+    path: '/forced'
+  })
+  forcedRequest.on('error', () => {})
+  await forcedRequestStarted
+  forcedProcess.emit('SIGINT')
+  await Promise.race([
+    forcedClosed,
+    new Promise((_, reject) => setTimeout(
+      () => reject(new Error('forced shutdown did not complete')),
+      500
+    ))
+  ])
+  assert.deepStrictEqual(forcedEvents, [
+    'request-started',
+    'runtime-cleanup',
+    'database-cleanup'
+  ])
+}
+
 async function run() {
   const initialUmask = process.umask()
   try {
+  await testAsyncInFlightShutdown()
   const { runServerExecutable, startServer } = require('../server')
+  const {
+    closeDb,
+    getDbPath,
+    openDb,
+    setDbPath
+  } = require('../db/refresh-db')
+  const { getHealthState } = require('../services/health')
+
+  const originalDatabasePath = getDbPath()
+  const databaseDirectory = fs.mkdtempSync(path.join(
+    os.tmpdir(),
+    'kinvest-formal-db-'
+  ))
+  const formalDatabasePath = path.join(databaseDirectory, 'formal.sqlite')
+  const formalProcess = new EventEmitter()
+  const formalServer = new FakeServer()
+  let accessDatabase
+  try {
+    closeDb()
+    setDbPath(formalDatabasePath)
+    await startServer({
+      runtimeServer: formalServer,
+      bootstrap: async () => ({
+        status: Object.freeze({ mode: 'disabled', referenceCount: 0 }),
+        clear() {}
+      }),
+      createAccessRuntime: ({ openDatabase, initializeDatabase }) => {
+        accessDatabase = openDatabase()
+        initializeDatabase(accessDatabase)
+        return {
+          status: Object.freeze({ mode: 'disabled' }),
+          adminAuth: null,
+          deviceApproval: null,
+          clear() {
+            throw new Error('fixture access cleanup failure')
+          }
+        }
+      },
+      createHttpHandler: () => () => {},
+      processRef: formalProcess,
+      logger: { log() {} }
+    })
+
+    getHealthState()
+    const healthDatabase = openDb()
+    const sharedConnection = healthDatabase === accessDatabase
+    formalProcess.emit('SIGTERM')
+
+    assert.equal(sharedConnection, true)
+    assert.throws(() => accessDatabase.prepare('SELECT 1'))
+    assert.throws(() => healthDatabase.prepare('SELECT 1'))
+  } finally {
+    closeDb()
+    setDbPath(originalDatabasePath)
+    fs.rmSync(databaseDirectory, { recursive: true, force: true })
+  }
+
   const loggerFailureOrder = []
   const loggerFailureProcess = new EventEmitter()
   const loggerFailureServer = new FakeServer()
@@ -283,4 +456,4 @@ async function run() {
   assert.equal(process.umask(), initialUmask, 'server bootstrap suite must restore the parent process umask')
 }
 
-module.exports = { run }
+module.exports = { run, testAsyncInFlightShutdown }

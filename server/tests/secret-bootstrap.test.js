@@ -179,6 +179,24 @@ async function run() {
     })
   }), hasCode('SECRET_MATERIAL_INVALID'))
   assert.equal(failedProviderClears, 1)
+
+  await assert.rejects(bootstrapSecrets({
+    env: {
+      KINVEST_SECRET_PROVIDER_MODE: 'cvm-ssm',
+      KINVEST_SECRET_VERSION_IDS: ENABLED_JSON
+    },
+    loadSecrets: async () => ({
+      readSecret: () => Buffer.from('invalid'),
+      clear: () => {
+        throw new Error('sensitive provider cleanup failure')
+      }
+    })
+  }), (error) => {
+    assert.ok(error instanceof Error)
+    assert.equal('code' in error && error.code, 'SECRET_MATERIAL_INVALID')
+    assert.equal(error.message.includes('sensitive provider cleanup failure'), false)
+    return true
+  })
 }
 
 module.exports = { run }
