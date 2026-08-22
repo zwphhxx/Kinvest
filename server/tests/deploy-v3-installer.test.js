@@ -125,6 +125,30 @@ function assertOldTargets(context) {
   }
 }
 
+function assertNewTargets(context) {
+  for (let index = 0; index < targetNames.length; index += 1) {
+    const source = fs.readFileSync(path.join(context.source, assetNames[index]), 'utf8')
+    const expected = index === 7
+      ? source.replaceAll('@KINVEST_DEPLOY_GATE_USER@', 'lighthouse')
+      : source
+    assert.equal(fs.readFileSync(path.join(context.target, targetNames[index]), 'utf8'), expected)
+  }
+}
+
+function runGate(context, command = 'deploy-v3') {
+  const gateHarness = path.join(context.fixture, 'gate-harness')
+  const source = fs.readFileSync(path.join(context.source, 'kinvest-ssh-command-v3'), 'utf8')
+    .replace("GATE_STATE_DIR='/var/lib/kinvest-deploy-gate'", `GATE_STATE_DIR='${path.join(context.fixture, 'gate-state')}'`)
+    .replace('/usr/bin/flock', path.join(context.bin, 'flock'))
+    .replaceAll('directory_info.st_uid != 0', `directory_info.st_uid != ${process.getuid()}`)
+    .replaceAll('marker_info.st_uid != 0', `marker_info.st_uid != ${process.getuid()}`)
+  write(gateHarness, source)
+  return spawnSync(gateHarness, [], {
+    encoding: 'utf8',
+    env: { ...process.env, PATH: `${context.bin}:${process.env.PATH}`, SSH_ORIGINAL_COMMAND: command }
+  })
+}
+
 function backupDirectories(context) {
   const backupRoot = path.join(context.target, 'install-backups/deploy-v3')
   if (!fs.existsSync(backupRoot)) return []
@@ -385,8 +409,46 @@ async function run() {
     'mv -fT -- "$sudoers_temporary" "$SUDOERS_TARGET"',
     'mv -fT -- "$wrapper_temporary" "$WRAPPER_TARGET"'
   ]
+  const postcheckFaultAnchor = '# test-fault-anchor: deploy-v3-postcheck-complete'
+  assert.equal(installer.split(postcheckFaultAnchor).length - 1, 1)
 
-  for (const [stage, injectionLine] of [...replacementLines.map((line, index) => [`replace-${index}`, line]), ['postcheck', 'visudo -cf "$SUDOERS_TARGET" >/dev/null']]) {
+  for (const markerWindow of ['before-journal', 'after-journal-clear']) {
+    const interrupted = createFixture(installer)
+    try {
+      const killedScript = path.join(interrupted.fixture, `marker-only-${markerWindow}.sh`)
+      const baseScript = fs.readFileSync(interrupted.script, 'utf8')
+      const injectionPoint = markerWindow === 'before-journal'
+        ? "publish_gate_marker || fail 'DEPLOY_V3_GATE_MARKER_FAILED'"
+        : '  clear_gate_marker\n}'
+      const injected = markerWindow === 'before-journal'
+        ? `${injectionPoint}\nkill -KILL $$ # injected marker-only before journal`
+        : '  kill -KILL $$ # injected marker-only after journal clear\n  clear_gate_marker\n}'
+      const killedSource = baseScript.replace(injectionPoint, () => injected)
+      assert.notEqual(killedSource, baseScript, markerWindow)
+      write(killedScript, killedSource)
+
+      const killed = runInstaller(interrupted, interrupted.source, killedScript)
+      assert.equal(killed.signal, 'SIGKILL', markerWindow)
+      assert.equal(fs.existsSync(installJournal(interrupted)), false, markerWindow)
+      assert.equal(fs.readFileSync(path.join(interrupted.fixture, 'gate-state/install-incomplete'), 'utf8'), 'ACTIVE\n', markerWindow)
+      if (markerWindow === 'before-journal') assertOldTargets(interrupted)
+      else assertNewTargets(interrupted)
+
+      const reconciled = runInstaller(interrupted)
+      assert.equal(reconciled.status, 75, `${markerWindow}: ${reconciled.stderr}`)
+      assert.match(reconciled.stderr, /DEPLOY_V3_INSTALL_RECONCILED_RETRY_REQUIRED/, markerWindow)
+      assert.equal(fs.existsSync(path.join(interrupted.fixture, 'gate-state/install-incomplete')), false, markerWindow)
+      assert.equal(runGate(interrupted).status, 0, markerWindow)
+
+      const installed = runInstaller(interrupted)
+      assert.equal(installed.status, 0, `${markerWindow}: ${installed.stderr}`)
+      assertNewTargets(interrupted)
+    } finally {
+      fs.rmSync(interrupted.fixture, { recursive: true, force: true })
+    }
+  }
+
+  for (const [stage, injectionLine] of [...replacementLines.map((line, index) => [`replace-${index}`, line]), ['postcheck', postcheckFaultAnchor]]) {
     const interrupted = createFixture(installer)
     try {
       const killedScript = path.join(interrupted.fixture, `kill-${stage}.sh`)
@@ -401,6 +463,7 @@ async function run() {
       assert.equal(killed.signal, 'SIGKILL', `${stage}: status=${killed.status} stderr=${killed.stderr}`)
       assert.equal(fs.existsSync(installJournal(interrupted)), true, stage)
       assert.equal(fs.readFileSync(path.join(interrupted.fixture, 'gate-state/install-incomplete'), 'utf8'), 'ACTIVE\n', stage)
+      if (stage === 'postcheck') assertNewTargets(interrupted)
       const journalText = fs.readFileSync(installJournal(interrupted), 'utf8')
       assert.match(journalText, /^version=1$/m, stage)
       assert.match(journalText, new RegExp(`^stage=${stage}$`, 'm'), stage)
@@ -474,11 +537,13 @@ async function run() {
   const postcheckFailure = createFixture(installer)
   try {
     const failedScript = path.join(postcheckFailure.fixture, 'postcheck-fails.sh')
+    const postcheckHit = path.join(postcheckFailure.fixture, 'postcheck-hit')
     write(failedScript, fs.readFileSync(postcheckFailure.script, 'utf8').replace(
-      'visudo -cf "$SUDOERS_TARGET" >/dev/null',
-      'false # injected installed sudoers postcheck failure'
+      postcheckFaultAnchor,
+      `: >'${postcheckHit}'\nfalse # injected final installed postcheck failure`
     ))
     assert.notEqual(runInstaller(postcheckFailure, postcheckFailure.source, failedScript).status, 0)
+    assert.equal(fs.existsSync(postcheckHit), true)
     assertOldTargets(postcheckFailure)
     assert.equal(fs.existsSync(installJournal(postcheckFailure)), false)
     assert.equal(fs.existsSync(path.join(postcheckFailure.fixture, 'gate-state/install-incomplete')), false)

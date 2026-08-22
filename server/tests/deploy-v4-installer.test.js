@@ -690,6 +690,19 @@ PY
     fs.rmSync(signalled.base, { recursive: true, force: true })
   }
 
+  const markerOnly = fixture()
+  try {
+    const marker = path.join(markerOnly.gateStateDir, 'install-incomplete')
+    fs.mkdirSync(markerOnly.gateStateDir, { mode: 0o750 })
+    fs.writeFileSync(marker, 'ACTIVE\n', { mode: 0o640 })
+    const resumed = execute(markerOnly)
+    assert.equal(resumed.status, 0, resumed.stderr)
+    assert.equal(fs.existsSync(marker), false)
+    for (const target of markerOnly.targets) assert.doesNotMatch(fs.readFileSync(target, 'utf8'), /^old-/)
+  } finally {
+    fs.rmSync(markerOnly.base, { recursive: true, force: true })
+  }
+
   for (const killStage of ['before-gate', 'after-gate', 'after-journal']) {
     const interrupted = fixture({ killStage })
     try {

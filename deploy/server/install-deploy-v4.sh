@@ -346,6 +346,7 @@ if [[ -e "$INSTALL_JOURNAL" || -L "$INSTALL_JOURNAL" ]]; then
   BACKUP_ATTRIBUTES=('')
   backup=''
 elif [[ -e "$GATE_INSTALL_MARKER" || -L "$GATE_INSTALL_MARKER" ]]; then
+  validate_gate_marker || fail 'DEPLOY_V4_GATE_STATE_INVALID'
   clear_public_marker || fail 'DEPLOY_V4_INSTALL_RECONCILE_FAILED'
 fi
 

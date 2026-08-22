@@ -503,7 +503,8 @@ if [[ -e "$INSTALL_JOURNAL" || -L "$INSTALL_JOURNAL" ]]; then
 fi
 if [[ -e "$GATE_INSTALL_MARKER" || -L "$GATE_INSTALL_MARKER" ]]; then
   validate_gate_marker || fail 'DEPLOY_V3_GATE_STATE_INVALID'
-  fail 'DEPLOY_INSTALL_INCOMPLETE' 76
+  clear_gate_marker || fail 'DEPLOY_V3_INSTALL_RECONCILE_FAILED'
+  fail 'DEPLOY_V3_INSTALL_RECONCILED_RETRY_REQUIRED' 75
 fi
 
 for target in "${TARGETS[@]}"; do
@@ -634,6 +635,7 @@ visudo -cf "$SUDOERS_TARGET" >/dev/null
 sudo -n -U "$GATE_USER" -l "$LOCAL_SBIN/deploy-kinvest" >/dev/null
 sudo -n -U "$GATE_USER" -l "$LOCAL_SBIN/deploy-kinvest-v3" >/dev/null
 sudo -n -U "$GATE_USER" -l "$LOCAL_SBIN/deploy-kinvest-v4" >/dev/null
+# test-fault-anchor: deploy-v3-postcheck-complete
 clear_install_journal || fail 'DEPLOY_V3_GATE_MARKER_CLEAR_FAILED'
 transaction_committed='true'
 
