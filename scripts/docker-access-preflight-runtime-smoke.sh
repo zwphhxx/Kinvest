@@ -45,12 +45,12 @@ fs.chownSync('/fixture/candidate.sqlite', 10001, 10001)
 fs.chmodSync('/fixture/candidate.sqlite', 0o440)
 JS
 
-docker run --rm --user 0:0 --volume "$fixture:/fixture" --entrypoint node "$image" /fixture/prepare.js > /dev/null 2>"$stderr_file" || fail KINVEST_ACCESS_PREFLIGHT_RUNTIME_SMOKE_FIXTURE_FAILED
+docker run --rm --platform linux/amd64 --user 0:0 --volume "$fixture:/fixture" --entrypoint node "$image" /fixture/prepare.js > /dev/null 2>"$stderr_file" || fail KINVEST_ACCESS_PREFLIGHT_RUNTIME_SMOKE_FIXTURE_FAILED
 rm -f -- "$fixture/prepare.js"
 
 version_config='{"adminPasswordVerifier":"v20000101-001","deviceTokenHmac":{"accepted":["v20000101-001"],"active":"v20000101-001"}}'
 common=(
-  run --rm --user 10001:10001 --read-only --cap-drop ALL
+  run --rm --platform linux/amd64 --user 10001:10001 --read-only --cap-drop ALL
   --security-opt no-new-privileges:true --network none
   --ulimit fsize=268435456:268435456
   --env KINVEST_SECRET_PROVIDER_MODE=github-tmpfs-v1

@@ -2329,7 +2329,14 @@ function run() {
   const accessPreflightSmoke = fs.readFileSync(accessPreflightSmokePath, 'utf8')
   assert.notEqual(fs.statSync(accessPreflightSmokePath).mode & 0o111, 0)
   assert.equal(spawnSync('bash', ['-n', accessPreflightSmokePath], { encoding: 'utf8' }).status, 0)
+  assert.equal(
+    (accessPreflightSmoke.match(/--platform linux\/amd64/g) || []).length,
+    2,
+    'fixture preparation and the common runtime cases must each pin the production platform'
+  )
   for (const fragment of [
+    'docker run --rm --platform linux/amd64 --user 0:0',
+    'run --rm --platform linux/amd64 --user 10001:10001',
     '--user 10001:10001', '--read-only', '--cap-drop ALL',
     '--security-opt no-new-privileges:true', '--network none',
     '--ulimit fsize=268435456:268435456',
