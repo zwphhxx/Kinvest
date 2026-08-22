@@ -2324,6 +2324,31 @@ function run() {
   const publishTimeoutMinutes = Number.parseInt(publishTimeoutMatch[1], 10)
   assert.equal(publishTimeoutMinutes, 30)
   assert.match(workflow, /docker\/build-push-action@[0-9a-f]{40}/)
+  const accessPreflightSmokePath = path.join(rootDir, 'scripts/docker-access-preflight-runtime-smoke.sh')
+  assert.equal(fs.existsSync(accessPreflightSmokePath), true, 'container build must include the runtime access-preflight smoke')
+  const accessPreflightSmoke = fs.readFileSync(accessPreflightSmokePath, 'utf8')
+  assert.notEqual(fs.statSync(accessPreflightSmokePath).mode & 0o111, 0)
+  assert.equal(spawnSync('bash', ['-n', accessPreflightSmokePath], { encoding: 'utf8' }).status, 0)
+  for (const fragment of [
+    '--user 10001:10001', '--read-only', '--cap-drop ALL',
+    '--security-opt no-new-privileges:true', '--network none',
+    '--ulimit fsize=268435456:268435456',
+    '/tmp:rw,noexec,nosuid,nodev,uid=10001,gid=10001,mode=0700,size=512m',
+    'command+=(--env "KINVEST_DB_PATH=$production")',
+    '/data/kinvest.sqlite',
+    ':/preflight/candidate.sqlite:ro',
+    'command+=(--entrypoint node "$image" server/access-preflight.js)',
+    'command+=("$candidate_argument")'
+  ]) assert.match(accessPreflightSmoke, new RegExp(fragment.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')))
+  for (const negative of ['missing-candidate-argument', 'candidate-equals-production', 'missing-tmpfs', 'insufficient-tmpfs']) {
+    assert.match(accessPreflightSmoke, new RegExp(negative))
+  }
+  const containerBuildJob = workflow.match(/^ {2}container-build:\n[\s\S]*?(?=^ {2}[a-z][a-z-]+:)/m)?.[0] || ''
+  assert.match(containerBuildJob, /^ {10}load: true$/m)
+  assert.match(containerBuildJob, /^ {10}push: false$/m)
+  assert.match(containerBuildJob, /^ {10}tags: kinvest-access-preflight-smoke:\$\{\{ github\.sha \}\}$/m)
+  assert.match(containerBuildJob, /scripts\/docker-access-preflight-runtime-smoke\.sh "kinvest-access-preflight-smoke:\$\{\{ github\.sha \}\}"/)
+  assert.doesNotMatch(containerBuildJob, /secrets\.|environment:|packages: write/)
   assert.match(workflow, /docker\/login-action@[0-9a-f]{40}/)
   assert.match(workflow, /docker\/setup-buildx-action@[0-9a-f]{40}/)
   assert.match(workflow, /BUILD_DIGEST: \$\{\{ steps\.build\.outputs\.digest \}\}/)

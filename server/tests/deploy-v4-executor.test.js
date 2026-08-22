@@ -169,6 +169,14 @@ if [[ "$command" == run ]]; then
   [[ "$all" == *"$PREVIOUS_ID"* ]] && image="$PREVIOUS_ID"
   if [[ "$FAILURE" == preflight ]]; then exit 1; fi
   if [[ "$all" == *server/access-preflight.js* ]]; then
+    candidate_path='/preflight/candidate.sqlite'
+    production_path='/data/kinvest.sqlite'
+    tmpfs_spec='/tmp:rw,noexec,nosuid,nodev,uid=10001,gid=10001,mode=0700,size=512m'
+    [[ " $all " == *" --tmpfs $tmpfs_spec "* ]] || exit 64
+    [[ " $all " == *" --env KINVEST_DB_PATH=$production_path "* ]] || exit 64
+    [[ "$all" =~ --volume[[:space:]][^[:space:]]+:\${candidate_path}:ro([[:space:]]|$) ]] || exit 64
+    [[ " $all " == *" server/access-preflight.js $candidate_path "* ]] || exit 64
+    [[ "$candidate_path" != "$production_path" ]] || exit 64
     printf 'preflight access %s %s\n' "$image" "$all" >>"$PREFLIGHTS"
     echo 'KINVEST_ACCESS_PREFLIGHT_OK mode=device-approval references=2 database=ready proxy=ready'
   else
@@ -387,6 +395,26 @@ function assertRecovered(context, result) {
   for (const secret of [candidateMaterial.admin, candidateMaterial.hmac]) assert.equal(combined.includes(secret), false)
 }
 
+function assertAccessPreflightDockerContract(context) {
+  const accessRuns = fs.readFileSync(context.operations, 'utf8').split('\n')
+    .filter((line) => line.includes('server/access-preflight.js'))
+  assert.ok(accessRuns.length > 0)
+  for (const invocation of accessRuns) {
+    assert.match(invocation, / --user 10001:10001 /)
+    assert.match(invocation, / --read-only /)
+    assert.match(invocation, / --cap-drop ALL /)
+    assert.match(invocation, / --security-opt no-new-privileges:true /)
+    assert.match(invocation, / --network none /)
+    assert.match(invocation, / --ulimit fsize=268435456:268435456 /)
+    assert.match(invocation, / --env NODE_NO_WARNINGS=1 /)
+    assert.match(invocation, / --tmpfs \/tmp:rw,noexec,nosuid,nodev,uid=10001,gid=10001,mode=0700,size=512m /)
+    assert.match(invocation, / --env KINVEST_DB_PATH=\/data\/kinvest\.sqlite /)
+    assert.match(invocation, / --volume [^ ]+:\/preflight\/candidate\.sqlite:ro /)
+    assert.match(invocation, / server\/access-preflight\.js \/preflight\/candidate\.sqlite$/)
+    assert.doesNotMatch(invocation, /--volume [^ ]+:\/data\/kinvest\.sqlite:ro/)
+  }
+}
+
 function parsedState(context, name) {
   const result = spawnSync('python3', [context.contract, 'parse-state'], {
     encoding: 'utf8',
@@ -435,8 +463,47 @@ async function run() {
       assert.match(preflights, new RegExp(`preflight secret ${identities.currentId}`))
       assert.match(preflights, new RegExp(`preflight access ${identities.candidateId}`))
       if (scenario.currentDevice) assert.match(preflights, new RegExp(`preflight access ${identities.currentId}`))
+      assertAccessPreflightDockerContract(context)
       assert.match(operations, /docker inspect --format \{\{\.State\.Running\}\} nginx/)
       assert.match(operations, /docker inspect --format \{\{with index \.NetworkSettings\.Networks "web"\}\}\{\{\.IPAddress\}\}\{\{end\}\} nginx/)
+    } finally {
+      spawnSync('/bin/rm', ['-rf', context.base])
+    }
+  }
+
+  for (const invalidContainerContract of [
+    {
+      name: 'missing-candidate-argument',
+      from: 'server/access-preflight.js /preflight/candidate.sqlite',
+      to: 'server/access-preflight.js'
+    },
+    {
+      name: 'candidate-equals-production',
+      from: '--env KINVEST_DB_PATH=/data/kinvest.sqlite',
+      to: '--env KINVEST_DB_PATH=/preflight/candidate.sqlite'
+    },
+    {
+      name: 'missing-tmpfs',
+      from: '      --tmpfs "$PREFLIGHT_DB_TMPFS_SPEC" \\\n',
+      to: ''
+    },
+    {
+      name: 'insufficient-tmpfs',
+      from: 'mode=0700,size=512m',
+      to: 'mode=0700,size=1m'
+    }
+  ]) {
+    const context = createFixture({ failure: 'none', currentDevice: false })
+    try {
+      const source = fs.readFileSync(context.deployer, 'utf8')
+      const invalid = source.replace(invalidContainerContract.from, invalidContainerContract.to)
+      assert.notEqual(invalid, source, invalidContainerContract.name)
+      fs.writeFileSync(context.deployer, invalid, { mode: 0o755 })
+      const result = execute(context, payload())
+      assert.notEqual(result.status, 0, invalidContainerContract.name)
+      assert.equal(result.stderr, 'DEPLOY_V4_ACCESS_PREFLIGHT_FAILED\n', invalidContainerContract.name)
+      assert.equal(fs.readFileSync(path.join(context.stateDir, 'current.state'), 'utf8'), context.currentText)
+      assert.doesNotMatch(fs.readFileSync(context.operations, 'utf8'), /compose up/)
     } finally {
       spawnSync('/bin/rm', ['-rf', context.base])
     }

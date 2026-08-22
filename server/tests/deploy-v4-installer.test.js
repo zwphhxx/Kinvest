@@ -8,6 +8,7 @@ const rootDir = path.resolve(__dirname, '../..')
 const sourceDir = path.join(rootDir, 'deploy/server')
 const installerSource = fs.readFileSync(path.join(sourceDir, 'install-deploy-v4.sh'), 'utf8')
 const gateSource = fs.readFileSync(path.join(sourceDir, 'kinvest-ssh-command-v3'), 'utf8')
+const targetCount = 9
 
 function writeExecutable(file, source) {
   fs.writeFileSync(file, source, { mode: 0o755 })
@@ -109,7 +110,9 @@ exec /bin/mv -f "\${args[@]}"
     path.join(libexec, 'kinvest-deploy-v3-contract'),
     path.join(serverRoot, 'docker-compose-v4.yml'),
     path.join(sudoers, 'kinvest-deploy-v4'),
-    path.join(serverRoot, 'access-control-network.conf.example')
+    path.join(serverRoot, 'access-control-network.conf.example'),
+    path.join(sbin, 'kinvest-nginx-fixed-ip-gate'),
+    path.join(serverRoot, 'docker-compose.nginx-fixed-ip.yml')
   ]
   if (existing) {
     for (let index = 0; index < targets.length; index += 1) {
@@ -292,7 +295,7 @@ function assertDurableRenames(trace, fragment) {
   const renames = trace
     .map((event, index) => ({ event, index }))
     .filter(({ event }) => event.startsWith('rename:') && event.includes(fragment))
-  assert.equal(renames.length, 7, fragment)
+  assert.equal(renames.length, targetCount, fragment)
   for (let position = 0; position < renames.length; position += 1) {
     const { event, index } = renames[position]
     const [, temporary, target] = event.split(':')
@@ -309,6 +312,7 @@ function canWriteAs(info, uid, gid) {
 }
 
 async function run() {
+  assert.match(installerSource, /bash -n "\$LOCAL_SBIN\/kinvest-nginx-fixed-ip-gate"/)
   assert.doesNotMatch(installerSource, /systemctl restart|docker compose|DEPLOY_V4_ENABLED/)
   assert.doesNotMatch(installerSource, /install\.lock|\.install-lock\./)
   assert.doesNotMatch(installerSource, /DEPLOY_USER='kinvest-deploy'/)
@@ -727,7 +731,7 @@ PY
     }
   }
 
-  for (let index = 0; index < 7; index += 1) {
+  for (let index = 0; index < targetCount; index += 1) {
     const interrupted = fixture({ killAfterReplacement: index })
     try {
       const killed = execute(interrupted)
@@ -758,7 +762,7 @@ PY
     }
   }
 
-  for (let index = 0; index < 7; index += 1) {
+  for (let index = 0; index < targetCount; index += 1) {
     const context = fixture({ replaceFailure: index })
     try {
       const result = execute(context)
@@ -792,6 +796,8 @@ PY
     assert.equal(result.status, 0, result.stderr)
     for (const target of success.targets) assert.equal(fs.existsSync(target), true)
     assert.equal(fs.readFileSync(success.targets[2], 'utf8'), fs.readFileSync(success.targets[3], 'utf8'))
+    assert.equal(fs.readFileSync(success.targets[7], 'utf8'), fs.readFileSync(path.join(sourceDir, 'kinvest-nginx-fixed-ip-gate'), 'utf8'))
+    assert.equal(fs.readFileSync(success.targets[8], 'utf8'), fs.readFileSync(path.join(sourceDir, 'docker-compose.nginx-fixed-ip.yml'), 'utf8'))
     assert.equal(fs.readFileSync(success.targets[5], 'utf8'),
       'lighthouse ALL=(root) NOPASSWD: /usr/local/sbin/deploy-kinvest ""\n' +
       'lighthouse ALL=(root) NOPASSWD: /usr/local/sbin/deploy-kinvest-v3 ""\n' +

@@ -29,6 +29,8 @@ PUBLIC_HEALTH_URL='https://dearmina.cn/api/health'
 BUNDLE_ROOT="$RUN_ROOT/kinvest-secrets"
 METADATA_NETWORK_CONFIG='/etc/kinvest/metadata-network.conf'
 ACCESS_NETWORK_CONFIG='/etc/kinvest/access-control-network.conf'
+PREFLIGHT_DB_TMPFS_SPEC='/tmp:rw,noexec,nosuid,nodev,uid=10001,gid=10001,mode=0700,size=512m'
+PREFLIGHT_DB_MAX_BYTES=$((256 * 1024 * 1024))
 DOCKER_TIMEOUT='120s'
 INSPECT_TIMEOUT='15s'
 PULL_TIMEOUT='300s'
@@ -253,6 +255,7 @@ for suffix in ("-wal", "-shm", "-journal"):
     if os.path.exists(sys.argv[2] + suffix):
         raise SystemExit(1)
 PY
+  [[ "$(python3 -c 'import os,sys; print(os.stat(sys.argv[1], follow_symlinks=False).st_size)' "$access_snapshot")" -le "$PREFLIGHT_DB_MAX_BYTES" ]] || return 1
   chown 10001:10001 "$access_snapshot"
   chmod 0440 "$access_snapshot"
 }
@@ -328,18 +331,20 @@ run_access_preflight() {
   chmod 0600 "$output" "$error"
   status=0
   (
-    ulimit -f 1
     run_docker run --rm --user 10001:10001 --read-only --cap-drop ALL \
       --security-opt no-new-privileges:true --network none \
+      --ulimit fsize=268435456:268435456 \
+      --tmpfs "$PREFLIGHT_DB_TMPFS_SPEC" \
       --env "KINVEST_SECRET_PROVIDER_MODE=$provider" \
       --env "KINVEST_SECRET_VERSION_IDS=$versions" \
+      --env NODE_NO_WARNINGS=1 \
       --env KINVEST_SECRET_BUNDLE_PATH=/run/secrets/kinvest \
       --env "KINVEST_ACCESS_CONTROL_MODE=$mode" \
       --env "KINVEST_TRUSTED_PROXY_ADDRESSES=$proxies" \
       --env KINVEST_DB_PATH=/data/kinvest.sqlite \
       --volume "$bundle_path:/run/secrets/kinvest:ro" \
-      --volume "$access_snapshot:/data/kinvest.sqlite:ro" \
-      --entrypoint node "$image_id" server/access-preflight.js
+      --volume "$access_snapshot:/preflight/candidate.sqlite:ro" \
+      --entrypoint node "$image_id" server/access-preflight.js /preflight/candidate.sqlite
   ) >"$output" 2>"$error" || status=$?
   expected='KINVEST_ACCESS_PREFLIGHT_OK mode=device-approval references=2 database=ready proxy=ready'
   bytes=$((${#expected} + 1))

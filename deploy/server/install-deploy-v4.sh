@@ -21,17 +21,19 @@ GATE_IDENTITY_CONTENT=''
 GATE_SOURCE="$SOURCE_DIR/kinvest-ssh-command-v3"
 GATE_TARGET="$LOCAL_SBIN/kinvest-ssh-command"
 GATE_EXPECTED_HASH='adf011acd3cb7b242bfa0f3e3c863999980e41c011320b04cbea723e137f677c'
-SOURCE_ASSETS=('deploy-kinvest-v4' 'deploy-kinvest-v3.sh' 'deploy-v3-contract.py' 'deploy-v3-contract.py' 'docker-compose-v3.yml' 'kinvest-deploy-v4.sudoers.in' 'access-control-network.conf.example')
-TARGETS=("$LOCAL_SBIN/deploy-kinvest-v4" "$LOCAL_SBIN/deploy-kinvest-v3" "$LOCAL_LIBEXEC/kinvest-deploy-v4-contract" "$LOCAL_LIBEXEC/kinvest-deploy-v3-contract" "$SERVER_ROOT/docker-compose-v4.yml" "$SUDOERS_DIR/kinvest-deploy-v4" "$SERVER_ROOT/access-control-network.conf.example")
-MODES=('0755' '0755' '0755' '0755' '0644' '0440' '0600')
+SOURCE_ASSETS=('deploy-kinvest-v4' 'deploy-kinvest-v3.sh' 'deploy-v3-contract.py' 'deploy-v3-contract.py' 'docker-compose-v3.yml' 'kinvest-deploy-v4.sudoers.in' 'access-control-network.conf.example' 'kinvest-nginx-fixed-ip-gate' 'docker-compose.nginx-fixed-ip.yml')
+TARGETS=("$LOCAL_SBIN/deploy-kinvest-v4" "$LOCAL_SBIN/deploy-kinvest-v3" "$LOCAL_LIBEXEC/kinvest-deploy-v4-contract" "$LOCAL_LIBEXEC/kinvest-deploy-v3-contract" "$SERVER_ROOT/docker-compose-v4.yml" "$SUDOERS_DIR/kinvest-deploy-v4" "$SERVER_ROOT/access-control-network.conf.example" "$LOCAL_SBIN/kinvest-nginx-fixed-ip-gate" "$SERVER_ROOT/docker-compose.nginx-fixed-ip.yml")
+MODES=('0755' '0755' '0755' '0755' '0644' '0440' '0600' '0755' '0644')
 EXPECTED_ASSET_HASHES=(
   'fb25bd314ab46e3af56fe46e83564000d7388d6f7670b63d370b4047d2d4e86d'
-  '0f5a6b5a09a6251c48b329263d9a5a27221bd6a1fa6b9a42a69750614b788bd8'
+  '3bb3abdfee9b33cd9bd703730c3eb4fc7c1a25d3b6dc3e1ae00e2a775dd36bb1'
   '68040b9177cc8d2bb929a351e289eee7e9c6e446fda447ceec12d9ad382afe23'
   '68040b9177cc8d2bb929a351e289eee7e9c6e446fda447ceec12d9ad382afe23'
   '7698dd619fb6a441763f85e4e35c819af55e431c6d0ac9c4b527930d07a644aa'
   '7b5e370620d99b501bd60a78637dc51984a09b550923181e424c98e4f9b36040'
   'cef9b242ad3de3c2134e2a4e7e1ae1693ce55cd63bb9ac9d65710ec796309594'
+  '929756711b26f84bfd13bc6d4ba05b022b71ccdcc0ad93f61e7b7854eba25044'
+  'b15073063d733d997a3bf22159a024df3caeb4eaea1bc458c176b127ab48c60a'
 )
 
 fail() { printf '%s\n' "$1" >&2; exit "${2:-1}"; }
@@ -195,6 +197,7 @@ done
 bash -n "$SOURCE_DIR/deploy-kinvest-v4"
 bash -n "$SOURCE_DIR/deploy-kinvest-v3.sh"
 bash -n "$SOURCE_DIR/kinvest-ssh-command-v3"
+bash -n "$SOURCE_DIR/kinvest-nginx-fixed-ip-gate"
 PYTHONDONTWRITEBYTECODE=1 python3 -m py_compile "$SOURCE_DIR/deploy-v3-contract.py"
 [[ -f "$GATE_SOURCE" && ! -L "$GATE_SOURCE" ]] || fail 'invalid deploy-v4 forced-command gate'
 [[ "$(file_hash "$GATE_SOURCE")" == "$GATE_EXPECTED_HASH" ]] || fail 'untrusted deploy-v4 forced-command gate hash'
@@ -244,7 +247,7 @@ load_backup() {
   [[ "$(realpath -e "$candidate")" == "$candidate" ]] || return 1
   [[ -f "$candidate/manifest.txt" && ! -L "$candidate/manifest.txt" ]] || return 1
   line_count="$(wc -l <"$candidate/manifest.txt" | tr -d '[:space:]')"
-  [[ "$line_count" == 8 && "$(sed -n '1p' "$candidate/manifest.txt")" == kinvest-deploy-v4-install-backup-v1 ]] || return 1
+  [[ "$line_count" == "$((${#TARGETS[@]} + 1))" && "$(sed -n '1p' "$candidate/manifest.txt")" == kinvest-deploy-v4-install-backup-v1 ]] || return 1
   for index in "${!TARGETS[@]}"; do
     line="$(sed -n "$((index + 2))p" "$candidate/manifest.txt")"
     IFS='|' read -r manifest_index present hash attributes extra <<<"$line"
@@ -454,6 +457,7 @@ done
 bash -n "$LOCAL_SBIN/deploy-kinvest-v4"
 bash -n "$LOCAL_SBIN/deploy-kinvest-v3"
 bash -n "$GATE_TARGET"
+bash -n "$LOCAL_SBIN/kinvest-nginx-fixed-ip-gate"
 PYTHONDONTWRITEBYTECODE=1 python3 -m py_compile "$LOCAL_LIBEXEC/kinvest-deploy-v4-contract"
 visudo -cf "$SUDOERS_DIR/kinvest-deploy-v4" >/dev/null
 sudo -n -U "$GATE_USER" -l "$LOCAL_SBIN/deploy-kinvest" >/dev/null

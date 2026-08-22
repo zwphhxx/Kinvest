@@ -16,14 +16,53 @@ post-switch access acceptance. State and logs contain no secret material.
 2. Set Production `KINVEST_ACCESS_CONTROL_MODE=disabled`, temporarily approve
    `DEPLOY_V4_ENABLED=true`, and run a v4 disabled baseline. This writes v5 state
    with an empty trusted-proxy list.
-3. In a separate Docker/network change, assign Nginx one fixed IPv4 on `web`
-   using `docker-compose.nginx-fixed-ip.yml`. Never trust the current dynamic
-   address or the `172.19.0.0/16` subnet.
-4. Install `/etc/kinvest/access-control-network.conf` from the example as a
-   root-owned regular `0600` file. Confirm the named Nginx container is running
-   on exactly the named network and exact configured IPv4.
-5. In a separate Production approval, change the variable to `device-approval`
+3. Install `/etc/kinvest/access-control-network.conf` from the example as a
+   root-owned regular `0600` file. Its exact `KINVEST_NGINX_IPV4` is the only
+   permitted source for the fixed-IP overlay. Never copy an address from chat,
+   an arbitrary `.env`, the current dynamic container address, or the
+   `172.19.0.0/16` subnet.
+4. Run the read-only fixed-IP render gate below. Stop after its exact success
+   line and obtain the separate Docker/network approval.
+5. After that approval only, run the apply gate below. It recreates only Nginx,
+   immediately verifies running/network/IP and the public Kinvest HTTPS health
+   response, then stops. Do not continue automatically into access activation.
+6. In a separate Production approval, change the variable to `device-approval`
    and activate with deploy-v4.
+
+## Fixed Nginx IP gates
+
+The reviewed root project is fixed to workdir `/root/docker`, base file
+`/root/docker/docker-compose.yml`, existing Nginx overlay
+`/root/docker/docker-compose.kinvest-nginx.yml`, and trusted fixed-IP overlay
+`/root/docker/kinvest/docker-compose.nginx-fixed-ip.yml`. The v4 installer owns
+and hashes the last file but never applies it, invokes Compose, or restarts a
+container.
+
+Gate 1 is read-only:
+
+```bash
+cd /root/docker
+sudo /usr/local/sbin/kinvest-nginx-fixed-ip-gate render
+```
+
+The gate requires Docker Compose `2.24.4` or newer for `!override`, parses the
+IP only through the strict root-owned access-control config contract, runs
+`docker compose config --format json`, and requires the rendered
+`services.nginx.networks.web.ipv4_address` to equal that exact IP. The only
+success output is `KINVEST_NGINX_FIXED_IP_RENDER_OK ip=<approved-ip>`.
+
+Stop here. After a separate Docker/network approval, Gate 2 is:
+
+```bash
+cd /root/docker
+sudo /usr/local/sbin/kinvest-nginx-fixed-ip-gate apply
+```
+
+Gate 2 repeats Gate 1 before `up -d --no-deps --force-recreate nginx`, then
+requires Nginx running on exactly network `web` at the configured IP and an
+HTTPS `200 application/json` Kinvest health body. Its only success output is
+`KINVEST_NGINX_FIXED_IP_APPLY_OK ip=<approved-ip> health=ready https=ready`.
+Stop again; device approval remains a separate Production approval.
 
 ## Rollback boundary
 
@@ -195,9 +234,21 @@ the exact RESTORE with an approved new bundle. Successful retry updates only the
 bundle identifier and clears the marker.
 
 The device-approval candidate receives only a consistent SQLite backup in
-`/run`, never the production database. It has no network, runs as UID 10001,
-uses a read-only root filesystem, drops all capabilities, and mounts the tmpfs
-secret bundle and snapshot read-only. Activation requires the exact access
+`/run`, never the production database. The deployer mounts that snapshot
+read-only at `/preflight/candidate.sqlite`, keeps the production logic path at
+the distinct `/data/kinvest.sqlite`, and explicitly executes
+`node server/access-preflight.js /preflight/candidate.sqlite`. It has no
+network, runs as UID 10001, uses a read-only root filesystem, drops all
+capabilities, and receives a `noexec,nosuid,nodev` UID/GID 10001 `/tmp` tmpfs.
+Snapshots are limited to 256 MiB and the tmpfs is 512 MiB so the application can
+make its separately verified private SQLite backup without writing the mounted
+snapshot. Activation requires the exact access
 preflight output and post-switch anonymous 401/200 behavior. Disabled acceptance
 requires an `application/json` watchlist response with exactly `success: true`
 and an array `data`; HTML catchalls and malformed JSON fail recovery-safe.
+
+## Residual risk
+
+The previously identified medium-severity UUID concern is unchanged in this
+task and remains separately tracked. This deployment change does not broaden
+its use or treat it as an access-control or secret identifier.

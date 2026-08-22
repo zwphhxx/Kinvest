@@ -57,6 +57,7 @@ const tests = [
   require('./deploy-v4-executor.test'),
   require('./deploy-v4-installer.test'),
   require('./deploy-v4-workflow.test'),
+  require('./nginx-fixed-ip-gate.test'),
   require('./data-lifecycle.test'),
   require('./workflow-contract.test')
 ]

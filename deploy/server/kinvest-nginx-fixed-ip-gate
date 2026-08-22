@@ -1,0 +1,109 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+PROJECT_ROOT='/root/docker'
+BASE_COMPOSE="$PROJECT_ROOT/docker-compose.yml"
+NGINX_OVERLAY="$PROJECT_ROOT/docker-compose.kinvest-nginx.yml"
+FIXED_OVERLAY="$PROJECT_ROOT/kinvest/docker-compose.nginx-fixed-ip.yml"
+ACCESS_NETWORK_CONFIG='/etc/kinvest/access-control-network.conf'
+CONTRACT='/usr/local/libexec/kinvest-deploy-v4-contract'
+RUN_ROOT='/run'
+ROOT_UID='0'
+ROOT_GID='0'
+FIXED_OVERLAY_SHA256='b15073063d733d997a3bf22159a024df3caeb4eaea1bc458c176b127ab48c60a'
+PUBLIC_HEALTH_URL='https://dearmina.cn/api/health'
+
+fail() { printf '%s\n' "$1" >&2; exit "${2:-1}"; }
+[[ "$#" -eq 1 && ( "$1" == render || "$1" == apply ) ]] || fail KINVEST_NGINX_FIXED_IP_ARGUMENTS_INVALID 2
+[[ "$(id -u)" -eq 0 ]] || fail KINVEST_NGINX_FIXED_IP_ROOT_REQUIRED
+mode="$1"
+
+file_attributes() {
+  python3 -c 'import os,stat,sys; v=os.lstat(sys.argv[1]); print(f"{v.st_uid}:{v.st_gid}:{stat.S_IMODE(v.st_mode):o}:{int(stat.S_ISREG(v.st_mode))}:{v.st_nlink}")' "$1"
+}
+
+directory_attributes() {
+  python3 -c 'import os,stat,sys; v=os.lstat(sys.argv[1]); print(f"{v.st_uid}:{v.st_gid}:{stat.S_IMODE(v.st_mode):o}:{int(stat.S_ISDIR(v.st_mode))}")' "$1"
+}
+
+[[ -d "$PROJECT_ROOT" && ! -L "$PROJECT_ROOT" ]] || fail KINVEST_NGINX_FIXED_IP_PROJECT_INVALID
+[[ "$(directory_attributes "$PROJECT_ROOT" 2>/dev/null)" == "$ROOT_UID:$ROOT_GID:755:1" ]] || fail KINVEST_NGINX_FIXED_IP_PROJECT_INVALID
+for specification in \
+  "$BASE_COMPOSE:644" \
+  "$NGINX_OVERLAY:644" \
+  "$FIXED_OVERLAY:644" \
+  "$ACCESS_NETWORK_CONFIG:600" \
+  "$CONTRACT:755"; do
+  target="${specification%:*}"
+  expected_mode="${specification##*:}"
+  [[ -f "$target" && ! -L "$target" ]] || fail KINVEST_NGINX_FIXED_IP_ASSET_INVALID
+  [[ "$(file_attributes "$target" 2>/dev/null)" == "$ROOT_UID:$ROOT_GID:$expected_mode:1:1" ]] || fail KINVEST_NGINX_FIXED_IP_ASSET_INVALID
+done
+[[ "$(sha256sum "$FIXED_OVERLAY" | awk '{print $1}')" == "$FIXED_OVERLAY_SHA256" ]] || fail KINVEST_NGINX_FIXED_IP_OVERLAY_HASH_INVALID
+
+network_json="$(mktemp "$RUN_ROOT/kinvest-nginx-fixed-ip.network.XXXXXX")"
+render_json="$(mktemp "$RUN_ROOT/kinvest-nginx-fixed-ip.render.XXXXXX")"
+health_json="$(mktemp "$RUN_ROOT/kinvest-nginx-fixed-ip.health.XXXXXX")"
+cleanup() { rm -f -- "$network_json" "$render_json" "$health_json"; }
+trap cleanup EXIT HUP INT TERM
+chmod 0600 "$network_json" "$render_json" "$health_json"
+"$CONTRACT" validate-network-config "$ACCESS_NETWORK_CONFIG" >"$network_json" || fail KINVEST_NGINX_FIXED_IP_CONFIG_INVALID
+IFS=$'\t' read -r nginx_container web_network trusted_ip < <(python3 - "$network_json" <<'PY'
+import json, sys
+with open(sys.argv[1], encoding="ascii") as stream:
+    value = json.load(stream)
+fields = (value.get("container"), value.get("network"), value.get("ip"))
+if not all(isinstance(item, str) and item for item in fields):
+    raise SystemExit(1)
+print("\t".join(fields))
+PY
+) || fail KINVEST_NGINX_FIXED_IP_CONFIG_INVALID
+[[ "$nginx_container" == nginx && "$web_network" == web && "$trusted_ip" =~ ^([0-9]{1,3}\.){3}[0-9]{1,3}$ ]] || fail KINVEST_NGINX_FIXED_IP_CONFIG_INVALID
+unset KINVEST_NGINX_IPV4
+export KINVEST_NGINX_IPV4="$trusted_ip"
+
+compose=(docker compose --project-directory "$PROJECT_ROOT" -f "$BASE_COMPOSE" -f "$NGINX_OVERLAY" -f "$FIXED_OVERLAY")
+compose_version="$(docker compose version --short)" || fail KINVEST_NGINX_FIXED_IP_COMPOSE_VERSION_INVALID
+python3 - "$compose_version" <<'PY' || fail KINVEST_NGINX_FIXED_IP_COMPOSE_VERSION_INVALID
+import re, sys
+match = re.fullmatch(r"v?(\d+)\.(\d+)\.(\d+)", sys.argv[1])
+if not match or tuple(map(int, match.groups())) < (2, 24, 4):
+    raise SystemExit(1)
+PY
+
+render_config() {
+  "${compose[@]}" config --format json >"$render_json" || fail KINVEST_NGINX_FIXED_IP_RENDER_FAILED
+  python3 - "$render_json" "$trusted_ip" <<'PY' || fail KINVEST_NGINX_FIXED_IP_RENDER_MISMATCH
+import json, sys
+with open(sys.argv[1], encoding="utf-8") as stream:
+    value = json.load(stream)
+try:
+    rendered = value["services"]["nginx"]["networks"]["web"]["ipv4_address"]
+except (KeyError, TypeError):
+    raise SystemExit(1)
+if rendered != sys.argv[2]:
+    raise SystemExit(1)
+PY
+}
+
+render_config
+if [[ "$mode" == render ]]; then
+  printf 'KINVEST_NGINX_FIXED_IP_RENDER_OK ip=%s\n' "$trusted_ip"
+  exit 0
+fi
+
+"${compose[@]}" up -d --no-deps --force-recreate nginx >/dev/null || fail KINVEST_NGINX_FIXED_IP_APPLY_FAILED
+[[ "$(docker inspect --format '{{.State.Running}}' "$nginx_container")" == true ]] || fail KINVEST_NGINX_FIXED_IP_INSPECT_FAILED
+actual_ip="$(docker inspect --format "{{with index .NetworkSettings.Networks \"$web_network\"}}{{.IPAddress}}{{end}}" "$nginx_container")" || fail KINVEST_NGINX_FIXED_IP_INSPECT_FAILED
+[[ "$actual_ip" == "$trusted_ip" ]] || fail KINVEST_NGINX_FIXED_IP_INSPECT_FAILED
+health_result="$(curl -sS --max-time 15 -o "$health_json" -w '%{http_code} %{content_type}' "$PUBLIC_HEALTH_URL")" || fail KINVEST_NGINX_FIXED_IP_HEALTH_FAILED
+read -r health_status health_type <<<"$health_result"
+[[ "$health_status" == 200 && ( "$health_type" == application/json || "$health_type" == application/json\;* ) ]] || fail KINVEST_NGINX_FIXED_IP_HEALTH_FAILED
+python3 - "$health_json" <<'PY' || fail KINVEST_NGINX_FIXED_IP_HEALTH_FAILED
+import json, sys
+with open(sys.argv[1], encoding="utf-8") as stream:
+    value = json.load(stream)
+if value != {"status": "ok", "service": "kinvest"}:
+    raise SystemExit(1)
+PY
+printf 'KINVEST_NGINX_FIXED_IP_APPLY_OK ip=%s health=ready https=ready\n' "$trusted_ip"

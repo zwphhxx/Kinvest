@@ -53,6 +53,9 @@ RUN addgroup -g 10001 -S kinvest && \
 
 WORKDIR /app
 
+RUN install -d -o root -g root -m 0755 /preflight && \
+    install -d -o root -g root -m 0711 /run/secrets
+
 COPY --from=runtime-dependencies /app/node_modules ./node_modules
 COPY --from=build --chown=10001:10001 /app/dist ./
 COPY --from=github-tmpfs-provider-smoke /tmp/kinvest-github-tmpfs-smoke-ok /tmp/kinvest-github-tmpfs-smoke-ok
