@@ -1166,11 +1166,13 @@ async function run() {
     const capture = path.join(sshFixture, 'capture')
     fs.mkdirSync(fakeBin)
     writeExecutable(path.join(fakeBin, 'sudo'), '#!/bin/sh\n[ "$1" = -n ] && shift\nexec "$@"\n')
+    writeExecutable(path.join(fakeBin, 'flock'), '#!/bin/sh\nexit 0\n')
     writeExecutable(capture, `#!/bin/sh\ncat > '${path.join(sshFixture, 'stdin')}'\n`)
     const wrapperPath = path.join(sshFixture, 'wrapper')
     writeExecutable(
       wrapperPath,
       wrapper
+        .replace('/usr/bin/flock', path.join(fakeBin, 'flock'))
         .replace('/usr/local/sbin/deploy-kinvest-v3', capture)
         .replace('/usr/local/sbin/deploy-kinvest', capture)
     )

@@ -232,6 +232,7 @@ function createFixture({ failure, currentDevice = false, oldBundleMissing = fals
   const stateDir = path.join(serverRoot, 'state')
   const bundleRoot = path.join(runRoot, 'kinvest-secrets')
   for (const directory of [stateDir, path.join(serverRoot, 'data'), path.join(serverRoot, 'backups'), runRoot, bin, bundleRoot]) fs.mkdirSync(directory, { recursive: true })
+  fs.chmodSync(path.join(serverRoot, 'backups'), 0o700)
   fs.chmodSync(bundleRoot, 0o700)
   const contract = path.join(base, 'contract.py')
   const deployer = path.join(base, 'deployer.sh')
@@ -265,6 +266,9 @@ function createFixture({ failure, currentDevice = false, oldBundleMissing = fals
     .replace('BUNDLE_ROOT = Path("/run/kinvest-secrets")', `BUNDLE_ROOT = Path("${bundleRoot}")`)
     .replace('BUNDLE_UID = 0', `BUNDLE_UID = ${uid}`)
     .replace('BUNDLE_GID = 10001', `BUNDLE_GID = ${gid}`)
+    .replace('BACKUP_ROOT = Path("/root/docker/kinvest/backups")', `BACKUP_ROOT = Path("${path.join(serverRoot, 'backups')}")`)
+    .replace('BACKUP_UID = 0', `BACKUP_UID = ${uid}`)
+    .replace('BACKUP_GID = 0', `BACKUP_GID = ${gid}`)
     .replace('bundle_root.parent != Path("/run")', `bundle_root.parent != Path("${runRoot}")`)
     .replace('info.st_uid != 0', `info.st_uid != ${uid}`)
     .replace('backup_path.startswith("/root/docker/kinvest/backups/")', `backup_path.startswith("${path.join(serverRoot, 'backups')}/")`)
@@ -613,7 +617,10 @@ async function run() {
       }))
       if (recoverySchemaMax === 1) {
         assert.equal(restore.status, 0, restore.stderr)
-        assert.equal(parsedState(migratedCrash, 'current.state').schemaVersion, 1)
+        const restoredState = parsedState(migratedCrash, 'current.state')
+        assert.equal(restoredState.schemaVersion, 1)
+        assert.equal(restoredState.databaseBackupPath, marker.databaseBackupPath)
+        assert.equal(restoredState.databaseBackupChecksum, marker.databaseBackupChecksum)
         assert.equal(fs.existsSync(markerPath), false)
       } else {
         assert.equal(restore.status, 75)
@@ -623,6 +630,40 @@ async function run() {
       }
     } finally {
       spawnSync('/bin/rm', ['-rf', migratedCrash.base])
+    }
+  }
+
+  for (const invalidReference of ['outside-root', 'missing', 'checksum-mismatch']) {
+    const invalidMarker = createFixture({
+      failure: 'none', legacyProtocol4: true, crashStage: 'compose', migratedSchema: 1, recoverySchemaMax: 1
+    })
+    try {
+      const request = payload({ mode: 'disabled', provider: 'disabled' })
+      assert.equal(execute(invalidMarker, request).signal, 'SIGKILL')
+      assert.equal(execute(invalidMarker, request).stderr, 'DEPLOY_INCOMPLETE_RESTORE_REQUIRED\n')
+      const markerPath = path.join(invalidMarker.stateDir, 'deploy-incomplete.marker')
+      const marker = JSON.parse(fs.readFileSync(markerPath, 'utf8'))
+      if (invalidReference === 'outside-root') {
+        const outside = path.join(invalidMarker.base, 'outside.sqlite')
+        fs.copyFileSync(marker.databaseBackupPath, outside)
+        fs.chmodSync(outside, 0o600)
+        marker.databaseBackupPath = outside
+      } else if (invalidReference === 'missing') {
+        marker.databaseBackupPath = path.join(invalidMarker.base, 'server/backups/missing.sqlite')
+      } else {
+        marker.databaseBackupChecksum = '0'.repeat(64)
+      }
+      fs.writeFileSync(markerPath, `${JSON.stringify(marker)}\n`, { mode: 0o600 })
+      const before = fs.readFileSync(markerPath, 'utf8')
+      const restore = execute(invalidMarker, payload({
+        intent: 'RESTORE', digest: identities.currentDigest, commit: identities.currentCommit,
+        mode: 'disabled', provider: 'disabled'
+      }))
+      assert.notEqual(restore.status, 0, invalidReference)
+      assert.match(restore.stderr, /DEPLOY_INCOMPLETE_MARKER_BACKUP_INVALID/, invalidReference)
+      assert.equal(fs.readFileSync(markerPath, 'utf8'), before, invalidReference)
+    } finally {
+      spawnSync('/bin/rm', ['-rf', invalidMarker.base])
     }
   }
 

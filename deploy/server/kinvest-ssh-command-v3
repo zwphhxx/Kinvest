@@ -2,6 +2,11 @@
 set -euo pipefail
 
 INSTALL_JOURNAL='/root/docker/kinvest/state/install-v4.journal'
+INSTALL_LOCK="${INSTALL_JOURNAL%/*}/install-v4.lock"
+if ! /usr/bin/flock -n "$INSTALL_LOCK" true; then
+  printf '%s\n' 'DEPLOY_INSTALL_INCOMPLETE' >&2
+  exit 76
+fi
 if [[ -e "$INSTALL_JOURNAL" || -L "$INSTALL_JOURNAL" ]]; then
   printf '%s\n' 'DEPLOY_INSTALL_INCOMPLETE' >&2
   exit 76

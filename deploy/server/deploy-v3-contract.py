@@ -24,6 +24,9 @@ MAX_LINE_BYTES = 6144
 BUNDLE_ROOT = Path("/run/kinvest-secrets")
 BUNDLE_UID = 0
 BUNDLE_GID = 10001
+BACKUP_ROOT = Path("/root/docker/kinvest/backups")
+BACKUP_UID = 0
+BACKUP_GID = 0
 BUNDLE_MODE = 0o550
 BUNDLE_FILE_MODE = 0o440
 VERSION_PATTERN = re.compile(r"^v[0-9]{8}-[0-9]{3}$")
@@ -1142,7 +1145,7 @@ def write_incomplete_marker(destination: Path, journal_value: dict[str, Any]) ->
     write_deploy_journal(destination, value)
 
 
-def load_incomplete_marker(destination: Path) -> bool:
+def load_incomplete_marker(destination: Path) -> dict[str, Any] | None:
     validate_atomic_destination(destination, "DEPLOY_INCOMPLETE_MARKER_INVALID")
     try:
         info = destination.lstat()
@@ -1182,7 +1185,49 @@ def load_incomplete_marker(destination: Path) -> bool:
         or not isinstance(backup_checksum, str) or FINGERPRINT_PATTERN.fullmatch(backup_checksum) is None
     ):
         fail("DEPLOY_INCOMPLETE_MARKER_INVALID")
-    return True
+    return value
+
+
+def incomplete_marker_backup_reference(destination: Path) -> dict[str, str]:
+    value = load_incomplete_marker(destination)
+    if value is None:
+        fail("DEPLOY_INCOMPLETE_MARKER_BACKUP_INVALID")
+    backup_path = value["databaseBackupPath"]
+    backup_checksum = value["databaseBackupChecksum"]
+    if (backup_path, backup_checksum) == ("none", "none"):
+        return {"databaseBackupChecksum": "none", "databaseBackupPath": "none"}
+    path = Path(backup_path)
+    descriptor = None
+    try:
+        root_info = BACKUP_ROOT.lstat()
+        file_info = path.lstat()
+        if (
+            path.parent != BACKUP_ROOT
+            or not stat.S_ISDIR(root_info.st_mode)
+            or stat.S_IMODE(root_info.st_mode) != 0o700
+            or root_info.st_uid != BACKUP_UID
+            or root_info.st_gid != BACKUP_GID
+            or not stat.S_ISREG(file_info.st_mode)
+            or stat.S_IMODE(file_info.st_mode) != 0o600
+            or file_info.st_uid != BACKUP_UID
+            or file_info.st_gid != BACKUP_GID
+        ):
+            fail("DEPLOY_INCOMPLETE_MARKER_BACKUP_INVALID")
+        descriptor = os.open(path, os.O_RDONLY | os.O_NOFOLLOW)
+        opened = os.fstat(descriptor)
+        if (opened.st_dev, opened.st_ino) != (file_info.st_dev, file_info.st_ino):
+            fail("DEPLOY_INCOMPLETE_MARKER_BACKUP_INVALID")
+        digest = hashlib.sha256()
+        while chunk := os.read(descriptor, 1024 * 1024):
+            digest.update(chunk)
+        if digest.hexdigest() != backup_checksum:
+            fail("DEPLOY_INCOMPLETE_MARKER_BACKUP_INVALID")
+    except OSError:
+        fail("DEPLOY_INCOMPLETE_MARKER_BACKUP_INVALID")
+    finally:
+        if descriptor is not None:
+            os.close(descriptor)
+    return {"databaseBackupChecksum": backup_checksum, "databaseBackupPath": backup_path}
 
 
 def clear_incomplete_marker(destination: Path) -> None:
@@ -1753,6 +1798,9 @@ def main(argv: list[str]) -> int:
         return 0
     if command == "check-incomplete-marker" and len(argv) == 3:
         sys.stdout.write("ACTIVE\n" if load_incomplete_marker(Path(argv[2])) else "CLEAN\n")
+        return 0
+    if command == "incomplete-marker-backup-reference" and len(argv) == 3:
+        sys.stdout.write(canonical_json(incomplete_marker_backup_reference(Path(argv[2]))) + "\n")
         return 0
     if command == "clear-incomplete-marker" and len(argv) == 3:
         clear_incomplete_marker(Path(argv[2]))

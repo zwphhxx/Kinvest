@@ -61,11 +61,27 @@ the marker. Otherwise it stops with `ROLLBACK_REQUIRES_DB_RESTORE` and preserves
 the backup path and checksum. Database restoration remains a separate manual,
 approved operation; deploy-v4 never restores the persistent database itself.
 
+For an ACTIVE marker, RESTORE uses the marker's database backup reference ahead
+of state or attempt data. The referenced file must be a root-owned regular
+`0600` file directly under the approved backup directory, and its actual
+SHA-256 must match the marker. Invalid, missing, writable, symlinked, or changed
+references fail closed while preserving the marker. A compatible successful
+RESTORE first persists that exact path and checksum in `current.state`; only
+after the atomic state write and directory fsync may it clear the marker.
+
 The v4 installer first installs one backward-compatible journal-aware gate by
 fsyncing a temporary file, atomically renaming it, and fsyncing its directory.
 With no install journal, deploy-v3 still delegates to the old assets; deploy-v4
 delegates only after its complete asset closure exists. With a journal, both
 paths return `DEPLOY_INSTALL_INCOMPLETE` before executing any deploy asset.
+
+The installer always acquires `install-v4.lock` before the shared `deploy.lock`
+and holds both through gate installation, reconciliation, transaction commit,
+and journal clearing. A deployment already holding `deploy.lock` therefore
+prevents the installer from reading or replacing any target asset. The stable
+gate probes only `install-v4.lock` without waiting; it fails closed even in the
+window before the install journal is published. The deployer continues to own
+the deploy lock itself, so there is no reverse lock acquisition path.
 
 The subsequent v4 transaction includes the shared deployer, both v3 and v4
 contract paths, Compose, sudoers, and configuration. Before publishing
@@ -76,6 +92,13 @@ is fsynced again after clearing. Re-run the same reviewed installer to reconcile
 an interrupted installation: it restores the complete old target set first and
 then starts a new transaction. Installation and reconciliation never restart a
 service or invoke Compose.
+
+Each installed or restored regular file is written to a same-directory
+temporary file, fsynced, atomically renamed, and followed immediately by a
+parent-directory fsync. Removing a target recorded as originally absent is
+followed by a parent-directory fsync. These calls establish the intended
+filesystem ordering for crash recovery; they do not claim protection from
+storage hardware or filesystems that falsely report completed flushes.
 
 If a protocol-v4 RESTORE has already switched runtime to a newly approved tmpfs
 bundle and post-switch acceptance fails, the marker remains even though the raw

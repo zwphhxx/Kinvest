@@ -11,15 +11,15 @@ BACKUP_ROOT="$SERVER_ROOT/install-backups/deploy-v4"
 INSTALL_JOURNAL="$SERVER_ROOT/state/install-v4.journal"
 GATE_SOURCE="$SOURCE_DIR/kinvest-ssh-command-v3"
 GATE_TARGET="$LOCAL_SBIN/kinvest-ssh-command"
-GATE_EXPECTED_HASH='f4da2a9c3358ed9f79b8681b0ade24237a6494f6a6e00407c7bcc73efe8f2442'
+GATE_EXPECTED_HASH='22831d2ac664e9d384d2b5fedc63d090fa4cfe1fc8a5608e851260cb32e00081'
 SOURCE_ASSETS=('deploy-kinvest-v4' 'deploy-kinvest-v3.sh' 'deploy-v3-contract.py' 'deploy-v3-contract.py' 'docker-compose-v3.yml' 'kinvest-deploy-v4.sudoers' 'access-control-network.conf.example')
 TARGETS=("$LOCAL_SBIN/deploy-kinvest-v4" "$LOCAL_SBIN/deploy-kinvest-v3" "$LOCAL_LIBEXEC/kinvest-deploy-v4-contract" "$LOCAL_LIBEXEC/kinvest-deploy-v3-contract" "$SERVER_ROOT/docker-compose-v4.yml" "$SUDOERS_DIR/kinvest-deploy-v4" "$SERVER_ROOT/access-control-network.conf.example")
 MODES=('0755' '0755' '0755' '0755' '0644' '0440' '0600')
 EXPECTED_ASSET_HASHES=(
   'fb25bd314ab46e3af56fe46e83564000d7388d6f7670b63d370b4047d2d4e86d'
-  'd9c695c0852a346d78e4021c1915a176f77aba9a6259a40bf8794855d226235e'
-  '2d5e2bd7b6831cebbe3c9b26b832a9d7437789e728931f07f0c64a8041019a1c'
-  '2d5e2bd7b6831cebbe3c9b26b832a9d7437789e728931f07f0c64a8041019a1c'
+  '0f5a6b5a09a6251c48b329263d9a5a27221bd6a1fa6b9a42a69750614b788bd8'
+  '68040b9177cc8d2bb929a351e289eee7e9c6e446fda447ceec12d9ad382afe23'
+  '68040b9177cc8d2bb929a351e289eee7e9c6e446fda447ceec12d9ad382afe23'
   '7698dd619fb6a441763f85e4e35c819af55e431c6d0ac9c4b527930d07a644aa'
   '3001cab7876d3d03b3188aa60f25450d0010ba272e2419b10a5da2fba9ad51cf'
   'cef9b242ad3de3c2134e2a4e7e1ae1693ce55cd63bb9ac9d65710ec796309594'
@@ -60,6 +60,8 @@ done
 install -d -o root -g root -m 0755 "$LOCAL_SBIN" "$LOCAL_LIBEXEC" "$SERVER_ROOT" "$SERVER_ROOT/state" "$SUDOERS_DIR"
 install -d -o root -g root -m 0700 "$BACKUP_ROOT"
 
+exec 8>"$SERVER_ROOT/state/install-v4.lock"
+flock -n 8 || fail 'another Kinvest installer is already running'
 exec 9>"$SERVER_ROOT/state/deploy.lock"
 flock -n 9 || fail 'another Kinvest deployment is already running'
 
@@ -109,12 +111,20 @@ rollback_targets() {
       chmod "$mode" "$restored" || rollback_failed='true'
       if [[ "$(file_hash "$restored")" != "${BACKUP_HASHES[$index]}" || "$(file_attributes "$restored")" != "${BACKUP_ATTRIBUTES[$index]}" ]]; then
         rollback_failed='true'
+      elif ! fsync_file "$restored"; then
+        rollback_failed='true'
       elif ! mv -fT "$restored" "$target"; then
+        rollback_failed='true'
+      elif ! fsync_directory "$(dirname "$target")"; then
         rollback_failed='true'
       fi
       rm -f "$restored"
     elif [[ -e "$target" || -L "$target" ]]; then
-      [[ -f "$target" || -L "$target" ]] && rm -f "$target" || rollback_failed='true'
+      if [[ -f "$target" || -L "$target" ]]; then
+        rm -f "$target" && fsync_directory "$(dirname "$target")" || rollback_failed='true'
+      else
+        rollback_failed='true'
+      fi
     fi
   done
   fsync_target_directories || rollback_failed='true'
@@ -247,7 +257,9 @@ transaction_started='true'
 for index in "${!TARGETS[@]}"; do
   temporary="$(mktemp "$(dirname "${TARGETS[$index]}")/.kinvest-v4-install.XXXXXX")"
   install -o root -g root -m "${MODES[$index]}" "$stage/$index" "$temporary"
+  fsync_file "$temporary"
   mv -fT "$temporary" "${TARGETS[$index]}"
+  fsync_directory "$(dirname "${TARGETS[$index]}")"
   temporary=''
 done
 fsync_target_directories

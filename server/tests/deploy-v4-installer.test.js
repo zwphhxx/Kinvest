@@ -12,7 +12,7 @@ function writeExecutable(file, source) {
   fs.writeFileSync(file, source, { mode: 0o755 })
 }
 
-function fixture({ existing = true, replaceFailure = null, postFailure = false, rollbackPause = false, killAfterReplacement = null, killStage = '' } = {}) {
+function fixture({ existing = true, replaceFailure = null, postFailure = false, rollbackPause = false, pauseBeforeGate = false, killAfterReplacement = null, killStage = '' } = {}) {
   const base = fs.mkdtempSync(path.join(os.tmpdir(), 'kinvest-v4-installer-'))
   const sbin = path.join(base, 'sbin')
   const libexec = path.join(base, 'libexec')
@@ -21,8 +21,10 @@ function fixture({ existing = true, replaceFailure = null, postFailure = false, 
   const runRoot = path.join(base, 'run')
   const bin = path.join(base, 'bin')
   const eventLog = path.join(base, 'events.log')
-  const lockDir = path.join(base, 'deploy.lock.held')
+  const installerLockDir = path.join(base, 'installer.lock.held')
+  const deployLockDir = path.join(base, 'deploy.lock.held')
   const lockRelease = path.join(base, 'lock.release')
+  const locksHeldMarker = path.join(base, 'locks.held')
   const rollbackMarker = path.join(base, 'rollback.started')
   const rollbackRelease = path.join(base, 'rollback.release')
   const killMarker = path.join(base, 'kill.once')
@@ -31,15 +33,29 @@ function fixture({ existing = true, replaceFailure = null, postFailure = false, 
     fs.mkdirSync(directory, { recursive: true })
   }
   writeExecutable(path.join(bin, 'flock'), `#!/usr/bin/env bash
-if [[ -z "\${INSTALL_LOCK_DIR:-}" ]]; then exit 0; fi
-if mkdir "$INSTALL_LOCK_DIR" 2>/dev/null; then
-  printf '%s:lock\\n' "$INSTALLER_ID" >>"$INSTALL_EVENTS"
-  if [[ "\${HOLD_INSTALL_LOCK:-}" == 1 ]]; then
+kind='gate'
+case "\${*: -1}" in 8) kind='install';; 9) kind='deploy';; esac
+if [[ "$kind" == install ]]; then lock_dir="\${INSTALLER_LOCK_DIR:-}"; else lock_dir="\${DEPLOY_LOCK_DIR:-}"; fi
+if [[ -z "$lock_dir" ]]; then exit 0; fi
+if [[ "$kind" == deploy && "\${BLOCK_DEPLOY_LOCK:-}" == 1 ]]; then
+  printf '%s:deploy-contended\\n' "$INSTALLER_ID" >>"$INSTALL_EVENTS"
+  exit 1
+fi
+if [[ "$kind" == gate ]]; then
+  if [[ -d "$INSTALLER_LOCK_DIR" ]]; then
+    printf '%s:gate-contended\\n' "$INSTALLER_ID" >>"$INSTALL_EVENTS"
+    exit 1
+  fi
+  exit 0
+fi
+if mkdir "$lock_dir" 2>/dev/null; then
+  printf '%s:%s-lock\\n' "$INSTALLER_ID" "$kind" >>"$INSTALL_EVENTS"
+  if [[ "\${HOLD_LOCK_KIND:-}" == "$kind" ]]; then
     while [[ ! -e "$INSTALL_LOCK_RELEASE" ]]; do sleep 0.01; done
   fi
   exit 0
 fi
-printf '%s:contended\\n' "$INSTALLER_ID" >>"$INSTALL_EVENTS"
+printf '%s:%s-contended\\n' "$INSTALLER_ID" "$kind" >>"$INSTALL_EVENTS"
 exit 1
 `)
   writeExecutable(path.join(bin, 'sha256sum'), `#!/usr/bin/env bash
@@ -53,7 +69,15 @@ exec "$REAL_SHA256SUM" "$@"
   writeExecutable(path.join(bin, 'sudo'), '#!/bin/sh\nexit 0\n')
   writeExecutable(path.join(bin, 'visudo'), '#!/bin/sh\nexit 0\n')
   writeExecutable(path.join(bin, 'realpath'), '#!/bin/sh\n[ "${1:-}" = -e ] && shift\nprintf \'%s\\n\' "$1"\n')
-  writeExecutable(path.join(bin, 'mv'), '#!/usr/bin/env bash\nargs=()\nfor arg in "$@"; do [[ "$arg" == -fT ]] || args+=("$arg"); done\nexec /bin/mv -f "${args[@]}"\n')
+  writeExecutable(path.join(bin, 'mv'), `#!/usr/bin/env bash
+args=()
+for arg in "$@"; do [[ "$arg" == -fT || "$arg" == -f ]] || args+=("$arg"); done
+count="\${#args[@]}"
+source="\${args[$((count - 2))]}"
+target="\${args[$((count - 1))]}"
+[[ -z "\${FSYNC_TRACE:-}" ]] || printf 'rename:%s:%s\\n' "$source" "$target" >>"$FSYNC_TRACE"
+exec /bin/mv -f "\${args[@]}"
+`)
 
   const gate = path.join(sbin, 'kinvest-ssh-command')
   const targets = [
@@ -127,9 +151,17 @@ if [[ ! -e '${killMarker}' ]]; then : >'${killMarker}'; kill -KILL $$; fi`]
   while [[ ! -e '${rollbackRelease}' ]]; do sleep 0.01; done`
     )
   }
+  if (pauseBeforeGate) {
+    instrumented = instrumented.replace(
+      "flock -n 9 || fail 'another Kinvest deployment is already running'",
+      `flock -n 9 || fail 'another Kinvest deployment is already running'
+  : >'${locksHeldMarker}'
+  while [[ ! -e '${lockRelease}' ]]; do sleep 0.01; done`
+    )
+  }
   const script = path.join(base, 'installer.sh')
   writeExecutable(script, instrumented)
-  return { base, bin, eventLog, fsyncTrace, gate, lockDir, lockRelease, rollbackMarker, rollbackRelease, script, serverRoot, targets }
+  return { base, bin, eventLog, fsyncTrace, gate, installerLockDir, deployLockDir, lockRelease, locksHeldMarker, rollbackMarker, rollbackRelease, script, serverRoot, targets }
 }
 
 function installerEnvironment(context, overrides = {}) {
@@ -138,6 +170,7 @@ function installerEnvironment(context, overrides = {}) {
     KINVEST_INSTALL_V4_TEST_ROOT: '1',
     PATH: `${context.bin}:${process.env.PATH}`,
     REAL_SHA256SUM: spawnSync('which', ['sha256sum'], { encoding: 'utf8' }).stdout.trim(),
+    FSYNC_TRACE: context.fsyncTrace,
     ...overrides
   }
 }
@@ -185,22 +218,56 @@ function assertOld(context, existing) {
   }
 }
 
+function assertDurableRenames(trace, fragment) {
+  const renames = trace
+    .map((event, index) => ({ event, index }))
+    .filter(({ event }) => event.startsWith('rename:') && event.includes(fragment))
+  assert.equal(renames.length, 7, fragment)
+  for (let position = 0; position < renames.length; position += 1) {
+    const { event, index } = renames[position]
+    const [, temporary, target] = event.split(':')
+    const nextRename = renames[position + 1]?.index ?? trace.length
+    assert.ok(trace.lastIndexOf(`file:${temporary}`, index) >= 0, `missing temp fsync for ${target}`)
+    assert.ok(trace.slice(index + 1, nextRename).includes(`dir:${path.dirname(target)}`), `missing immediate parent fsync for ${target}`)
+  }
+}
+
 async function run() {
   assert.doesNotMatch(installerSource, /systemctl restart|docker compose|DEPLOY_V4_ENABLED/)
+
+  const deploymentBusy = fixture()
+  try {
+    const result = execute(deploymentBusy, {
+      INSTALL_EVENTS: deploymentBusy.eventLog,
+      INSTALLER_LOCK_DIR: deploymentBusy.installerLockDir,
+      DEPLOY_LOCK_DIR: deploymentBusy.deployLockDir,
+      INSTALL_TARGET_ROOT: deploymentBusy.base,
+      INSTALLER_ID: 'installer',
+      BLOCK_DEPLOY_LOCK: '1'
+    })
+    assert.notEqual(result.status, 0)
+    const events = fs.readFileSync(deploymentBusy.eventLog, 'utf8').trim().split('\n')
+    assert.deepEqual(events.slice(0, 2), ['installer:install-lock', 'installer:deploy-contended'])
+    assert.equal(events.some((event) => event.endsWith(':target-read')), false)
+    assertOld(deploymentBusy, true)
+  } finally {
+    fs.rmSync(deploymentBusy.base, { recursive: true, force: true })
+  }
 
   const concurrent = fixture()
   try {
     const sharedEnvironment = {
       INSTALL_EVENTS: concurrent.eventLog,
-      INSTALL_LOCK_DIR: concurrent.lockDir,
+      INSTALLER_LOCK_DIR: concurrent.installerLockDir,
+      DEPLOY_LOCK_DIR: concurrent.deployLockDir,
       INSTALL_LOCK_RELEASE: concurrent.lockRelease,
       INSTALL_TARGET_ROOT: concurrent.base
     }
     const first = spawn('bash', [concurrent.script, sourceDir], {
-      env: installerEnvironment(concurrent, { ...sharedEnvironment, HOLD_INSTALL_LOCK: '1', INSTALLER_ID: 'first' }),
+      env: installerEnvironment(concurrent, { ...sharedEnvironment, HOLD_LOCK_KIND: 'install', INSTALLER_ID: 'first' }),
       stdio: 'ignore'
     })
-    await waitFor(() => fs.existsSync(concurrent.eventLog) && fs.readFileSync(concurrent.eventLog, 'utf8').includes('first:lock'))
+    await waitFor(() => fs.existsSync(concurrent.eventLog) && fs.readFileSync(concurrent.eventLog, 'utf8').includes('first:install-lock'))
     const second = execute(concurrent, { ...sharedEnvironment, INSTALLER_ID: 'second' })
     assert.notEqual(second.status, 0)
     const whileLocked = fs.readFileSync(concurrent.eventLog, 'utf8').trim().split('\n')
@@ -209,9 +276,58 @@ async function run() {
     const firstExit = await waitForExit(first)
     assert.equal(firstExit.status, 0)
     const events = fs.readFileSync(concurrent.eventLog, 'utf8').trim().split('\n')
-    assert.ok(events.indexOf('first:lock') < events.indexOf('first:target-read'))
+    assert.ok(events.indexOf('first:install-lock') < events.indexOf('first:deploy-lock'))
+    assert.ok(events.indexOf('first:deploy-lock') < events.indexOf('first:target-read'))
   } finally {
     fs.rmSync(concurrent.base, { recursive: true, force: true })
+  }
+
+  const gateWindow = fixture({ pauseBeforeGate: true })
+  try {
+    const lockEnvironment = {
+      INSTALL_EVENTS: gateWindow.eventLog,
+      INSTALLER_LOCK_DIR: gateWindow.installerLockDir,
+      DEPLOY_LOCK_DIR: gateWindow.deployLockDir,
+      INSTALL_LOCK_RELEASE: gateWindow.lockRelease,
+      INSTALLER_ID: 'installer'
+    }
+    const child = spawn('bash', [gateWindow.script, sourceDir], {
+      env: installerEnvironment(gateWindow, lockEnvironment), stdio: 'ignore'
+    })
+    await waitFor(() => fs.existsSync(gateWindow.locksHeldMarker))
+    const journal = path.join(gateWindow.serverRoot, 'state/install-v4.journal')
+    assert.equal(fs.existsSync(journal), false)
+    const gateHarness = path.join(gateWindow.base, 'gate-harness')
+    writeExecutable(gateHarness, fs.readFileSync(path.join(sourceDir, 'kinvest-ssh-command-v3'), 'utf8')
+      .replace('/usr/bin/flock', path.join(gateWindow.bin, 'flock'))
+      .replace('/root/docker/kinvest/state/install-v4.journal', journal))
+    const blocked = spawnSync(gateHarness, [], {
+      encoding: 'utf8', env: { ...process.env, ...lockEnvironment, PATH: `${gateWindow.bin}:${process.env.PATH}`, INSTALLER_ID: 'gate', SSH_ORIGINAL_COMMAND: 'deploy-v3' }
+    })
+    assert.equal(blocked.status, 76)
+    assert.equal(blocked.stderr, 'DEPLOY_INSTALL_INCOMPLETE\n')
+    fs.writeFileSync(gateWindow.lockRelease, '')
+    assert.equal((await waitForExit(child)).status, 0)
+    fs.rmSync(gateWindow.installerLockDir, { recursive: true, force: true })
+    fs.rmSync(gateWindow.deployLockDir, { recursive: true, force: true })
+    const installedGate = path.join(gateWindow.base, 'installed-gate')
+    let installedSource = fs.readFileSync(gateWindow.gate, 'utf8')
+      .replace('/usr/bin/flock', path.join(gateWindow.bin, 'flock'))
+      .replace('/root/docker/kinvest/state/install-v4.journal', journal)
+    const productionAssets = [
+      '/usr/local/sbin/deploy-kinvest-v4', '/usr/local/sbin/deploy-kinvest-v3',
+      '/usr/local/libexec/kinvest-deploy-v4-contract', '/usr/local/libexec/kinvest-deploy-v3-contract'
+    ]
+    for (let index = 0; index < productionAssets.length; index += 1) installedSource = installedSource.replaceAll(productionAssets[index], gateWindow.targets[index])
+    for (let index = 0; index < 4; index += 1) assert.equal(fs.accessSync(gateWindow.targets[index], fs.constants.X_OK), undefined, `asset ${index}`)
+    writeExecutable(installedGate, installedSource)
+    const delegated = spawnSync(installedGate, [], {
+      encoding: 'utf8', env: { ...process.env, ...lockEnvironment, PATH: `${gateWindow.bin}:${process.env.PATH}`, INSTALLER_ID: 'gate', SSH_ORIGINAL_COMMAND: 'deploy-v4' }
+    })
+    assert.equal(delegated.status, 0, delegated.stderr)
+    for (const target of gateWindow.targets) assert.doesNotMatch(fs.readFileSync(target, 'utf8'), /^old-/)
+  } finally {
+    fs.rmSync(gateWindow.base, { recursive: true, force: true })
   }
 
   const signalled = fixture({ replaceFailure: 3, rollbackPause: true })
@@ -240,7 +356,11 @@ async function run() {
       const journal = path.join(interrupted.serverRoot, 'state/install-v4.journal')
       assert.equal(fs.existsSync(journal), killStage === 'after-journal', killStage)
       if (killStage === 'after-gate') {
-        const delegated = spawnSync(interrupted.gate, [], {
+        const wrapperHarness = path.join(interrupted.base, 'after-gate-wrapper')
+        writeExecutable(wrapperHarness, fs.readFileSync(interrupted.gate, 'utf8')
+          .replace('/usr/bin/flock', path.join(interrupted.bin, 'flock'))
+          .replace('/root/docker/kinvest/state/install-v4.journal', journal))
+        const delegated = spawnSync(wrapperHarness, [], {
           encoding: 'utf8', env: { ...process.env, PATH: `${interrupted.bin}:${process.env.PATH}`, SSH_ORIGINAL_COMMAND: 'deploy-v3' }
         })
         assert.equal(delegated.status, 0, delegated.stderr)
@@ -265,7 +385,9 @@ async function run() {
         assert.notEqual(blocked.status, 0, `replacement ${index}`)
       } else {
         const wrapperHarness = path.join(interrupted.base, 'wrapper-harness')
-        writeExecutable(wrapperHarness, fs.readFileSync(interrupted.gate, 'utf8').replace('/root/docker/kinvest/state/install-v4.journal', journal))
+        writeExecutable(wrapperHarness, fs.readFileSync(interrupted.gate, 'utf8')
+          .replace('/usr/bin/flock', path.join(interrupted.bin, 'flock'))
+          .replace('/root/docker/kinvest/state/install-v4.journal', journal))
         const blocked = spawnSync(wrapperHarness, [], {
           encoding: 'utf8',
           env: { ...process.env, PATH: `${interrupted.bin}:${process.env.PATH}`, SSH_ORIGINAL_COMMAND: 'deploy-v4' }
@@ -299,6 +421,7 @@ async function run() {
   try {
     assert.notEqual(execute(post).status, 0)
     assertOld(post, true)
+    assertDurableRenames(fs.readFileSync(post.fsyncTrace, 'utf8').trim().split('\n'), '.kinvest-v4-restore.')
   } finally {
     fs.rmSync(post.base, { recursive: true, force: true })
   }
@@ -318,6 +441,7 @@ async function run() {
     for (const target of success.targets) assert.equal(fs.existsSync(target), true)
     assert.equal(fs.readFileSync(success.targets[2], 'utf8'), fs.readFileSync(success.targets[3], 'utf8'))
     const trace = fs.readFileSync(success.fsyncTrace, 'utf8').trim().split('\n')
+    assertDurableRenames(trace, '.kinvest-v4-install.')
     const publish = trace.indexOf('publish')
     const clear = trace.lastIndexOf('clear')
     assert.ok(publish > 0 && clear > publish)

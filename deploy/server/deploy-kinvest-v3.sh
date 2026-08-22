@@ -86,6 +86,7 @@ preflight_stderr=''
 health_file=''
 access_snapshot=''
 network_json=''
+marker_reference_file=''
 candidate_bundle_id='none'
 candidate_bundle_path=''
 candidate_bundle_keep='false'
@@ -572,7 +573,7 @@ cleanup() {
   for item in "$prepared_file" "$current_json" "$previous_json" "$attempt_json" "$current_original_file" \
     "$previous_original_file" "$plan_file" "$base_file" \
     "$candidate_state_file" "$recovery_state_file" "$envelope_file" "$preflight_stdout" \
-    "$preflight_stderr" "$health_file"; do
+    "$preflight_stderr" "$health_file" "$marker_reference_file"; do
     if safe_runtime_file "$item"; then rm -f -- "$item"; fi
   done
   for item in "${response_files[@]}"; do
@@ -598,6 +599,13 @@ json_field() { "$CONTRACT" json-field "$2" <"$1"; }
 intent="$(json_field "$prepared_file" intent)"
 if [[ "$incomplete_status" == ACTIVE && "$intent" != RESTORE ]]; then
   fail DEPLOY_RESTORE_REQUIRED 76
+fi
+if [[ "$incomplete_status" == ACTIVE ]]; then
+  marker_reference_file="$(mktemp "$RUN_ROOT/kinvest-v3.marker-reference.XXXXXX")"
+  chmod 0600 "$marker_reference_file"
+  "$CONTRACT" incomplete-marker-backup-reference "$INCOMPLETE_MARKER" >"$marker_reference_file" || fail DEPLOY_INCOMPLETE_MARKER_BACKUP_INVALID 76
+  restore_backup_path="$(json_field "$marker_reference_file" databaseBackupPath)"
+  restore_backup_checksum="$(json_field "$marker_reference_file" databaseBackupChecksum)"
 fi
 request_provider="$(json_field "$prepared_file" secretProviderMode)"
 request_versions="$(json_field "$prepared_file" secretVersionIds)"
@@ -888,14 +896,16 @@ fi
 candidate_state_file="$(mktemp "$RUN_ROOT/kinvest-v3.candidate-state.XXXXXX")"
 chmod 0600 "$candidate_state_file"
 if [[ "$intent" == RESTORE ]]; then
-  restore_backup_path="$(json_field "$current_json" databaseBackupPath)"
-  restore_backup_checksum="$(json_field "$current_json" databaseBackupChecksum)"
-  if [[ -n "$attempt_json" ]]; then
-    attempt_backup_path="$(json_field "$attempt_json" databaseBackupPath)"
-    attempt_backup_checksum="$(json_field "$attempt_json" databaseBackupChecksum)"
-    if [[ "$attempt_backup_path" != none ]]; then
-      restore_backup_path="$attempt_backup_path"
-      restore_backup_checksum="$attempt_backup_checksum"
+  if [[ "$incomplete_status" != ACTIVE ]]; then
+    restore_backup_path="$(json_field "$current_json" databaseBackupPath)"
+    restore_backup_checksum="$(json_field "$current_json" databaseBackupChecksum)"
+    if [[ -n "$attempt_json" ]]; then
+      attempt_backup_path="$(json_field "$attempt_json" databaseBackupPath)"
+      attempt_backup_checksum="$(json_field "$attempt_json" databaseBackupChecksum)"
+      if [[ "$attempt_backup_path" != none ]]; then
+        restore_backup_path="$attempt_backup_path"
+        restore_backup_checksum="$attempt_backup_checksum"
+      fi
     fi
   fi
   envelope_file="$(mktemp "$RUN_ROOT/kinvest-v3.restore-envelope.XXXXXX")"
