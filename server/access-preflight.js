@@ -116,10 +116,12 @@ async function snapshotDatabaseToPrivateDirectory(
     const reboundDescriptorStat = fs.fstatSync(sourceDescriptor)
     if (!reboundStat.isFile() || reboundStat.isSymbolicLink() ||
       !sameIdentity(anchoredStat, reboundStat) ||
-      !sameIdentity(anchoredStat, reboundDescriptorStat) ||
-      !sameFileState(anchoredStat, reboundStat) ||
-      !sameFileState(anchoredStat, reboundDescriptorStat)) {
+      !sameIdentity(anchoredStat, reboundDescriptorStat)) {
       throw preflightError('ACCESS_PREFLIGHT_DATABASE_PATH_INVALID')
+    }
+    if (!sameFileState(anchoredStat, reboundStat) ||
+      !sameFileState(anchoredStat, reboundDescriptorStat)) {
+      throw preflightError('ACCESS_PREFLIGHT_DATABASE_SNAPSHOT_INVALID')
     }
     await backupDatabase(sourceDatabase, databasePath)
     sourceDatabase.close()

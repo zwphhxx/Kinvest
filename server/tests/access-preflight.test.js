@@ -610,6 +610,49 @@ async function testRejectsInPlaceSnapshotMutation(tempDirectory) {
   assert.equal(stderr.value(), 'ACCESS_PREFLIGHT_DATABASE_SNAPSHOT_INVALID\n')
 }
 
+async function testRejectsReboundStateMutation(tempDirectory) {
+  const { runAccessPreflight } = require('../access-preflight')
+  const productionPath = path.join(tempDirectory, 'rebound-mutation-production.sqlite')
+  const candidatePath = path.join(tempDirectory, 'rebound-mutation-candidate.sqlite')
+  createEmptyDatabase(candidatePath)
+  const anchoredStat = fs.statSync(candidatePath)
+  let backupCalls = 0
+  let preparationCalls = 0
+  const stdout = capture()
+  const stderr = capture()
+
+  const exitCode = await runAccessPreflight({
+    env: enabledEnv(productionPath),
+    databasePath: candidatePath,
+    sourceDescriptorPath: (descriptor) => `/dev/fd/${descriptor}`,
+    openSourceDatabase: (descriptorPath, options) => {
+      const database = new DatabaseSync(descriptorPath, options)
+      fs.appendFileSync(candidatePath, Buffer.from([0]))
+      const mutatedStat = fs.statSync(candidatePath)
+      assert.equal(mutatedStat.dev, anchoredStat.dev)
+      assert.equal(mutatedStat.ino, anchoredStat.ino)
+      assert.notEqual(mutatedStat.size, anchoredStat.size)
+      return database
+    },
+    backupDatabase: async () => {
+      backupCalls += 1
+    },
+    prepare: async () => {
+      preparationCalls += 1
+      throw new Error('prepare must not run for a rebound-mutated snapshot source')
+    },
+    stdout: stdout.stream,
+    stderr: stderr.stream,
+    processRef: new EventEmitter()
+  })
+
+  assert.equal(exitCode, 1)
+  assert.equal(backupCalls, 0)
+  assert.equal(preparationCalls, 0)
+  assert.equal(stdout.value(), '')
+  assert.equal(stderr.value(), 'ACCESS_PREFLIGHT_DATABASE_SNAPSHOT_INVALID\n')
+}
+
 async function testConcurrentSqliteSnapshot(tempDirectory) {
   const { runAccessPreflight } = require('../access-preflight')
   const productionPath = path.join(tempDirectory, 'concurrent-production.sqlite')
@@ -775,16 +818,10 @@ async function testDescriptorAnchorsSqliteOpen(tempDirectory) {
       openCalls += 1
       fs.renameSync(candidatePath, anchoredPath)
       fs.renameSync(replacementPath, candidatePath)
-      let database
-      try {
-        database = new DatabaseSync(descriptorPath, options)
-        openedMarker = database.prepare(
-          'SELECT value FROM identity_marker'
-        ).get().value
-      } finally {
-        fs.renameSync(candidatePath, replacementPath)
-        fs.renameSync(anchoredPath, candidatePath)
-      }
+      const database = new DatabaseSync(descriptorPath, options)
+      openedMarker = database.prepare(
+        'SELECT value FROM identity_marker'
+      ).get().value
       return database
     },
     prepare: async ({ openDatabase, closeDatabase }) => {
@@ -810,6 +847,8 @@ async function testDescriptorAnchorsSqliteOpen(tempDirectory) {
     stderr: stderr.stream,
     processRef: new EventEmitter()
   })
+  fs.renameSync(candidatePath, replacementPath)
+  fs.renameSync(anchoredPath, candidatePath)
 
   assert.equal(openCalls, 1)
   assert.equal(openedMarker, 'verified-inode')
@@ -1078,6 +1117,7 @@ async function run() {
     await testRejectsWalSnapshotSidecars(tempDirectory)
     await testCleanupCompletesBeforeSuccessOutput(tempDirectory)
     await testRejectsInPlaceSnapshotMutation(tempDirectory)
+    await testRejectsReboundStateMutation(tempDirectory)
     await testConcurrentSqliteSnapshot(tempDirectory)
     await testDescriptorAnchorsSqliteOpen(tempDirectory)
     await testRealGithubTmpfsProviderChain(tempDirectory)
