@@ -4,10 +4,15 @@ umask 077
 
 ROOT='/root/docker/kinvest'
 RUN_ROOT='/run'
+DEPLOY_PROTOCOL="${KINVEST_DEPLOY_PROTOCOL:-3}"
 BUNDLE_UID='0'
 BUNDLE_GID='10001'
 COMPOSE="$ROOT/docker-compose-v3.yml"
 CONTRACT='/usr/local/libexec/kinvest-deploy-v3-contract'
+if [[ "$DEPLOY_PROTOCOL" == 4 ]]; then
+  COMPOSE="${KINVEST_DEPLOY_COMPOSE:?set v4 compose path}"
+  CONTRACT="${KINVEST_DEPLOY_CONTRACT:?set v4 contract path}"
+fi
 OFFLINE_IMAGE_ATTESTATION='/usr/local/libexec/kinvest-offline-image-attestation'
 DATA_DIR="$ROOT/data"
 DATABASE="$DATA_DIR/kinvest.sqlite"
@@ -20,6 +25,7 @@ VERSION_LEDGER="$STATE/secret-version-ledger.json"
 PUBLIC_HEALTH_URL='https://dearmina.cn/api/health'
 BUNDLE_ROOT="$RUN_ROOT/kinvest-secrets"
 METADATA_NETWORK_CONFIG='/etc/kinvest/metadata-network.conf'
+ACCESS_NETWORK_CONFIG='/etc/kinvest/access-control-network.conf'
 DOCKER_TIMEOUT='120s'
 INSPECT_TIMEOUT='15s'
 PULL_TIMEOUT='300s'
@@ -37,6 +43,10 @@ install -d -m 0700 -- "$STATE" "$BACKUP_DIR"
 
 exec 9>"$STATE/deploy.lock"
 flock -n 9 || fail DEPLOY_V3_LOCKED
+
+if [[ "$DEPLOY_PROTOCOL" == 3 && -f "$CURRENT_STATE" && "$(head -n 1 "$CURRENT_STATE")" == 'protocolVersion=5' ]]; then
+  fail DEPLOY_V3_PROTOCOL_RETIRED
+fi
 
 [[ -f "$METADATA_NETWORK_CONFIG" && ! -L "$METADATA_NETWORK_CONFIG" ]] || fail DEPLOY_V3_METADATA_CONFIG_INVALID
 if grep -Eq '^[[:space:]]*(export[[:space:]]+)?KINVEST_SECRET_BUNDLE_PATH[[:space:]]*=' "$METADATA_NETWORK_CONFIG"; then
@@ -60,6 +70,8 @@ envelope_file=''
 preflight_stdout=''
 preflight_stderr=''
 health_file=''
+access_snapshot=''
+network_json=''
 candidate_bundle_id='none'
 candidate_bundle_path=''
 candidate_bundle_keep='false'
@@ -77,6 +89,16 @@ current_schema_version=''
 restore_backup_path='none'
 restore_backup_checksum='none'
 last_preflight_legacy_failure='false'
+request_access_mode='disabled'
+current_access_mode='disabled'
+current_access_contract='0'
+current_trusted_proxies='[]'
+current_proxy_checksum=''
+current_bundle_path=''
+target_access_mode='disabled'
+target_access_contract='0'
+target_trusted_proxies='[]'
+target_proxy_checksum=''
 
 safe_runtime_file() {
   [[ -n "$1" && "$1" == "$RUN_ROOT"/kinvest-v3.* ]]
@@ -155,6 +177,71 @@ if value.get("status") != "ok" or value.get("service") != "kinvest":
 PY
 }
 
+verify_access_behavior() {
+  local mode="$1" watch_body watch_status auth_body auth_status
+  watch_body="$(mktemp "$RUN_ROOT/kinvest-v3.watchlist.XXXXXX")"
+  auth_body="$(mktemp "$RUN_ROOT/kinvest-v3.auth-status.XXXXXX")"
+  chmod 0600 "$watch_body" "$auth_body"
+  watch_status="$(curl -sS --max-time 15 -o "$watch_body" -w '%{http_code}' https://dearmina.cn/api/watchlist)" || return 1
+  if [[ "$mode" == disabled ]]; then
+    [[ "$watch_status" == 200 ]] || return 1
+  else
+    [[ "$watch_status" == 401 ]] || return 1
+    python3 - "$watch_body" <<'PY' || return 1
+import json, sys
+with open(sys.argv[1], encoding="utf-8") as stream:
+    value = json.load(stream)
+if value != {"error": "AUTH_REQUIRED"}:
+    raise SystemExit(1)
+PY
+    auth_status="$(curl -sS --max-time 15 -o "$auth_body" -w '%{http_code}' https://dearmina.cn/api/auth/status)" || return 1
+    [[ "$auth_status" == 200 ]] || return 1
+    python3 - "$auth_body" <<'PY' || return 1
+import json, sys
+with open(sys.argv[1], encoding="utf-8") as stream:
+    value = json.load(stream)
+if value != {"authorized": False}:
+    raise SystemExit(1)
+PY
+  fi
+  rm -f -- "$watch_body" "$auth_body"
+}
+
+create_access_snapshot() {
+  access_snapshot="$(mktemp "$RUN_ROOT/kinvest-v3.access-snapshot.XXXXXX")"
+  python3 - "$DATABASE" "$access_snapshot" <<'PY'
+import os, sqlite3, sys
+source = sqlite3.connect(f"file:{sys.argv[1]}?mode=ro", uri=True)
+destination = sqlite3.connect(sys.argv[2])
+try:
+    source.backup(destination)
+    if destination.execute("PRAGMA quick_check").fetchone()[0] != "ok":
+        raise SystemExit(1)
+finally:
+    destination.close(); source.close()
+for suffix in ("-wal", "-shm", "-journal"):
+    if os.path.exists(sys.argv[2] + suffix):
+        raise SystemExit(1)
+PY
+  chown 10001:10001 "$access_snapshot"
+  chmod 0440 "$access_snapshot"
+}
+
+load_access_network() {
+  network_json="$(mktemp "$RUN_ROOT/kinvest-v3.access-network.XXXXXX")"
+  chmod 0600 "$network_json"
+  "$CONTRACT" validate-network-config "$ACCESS_NETWORK_CONFIG" >"$network_json" || return 1
+  local container network ip running actual_ip
+  container="$(json_field "$network_json" container)"
+  network="$(json_field "$network_json" network)"
+  ip="$(json_field "$network_json" ip)"
+  running="$(run_inspect inspect --format '{{.State.Running}}' "$container" 2>/dev/null)" || return 1
+  actual_ip="$(run_inspect inspect --format "{{with index .NetworkSettings.Networks \"$network\"}}{{.IPAddress}}{{end}}" "$container" 2>/dev/null)" || return 1
+  [[ "$running" == true && "$actual_ip" == "$ip" ]] || return 1
+  target_trusted_proxies="$(json_field "$network_json" trustedProxyAddresses)"
+  target_proxy_checksum="$(json_field "$network_json" checksum)"
+}
+
 run_secret_preflight() {
   local image_id="$1" provider="$2" versions="$3" bundle_path="$4" expected expected_error references bytes error_bytes status output error valid
   output="$(mktemp "$RUN_ROOT/kinvest-v3.preflight-out.XXXXXX")"
@@ -204,6 +291,36 @@ run_secret_preflight() {
   [[ "$valid" == true ]]
 }
 
+run_access_preflight() {
+  local image_id="$1" provider="$2" versions="$3" bundle_path="$4" mode="$5" proxies="$6" output error status expected bytes valid
+  output="$(mktemp "$RUN_ROOT/kinvest-v3.access-preflight-out.XXXXXX")"
+  error="$(mktemp "$RUN_ROOT/kinvest-v3.access-preflight-err.XXXXXX")"
+  chmod 0600 "$output" "$error"
+  status=0
+  (
+    ulimit -f 1
+    run_docker run --rm --user 10001:10001 --read-only --cap-drop ALL \
+      --security-opt no-new-privileges:true --network none \
+      --env "KINVEST_SECRET_PROVIDER_MODE=$provider" \
+      --env "KINVEST_SECRET_VERSION_IDS=$versions" \
+      --env KINVEST_SECRET_BUNDLE_PATH=/run/secrets/kinvest \
+      --env "KINVEST_ACCESS_CONTROL_MODE=$mode" \
+      --env "KINVEST_TRUSTED_PROXY_ADDRESSES=$proxies" \
+      --env KINVEST_DB_PATH=/data/kinvest.sqlite \
+      --volume "$bundle_path:/run/secrets/kinvest:ro" \
+      --volume "$access_snapshot:/data/kinvest.sqlite:ro" \
+      --entrypoint node "$image_id" server/access-preflight.js
+  ) >"$output" 2>"$error" || status=$?
+  expected='KINVEST_ACCESS_PREFLIGHT_OK mode=device-approval references=2 database=ready proxy=ready'
+  bytes=$((${#expected} + 1))
+  valid=false
+  if ((status == 0)) && [[ ! -s "$error" ]] && \
+    [[ "$(wc -c <"$output" | tr -d '[:space:]')" -eq "$bytes" ]] && \
+    [[ "$(cat "$output")" == "$expected" ]]; then valid=true; fi
+  rm -f -- "$output" "$error"
+  [[ "$valid" == true ]]
+}
+
 run_legacy_disabled_recovery_preflight() {
   local image_id="$1" expected bytes status output error valid
   output="$(mktemp "$RUN_ROOT/kinvest-v3.legacy-preflight-out.XXXXXX")"
@@ -233,12 +350,14 @@ run_legacy_disabled_recovery_preflight() {
 }
 
 compose_up() {
-  local image_id="$1" provider="$2" versions="$3" bundle_path="$4"
+  local image_id="$1" provider="$2" versions="$3" bundle_path="$4" access_mode="${5:-disabled}" proxies="${6:-[]}" 
   (
     export KINVEST_IMAGE="$image_id"
     export KINVEST_SECRET_PROVIDER_MODE="$provider"
     export KINVEST_SECRET_VERSION_IDS="$versions"
     export KINVEST_SECRET_BUNDLE_HOST_PATH="$bundle_path"
+    export KINVEST_ACCESS_CONTROL_MODE="$access_mode"
+    export KINVEST_TRUSTED_PROXY_ADDRESSES="$proxies"
     if [[ "$provider" == github-tmpfs-v1 ]]; then
       export KINVEST_SECRET_BUNDLE_PATH=/run/secrets/kinvest
     else
@@ -249,12 +368,14 @@ compose_up() {
 }
 
 compose_down() {
-  local image_id="$1" provider="$2" versions="$3" bundle_path="$4"
+  local image_id="$1" provider="$2" versions="$3" bundle_path="$4" access_mode="${5:-disabled}" proxies="${6:-[]}"
   (
     export KINVEST_IMAGE="$image_id"
     export KINVEST_SECRET_PROVIDER_MODE="$provider"
     export KINVEST_SECRET_VERSION_IDS="$versions"
     export KINVEST_SECRET_BUNDLE_HOST_PATH="$bundle_path"
+    export KINVEST_ACCESS_CONTROL_MODE="$access_mode"
+    export KINVEST_TRUSTED_PROXY_ADDRESSES="$proxies"
     if [[ "$provider" == github-tmpfs-v1 ]]; then
       export KINVEST_SECRET_BUNDLE_PATH=/run/secrets/kinvest
     else
@@ -265,8 +386,8 @@ compose_down() {
 }
 
 make_approved_envelope() {
-  local original="$1" output="$2"
-  python3 - "$original" "$prepared_file" >"$output" <<'PY'
+  local original="$1" output="$2" access_mode="${3:-disabled}" access_contract="${4:-0}" proxies="${5:-[]}" proxy_checksum="${6:-}"
+  python3 - "$original" "$prepared_file" "$access_mode" "$access_contract" "$proxies" "$proxy_checksum" >"$output" <<'PY'
 import json, sys
 with open(sys.argv[1], encoding="ascii") as stream:
     original = json.load(stream)
@@ -275,6 +396,13 @@ with open(sys.argv[2], encoding="ascii") as stream:
 approved = {key: prepared[key] for key in (
     "secretProviderMode", "secretVersionIds", "secretMaterialFingerprints", "secretBundleId"
 )}
+if original.get("protocolVersion") == 5:
+    approved.update({
+        "accessControlMode": sys.argv[3],
+        "imageAccessControlContract": int(sys.argv[4]),
+        "trustedProxyAddresses": json.loads(sys.argv[5]),
+        "trustedProxyConfigChecksum": sys.argv[6],
+    })
 print(json.dumps({"approved": approved, "original": original}, ensure_ascii=True, separators=(",", ":")))
 PY
 }
@@ -298,10 +426,14 @@ prune_unreferenced_bundles() {
 restore_previous_runtime() {
   local recovery_versions recovery_provider recovery_bundle schema_after
   [[ "$transaction_started" == true && -n "$recovery_image_id" ]] || return 1
-  recovery_provider="$request_provider"
-  recovery_versions="$request_versions"
-  recovery_bundle="$candidate_bundle_path"
-  compose_down "$runtime_image_id" "$target_provider" "$target_versions" "$candidate_bundle_path" >/dev/null || return 1
+  recovery_provider="$current_provider"
+  recovery_versions="$current_versions"
+  if [[ "$DEPLOY_PROTOCOL" == 4 ]]; then
+    recovery_bundle="$current_bundle_path"
+  else
+    recovery_bundle="$candidate_bundle_path"
+  fi
+  compose_down "$runtime_image_id" "$target_provider" "$target_versions" "$candidate_bundle_path" "$target_access_mode" "$target_trusted_proxies" >/dev/null || return 1
   schema_after="$(read_schema_version)" || return 1
   if [[ "$current_was_legacy" == true && "$schema_after" != "$current_schema_version" ]]; then
     recovery_error='ROLLBACK_REQUIRES_DB_RESTORE'
@@ -311,9 +443,10 @@ restore_previous_runtime() {
     recovery_error='ROLLBACK_REQUIRES_DB_RESTORE'
     return 1
   fi
-  compose_up "$recovery_image_id" "$recovery_provider" "$recovery_versions" "$recovery_bundle" >/dev/null || return 1
+  compose_up "$recovery_image_id" "$recovery_provider" "$recovery_versions" "$recovery_bundle" "$current_access_mode" "$current_trusted_proxies" >/dev/null || return 1
   wait_for_container "$recovery_image_id" || return 1
   verify_public_health || return 1
+  if [[ "$DEPLOY_PROTOCOL" == 4 ]]; then verify_access_behavior "$current_access_mode" || return 1; fi
 
   if [[ "$current_was_legacy" == true ]]; then
     "$CONTRACT" atomic-legacy-state "$CURRENT_STATE" <"$current_original_file" || return 1
@@ -321,7 +454,7 @@ restore_previous_runtime() {
     envelope_file="$(mktemp "$RUN_ROOT/kinvest-v3.recovery-envelope.XXXXXX")"
     safe_runtime_file "$envelope_file" || return 1
     chmod 0600 "$envelope_file"
-    make_approved_envelope "$current_json" "$envelope_file" || return 1
+    make_approved_envelope "$current_json" "$envelope_file" "$current_access_mode" "$current_access_contract" "$current_trusted_proxies" "$current_proxy_checksum" || return 1
     recovery_state_file="$(mktemp "$RUN_ROOT/kinvest-v3.recovery-state.XXXXXX")"
     chmod 0600 "$recovery_state_file"
     if [[ "$intent" == RESTORE ]]; then
@@ -368,6 +501,7 @@ cleanup() {
     "$preflight_stderr" "$health_file"; do
     if safe_runtime_file "$item"; then rm -f -- "$item"; fi
   done
+  rm -f -- "$access_snapshot" "$network_json"
   exit "$status"
 }
 
@@ -393,6 +527,9 @@ request_provider="$(json_field "$prepared_file" secretProviderMode)"
 request_versions="$(json_field "$prepared_file" secretVersionIds)"
 request_fingerprints="$(json_field "$prepared_file" secretMaterialFingerprints)"
 request_bundle_id="$(json_field "$prepared_file" secretBundleId)"
+if [[ "$DEPLOY_PROTOCOL" == 4 ]]; then
+  request_access_mode="$(json_field "$prepared_file" accessControlMode)"
+fi
 candidate_bundle_id="$request_bundle_id"
 candidate_bundle_path="$(json_field "$prepared_file" secretBundlePath)"
 verification_run_id="$(json_field "$prepared_file" verificationRunId)"
@@ -420,6 +557,17 @@ current_provider="$(json_field "$current_json" secretProviderMode)"
 current_versions="$(json_field "$current_json" secretVersionIds)"
 current_fingerprints="$(json_field "$current_json" secretMaterialFingerprints)"
 current_bundle_id="$(json_field "$current_json" secretBundleId)"
+if [[ "$current_provider" == github-tmpfs-v1 ]]; then
+  current_bundle_path="$BUNDLE_ROOT/$current_bundle_id"
+else
+  current_bundle_path="$BUNDLE_ROOT/disabled"
+fi
+if [[ "$DEPLOY_PROTOCOL" == 4 ]]; then
+  current_access_mode="$(json_field "$current_json" accessControlMode)"
+  current_access_contract="$(json_field "$current_json" imageAccessControlContract)"
+  current_trusted_proxies="$(json_field "$current_json" trustedProxyAddresses)"
+  current_proxy_checksum="$(json_field "$current_json" trustedProxyConfigChecksum)"
+fi
 if [[ "$current_was_legacy" == true && "$request_provider" != disabled ]]; then
   fail DEPLOY_V3_LEGACY_BASELINE_REQUIRED
 fi
@@ -467,6 +615,22 @@ target_commit="$(json_field "$base_file" commit)"
 target_provider="$request_provider"
 target_versions="$(json_field "$plan_file" secretVersionIds)"
 recovery_image_id="$(json_field "$current_json" runtimeImageId)"
+if [[ "$DEPLOY_PROTOCOL" == 4 ]]; then
+  if [[ "$intent" == FORWARD ]]; then
+    target_access_mode="$request_access_mode"
+  else
+    target_access_mode="$current_access_mode"
+  fi
+  if [[ "$target_access_mode" == device-approval ]]; then
+    load_access_network || fail DEPLOY_V4_PROXY_CONFIG_INVALID
+    if [[ "$intent" != FORWARD && ( "$target_trusted_proxies" != "$current_trusted_proxies" || "$target_proxy_checksum" != "$current_proxy_checksum" ) ]]; then
+      fail RESTORE_STATE_MISMATCH
+    fi
+  else
+    target_trusted_proxies='[]'
+    target_proxy_checksum=''
+  fi
+fi
 
 verify_repo_digest() {
   local values=''
@@ -527,9 +691,17 @@ else
 fi
 
 schema_before="$(read_schema_version)" || fail DEPLOY_V3_SCHEMA_READ_FAILED
+if [[ "$DEPLOY_PROTOCOL" == 4 && "$intent" == RESTORE && "$schema_before" != "$current_schema_version" ]]; then
+  fail RESTORE_SCHEMA_MISMATCH
+fi
 target_schema_min="$(read_image_label "$runtime_image_id" io.kinvest.schema.min)" || fail DEPLOY_V3_IMAGE_CAPABILITY_INVALID
 target_schema_max="$(read_image_label "$runtime_image_id" io.kinvest.schema.max)" || fail DEPLOY_V3_IMAGE_CAPABILITY_INVALID
 target_bootstrap="$(read_image_label "$runtime_image_id" io.kinvest.secret-bootstrap)" || fail DEPLOY_V3_IMAGE_CAPABILITY_INVALID
+target_access_contract='0'
+if [[ "$DEPLOY_PROTOCOL" == 4 ]]; then
+  target_access_contract="$(read_image_label "$runtime_image_id" io.kinvest.access-control.contract)" || fail DEPLOY_V4_IMAGE_ACCESS_CONTRACT_INVALID
+  [[ "$target_access_contract" == 1 ]] || fail DEPLOY_V4_IMAGE_ACCESS_CONTRACT_INVALID
+fi
 [[ "$target_schema_min" =~ ^[0-9]+$ && "$target_schema_max" =~ ^[0-9]+$ && "$target_schema_min" -le "$target_schema_max" && "$target_bootstrap" == 1 ]] || fail DEPLOY_V3_IMAGE_CAPABILITY_INVALID
 [[ "$schema_before" -ge "$target_schema_min" && "$schema_before" -le "$target_schema_max" ]] || fail ROLLBACK_REQUIRES_DB_RESTORE
 
@@ -538,6 +710,11 @@ available_recovery_id="$(inspect_image_id "$recovery_image_id")" || fail ROLLBAC
 recovery_schema_min="$(read_image_label "$recovery_image_id" io.kinvest.schema.min)" || fail ROLLBACK_REQUIRES_DB_RESTORE
 recovery_schema_max="$(read_image_label "$recovery_image_id" io.kinvest.schema.max)" || fail ROLLBACK_REQUIRES_DB_RESTORE
 recovery_bootstrap="$(read_image_label "$recovery_image_id" io.kinvest.secret-bootstrap)" || fail ROLLBACK_REQUIRES_DB_RESTORE
+recovery_access_contract="$current_access_contract"
+if [[ "$DEPLOY_PROTOCOL" == 4 && "$current_access_mode" == device-approval ]]; then
+  recovery_access_contract="$(read_image_label "$recovery_image_id" io.kinvest.access-control.contract)" || fail ROLLBACK_ACCESS_CONTROL_INCOMPATIBLE
+  [[ "$recovery_access_contract" == 1 ]] || fail ROLLBACK_ACCESS_CONTROL_INCOMPATIBLE
+fi
 [[ "$recovery_schema_min" =~ ^[0-9]+$ && "$recovery_schema_max" =~ ^[0-9]+$ && "$recovery_schema_min" -le "$recovery_schema_max" && "$recovery_bootstrap" == 1 ]] || fail ROLLBACK_REQUIRES_DB_RESTORE
 [[ "$schema_before" -ge "$recovery_schema_min" && "$schema_before" -le "$recovery_schema_max" ]] || fail ROLLBACK_REQUIRES_DB_RESTORE
 
@@ -558,11 +735,20 @@ legacy_disabled_recovery_preflight_allowed() {
 }
 
 run_secret_preflight "$runtime_image_id" "$target_provider" "$target_versions" "$candidate_bundle_path" || fail DEPLOY_V3_PREFLIGHT_FAILED
-if ! run_secret_preflight "$recovery_image_id" "$request_provider" "$request_versions" "$candidate_bundle_path"; then
+if [[ "$DEPLOY_PROTOCOL" == 4 ]]; then
+  run_secret_preflight "$recovery_image_id" "$current_provider" "$current_versions" "$current_bundle_path" || fail DEPLOY_V4_RECOVERY_PREFLIGHT_FAILED
+elif ! run_secret_preflight "$recovery_image_id" "$request_provider" "$request_versions" "$candidate_bundle_path"; then
   if [[ "$last_preflight_legacy_failure" != true ]] || \
     ! legacy_disabled_recovery_preflight_allowed || \
     ! run_legacy_disabled_recovery_preflight "$recovery_image_id"; then
     fail DEPLOY_V3_RECOVERY_PREFLIGHT_FAILED
+  fi
+fi
+if [[ "$DEPLOY_PROTOCOL" == 4 && "$target_access_mode" == device-approval ]]; then
+  create_access_snapshot || fail DEPLOY_V4_ACCESS_SNAPSHOT_FAILED
+  run_access_preflight "$runtime_image_id" "$target_provider" "$target_versions" "$candidate_bundle_path" "$target_access_mode" "$target_trusted_proxies" || fail DEPLOY_V4_ACCESS_PREFLIGHT_FAILED
+  if [[ "$current_access_mode" == device-approval ]]; then
+    run_access_preflight "$recovery_image_id" "$current_provider" "$current_versions" "$current_bundle_path" "$current_access_mode" "$current_trusted_proxies" || fail DEPLOY_V4_RECOVERY_ACCESS_PREFLIGHT_FAILED
   fi
 fi
 "$CONTRACT" ledger-commit "$VERSION_LEDGER" <"$prepared_file"
@@ -633,13 +819,19 @@ if [[ "$intent" == RESTORE ]]; then
   fi
   envelope_file="$(mktemp "$RUN_ROOT/kinvest-v3.restore-envelope.XXXXXX")"
   chmod 0600 "$envelope_file"
-  make_approved_envelope "$current_json" "$envelope_file"
+  make_approved_envelope "$current_json" "$envelope_file" "$current_access_mode" "$current_access_contract" "$current_trusted_proxies" "$current_proxy_checksum"
   "$CONTRACT" make-restore-state "$schema_before" "$restore_backup_path" "$restore_backup_checksum" <"$envelope_file" >"$candidate_state_file"
 else
   started_at="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
-  "$CONTRACT" make-state "$runtime_image_id" "$schema_before" "$target_schema_min" "$target_schema_max" \
-    "$candidate_bundle_id" "$database_backup_path" "$database_backup_checksum" "$started_at" \
-    <"$base_file" >"$candidate_state_file"
+  if [[ "$DEPLOY_PROTOCOL" == 4 ]]; then
+    "$CONTRACT" make-state "$runtime_image_id" "$schema_before" "$target_schema_min" "$target_schema_max" \
+      "$candidate_bundle_id" "$database_backup_path" "$database_backup_checksum" "$started_at" \
+      "$target_access_contract" "$target_trusted_proxies" "$target_proxy_checksum" <"$base_file" >"$candidate_state_file"
+  else
+    "$CONTRACT" make-state "$runtime_image_id" "$schema_before" "$target_schema_min" "$target_schema_max" \
+      "$candidate_bundle_id" "$database_backup_path" "$database_backup_checksum" "$started_at" \
+      <"$base_file" >"$candidate_state_file"
+  fi
 fi
 
 "$CONTRACT" atomic-state "$ATTEMPT_STATE" <"$candidate_state_file"
@@ -648,19 +840,31 @@ if [[ "$intent" != RESTORE ]]; then
   "$CONTRACT" atomic-state "$PREVIOUS_STATE" <"$current_json"
 fi
 
-compose_up "$runtime_image_id" "$target_provider" "$target_versions" "$candidate_bundle_path" >/dev/null || fail DEPLOY_V3_COMPOSE_FAILED
+compose_up "$runtime_image_id" "$target_provider" "$target_versions" "$candidate_bundle_path" "$target_access_mode" "$target_trusted_proxies" >/dev/null || fail DEPLOY_V3_COMPOSE_FAILED
 wait_for_container "$runtime_image_id" || fail DEPLOY_V3_HEALTH_FAILED
 schema_after="$(read_schema_version)" || fail DEPLOY_V3_SCHEMA_READ_FAILED
+if [[ "$DEPLOY_PROTOCOL" == 4 && "$intent" == RESTORE && "$schema_after" != "$current_schema_version" ]]; then
+  fail RESTORE_SCHEMA_MISMATCH
+fi
 [[ "$schema_after" -ge "$target_schema_min" && "$schema_after" -le "$target_schema_max" ]] || fail ROLLBACK_REQUIRES_DB_RESTORE
 verify_public_health || fail DEPLOY_V3_PUBLIC_HEALTH_FAILED
+if [[ "$DEPLOY_PROTOCOL" == 4 ]]; then
+  verify_access_behavior "$target_access_mode" || fail DEPLOY_V4_ACCESS_ACCEPTANCE_FAILED
+fi
 
 if [[ "$intent" != RESTORE ]]; then
   deployed_at="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
-  "$CONTRACT" make-state "$runtime_image_id" "$schema_after" "$target_schema_min" "$target_schema_max" \
-    "$candidate_bundle_id" "$database_backup_path" "$database_backup_checksum" "$deployed_at" \
-    <"$base_file" >"$candidate_state_file"
+  if [[ "$DEPLOY_PROTOCOL" == 4 ]]; then
+    "$CONTRACT" make-state "$runtime_image_id" "$schema_after" "$target_schema_min" "$target_schema_max" \
+      "$candidate_bundle_id" "$database_backup_path" "$database_backup_checksum" "$deployed_at" \
+      "$target_access_contract" "$target_trusted_proxies" "$target_proxy_checksum" <"$base_file" >"$candidate_state_file"
+  else
+    "$CONTRACT" make-state "$runtime_image_id" "$schema_after" "$target_schema_min" "$target_schema_max" \
+      "$candidate_bundle_id" "$database_backup_path" "$database_backup_checksum" "$deployed_at" \
+      <"$base_file" >"$candidate_state_file"
+  fi
 else
-  make_approved_envelope "$current_json" "$envelope_file"
+  make_approved_envelope "$current_json" "$envelope_file" "$current_access_mode" "$current_access_contract" "$current_trusted_proxies" "$current_proxy_checksum"
   "$CONTRACT" make-restore-state "$schema_after" "$restore_backup_path" "$restore_backup_checksum" <"$envelope_file" >"$candidate_state_file"
 fi
 candidate_bundle_keep='true'
@@ -670,4 +874,4 @@ rm -f -- "$ATTEMPT_STATE" || fail DEPLOY_V3_CLEANUP_PENDING 71
 prune_unreferenced_bundles "$candidate_bundle_id" || fail DEPLOY_V3_CLEANUP_PENDING 71
 deployment_succeeded='true'
 
-printf 'KINVEST_DEPLOY_V3_OK intent=%s commit=%s\n' "$intent" "$target_commit"
+printf 'KINVEST_DEPLOY_V%s_OK intent=%s commit=%s mode=%s contract=%s\n' "$DEPLOY_PROTOCOL" "$intent" "$target_commit" "$target_access_mode" "$target_access_contract"

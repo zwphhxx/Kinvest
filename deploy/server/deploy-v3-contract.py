@@ -6,6 +6,7 @@ from __future__ import annotations
 import base64
 import binascii
 import hashlib
+import ipaddress
 import json
 import os
 import re
@@ -36,7 +37,9 @@ BUNDLE_ID_PATTERN = re.compile(r"^[0-9a-f]{32}$")
 TIMESTAMP_PATTERN = re.compile(
     r"^[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}Z$"
 )
-STATE_FIELDS = (
+DEPLOY_PROTOCOL = os.environ.get("KINVEST_DEPLOY_PROTOCOL", "3")
+IS_V4 = DEPLOY_PROTOCOL == "4"
+STATE_FIELDS_V4 = (
     "protocolVersion",
     "imageDigest",
     "runtimeImageId",
@@ -48,6 +51,29 @@ STATE_FIELDS = (
     "secretVersionIds",
     "secretBundleId",
     "secretMaterialFingerprints",
+    "releaseRecordSchemaVersion",
+    "verificationRunId",
+    "artifactSource",
+    "databaseBackupPath",
+    "databaseBackupChecksum",
+    "deployedAt",
+)
+STATE_FIELDS_V5 = (
+    "protocolVersion",
+    "imageDigest",
+    "runtimeImageId",
+    "commit",
+    "schemaVersion",
+    "imageSchemaMin",
+    "imageSchemaMax",
+    "secretProviderMode",
+    "secretVersionIds",
+    "secretBundleId",
+    "secretMaterialFingerprints",
+    "accessControlMode",
+    "imageAccessControlContract",
+    "trustedProxyAddresses",
+    "trustedProxyConfigChecksum",
     "releaseRecordSchemaVersion",
     "verificationRunId",
     "artifactSource",
@@ -201,16 +227,26 @@ def validate_fingerprints(value: Any, provider: str) -> dict[str, str]:
 
 
 def read_payload(stream: Any = sys.stdin.buffer) -> tuple[dict[str, Any], bytearray | None, bytearray | None]:
+    prefix = "DEPLOY_V4" if IS_V4 else "DEPLOY_V3"
     raw = stream.read(MAX_PAYLOAD_BYTES + 1)
     if len(raw) > MAX_PAYLOAD_BYTES:
-        fail("DEPLOY_V3_PAYLOAD_TOO_LARGE")
+        fail(f"{prefix}_PAYLOAD_TOO_LARGE")
     if b"\r" in raw or not raw.endswith(b"\n"):
-        fail("DEPLOY_V3_PAYLOAD_INVALID")
+        fail(f"{prefix}_PAYLOAD_INVALID")
     lines = raw[:-1].split(b"\n")
-    if len(lines) != 12 or any(len(line) > MAX_LINE_BYTES for line in lines):
-        fail("DEPLOY_V3_PAYLOAD_INVALID")
+    expected_lines = 13 if IS_V4 else 12
+    if len(lines) != expected_lines or any(len(line) > MAX_LINE_BYTES for line in lines):
+        fail(f"{prefix}_PAYLOAD_INVALID")
     try:
-        (
+        decoded = [line.decode("ascii") for line in lines]
+        if IS_V4:
+            (
+                magic, intent, image_digest, commit, provenance_raw, registry_raw,
+                provider, admin_version, hmac_version, admin_raw, hmac_raw,
+                policy_raw, end,
+            ) = decoded
+        else:
+            (
             magic,
             intent,
             image_digest,
@@ -223,11 +259,12 @@ def read_payload(stream: Any = sys.stdin.buffer) -> tuple[dict[str, Any], bytear
             admin_raw,
             hmac_raw,
             end,
-        ) = [line.decode("ascii") for line in lines]
+            ) = decoded
+            policy_raw = '{"accessControlMode":"disabled","schemaVersion":1}'
     except UnicodeDecodeError:
-        fail("DEPLOY_V3_PAYLOAD_INVALID")
-    if magic != "KINVEST_DEPLOY_V3" or end != "EOF":
-        fail("DEPLOY_V3_ENVELOPE_INVALID")
+        fail(f"{prefix}_PAYLOAD_INVALID")
+    if magic != ("KINVEST_DEPLOY_V4" if IS_V4 else "KINVEST_DEPLOY_V3") or end != "EOF":
+        fail(f"{prefix}_ENVELOPE_INVALID")
     if intent not in {"FORWARD", "ROLLBACK", "RESTORE"}:
         fail("DEPLOY_V3_INTENT_INVALID")
     if DIGEST_PATTERN.fullmatch(image_digest) is None:
@@ -259,6 +296,13 @@ def read_payload(stream: Any = sys.stdin.buffer) -> tuple[dict[str, Any], bytear
         fail("DEPLOY_V3_REGISTRY_INVALID")
     if provider not in {"disabled", "github-tmpfs-v1"}:
         fail("DEPLOY_V3_PROVIDER_INVALID")
+    policy = parse_canonical_json(
+        policy_raw,
+        {"accessControlMode", "schemaVersion"},
+        "DEPLOY_V4_POLICY_INVALID" if IS_V4 else "DEPLOY_V3_POLICY_INVALID",
+    )
+    if policy["schemaVersion"] != 1 or policy["accessControlMode"] not in {"disabled", "device-approval"}:
+        fail("DEPLOY_V4_POLICY_INVALID" if IS_V4 else "DEPLOY_V3_POLICY_INVALID")
 
     admin_material = None
     hmac_material = None
@@ -294,6 +338,9 @@ def read_payload(stream: Any = sys.stdin.buffer) -> tuple[dict[str, Any], bytear
         "secretVersionIds": version_ids,
         "verificationRunId": provenance["verificationRunId"],
     }
+    if IS_V4:
+        metadata["accessControlMode"] = policy["accessControlMode"]
+        metadata["runtimePolicy"] = policy
     return metadata, admin_material, hmac_material
 
 
@@ -390,9 +437,25 @@ def build_bundle(
 
 
 def validate_state(value: Any) -> dict[str, Any]:
-    value = require_exact_keys(value, set(STATE_FIELDS), "DEPLOY_V3_STATE_INVALID")
-    if value["protocolVersion"] != 4:
-        fail("DEPLOY_V3_STATE_INVALID")
+    code = "DEPLOY_V4_STATE_INVALID" if IS_V4 else "DEPLOY_V3_STATE_INVALID"
+    if not isinstance(value, dict):
+        fail(code)
+    protocol_version = value.get("protocolVersion")
+    if protocol_version == 4:
+        value = require_exact_keys(value, set(STATE_FIELDS_V4), code)
+        if IS_V4:
+            value = {
+                **value,
+                "protocolVersion": 5,
+                "accessControlMode": "disabled",
+                "imageAccessControlContract": 0,
+                "trustedProxyAddresses": [],
+                "trustedProxyConfigChecksum": "",
+            }
+    elif protocol_version == 5 and IS_V4:
+        value = require_exact_keys(value, set(STATE_FIELDS_V5), code)
+    else:
+        fail(code)
     if DIGEST_PATTERN.fullmatch(value["imageDigest"]) is None:
         fail("DEPLOY_V3_STATE_INVALID")
     if IMAGE_ID_PATTERN.fullmatch(value["runtimeImageId"]) is None:
@@ -433,11 +496,30 @@ def validate_state(value: Any) -> dict[str, Any]:
         ):
             fail("DEPLOY_V3_STATE_INVALID")
     if not isinstance(value["deployedAt"], str) or TIMESTAMP_PATTERN.fullmatch(value["deployedAt"]) is None:
-        fail("DEPLOY_V3_STATE_INVALID")
+        fail(code)
     try:
         datetime.strptime(value["deployedAt"], "%Y-%m-%dT%H:%M:%SZ")
     except ValueError:
-        fail("DEPLOY_V3_STATE_INVALID")
+        fail(code)
+    if value["protocolVersion"] == 5:
+        mode = value["accessControlMode"]
+        contract = value["imageAccessControlContract"]
+        proxies = value["trustedProxyAddresses"]
+        checksum = value["trustedProxyConfigChecksum"]
+        if mode not in {"disabled", "device-approval"} or contract not in {0, 1}:
+            fail(code)
+        if not isinstance(proxies, list) or len(set(proxies)) != len(proxies):
+            fail(code)
+        try:
+            if any(str(ipaddress.IPv4Address(item)) != item for item in proxies):
+                fail(code)
+        except (ipaddress.AddressValueError, TypeError):
+            fail(code)
+        if mode == "disabled":
+            if proxies != [] or checksum != "":
+                fail(code)
+        elif contract != 1 or len(proxies) != 1 or not isinstance(checksum, str) or FINGERPRINT_PATTERN.fullmatch(checksum) is None:
+            fail(code)
     normalized = dict(value)
     normalized["secretVersionIds"] = versions
     normalized["secretMaterialFingerprints"] = fingerprints
@@ -447,7 +529,8 @@ def validate_state(value: Any) -> dict[str, Any]:
 def state_text(value: Any) -> str:
     normalized = validate_state(value)
     lines = []
-    for field in STATE_FIELDS:
+    fields = STATE_FIELDS_V5 if normalized["protocolVersion"] == 5 else STATE_FIELDS_V4
+    for field in fields:
         field_value = normalized[field]
         if isinstance(field_value, (dict, list)):
             rendered = canonical_json(field_value)
@@ -502,10 +585,16 @@ def state_from_text(raw: str) -> dict[str, Any]:
         except ValueError:
             fail("DEPLOY_V3_STATE_INVALID")
         return validate_state(migrated)
-    if len(lines) != len(STATE_FIELDS) or not raw.endswith("\n"):
-        fail("DEPLOY_V3_STATE_INVALID")
+    if lines and lines[0] == "protocolVersion=5":
+        fields = STATE_FIELDS_V5
+    elif lines and lines[0] == "protocolVersion=4":
+        fields = STATE_FIELDS_V4
+    else:
+        fail("DEPLOY_V4_STATE_INVALID" if IS_V4 else "DEPLOY_V3_STATE_INVALID")
+    if len(lines) != len(fields) or not raw.endswith("\n"):
+        fail("DEPLOY_V4_STATE_INVALID" if IS_V4 else "DEPLOY_V3_STATE_INVALID")
     value: dict[str, Any] = {}
-    for field, line in zip(STATE_FIELDS, lines):
+    for field, line in zip(fields, lines):
         prefix = field + "="
         if not line.startswith(prefix):
             fail("DEPLOY_V3_STATE_INVALID")
@@ -514,7 +603,7 @@ def state_from_text(raw: str) -> dict[str, Any]:
             if re.fullmatch(r"0|[1-9][0-9]*", item) is None:
                 fail("DEPLOY_V3_STATE_INVALID")
             value[field] = int(item)
-        elif field in {"secretVersionIds", "secretMaterialFingerprints"}:
+        elif field in {"secretVersionIds", "secretMaterialFingerprints", "trustedProxyAddresses"}:
             try:
                 value[field] = json.loads(item)
             except ValueError:
@@ -930,9 +1019,10 @@ def remove_bundle(bundle_id: str, bundle_root: Path = BUNDLE_ROOT) -> None:
 
 
 def make_state(base: Any, argv: list[str]) -> dict[str, Any]:
-    if not isinstance(base, dict) or len(argv) != 8:
+    expected_argv = 11 if IS_V4 else 8
+    if not isinstance(base, dict) or len(argv) != expected_argv:
         fail("DEPLOY_V3_STATE_INVALID")
-    runtime_image_id, schema, minimum, maximum, bundle_id, backup_path, backup_checksum, deployed_at = argv
+    runtime_image_id, schema, minimum, maximum, bundle_id, backup_path, backup_checksum, deployed_at = argv[:8]
     try:
         numeric_schema, numeric_minimum, numeric_maximum = int(schema), int(minimum), int(maximum)
     except ValueError:
@@ -944,8 +1034,8 @@ def make_state(base: Any, argv: list[str]) -> dict[str, Any]:
     }
     if not required.issubset(base):
         fail("DEPLOY_V3_STATE_INVALID")
-    return validate_state({
-        "protocolVersion": 4,
+    result = {
+        "protocolVersion": 5 if IS_V4 else 4,
         "imageDigest": base["imageDigest"],
         "runtimeImageId": runtime_image_id,
         "commit": base["commit"],
@@ -962,10 +1052,29 @@ def make_state(base: Any, argv: list[str]) -> dict[str, Any]:
         "databaseBackupPath": backup_path,
         "databaseBackupChecksum": backup_checksum,
         "deployedAt": deployed_at,
-    })
+    }
+    if IS_V4:
+        image_contract, proxy_json, proxy_checksum = argv[8:]
+        try:
+            proxies = json.loads(proxy_json)
+        except ValueError:
+            fail("DEPLOY_V4_STATE_INVALID")
+        if canonical_json(proxies) != proxy_json:
+            fail("DEPLOY_V4_STATE_INVALID")
+        result.update({
+            "accessControlMode": base.get("accessControlMode"),
+            "imageAccessControlContract": int(image_contract),
+            "trustedProxyAddresses": proxies,
+            "trustedProxyConfigChecksum": proxy_checksum,
+        })
+    return validate_state(result)
 
 
 def validate_approved_secret_state(value: Any) -> dict[str, Any]:
+    access_fields = {
+        "accessControlMode", "imageAccessControlContract",
+        "trustedProxyAddresses", "trustedProxyConfigChecksum",
+    } if IS_V4 else set()
     value = require_exact_keys(
         value,
         {
@@ -973,7 +1082,7 @@ def validate_approved_secret_state(value: Any) -> dict[str, Any]:
             "secretVersionIds",
             "secretMaterialFingerprints",
             "secretBundleId",
-        },
+        } | access_fields,
         "DEPLOY_V3_RECOVERY_STATE_INVALID",
     )
     provider = value["secretProviderMode"]
@@ -985,12 +1094,34 @@ def validate_approved_secret_state(value: Any) -> dict[str, Any]:
             fail("DEPLOY_V3_RECOVERY_STATE_INVALID")
     elif BUNDLE_ID_PATTERN.fullmatch(bundle_id) is None:
         fail("DEPLOY_V3_RECOVERY_STATE_INVALID")
-    return {
+    result = {
         "secretProviderMode": provider,
         "secretVersionIds": versions,
         "secretMaterialFingerprints": fingerprints,
         "secretBundleId": bundle_id,
     }
+    if IS_V4:
+        candidate = validate_state({
+            **{
+                "protocolVersion": 5,
+                "imageDigest": f"ghcr.io/zwphhxx/kinvest@sha256:{'0' * 64}",
+                "runtimeImageId": f"sha256:{'0' * 64}",
+                "commit": "0" * 40,
+                "schemaVersion": 0,
+                "imageSchemaMin": 0,
+                "imageSchemaMax": 0,
+                "releaseRecordSchemaVersion": 2,
+                "verificationRunId": "0",
+                "artifactSource": "ghcr-public",
+                "databaseBackupPath": "none",
+                "databaseBackupChecksum": "none",
+                "deployedAt": "2026-01-01T00:00:00Z",
+            },
+            **result,
+            **{field: value[field] for field in access_fields},
+        })
+        result.update({field: candidate[field] for field in access_fields})
+    return result
 
 
 def make_recovery_state(
@@ -1003,13 +1134,17 @@ def make_recovery_state(
     value = require_exact_keys(value, {"original", "approved"}, "DEPLOY_V3_RECOVERY_STATE_INVALID")
     original = validate_state(value["original"])
     approved = validate_approved_secret_state(value["approved"])
+    protected_fields = [
+        "secretProviderMode", "secretVersionIds", "secretMaterialFingerprints",
+    ]
+    if IS_V4:
+        protected_fields.extend([
+            "accessControlMode", "imageAccessControlContract",
+            "trustedProxyAddresses", "trustedProxyConfigChecksum",
+        ])
     if restore and any(
         approved[field] != original[field]
-        for field in (
-            "secretProviderMode",
-            "secretVersionIds",
-            "secretMaterialFingerprints",
-        )
+        for field in protected_fields
     ):
         fail("RESTORE_STATE_MISMATCH")
     recovered = {**original, **approved}
@@ -1026,15 +1161,25 @@ def make_recovery_state(
 def resolve_intent(value: Any) -> dict[str, Any]:
     value = require_exact_keys(value, {"intent", "request", "current", "previous"}, "DEPLOY_V3_INTENT_STATE_INVALID")
     intent = value["intent"]
+    request_fields = {
+        "imageDigest", "commit", "secretProviderMode", "secretVersionIds", "secretMaterialFingerprints",
+    }
+    if IS_V4:
+        request_fields.add("accessControlMode")
     request = require_exact_keys(
         value["request"],
-        {"imageDigest", "commit", "secretProviderMode", "secretVersionIds", "secretMaterialFingerprints"},
+        request_fields,
         "DEPLOY_V3_INTENT_STATE_INVALID",
     )
     current = validate_state(value["current"])
     provider = request["secretProviderMode"]
     versions = validate_secret_versions(request["secretVersionIds"], provider)
     fingerprints = validate_fingerprints(request["secretMaterialFingerprints"], provider)
+    requested_access = request.get("accessControlMode", "disabled")
+    if requested_access not in {"disabled", "device-approval"}:
+        fail("DEPLOY_V4_INTENT_STATE_INVALID")
+    if IS_V4 and intent == "FORWARD" and current["accessControlMode"] == "device-approval" and requested_access == "disabled":
+        fail("ACCESS_CONTROL_DOWNGRADE_FORBIDDEN")
     if current["secretProviderMode"] == "github-tmpfs-v1" and provider == "disabled":
         fail("SECRET_PROVIDER_DOWNGRADE_FORBIDDEN")
     check_version_reuse(current, request)
@@ -1046,10 +1191,18 @@ def resolve_intent(value: Any) -> dict[str, Any]:
             "operations": ["resolve-image", "preflight", "backup", "compose", "health", "state"],
             "secretMaterialFingerprints": fingerprints,
             "secretVersionIds": versions,
+            **({"accessControlMode": requested_access} if IS_V4 else {}),
         }
     if intent == "ROLLBACK":
         if value["previous"] is None:
             fail("ROLLBACK_STATE_UNAVAILABLE")
+        if IS_V4 and (
+            provider != current["secretProviderMode"]
+            or versions != current["secretVersionIds"]
+            or fingerprints != current["secretMaterialFingerprints"]
+            or requested_access != current["accessControlMode"]
+        ):
+            fail("ROLLBACK_SECURITY_STATE_MISMATCH")
         target = validate_state(value["previous"])
         if request["imageDigest"] != target["imageDigest"] or request["commit"] != target["commit"]:
             fail("ROLLBACK_STATE_MISMATCH")
@@ -1057,15 +1210,23 @@ def resolve_intent(value: Any) -> dict[str, Any]:
             fail("ROLLBACK_REQUIRES_DB_RESTORE")
         target = {
             **target,
-            "secretProviderMode": provider,
-            "secretVersionIds": versions,
-            "secretMaterialFingerprints": fingerprints,
+            "secretProviderMode": current["secretProviderMode"] if IS_V4 else provider,
+            "secretVersionIds": current["secretVersionIds"] if IS_V4 else versions,
+            "secretMaterialFingerprints": current["secretMaterialFingerprints"] if IS_V4 else fingerprints,
         }
+        if IS_V4:
+            target.update({
+                "accessControlMode": current["accessControlMode"],
+                "imageAccessControlContract": current["imageAccessControlContract"],
+                "trustedProxyAddresses": current["trustedProxyAddresses"],
+                "trustedProxyConfigChecksum": current["trustedProxyConfigChecksum"],
+            })
         return {
             "intent": intent,
             "operations": ["preflight", "backup", "compose", "health", "state"],
-            "secretMaterialFingerprints": fingerprints,
-            "secretVersionIds": versions,
+            "secretMaterialFingerprints": current["secretMaterialFingerprints"] if IS_V4 else fingerprints,
+            "secretVersionIds": current["secretVersionIds"] if IS_V4 else versions,
+            **({"accessControlMode": current["accessControlMode"]} if IS_V4 else {}),
             "target": target,
         }
     if intent == "RESTORE":
@@ -1075,6 +1236,7 @@ def resolve_intent(value: Any) -> dict[str, Any]:
             or provider != current["secretProviderMode"]
             or versions != current["secretVersionIds"]
             or fingerprints != current["secretMaterialFingerprints"]
+            or (IS_V4 and requested_access != current["accessControlMode"])
         ):
             fail("RESTORE_STATE_MISMATCH")
         return {
@@ -1085,6 +1247,50 @@ def resolve_intent(value: Any) -> dict[str, Any]:
             "target": current,
         }
     fail("DEPLOY_V3_INTENT_INVALID")
+
+
+def validate_network_config(path: Path) -> dict[str, Any]:
+    try:
+        info = path.lstat()
+        expected_uid = int(os.environ.get("KINVEST_V4_TEST_ROOT_UID", "0"))
+        if (
+            not path.is_absolute()
+            or not stat.S_ISREG(info.st_mode)
+            or path.is_symlink()
+            or info.st_uid != expected_uid
+            or stat.S_IMODE(info.st_mode) & 0o022
+            or info.st_size > 1024
+        ):
+            fail("DEPLOY_V4_PROXY_CONFIG_INVALID")
+        raw = path.read_bytes()
+        text = raw.decode("ascii")
+    except (OSError, UnicodeError, ValueError):
+        fail("DEPLOY_V4_PROXY_CONFIG_INVALID")
+    lines = text.splitlines()
+    expected_names = ("KINVEST_WEB_NETWORK", "KINVEST_NGINX_CONTAINER", "KINVEST_NGINX_IPV4")
+    if not text.endswith("\n") or len(lines) != 3:
+        fail("DEPLOY_V4_PROXY_CONFIG_INVALID")
+    values = {}
+    for name, line in zip(expected_names, lines):
+        prefix = name + "="
+        if not line.startswith(prefix):
+            fail("DEPLOY_V4_PROXY_CONFIG_INVALID")
+        values[name] = line[len(prefix):]
+    if values["KINVEST_WEB_NETWORK"] != "web" or values["KINVEST_NGINX_CONTAINER"] != "nginx":
+        fail("DEPLOY_V4_PROXY_CONFIG_INVALID")
+    try:
+        ip = str(ipaddress.IPv4Address(values["KINVEST_NGINX_IPV4"]))
+    except ipaddress.AddressValueError:
+        fail("DEPLOY_V4_PROXY_CONFIG_INVALID")
+    if ip != values["KINVEST_NGINX_IPV4"]:
+        fail("DEPLOY_V4_PROXY_CONFIG_INVALID")
+    return {
+        "checksum": hashlib.sha256(raw).hexdigest(),
+        "container": "nginx",
+        "ip": ip,
+        "network": "web",
+        "trustedProxyAddresses": [ip],
+    }
 
 
 def read_json_stdin() -> Any:
@@ -1185,17 +1391,23 @@ def main(argv: list[str]) -> int:
             previous = None if argv[4] == "none" else json.loads(Path(argv[4]).read_text(encoding="ascii"))
         except (OSError, ValueError):
             fail("DEPLOY_V3_INTENT_STATE_INVALID")
-        request = {key: prepared[key] for key in (
+        request_keys = [
             "imageDigest", "commit", "secretProviderMode",
             "secretVersionIds", "secretMaterialFingerprints",
-        )}
+        ]
+        if IS_V4:
+            request_keys.append("accessControlMode")
+        request = {key: prepared[key] for key in request_keys}
         sys.stdout.write(canonical_json(resolve_intent({
             "intent": prepared["intent"], "request": request,
             "current": current, "previous": previous,
         })) + "\n")
         return 0
-    if command == "make-state" and len(argv) == 10:
+    if command == "make-state" and len(argv) == (13 if IS_V4 else 10):
         sys.stdout.write(canonical_json(make_state(read_json_stdin(), argv[2:])) + "\n")
+        return 0
+    if command == "validate-network-config" and len(argv) == 3 and IS_V4:
+        sys.stdout.write(canonical_json(validate_network_config(Path(argv[2]))) + "\n")
         return 0
     if command == "make-recovery-state" and len(argv) in {2, 5}:
         result = make_recovery_state(
@@ -1235,5 +1447,5 @@ if __name__ == "__main__":
         sys.stderr.write(error.code + "\n")
         raise SystemExit(2)
     except Exception:
-        sys.stderr.write("DEPLOY_V3_INTERNAL_ERROR\n")
+        sys.stderr.write(("DEPLOY_V4" if IS_V4 else "DEPLOY_V3") + "_INTERNAL_ERROR\n")
         raise SystemExit(1)

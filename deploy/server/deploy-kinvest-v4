@@ -1,0 +1,8 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+[[ "$#" -eq 0 ]] || { printf '%s\n' DEPLOY_V4_ARGUMENTS_FORBIDDEN >&2; exit 2; }
+export KINVEST_DEPLOY_PROTOCOL=4
+export KINVEST_DEPLOY_CONTRACT=/usr/local/libexec/kinvest-deploy-v4-contract
+export KINVEST_DEPLOY_COMPOSE=/root/docker/kinvest/docker-compose-v4.yml
+exec /usr/local/sbin/deploy-kinvest-v3

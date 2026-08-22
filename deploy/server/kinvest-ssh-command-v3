@@ -16,6 +16,9 @@ case "${SSH_ORIGINAL_COMMAND:-}" in
   deploy-v3)
     exec sudo -n /usr/local/sbin/deploy-kinvest-v3
     ;;
+  deploy-v4)
+    exec sudo -n /usr/local/sbin/deploy-kinvest-v4
+    ;;
   *)
     printf '%s\n' 'KINVEST_DEPLOY_WRAPPER_COMMAND_REJECTED' >&2
     exit 2
