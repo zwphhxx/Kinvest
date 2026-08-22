@@ -1,1 +1,3 @@
+@KINVEST_DEPLOY_GATE_USER@ ALL=(root) NOPASSWD: /usr/local/sbin/deploy-kinvest ""
+@KINVEST_DEPLOY_GATE_USER@ ALL=(root) NOPASSWD: /usr/local/sbin/deploy-kinvest-v3 ""
 @KINVEST_DEPLOY_GATE_USER@ ALL=(root) NOPASSWD: /usr/local/sbin/deploy-kinvest-v4 ""

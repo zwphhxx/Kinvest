@@ -29,10 +29,11 @@ try:
     if any(
         name not in {"identity", "install-incomplete"}
         and not name.startswith(".install-incomplete.")
+        and not name.startswith(".identity.")
         for name in names
     ):
         raise OSError("unexpected gate state entry")
-    if any(name.startswith(".install-incomplete.") for name in names):
+    if any(name.startswith((".install-incomplete.", ".identity.")) for name in names):
         print("ACTIVE")
     elif os.path.lexists(marker):
         marker_info = os.lstat(marker)

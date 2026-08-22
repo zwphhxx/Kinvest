@@ -1,5 +1,5 @@
 const assert = require('node:assert/strict')
-const { spawnSync } = require('node:child_process')
+const { spawn, spawnSync } = require('node:child_process')
 const crypto = require('node:crypto')
 const fs = require('node:fs')
 const os = require('node:os')
@@ -7,13 +7,16 @@ const path = require('node:path')
 
 const rootDir = path.resolve(__dirname, '../..')
 const assetNames = [
+  'deploy-kinvest-v2.sh',
+  'secret-version-config.py',
+  'offline-image-attestation.py',
   'deploy-kinvest-v3.sh',
   'kinvest-ssh-command-v3',
   'deploy-v3-contract.py',
   'docker-compose-v3.yml',
-  'kinvest-deploy-v3.sudoers'
+  'kinvest-deploy-v4.sudoers.in'
 ]
-const targetNames = ['deployer', 'wrapper', 'helper', 'compose', 'sudoers']
+const targetNames = ['v2-deployer', 'validator', 'attestation', 'deployer', 'wrapper', 'helper', 'compose', 'sudoers']
 
 function write(filePath, contents, mode = 0o755) {
   fs.mkdirSync(path.dirname(filePath), { recursive: true })
@@ -32,16 +35,28 @@ function createFixture(installer, { existingTargets = true } = {}) {
   fs.mkdirSync(bin)
   write(path.join(bin, 'flock'), '#!/usr/bin/env bash\nexit 0\n')
   write(path.join(bin, 'visudo'), '#!/usr/bin/env bash\nexit 0\n')
-  write(path.join(bin, 'sudo'), '#!/usr/bin/env bash\nexit 0\n')
+  write(path.join(bin, 'sudo'), '#!/usr/bin/env bash\n[[ -z "${SUDO_LOG:-}" ]] || printf \'%s\\n\' "$*" >>"$SUDO_LOG"\nexit 0\n')
+  write(path.join(bin, 'getent'), `#!/usr/bin/env bash
+if [[ "$1" == passwd && "$2" == lighthouse ]]; then printf 'lighthouse:x:%s:%s:Deploy:/nonexistent:/usr/sbin/nologin\\n' '${Math.max(process.getuid(), 1)}' '${process.getgid()}'; exit 0; fi
+if [[ "$1" == group && "$2" == lighthouse ]]; then printf 'lighthouse:x:%s:\\n' '${process.getgid()}'; exit 0; fi
+exit 2
+`)
+  write(path.join(bin, 'id'), `#!/usr/bin/env bash
+if [[ "$1" == -G && "$2" == lighthouse ]]; then printf '%s\\n' '${process.getgid()}'; exit 0; fi
+exec /usr/bin/id "$@"
+`)
   write(
     path.join(bin, 'mv'),
     '#!/usr/bin/env bash\nset -euo pipefail\nargs=()\nfor value in "$@"; do\n  [[ "$value" == "-fT" || "$value" == "--" ]] || args+=("$value")\ndone\nexec /bin/mv -f "${args[@]}"\n'
   )
   write(path.join(source, assetNames[0]), '#!/usr/bin/env bash\nexit 0\n')
-  write(path.join(source, assetNames[1]), '#!/usr/bin/env bash\nexit 0\n')
-  write(path.join(source, assetNames[2]), '#!/usr/bin/env python3\nprint("ok")\n')
-  write(path.join(source, assetNames[3]), 'services: {}\n', 0o644)
-  write(path.join(source, assetNames[4]), 'kinvest-deploy ALL=(root) NOPASSWD: /usr/local/sbin/deploy-kinvest ""\nkinvest-deploy ALL=(root) NOPASSWD: /usr/local/sbin/deploy-kinvest-v3 ""\n', 0o440)
+  write(path.join(source, assetNames[1]), '#!/usr/bin/env python3\nimport sys\nprint("{}")\n')
+  write(path.join(source, assetNames[2]), '#!/usr/bin/env python3\nimport sys\nprint("KINVEST_OFFLINE_ATTESTATION_SELF_CHECK_OK")\n')
+  write(path.join(source, assetNames[3]), '#!/usr/bin/env bash\nexit 0\n')
+  write(path.join(source, assetNames[4]), fs.readFileSync(path.join(rootDir, 'deploy/server/kinvest-ssh-command-v3'), 'utf8'))
+  write(path.join(source, assetNames[5]), '#!/usr/bin/env python3\nprint("ok")\n')
+  write(path.join(source, assetNames[6]), 'services: {}\n', 0o644)
+  write(path.join(source, assetNames[7]), '@KINVEST_DEPLOY_GATE_USER@ ALL=(root) NOPASSWD: /usr/local/sbin/deploy-kinvest ""\n@KINVEST_DEPLOY_GATE_USER@ ALL=(root) NOPASSWD: /usr/local/sbin/deploy-kinvest-v3 ""\n@KINVEST_DEPLOY_GATE_USER@ ALL=(root) NOPASSWD: /usr/local/sbin/deploy-kinvest-v4 ""\n', 0o440)
   if (existingTargets) {
     for (const name of targetNames) write(path.join(target, name), `old-${name}\n`, 0o700)
   }
@@ -55,15 +70,22 @@ function createFixture(installer, { existingTargets = true } = {}) {
     .replace("SERVER_ROOT='/root/docker/kinvest'", `SERVER_ROOT='${target}'`)
     .replace("RUN_ROOT='/run'", `RUN_ROOT='${runRoot}'`)
     .replace("SUDOERS_DIR='/etc/sudoers.d'", `SUDOERS_DIR='${target}'`)
+    .replace("GATE_STATE_DIR='/var/lib/kinvest-deploy-gate'", `GATE_STATE_DIR='${path.join(fixture, 'gate-state')}'`)
+    .replace("GATE_ROOT_OWNER='0:0'", `GATE_ROOT_OWNER='${process.getuid()}:${process.getgid()}'`)
+    .replaceAll('-o root -g "$GATE_GROUP"', `-o ${process.getuid()} -g ${process.getgid()}`)
+    .replaceAll('chown root:"$GATE_GROUP"', `chown ${process.getuid()}:${process.getgid()}`)
     .replace("INSTALL_OWNER='root'", `INSTALL_OWNER='${process.getuid()}'`)
     .replace("INSTALL_GROUP='root'", `INSTALL_GROUP='${process.getgid()}'`)
+    .replace('V2_DEPLOY_TARGET="$LOCAL_SBIN/deploy-kinvest"', `V2_DEPLOY_TARGET='${path.join(target, 'v2-deployer')}'`)
+    .replace('V2_VALIDATOR_TARGET="$LOCAL_LIBEXEC/kinvest-secret-version-config"', `V2_VALIDATOR_TARGET='${path.join(target, 'validator')}'`)
+    .replace('V2_ATTESTATION_TARGET="$LOCAL_LIBEXEC/kinvest-offline-image-attestation"', `V2_ATTESTATION_TARGET='${path.join(target, 'attestation')}'`)
     .replace('DEPLOY_TARGET="$LOCAL_SBIN/deploy-kinvest-v3"', `DEPLOY_TARGET='${path.join(target, 'deployer')}'`)
     .replace('WRAPPER_TARGET="$LOCAL_SBIN/kinvest-ssh-command"', `WRAPPER_TARGET='${path.join(target, 'wrapper')}'`)
     .replace('HELPER_TARGET="$LOCAL_LIBEXEC/kinvest-deploy-v3-contract"', `HELPER_TARGET='${path.join(target, 'helper')}'`)
     .replace('COMPOSE_TARGET="$SERVER_ROOT/docker-compose-v3.yml"', `COMPOSE_TARGET='${path.join(target, 'compose')}'`)
     .replace('SUDOERS_TARGET="$SUDOERS_DIR/kinvest-deploy-v3"', `SUDOERS_TARGET='${path.join(target, 'sudoers')}'`)
     .replace(
-      /EXPECTED_ASSET_HASHES=\(\n(?: {2}'(?:[0-9a-f]{64}|__[A-Z_]+__)'\n){5}\)/,
+      /EXPECTED_ASSET_HASHES=\(\n(?: {2}'(?:[0-9a-f]{64}|__[A-Z_]+__)'\n){8}\)/,
       `EXPECTED_ASSET_HASHES=(\n${expectedHashes.map((hash) => `  '${hash}'`).join('\n')}\n)`
     )
   const script = path.join(fixture, 'install.sh')
@@ -71,13 +93,17 @@ function createFixture(installer, { existingTargets = true } = {}) {
   return { fixture, source, target, runRoot, bin, script }
 }
 
-function runInstaller(context, source = context.source, script = context.script) {
+function runInstaller(context, source = context.source, script = context.script, overrides = {}) {
   return spawnSync('bash', [script, source], {
     encoding: 'utf8',
     env: {
       ...process.env,
       KINVEST_INSTALL_V3_TEST_ROOT: '1',
-      PATH: `${context.bin}:${process.env.PATH}`
+      KINVEST_DEPLOY_GATE_USER: 'lighthouse',
+      KINVEST_DEPLOY_GATE_GROUP: 'lighthouse',
+      SUDO_LOG: path.join(context.fixture, 'sudo.log'),
+      PATH: `${context.bin}:${process.env.PATH}`,
+      ...overrides
     }
   })
 }
@@ -95,6 +121,25 @@ function backupDirectories(context) {
   return fs.readdirSync(backupRoot).filter((name) => name.startsWith('kinvest-deploy-v3-backup.'))
 }
 
+function waitFor(check, timeoutMs = 3000) {
+  const started = Date.now()
+  return new Promise((resolve, reject) => {
+    const poll = () => {
+      if (check()) return resolve()
+      if (Date.now() - started > timeoutMs) return reject(new Error('timed out waiting for v3 installer'))
+      setTimeout(poll, 10)
+    }
+    poll()
+  })
+}
+
+function waitForExit(child, timeoutMs = 5000) {
+  return new Promise((resolve, reject) => {
+    const timeout = setTimeout(() => { child.kill('SIGKILL'); reject(new Error('v3 installer did not exit')) }, timeoutMs)
+    child.once('exit', (status, signal) => { clearTimeout(timeout); resolve({ status, signal }) })
+  })
+}
+
 async function run() {
   const installerPath = path.join(rootDir, 'deploy/server/install-deploy-v3.sh')
   const installer = fs.readFileSync(installerPath, 'utf8')
@@ -106,21 +151,24 @@ async function run() {
   assert.match(installer, /mv -fT/)
   assert.match(installer, /INSTALL_OWNER='root'/)
   assert.match(installer, /INSTALL_GROUP='root'/)
-  assert.match(installer, /ASSET_MODES=\('0755' '0755' '0755' '0644' '0440'\)/)
-  assert.match(installer, /^DEPLOY_USER='kinvest-deploy'$/m)
+  assert.match(installer, /ASSET_MODES=\('0755' '0755' '0755' '0755' '0755' '0755' '0644' '0440'\)/)
+  assert.doesNotMatch(installer, /^DEPLOY_USER='kinvest-deploy'$/m)
+  assert.match(installer, /KINVEST_DEPLOY_GATE_USER:-/)
+  assert.match(installer, /KINVEST_DEPLOY_GATE_GROUP:-/)
   assert.match(installer, /visudo -cf/)
   assert.match(installer, /^DEPLOY_TARGET="\$LOCAL_SBIN\/deploy-kinvest-v3"$/m)
-  assert.match(installer, /^sudo -n -U "\$DEPLOY_USER" -l "\$DEPLOY_TARGET" >\/dev\/null$/m)
-  assert.match(installer, /^sudo -n -U "\$DEPLOY_USER" -l "\$LOCAL_SBIN\/deploy-kinvest" >\/dev\/null$/m)
+  for (const command of ['deploy-kinvest', 'deploy-kinvest-v3', 'deploy-kinvest-v4']) {
+    assert.match(installer, new RegExp(`sudo -n -U "\\$GATE_USER" -l "\\$LOCAL_SBIN/${command}"`))
+  }
   assert.doesNotMatch(installer, /\/usr\/local\/sbin\/deploy-kinvest-v2|\$LOCAL_SBIN\/deploy-kinvest-v2/)
   assert.match(installer, /INSTALL_BACKUP_ROOT="\$SERVER_ROOT\/install-backups\/deploy-v3"/)
-  const sudoers = fs.readFileSync(path.join(rootDir, 'deploy/server/kinvest-deploy-v3.sudoers'), 'utf8')
+  const sudoers = fs.readFileSync(path.join(rootDir, 'deploy/server/kinvest-deploy-v4.sudoers.in'), 'utf8')
   assert.equal(
     sudoers,
-    'kinvest-deploy ALL=(root) NOPASSWD: /usr/local/sbin/deploy-kinvest ""\n' +
-      'kinvest-deploy ALL=(root) NOPASSWD: /usr/local/sbin/deploy-kinvest-v3 ""\n'
+    '@KINVEST_DEPLOY_GATE_USER@ ALL=(root) NOPASSWD: /usr/local/sbin/deploy-kinvest ""\n' +
+      '@KINVEST_DEPLOY_GATE_USER@ ALL=(root) NOPASSWD: /usr/local/sbin/deploy-kinvest-v3 ""\n' +
+      '@KINVEST_DEPLOY_GATE_USER@ ALL=(root) NOPASSWD: /usr/local/sbin/deploy-kinvest-v4 ""\n'
   )
-  assert.doesNotMatch(sudoers, /^lighthouse /m)
   assert.doesNotMatch(sudoers, /\*/)
   assert.match(installer, /WRAPPER_TARGET="\$LOCAL_SBIN\/kinvest-ssh-command"/)
   assert.match(installer, /kinvest-deploy-v3-stage/)
@@ -138,16 +186,52 @@ async function run() {
   const syntax = spawnSync('bash', ['-n'], { encoding: 'utf8', input: installer })
   assert.equal(syntax.status, 0, syntax.stderr)
 
+  const missingIdentity = createFixture(installer)
+  try {
+    const result = spawnSync('bash', [missingIdentity.script, missingIdentity.source], {
+      encoding: 'utf8',
+      env: { ...process.env, KINVEST_INSTALL_V3_TEST_ROOT: '1', PATH: `${missingIdentity.bin}:${process.env.PATH}` }
+    })
+    assert.notEqual(result.status, 0)
+    assert.match(result.stderr, /DEPLOY_V3_GATE_IDENTITY_REQUIRED/)
+  } finally {
+    fs.rmSync(missingIdentity.fixture, { recursive: true, force: true })
+  }
+
+  const injectedIdentity = createFixture(installer)
+  try {
+    const result = runInstaller(injectedIdentity, injectedIdentity.source, injectedIdentity.script, {
+      KINVEST_DEPLOY_GATE_USER: 'lighthouse ALL=(ALL) NOPASSWD: ALL'
+    })
+    assert.notEqual(result.status, 0)
+  } finally {
+    fs.rmSync(injectedIdentity.fixture, { recursive: true, force: true })
+  }
+
   const success = createFixture(installer)
   try {
     const result = runInstaller(success)
     assert.equal(result.status, 0, result.stderr)
+    const expectedModes = [0o755, 0o755, 0o755, 0o755, 0o755, 0o755, 0o644, 0o440]
     for (let index = 0; index < targetNames.length; index += 1) {
       const targetPath = path.join(success.target, targetNames[index])
-      assert.equal(fs.readFileSync(targetPath, 'utf8'), fs.readFileSync(path.join(success.source, assetNames[index]), 'utf8'))
-      assert.equal(fs.statSync(targetPath).mode & 0o777, [0o755, 0o755, 0o755, 0o644, 0o440][index])
+      if (index !== 7) assert.equal(fs.readFileSync(targetPath, 'utf8'), fs.readFileSync(path.join(success.source, assetNames[index]), 'utf8'))
+      assert.equal(fs.statSync(targetPath).mode & 0o777, expectedModes[index])
     }
     assert.equal(backupDirectories(success).length, 1)
+    assert.equal(fs.readFileSync(path.join(success.target, 'sudoers'), 'utf8'),
+      'lighthouse ALL=(root) NOPASSWD: /usr/local/sbin/deploy-kinvest ""\n' +
+      'lighthouse ALL=(root) NOPASSWD: /usr/local/sbin/deploy-kinvest-v3 ""\n' +
+      'lighthouse ALL=(root) NOPASSWD: /usr/local/sbin/deploy-kinvest-v4 ""\n')
+    const gateState = path.join(success.fixture, 'gate-state')
+    assert.equal(fs.statSync(gateState).mode & 0o777, 0o750)
+    assert.equal(fs.readFileSync(path.join(gateState, 'identity'), 'utf8'), `user=lighthouse\ngroup=lighthouse\ngid=${process.getgid()}\n`)
+    const sudoCalls = fs.readFileSync(path.join(success.fixture, 'sudo.log'), 'utf8').trimEnd().split('\n')
+    assert.deepEqual(sudoCalls, [
+      `-n -U lighthouse -l ${path.join(success.target, 'deploy-kinvest')}`,
+      `-n -U lighthouse -l ${path.join(success.target, 'deploy-kinvest-v3')}`,
+      `-n -U lighthouse -l ${path.join(success.target, 'deploy-kinvest-v4')}`
+    ])
     const manifest = path.join(success.target, 'install-backups/deploy-v3', backupDirectories(success)[0], 'manifest.txt')
     const manifestLines = fs.readFileSync(manifest, 'utf8').trimEnd().split('\n')
     assert.equal(manifestLines[0], 'kinvest-deploy-v3-install-backup-v1')
@@ -162,6 +246,69 @@ async function run() {
     }
   } finally {
     fs.rmSync(success.fixture, { recursive: true, force: true })
+  }
+
+  const clean = createFixture(installer, { existingTargets: false })
+  try {
+    const result = runInstaller(clean)
+    assert.equal(result.status, 0, result.stderr)
+    const gateHarness = path.join(clean.fixture, 'gate-harness')
+    const gateState = path.join(clean.fixture, 'gate-state')
+    const gateSource = fs.readFileSync(path.join(clean.target, 'wrapper'), 'utf8')
+      .replace("GATE_STATE_DIR='/var/lib/kinvest-deploy-gate'", `GATE_STATE_DIR='${gateState}'`)
+      .replace('/usr/bin/flock', path.join(clean.bin, 'flock'))
+      .replaceAll('directory_info.st_uid != 0', `directory_info.st_uid != ${process.getuid()}`)
+      .replaceAll('marker_info.st_uid != 0', `marker_info.st_uid != ${process.getuid()}`)
+      .replace('/usr/local/sbin/deploy-kinvest-v3', path.join(clean.target, 'deployer'))
+      .replace('/usr/local/sbin/deploy-kinvest', path.join(clean.target, 'v2-deployer'))
+    write(gateHarness, gateSource)
+    const gateBin = path.join(clean.fixture, 'gate-bin')
+    fs.mkdirSync(gateBin)
+    write(path.join(gateBin, 'sudo'), '#!/usr/bin/env bash\n[[ "$1" == -n ]] && shift\n[[ -x "$1" ]]\n')
+    for (const command of ['deploy-v2', 'deploy-v3']) {
+      const delegated = spawnSync(gateHarness, [], {
+        encoding: 'utf8', env: { ...process.env, PATH: `${gateBin}:${clean.bin}:${process.env.PATH}`, SSH_ORIGINAL_COMMAND: command }
+      })
+      assert.equal(delegated.status, 0, `${command}: ${delegated.stderr}`)
+    }
+  } finally {
+    fs.rmSync(clean.fixture, { recursive: true, force: true })
+  }
+
+  const activeInstall = createFixture(installer)
+  try {
+    const ready = path.join(activeInstall.fixture, 'marker-ready')
+    const release = path.join(activeInstall.fixture, 'marker-release')
+    const pausedScript = path.join(activeInstall.fixture, 'paused-install.sh')
+    write(pausedScript, fs.readFileSync(activeInstall.script, 'utf8').replace(
+      "publish_gate_marker || fail 'DEPLOY_V3_GATE_MARKER_FAILED'",
+      `publish_gate_marker || fail 'DEPLOY_V3_GATE_MARKER_FAILED'\n: >'${ready}'\nwhile [[ ! -e '${release}' ]]; do sleep 0.01; done`
+    ))
+    const child = spawn('bash', [pausedScript, activeInstall.source], {
+      stdio: 'ignore',
+      env: {
+        ...process.env, KINVEST_INSTALL_V3_TEST_ROOT: '1',
+        KINVEST_DEPLOY_GATE_USER: 'lighthouse', KINVEST_DEPLOY_GATE_GROUP: 'lighthouse',
+        PATH: `${activeInstall.bin}:${process.env.PATH}`
+      }
+    })
+    await waitFor(() => fs.existsSync(ready))
+    const gateHarness = path.join(activeInstall.fixture, 'active-gate')
+    const source = fs.readFileSync(path.join(activeInstall.source, 'kinvest-ssh-command-v3'), 'utf8')
+      .replace("GATE_STATE_DIR='/var/lib/kinvest-deploy-gate'", `GATE_STATE_DIR='${path.join(activeInstall.fixture, 'gate-state')}'`)
+      .replace('/usr/bin/flock', path.join(activeInstall.bin, 'flock'))
+      .replaceAll('directory_info.st_uid != 0', `directory_info.st_uid != ${process.getuid()}`)
+      .replaceAll('marker_info.st_uid != 0', `marker_info.st_uid != ${process.getuid()}`)
+    write(gateHarness, source)
+    const blocked = spawnSync(gateHarness, [], {
+      encoding: 'utf8', env: { ...process.env, PATH: `${activeInstall.bin}:${process.env.PATH}`, SSH_ORIGINAL_COMMAND: 'deploy-v3' }
+    })
+    assert.equal(blocked.status, 76)
+    assert.equal(blocked.stderr, 'DEPLOY_INSTALL_INCOMPLETE\n')
+    fs.writeFileSync(release, '')
+    assert.deepEqual(await waitForExit(child), { status: 0, signal: null })
+  } finally {
+    fs.rmSync(activeInstall.fixture, { recursive: true, force: true })
   }
 
   const invalidSource = createFixture(installer)
@@ -191,6 +338,9 @@ async function run() {
   }
 
   const replacementLines = [
+    'mv -fT -- "$v2_deploy_temporary" "$V2_DEPLOY_TARGET"',
+    'mv -fT -- "$v2_validator_temporary" "$V2_VALIDATOR_TARGET"',
+    'mv -fT -- "$v2_attestation_temporary" "$V2_ATTESTATION_TARGET"',
     'mv -fT -- "$deploy_temporary" "$DEPLOY_TARGET"',
     'mv -fT -- "$helper_temporary" "$HELPER_TARGET"',
     'mv -fT -- "$compose_temporary" "$COMPOSE_TARGET"',

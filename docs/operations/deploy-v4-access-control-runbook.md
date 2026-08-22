@@ -90,9 +90,16 @@ group, and numeric gid in a non-secret `0640` identity file. A later invocation
 must provide the same identity. A change is rejected with a stable error and
 requires a separately reviewed identity-migration procedure.
 
-The installer takes an exclusive gate lock before the shared private
+Both the v3 and v4 installers require the same explicit identity and safely
+create or validate the same gate directory and identity file. A clean host may
+run only the v3 installer; afterward the deploy-v2 and deploy-v3 forced-command
+branches are usable because the v3 transaction also installs the required v2
+deployer, secret validator, and offline-attestation helper. The v3 installer
+does not make deploy-v4 usable until the complete v4 closure is installed.
+
+Each installer takes an exclusive gate-directory lock before the shared private
 `deploy.lock` and holds both through gate installation, reconciliation,
-transaction commit, and journal clearing. A deployment already holding
+transaction commit, and marker clearing. A deployment already holding
 `deploy.lock` therefore prevents the installer from reading or replacing any
 target asset. The deployer continues to own the deploy lock itself, so there is
 no reverse lock acquisition path.
@@ -103,9 +110,10 @@ lock owner, group, mode, type, and link count. The lock group must be in the
 process effective primary or supplementary groups before the gate opens it
 read-only and requests a nonblocking shared lock. A busy lock is never ignored
 after a timeout. A busy lock, unsafe metadata, missing group access,
-permission/stat failure, or root-owned `0644` `install-incomplete` marker produces
-`DEPLOY_INSTALL_INCOMPLETE` before sudo. The public marker contains only the
-fixed line `ACTIVE`; ordinary users can read it but cannot change or replace it.
+permission/stat failure, or root-and-gate-group-owned `0640`
+`install-incomplete` marker produces `DEPLOY_INSTALL_INCOMPLETE` before sudo.
+The public marker contains only the fixed line `ACTIVE`; only the trusted gate
+group can read it, and only root can change or replace it.
 Only members of the explicitly configured trusted forced-command deployment
 group can open the directory and hold its shared lock. That trusted principal
 already controls Production deployment availability. The Production workflow
@@ -137,7 +145,21 @@ successful install removes and fsyncs the private journal first, then removes
 and fsyncs the public marker. The private journal remains root-only `0600` and
 its backup directory remains root-only `0700`.
 
-The installer tracks same-directory `.install-incomplete.XXXXXX` files.
+The v3 and v4 installers render the same reviewed sudoers template for the
+explicit gate user. With no historical sudoers present, that file grants only
+the three fixed, no-argument root commands `/usr/local/sbin/deploy-kinvest`,
+`/usr/local/sbin/deploy-kinvest-v3`, and
+`/usr/local/sbin/deploy-kinvest-v4`. Each installer validates the rendered file
+with `visudo` and checks all three grants as the configured user. Usernames with
+template or shell metacharacters are rejected before rendering.
+
+The installers track same-directory `.install-incomplete.XXXXXX` and
+`.identity.XXXXXX` files.
+The gate treats any such temporary entry, including a malformed partial file,
+as `DEPLOY_INSTALL_INCOMPLETE`. Under the exclusive directory lock, installer
+reentry removes only an exact direct-child basename that remains root-owned,
+regular, single-linked, and non-symlink; unsafe entries remain in place and
+keep deployment fail-closed.
 Ordinary failure removes only the exact inode it created when it remains a
 root-owned regular file with one link, then fsyncs the directory. On reentry,
 after taking the directory's exclusive lock, it removes a SIGKILL orphan only

@@ -13,7 +13,7 @@ function writeExecutable(file, source) {
   fs.writeFileSync(file, source, { mode: 0o755 })
 }
 
-function fixture({ existing = true, replaceFailure = null, postFailure = false, rollbackPause = false, pauseBeforeGate = false, killAfterReplacement = null, killStage = '', failGateTemp = '', killGateTemp = '', killGateTempStage = '' } = {}) {
+function fixture({ existing = true, replaceFailure = null, postFailure = false, rollbackPause = false, pauseBeforeGate = false, killAfterReplacement = null, killStage = '', failGateTemp = '', killGateTemp = '', killGateTempStage = '', killIdentityTempStage = '', failIdentityTempStage = '' } = {}) {
   const base = fs.mkdtempSync(path.join(os.tmpdir(), 'kinvest-v4-installer-'))
   const sbin = path.join(base, 'sbin')
   const libexec = path.join(base, 'libexec')
@@ -189,6 +189,14 @@ if [[ ! -e '${killMarker}' ]]; then : >'${killMarker}'; kill -KILL $$; fi`]
     const point = points[killGateTempStage]
     instrumented = instrumented.replace(point, () => `${point}\n  if [[ ! -e '${killMarker}' ]]; then : >'${killMarker}'; kill -KILL $$; fi`)
   }
+  if (killIdentityTempStage) {
+    const point = `# gate-identity-temp-${killIdentityTempStage}`
+    instrumented = instrumented.replace(point, () => `${point}\n    if [[ ! -e '${killMarker}' ]]; then : >'${killMarker}'; kill -KILL $$; fi`)
+  }
+  if (failIdentityTempStage) {
+    const point = `# gate-identity-temp-${failIdentityTempStage}`
+    instrumented = instrumented.replace(point, `${point}\n    return 1 # injected identity temp failure`)
+  }
   if (postFailure) {
     instrumented = instrumented.replace(
       'visudo -cf "$SUDOERS_DIR/kinvest-deploy-v4" >/dev/null',
@@ -312,6 +320,7 @@ async function run() {
   assert.doesNotMatch(gateSource, /\/root\/docker\/kinvest/)
   assert.match(gateSource, /\/var\/lib\/kinvest-deploy-gate/)
   assert.doesNotMatch(gateSource, /timeout|sleep|retry/i)
+  assert.match(gateSource, /\.identity\./)
 
   const missingIdentity = fixture()
   try {
@@ -334,6 +343,15 @@ async function run() {
     } finally {
       fs.rmSync(invalidIdentity.base, { recursive: true, force: true })
     }
+  }
+
+  const injectedIdentity = fixture()
+  try {
+    const result = execute(injectedIdentity, { KINVEST_DEPLOY_GATE_USER: 'lighthouse ALL=(ALL) NOPASSWD: ALL' })
+    assert.notEqual(result.status, 0)
+    assert.match(result.stderr, /DEPLOY_V4_GATE_IDENTITY_INVALID/)
+  } finally {
+    fs.rmSync(injectedIdentity.base, { recursive: true, force: true })
   }
 
   const gatePermissionBase = fs.mkdtempSync(path.join(os.tmpdir(), 'kinvest-v4-gate-'))
@@ -446,6 +464,73 @@ PY
       assert.equal(fs.existsSync(candidate), true, fault)
     } finally {
       fs.rmSync(malicious.base, { recursive: true, force: true })
+    }
+  }
+
+  const legalIdentityTemp = fixture()
+  try {
+    fs.mkdirSync(legalIdentityTemp.gateStateDir, { mode: 0o750 })
+    const candidate = path.join(legalIdentityTemp.gateStateDir, '.identity.AbC123')
+    fs.writeFileSync(candidate, 'user=light', { mode: 0o600 })
+    const result = execute(legalIdentityTemp)
+    assert.equal(result.status, 0, result.stderr)
+    assert.equal(fs.existsSync(candidate), false)
+  } finally {
+    fs.rmSync(legalIdentityTemp.base, { recursive: true, force: true })
+  }
+
+  for (const fault of ['symlink', 'wrong-owner', 'hardlink', 'malformed-name']) {
+    const maliciousIdentity = fixture()
+    try {
+      fs.mkdirSync(maliciousIdentity.gateStateDir, { mode: 0o750 })
+      const candidate = path.join(maliciousIdentity.gateStateDir, fault === 'malformed-name' ? '.identity.bad!' : '.identity.Bad123')
+      const overrides = {}
+      if (fault === 'symlink') fs.symlinkSync('/dev/null', candidate)
+      else {
+        fs.writeFileSync(candidate, 'partial', { mode: 0o600 })
+        if (fault === 'wrong-owner') overrides.FAKE_BAD_OWNER_PATH = candidate
+        if (fault === 'hardlink') fs.linkSync(candidate, path.join(maliciousIdentity.base, 'identity-hardlink'))
+      }
+      const result = execute(maliciousIdentity, overrides)
+      assert.notEqual(result.status, 0, fault)
+      assert.match(result.stderr, /DEPLOY_V4_GATE_TEMP_INVALID/, fault)
+      assert.equal(fs.existsSync(candidate), true, fault)
+    } finally {
+      fs.rmSync(maliciousIdentity.base, { recursive: true, force: true })
+    }
+  }
+
+  const failedIdentity = fixture({ failIdentityTempStage: 'mode' })
+  try {
+    const result = execute(failedIdentity)
+    assert.notEqual(result.status, 0)
+    assert.deepEqual(fs.readdirSync(failedIdentity.gateStateDir).filter((name) => name.startsWith('.identity.')), [])
+    assert.ok(fs.readFileSync(failedIdentity.fsyncTrace, 'utf8').includes(`dir:${failedIdentity.gateStateDir}\n`))
+  } finally {
+    fs.rmSync(failedIdentity.base, { recursive: true, force: true })
+  }
+
+  for (const stage of ['created', 'written', 'owned', 'mode', 'durable', 'renamed']) {
+    const interrupted = fixture({ killIdentityTempStage: stage })
+    try {
+      const killed = execute(interrupted)
+      assert.equal(killed.signal, 'SIGKILL', stage)
+      const identityTemps = fs.readdirSync(interrupted.gateStateDir).filter((name) => name.startsWith('.identity.'))
+      assert.equal(identityTemps.length, stage === 'renamed' ? 0 : 1, stage)
+      const gateHarness = path.join(interrupted.base, `identity-gate-${stage}`)
+      writeExecutable(gateHarness, fixtureGateSource(interrupted, gateSource))
+      const beforeResume = spawnSync(gateHarness, [], {
+        encoding: 'utf8', env: { ...process.env, PATH: `${interrupted.bin}:${process.env.PATH}`, SSH_ORIGINAL_COMMAND: 'deploy-v3' }
+      })
+      assert.equal(beforeResume.status, stage === 'renamed' ? 0 : 76, stage)
+      const resumed = execute(interrupted)
+      assert.equal(resumed.status, 0, resumed.stderr)
+      const afterResume = spawnSync(gateHarness, [], {
+        encoding: 'utf8', env: { ...process.env, PATH: `${interrupted.bin}:${process.env.PATH}`, SSH_ORIGINAL_COMMAND: 'deploy-v3' }
+      })
+      assert.equal(afterResume.status, 0, stage)
+    } finally {
+      fs.rmSync(interrupted.base, { recursive: true, force: true })
     }
   }
 
@@ -694,9 +779,15 @@ PY
     assert.equal(result.status, 0, result.stderr)
     for (const target of success.targets) assert.equal(fs.existsSync(target), true)
     assert.equal(fs.readFileSync(success.targets[2], 'utf8'), fs.readFileSync(success.targets[3], 'utf8'))
-    assert.equal(fs.readFileSync(success.targets[5], 'utf8'), 'lighthouse ALL=(root) NOPASSWD: /usr/local/sbin/deploy-kinvest-v4 ""\n')
+    assert.equal(fs.readFileSync(success.targets[5], 'utf8'),
+      'lighthouse ALL=(root) NOPASSWD: /usr/local/sbin/deploy-kinvest ""\n' +
+      'lighthouse ALL=(root) NOPASSWD: /usr/local/sbin/deploy-kinvest-v3 ""\n' +
+      'lighthouse ALL=(root) NOPASSWD: /usr/local/sbin/deploy-kinvest-v4 ""\n')
     assert.equal(fs.readFileSync(path.join(success.gateStateDir, 'identity'), 'utf8'), `user=lighthouse\ngroup=lighthouse\ngid=${process.getgid()}\n`)
     assert.equal(fs.existsSync(path.join(success.gateStateDir, 'install.lock')), false)
+    for (const command of ['deploy-kinvest', 'deploy-kinvest-v3', 'deploy-kinvest-v4']) {
+      assert.match(installerSource, new RegExp(`sudo -n -U "\\$GATE_USER" -l "\\$LOCAL_SBIN/${command}"`))
+    }
     const trace = fs.readFileSync(success.fsyncTrace, 'utf8').trim().split('\n')
     assertDurableRenames(trace, '.kinvest-v4-install.')
     const publish = trace.indexOf('publish')

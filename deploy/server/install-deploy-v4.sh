@@ -19,7 +19,7 @@ GATE_GROUP_GID=''
 GATE_IDENTITY_CONTENT=''
 GATE_SOURCE="$SOURCE_DIR/kinvest-ssh-command-v3"
 GATE_TARGET="$LOCAL_SBIN/kinvest-ssh-command"
-GATE_EXPECTED_HASH='c330b139bd73706c8962b1454113586958932b35b7bcd57bbe2d96d363a64695'
+GATE_EXPECTED_HASH='adf011acd3cb7b242bfa0f3e3c863999980e41c011320b04cbea723e137f677c'
 SOURCE_ASSETS=('deploy-kinvest-v4' 'deploy-kinvest-v3.sh' 'deploy-v3-contract.py' 'deploy-v3-contract.py' 'docker-compose-v3.yml' 'kinvest-deploy-v4.sudoers.in' 'access-control-network.conf.example')
 TARGETS=("$LOCAL_SBIN/deploy-kinvest-v4" "$LOCAL_SBIN/deploy-kinvest-v3" "$LOCAL_LIBEXEC/kinvest-deploy-v4-contract" "$LOCAL_LIBEXEC/kinvest-deploy-v3-contract" "$SERVER_ROOT/docker-compose-v4.yml" "$SUDOERS_DIR/kinvest-deploy-v4" "$SERVER_ROOT/access-control-network.conf.example")
 MODES=('0755' '0755' '0755' '0755' '0644' '0440' '0600')
@@ -29,7 +29,7 @@ EXPECTED_ASSET_HASHES=(
   '68040b9177cc8d2bb929a351e289eee7e9c6e446fda447ceec12d9ad382afe23'
   '68040b9177cc8d2bb929a351e289eee7e9c6e446fda447ceec12d9ad382afe23'
   '7698dd619fb6a441763f85e4e35c819af55e431c6d0ac9c4b527930d07a644aa'
-  'a0c9f70f81f3b734faaf17dddc2fc35286cb70f947298da29bc131bb5f3856e5'
+  '7b5e370620d99b501bd60a78637dc51984a09b550923181e424c98e4f9b36040'
   'cef9b242ad3de3c2134e2a4e7e1ae1693ce55cd63bb9ac9d65710ec796309594'
 )
 
@@ -53,7 +53,7 @@ validate_reentry_gate_temp() {
   local candidate="$1" basename identity
   [[ "$(dirname "$candidate")" == "$GATE_STATE_DIR" ]] || return 1
   basename="$(basename "$candidate")"
-  [[ "$basename" =~ ^\.install-incomplete\.[A-Za-z0-9]{6}$ ]] || return 1
+  [[ "$basename" =~ ^\.(install-incomplete|identity)\.[A-Za-z0-9]{6}$ ]] || return 1
   [[ -f "$candidate" && ! -L "$candidate" ]] || return 1
   identity="$(gate_inode_identity "$candidate")" || return 1
   [[ "$identity" =~ ^[0-9]+:[0-9]+:${GATE_ROOT_OWNER%%:*}:1:1$ ]]
@@ -74,13 +74,20 @@ cleanup_tracked_gate_temporaries() {
     gate_marker_temporary_identity=''
     removed='true'
   fi
+  if [[ -n "${gate_identity_temporary:-}" ]]; then
+    validate_tracked_gate_temp "$gate_identity_temporary" "$gate_identity_temporary_identity" || return 1
+    rm -f "$gate_identity_temporary" || return 1
+    gate_identity_temporary=''
+    gate_identity_temporary_identity=''
+    removed='true'
+  fi
   [[ "$removed" == false ]] || fsync_directory "$GATE_STATE_DIR"
 }
 
 reconcile_gate_temporaries() {
   local candidate removed='false'
   shopt -s nullglob
-  for candidate in "$GATE_STATE_DIR"/.install-incomplete.*; do
+  for candidate in "$GATE_STATE_DIR"/.install-incomplete.* "$GATE_STATE_DIR"/.identity.*; do
     validate_reentry_gate_temp "$candidate" || { shopt -u nullglob; return 1; }
     rm -f "$candidate" || { shopt -u nullglob; return 1; }
     removed='true'
@@ -125,18 +132,26 @@ prepare_gate_state() {
 }
 
 validate_or_publish_gate_identity() {
-  local identity_temporary
   if [[ -e "$GATE_IDENTITY" || -L "$GATE_IDENTITY" ]]; then
     [[ -f "$GATE_IDENTITY" && ! -L "$GATE_IDENTITY" ]] || return 1
     [[ "$(file_attributes "$GATE_IDENTITY")" == "${GATE_ROOT_OWNER%%:*}:$GATE_GROUP_GID:640" ]] || return 1
     [[ "$(cat "$GATE_IDENTITY")" == "$GATE_IDENTITY_CONTENT" ]] || fail 'DEPLOY_V4_GATE_IDENTITY_MISMATCH'
   else
-    identity_temporary="$(mktemp "$GATE_STATE_DIR/.identity.XXXXXX")" || return 1
-    printf '%s\n' "$GATE_IDENTITY_CONTENT" >"$identity_temporary" || return 1
-    chown root:"$GATE_GROUP" "$identity_temporary" || return 1
-    chmod 0640 "$identity_temporary" || return 1
-    fsync_file "$identity_temporary" || return 1
-    mv -fT "$identity_temporary" "$GATE_IDENTITY" || return 1
+    gate_identity_temporary="$(mktemp "$GATE_STATE_DIR/.identity.XXXXXX")" || return 1
+    gate_identity_temporary_identity="$(gate_inode_identity "$gate_identity_temporary")" || return 1
+    # gate-identity-temp-created
+    printf '%s\n' "$GATE_IDENTITY_CONTENT" >"$gate_identity_temporary" || return 1
+    # gate-identity-temp-written
+    chown root:"$GATE_GROUP" "$gate_identity_temporary" || return 1
+    # gate-identity-temp-owned
+    chmod 0640 "$gate_identity_temporary" || return 1
+    # gate-identity-temp-mode
+    fsync_file "$gate_identity_temporary" || return 1
+    # gate-identity-temp-durable
+    mv -fT "$gate_identity_temporary" "$GATE_IDENTITY" || return 1
+    # gate-identity-temp-renamed
+    gate_identity_temporary=''
+    gate_identity_temporary_identity=''
     fsync_directory "$GATE_STATE_DIR" || return 1
   fi
   if [[ -e "$GATE_INSTALL_MARKER" || -L "$GATE_INSTALL_MARKER" ]]; then
@@ -191,6 +206,8 @@ install -d -o root -g root -m 0700 "$BACKUP_ROOT"
 
 gate_marker_temporary=''
 gate_marker_temporary_identity=''
+gate_identity_temporary=''
+gate_identity_temporary_identity=''
 early_cleanup() {
   local result=$?
   trap - EXIT
@@ -434,6 +451,8 @@ bash -n "$LOCAL_SBIN/deploy-kinvest-v3"
 bash -n "$GATE_TARGET"
 PYTHONDONTWRITEBYTECODE=1 python3 -m py_compile "$LOCAL_LIBEXEC/kinvest-deploy-v4-contract"
 visudo -cf "$SUDOERS_DIR/kinvest-deploy-v4" >/dev/null
+sudo -n -U "$GATE_USER" -l "$LOCAL_SBIN/deploy-kinvest" >/dev/null
+sudo -n -U "$GATE_USER" -l "$LOCAL_SBIN/deploy-kinvest-v3" >/dev/null
 sudo -n -U "$GATE_USER" -l "$LOCAL_SBIN/deploy-kinvest-v4" >/dev/null
 clear_install_journal
 transaction_committed='true'
