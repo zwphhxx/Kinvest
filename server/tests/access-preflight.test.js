@@ -485,6 +485,90 @@ async function testDatabasePathIsolation(tempDirectory) {
   assert.deepStrictEqual(fs.readFileSync(productionPath), productionBefore)
 }
 
+async function testRejectsWalSnapshotSidecars(tempDirectory) {
+  const { runAccessPreflight } = require('../access-preflight')
+  const productionPath = path.join(tempDirectory, 'wal-production.sqlite')
+  const candidatePath = path.join(tempDirectory, 'wal-candidate.sqlite')
+  const candidate = new DatabaseSync(candidatePath)
+  candidate.exec(`
+    PRAGMA journal_mode = WAL;
+    PRAGMA wal_autocheckpoint = 0;
+    CREATE TABLE wal_marker (value TEXT NOT NULL);
+    INSERT INTO wal_marker VALUES ('must-remain-in-wal');
+  `)
+  const walPath = `${candidatePath}-wal`
+  assert.equal(fs.existsSync(walPath), true)
+  const sourceBefore = fs.readFileSync(candidatePath)
+  const walBefore = fs.readFileSync(walPath)
+  const stdout = capture()
+  const stderr = capture()
+  let preparationCalls = 0
+  try {
+    assert.equal(await runAccessPreflight({
+      env: enabledEnv(productionPath),
+      databasePath: candidatePath,
+      prepare: async () => {
+        preparationCalls += 1
+        return {
+          status: {
+            mode: 'device-approval',
+            references: 2,
+            database: 'ready',
+            proxy: 'ready'
+          },
+          clear() {}
+        }
+      },
+      stdout: stdout.stream,
+      stderr: stderr.stream,
+      processRef: new EventEmitter()
+    }), 1)
+    assert.equal(preparationCalls, 0)
+    assert.equal(stdout.value(), '')
+    assert.equal(
+      stderr.value(),
+      'ACCESS_PREFLIGHT_DATABASE_SNAPSHOT_INVALID\n'
+    )
+    assert.deepStrictEqual(fs.readFileSync(candidatePath), sourceBefore)
+    assert.deepStrictEqual(fs.readFileSync(walPath), walBefore)
+  } finally {
+    candidate.close()
+  }
+}
+
+async function testCleanupCompletesBeforeSuccessOutput(tempDirectory) {
+  const { runAccessPreflight } = require('../access-preflight')
+  const productionPath = path.join(tempDirectory, 'cleanup-production.sqlite')
+  const candidatePath = path.join(tempDirectory, 'cleanup-candidate.sqlite')
+  createEmptyDatabase(candidatePath)
+  const stdout = capture()
+  const stderr = capture()
+  const sensitiveMarker = 'private-cleanup-sensitive-marker'
+
+  assert.equal(await runAccessPreflight({
+    env: enabledEnv(productionPath),
+    databasePath: candidatePath,
+    prepare: async () => ({
+      status: {
+        mode: 'device-approval',
+        references: 2,
+        database: 'ready',
+        proxy: 'ready'
+      },
+      clear() {}
+    }),
+    removePrivateDirectory: () => {
+      throw new Error(sensitiveMarker)
+    },
+    stdout: stdout.stream,
+    stderr: stderr.stream,
+    processRef: new EventEmitter()
+  }), 1)
+  assert.equal(stdout.value(), '')
+  assert.equal(stderr.value(), 'ACCESS_PREFLIGHT_CLEANUP_FAILED\n')
+  assert.equal(stderr.value().includes(sensitiveMarker), false)
+}
+
 async function testRealGithubTmpfsProviderChain(tempDirectory) {
   const { runAccessPreflight } = require('../access-preflight')
   const productionPath = path.join(tempDirectory, 'real-provider-production.sqlite')
@@ -733,6 +817,8 @@ async function run() {
     await testRealOpenerChecksIdentityBeforeRefreshExpand(tempDirectory)
     await testStableFailuresAndDatabaseClosure(tempDirectory)
     await testDatabasePathIsolation(tempDirectory)
+    await testRejectsWalSnapshotSidecars(tempDirectory)
+    await testCleanupCompletesBeforeSuccessOutput(tempDirectory)
     await testRealGithubTmpfsProviderChain(tempDirectory)
     await testSignalCleanup(tempDirectory)
     await testSubprocessSignalCancellation(tempDirectory)
@@ -742,4 +828,8 @@ async function run() {
   }
 }
 
-module.exports = { run }
+module.exports = {
+  run,
+  testCleanupCompletesBeforeSuccessOutput,
+  testRejectsWalSnapshotSidecars
+}

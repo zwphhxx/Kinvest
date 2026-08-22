@@ -108,7 +108,107 @@ function fakeMetadataTransport({ statusCode = 200, chunks = [], error, timeout =
   return { calls, requestFactory, requests, responses }
 }
 
+function delayedResult(promise, timeoutMs = 200) {
+  return Promise.race([
+    promise.then(
+      (value) => ({ status: 'fulfilled', value }),
+      (error) => ({ status: 'rejected', error })
+    ),
+    new Promise((resolve) => setTimeout(
+      () => resolve({ status: 'timed-out' }),
+      timeoutMs
+    ))
+  ])
+}
+
+async function testAbortAndDeadlinePropagation() {
+  const metadataAbort = new AbortController()
+  /** @type {any} */
+  let hangingRequest
+  const metadataPending = requestCvmMetadata({
+    host: METADATA_IP,
+    path: '/latest/meta-data/cam/security-credentials/KinvestProdRole',
+    timeoutMs: 1500,
+    maxBytes: METADATA_MAX_BYTES,
+    signal: metadataAbort.signal
+  }, () => {
+    hangingRequest = new EventEmitter()
+    hangingRequest.setTimeout = () => {}
+    hangingRequest.end = () => {}
+    hangingRequest.destroy = (cause) => {
+      hangingRequest.destroyed = true
+      queueMicrotask(() => hangingRequest.emit('error', cause))
+    }
+    return hangingRequest
+  })
+  metadataAbort.abort(Object.assign(new Error('interrupted'), {
+    code: 'ACCESS_PREFLIGHT_INTERRUPTED'
+  }))
+  const metadataResult = await delayedResult(metadataPending)
+  assert.equal(metadataResult.status, 'rejected')
+  assert.equal(metadataResult.error.code, 'ACCESS_PREFLIGHT_INTERRUPTED')
+  assert.equal(hangingRequest.destroyed, true)
+
+  const providerAbort = new AbortController()
+  const providerPending = loadCvmSsmSecrets({
+    references: [{ secretName: SECRET_NAME, versionId: 'v20260802-001' }],
+    roleName: 'KinvestProdRole',
+    signal: providerAbort.signal,
+    deadlineMs: 1000,
+    metadataRequest: ({ signal }) => new Promise((_resolve, reject) => {
+      signal.addEventListener('abort', () => reject(signal.reason), { once: true })
+    }),
+    clientFactory: () => assert.fail('aborted metadata must not create SSM client'),
+    now: () => NOW
+  })
+  providerAbort.abort(Object.assign(new Error('interrupted'), {
+    code: 'ACCESS_PREFLIGHT_INTERRUPTED'
+  }))
+  const providerResult = await delayedResult(providerPending)
+  assert.equal(providerResult.status, 'rejected')
+  assert.equal(providerResult.error.code, 'ACCESS_PREFLIGHT_INTERRUPTED')
+
+  const deadlineResult = await delayedResult(loadCvmSsmSecrets({
+    references: [{ secretName: SECRET_NAME, versionId: 'v20260802-001' }],
+    roleName: 'KinvestProdRole',
+    deadlineMs: 25,
+    metadataRequest: ({ signal }) => new Promise((_resolve, reject) => {
+      signal.addEventListener('abort', () => reject(signal.reason), { once: true })
+    }),
+    clientFactory: () => assert.fail('deadline metadata must not create SSM client'),
+    now: () => NOW
+  }))
+  assert.equal(deadlineResult.status, 'rejected')
+  assert.equal(deadlineResult.error.code, 'TEMPORARY_CREDENTIALS_REQUIRED')
+
+  const ssmAbort = new AbortController()
+  const ssmPending = loadCvmSsmSecrets({
+    references: [{ secretName: SECRET_NAME, versionId: 'v20260802-001' }],
+    roleName: 'KinvestProdRole',
+    signal: ssmAbort.signal,
+    deadlineMs: 1000,
+    metadataRequest: async () => JSON.stringify(metadataPayload()),
+    clientFactory: () => ({
+      getSecretValue: (_request, { signal } = {}) => new Promise(
+        (_resolve, reject) => signal && signal.addEventListener(
+          'abort',
+          () => reject(signal.reason),
+          { once: true }
+        )
+      )
+    }),
+    now: () => NOW
+  })
+  ssmAbort.abort(Object.assign(new Error('interrupted'), {
+    code: 'ACCESS_PREFLIGHT_INTERRUPTED'
+  }))
+  const ssmResult = await delayedResult(ssmPending)
+  assert.equal(ssmResult.status, 'rejected')
+  assert.equal(ssmResult.error.code, 'ACCESS_PREFLIGHT_INTERRUPTED')
+}
+
 async function run() {
+  await testAbortAndDeadlinePropagation()
   const successTransport = fakeMetadataTransport({
     chunks: [Buffer.alloc(METADATA_MAX_BYTES, 97)]
   })
@@ -180,7 +280,9 @@ async function run() {
   })
 
   assert.equal(metadataCalls.length, 1)
-  assert.deepEqual(metadataCalls[0], {
+  const { signal: metadataSignal, ...metadataOptions } = metadataCalls[0]
+  assert.equal(metadataSignal instanceof AbortSignal, true)
+  assert.deepEqual(metadataOptions, {
     host: METADATA_IP,
     path: '/latest/meta-data/cam/security-credentials/KinvestProdRole',
     timeoutMs: 1500,
@@ -325,4 +427,4 @@ async function run() {
   }), hasCode('SSM_BOOTSTRAP_INVALID'))
 }
 
-module.exports = { run }
+module.exports = { run, testAbortAndDeadlinePropagation }

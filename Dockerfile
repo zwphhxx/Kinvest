@@ -10,6 +10,10 @@ COPY server ./server
 COPY scripts ./scripts
 RUN npm run build
 
+FROM build AS access-preflight-linux-smoke
+
+RUN node scripts/docker-access-preflight-linux-smoke.js
+
 FROM node:22-alpine AS github-tmpfs-provider-smoke
 
 WORKDIR /app
@@ -52,9 +56,12 @@ WORKDIR /app
 COPY --from=runtime-dependencies /app/node_modules ./node_modules
 COPY --from=build --chown=10001:10001 /app/dist ./
 COPY --from=github-tmpfs-provider-smoke /tmp/kinvest-github-tmpfs-smoke-ok /tmp/kinvest-github-tmpfs-smoke-ok
+COPY --from=access-preflight-linux-smoke /tmp/kinvest-access-preflight-linux-smoke-ok /tmp/kinvest-access-preflight-linux-smoke-ok
 
 RUN test -f /tmp/kinvest-github-tmpfs-smoke-ok && \
+    test -f /tmp/kinvest-access-preflight-linux-smoke-ok && \
     rm -f /tmp/kinvest-github-tmpfs-smoke-ok && \
+    rm -f /tmp/kinvest-access-preflight-linux-smoke-ok && \
     node -e "require('tencentcloud-sdk-nodejs-ssm'); require('tencentcloud-sdk-nodejs-common'); require('./server/security/github-tmpfs-secret-provider')"
 
 USER 10001:10001

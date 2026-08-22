@@ -12,6 +12,8 @@ const ACCESS_PREFLIGHT_ERROR_CODES = new Set([
   'ACCESS_CONTROL_CONFIG_INVALID',
   'ACCESS_PREFLIGHT_DATABASE_PATH_INVALID',
   'ACCESS_PREFLIGHT_DATABASE_PATH_REQUIRED',
+  'ACCESS_PREFLIGHT_DATABASE_SNAPSHOT_INVALID',
+  'ACCESS_PREFLIGHT_CLEANUP_FAILED',
   'ACCESS_PREFLIGHT_INTERRUPTED',
   'GITHUB_TMPFS_BUNDLE_INVALID',
   'GITHUB_TMPFS_CONFIG_INVALID',
@@ -45,7 +47,27 @@ function sameIdentity(leftStat, rightStat) {
   return leftStat.dev === rightStat.dev && leftStat.ino === rightStat.ino
 }
 
-function copyDescriptorToPrivateDatabase(sourceDescriptor) {
+function defaultRemovePrivateDirectory(directory) {
+  fs.rmSync(directory, { recursive: true, force: true })
+}
+
+function assertSidecarFree(databasePath) {
+  for (const suffix of ['-wal', '-shm', '-journal']) {
+    try {
+      fs.lstatSync(databasePath + suffix)
+    } catch (error) {
+      if (error && typeof error === 'object' &&
+        'code' in error && error.code === 'ENOENT') continue
+      throw error
+    }
+    throw preflightError('ACCESS_PREFLIGHT_DATABASE_SNAPSHOT_INVALID')
+  }
+}
+
+function copyDescriptorToPrivateDatabase(
+  sourceDescriptor,
+  removePrivateDirectory
+) {
   const directory = fs.mkdtempSync(path.join(
     fs.realpathSync(os.tmpdir()),
     'kinvest-access-preflight-db-'
@@ -91,14 +113,16 @@ function copyDescriptorToPrivateDatabase(sourceDescriptor) {
         // The private directory is removed below even if descriptor close fails.
       }
     }
-    fs.rmSync(directory, { recursive: true, force: true })
+    removePrivateDirectory(directory)
     throw error
   } finally {
     scratch.fill(0)
   }
 }
 
-function bindCandidateDatabase(databasePath, productionDatabasePath) {
+function bindCandidateDatabase(databasePath, productionDatabasePath, {
+  removePrivateDirectory = defaultRemovePrivateDirectory
+} = {}) {
   if (typeof databasePath !== 'string' || databasePath.length === 0) {
     throw preflightError('ACCESS_PREFLIGHT_DATABASE_PATH_REQUIRED')
   }
@@ -116,6 +140,7 @@ function bindCandidateDatabase(databasePath, productionDatabasePath) {
       fs.realpathSync(parent) !== parent) {
       throw preflightError('ACCESS_PREFLIGHT_DATABASE_PATH_INVALID')
     }
+    assertSidecarFree(candidate)
     const pathStat = fs.lstatSync(candidate)
     if (!pathStat.isFile() || pathStat.isSymbolicLink() || pathStat.nlink !== 1 ||
       candidate === production) {
@@ -134,7 +159,11 @@ function bindCandidateDatabase(databasePath, productionDatabasePath) {
       sameIdentity(openedStat, fs.statSync(production))) {
       throw preflightError('ACCESS_PREFLIGHT_DATABASE_PATH_INVALID')
     }
-    privateCopy = copyDescriptorToPrivateDatabase(sourceDescriptor)
+    privateCopy = copyDescriptorToPrivateDatabase(
+      sourceDescriptor,
+      removePrivateDirectory
+    )
+    assertSidecarFree(candidate)
     let cleared = false
     return Object.freeze({
       databasePath: privateCopy.databasePath,
@@ -144,7 +173,7 @@ function bindCandidateDatabase(databasePath, productionDatabasePath) {
         try { fs.closeSync(sourceDescriptor) } catch {
           // The descriptor is no longer reachable after cleanup.
         }
-        fs.rmSync(privateCopy.directory, { recursive: true, force: true })
+        removePrivateDirectory(privateCopy.directory)
       }
     })
   } catch (error) {
@@ -154,10 +183,15 @@ function bindCandidateDatabase(databasePath, productionDatabasePath) {
       }
     }
     if (privateCopy) {
-      fs.rmSync(privateCopy.directory, { recursive: true, force: true })
+      try { removePrivateDirectory(privateCopy.directory) } catch {
+        // Preserve the stable validation error from the failed binding.
+      }
     }
     if (error && typeof error === 'object' &&
-      'code' in error && error.code === 'ACCESS_PREFLIGHT_DATABASE_PATH_REQUIRED') {
+      'code' in error && (
+        error.code === 'ACCESS_PREFLIGHT_DATABASE_PATH_REQUIRED' ||
+        error.code === 'ACCESS_PREFLIGHT_DATABASE_SNAPSHOT_INVALID'
+      )) {
       throw error
     }
     throw preflightError('ACCESS_PREFLIGHT_DATABASE_PATH_INVALID')
@@ -182,6 +216,7 @@ async function runAccessPreflight({
   loadSecrets,
   createAccessRuntime,
   createHandler,
+  removePrivateDirectory = defaultRemovePrivateDirectory,
   stdout = process.stdout,
   stderr = process.stderr,
   processRef = process
@@ -189,18 +224,26 @@ async function runAccessPreflight({
   let prepared
   let candidateDatabase
   let interrupted = false
+  let cleanupFailure
   const abortController = new AbortController()
   const handleSignal = () => {
     interrupted = true
     abortController.abort(preflightError('ACCESS_PREFLIGHT_INTERRUPTED'))
-    if (prepared) prepared.clear()
+    if (prepared) {
+      try { prepared.clear() } catch {
+        cleanupFailure = preflightError('ACCESS_PREFLIGHT_CLEANUP_FAILED')
+      }
+    }
   }
   processRef.once('SIGTERM', handleSignal)
   processRef.once('SIGINT', handleSignal)
+  let resultLine
+  let failure
   try {
     candidateDatabase = bindCandidateDatabase(
       databasePath,
-      productionDatabasePath
+      productionDatabasePath,
+      { removePrivateDirectory }
     )
     prepared = await prepare({
       env,
@@ -213,22 +256,40 @@ async function runAccessPreflight({
       closeDatabase
     })
     if (interrupted) throw preflightError('ACCESS_PREFLIGHT_INTERRUPTED')
-    stdout.write(successLine(prepared.status))
-    return 0
+    resultLine = successLine(prepared.status)
   } catch (error) {
-    stderr.write(`${stableAccessPreflightErrorCode(error)}\n`)
-    return 1
+    failure = error
   } finally {
-    if (prepared) prepared.clear()
-    if (candidateDatabase) candidateDatabase.clear()
+    if (prepared) {
+      try { prepared.clear() } catch {
+        cleanupFailure = preflightError('ACCESS_PREFLIGHT_CLEANUP_FAILED')
+      }
+    }
+    if (candidateDatabase) {
+      try { candidateDatabase.clear() } catch {
+        cleanupFailure = preflightError('ACCESS_PREFLIGHT_CLEANUP_FAILED')
+      }
+    }
     processRef.removeListener('SIGTERM', handleSignal)
     processRef.removeListener('SIGINT', handleSignal)
   }
+  if (!failure && cleanupFailure) failure = cleanupFailure
+  if (failure) {
+    stderr.write(`${stableAccessPreflightErrorCode(failure)}\n`)
+    return 1
+  }
+  stdout.write(resultLine)
+  return 0
 }
 
 if (require.main === module) {
   runAccessPreflight({ databasePath: process.argv[2] }).then((exitCode) => {
     process.exitCode = exitCode
+  }).catch(() => {
+    try { process.stderr.write('ACCESS_PREFLIGHT_FAILED\n') } catch {
+      // The process still exits unsuccessfully if stderr itself is unavailable.
+    }
+    process.exitCode = 1
   })
 }
 

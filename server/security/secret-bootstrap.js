@@ -146,7 +146,11 @@ async function bootstrapSecrets({
       mode: config.providerMode
     })
   } catch (error) {
-    if (provider && typeof provider.clear === 'function') provider.clear()
+    if (provider && typeof provider.clear === 'function') {
+      try { provider.clear() } catch {
+        // Preserve the original stable bootstrap failure.
+      }
+    }
     throw error
   }
 }

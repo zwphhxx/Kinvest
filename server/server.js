@@ -456,6 +456,7 @@ async function startServer({
   openDatabase = openTrackedDb,
   closeDatabase = closeTrackedDatabase,
   closeApplicationDatabase = closeDb,
+  shutdownTimeoutMs = 5000,
   initializeDatabase = initializeRefreshDatabase,
   createHttpHandler = createRequestHandler,
   runtimeServer,
@@ -482,9 +483,12 @@ async function startServer({
     })
   }
   let cleaned = false
+  let shutdownStarted = false
+  let shutdownTimer
   const cleanup = () => {
     if (cleaned) return
     cleaned = true
+    if (shutdownTimer) clearTimeout(shutdownTimer)
     processRef.removeListener('SIGTERM', handleSignal)
     processRef.removeListener('SIGINT', handleSignal)
     runtimeServer.removeListener('close', cleanup)
@@ -500,16 +504,34 @@ async function startServer({
     }
   }
   const handleSignal = () => {
-    cleanup()
+    if (shutdownStarted) return
+    shutdownStarted = true
     try {
-      runtimeServer.close()
+      runtimeServer.close(() => cleanup())
     } catch (error) {
-      if (!error || typeof error !== 'object' ||
-        !('code' in error) || error.code !== 'ERR_SERVER_NOT_RUNNING') {
-        throw Object.assign(new Error('Server close failed'), {
-          code: 'SERVER_CLOSE_FAILED'
-        })
+      cleanup()
+      if (error && typeof error === 'object' &&
+        'code' in error && error.code === 'ERR_SERVER_NOT_RUNNING') {
+        return
       }
+      throw Object.assign(new Error('Server close failed'), {
+        code: 'SERVER_CLOSE_FAILED'
+      })
+    }
+    if (!cleaned) {
+      const boundedTimeout = Number.isSafeInteger(shutdownTimeoutMs) &&
+        shutdownTimeoutMs >= 1 ? shutdownTimeoutMs : 5000
+      shutdownTimer = setTimeout(() => {
+        try {
+          if (typeof runtimeServer.closeAllConnections === 'function') {
+            runtimeServer.closeAllConnections()
+          }
+        } catch {
+          // Runtime and database cleanup must still complete at the deadline.
+        }
+        cleanup()
+      }, boundedTimeout)
+      if (typeof shutdownTimer.unref === 'function') shutdownTimer.unref()
     }
   }
   processRef.once('SIGTERM', handleSignal)

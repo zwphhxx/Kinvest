@@ -375,6 +375,7 @@ async function run() {
     dockerfile.match(/^FROM\b.*$/gm),
     [
       'FROM node:22-alpine AS build',
+      'FROM build AS access-preflight-linux-smoke',
       'FROM node:22-alpine AS github-tmpfs-provider-smoke',
       'FROM node:22-alpine AS runtime-dependencies',
       'FROM node:22-alpine AS runtime'
@@ -387,9 +388,10 @@ async function run() {
     [
       'COPY --from=runtime-dependencies /app/node_modules ./node_modules',
       'COPY --from=build --chown=10001:10001 /app/dist ./',
-      'COPY --from=github-tmpfs-provider-smoke /tmp/kinvest-github-tmpfs-smoke-ok /tmp/kinvest-github-tmpfs-smoke-ok'
+      'COPY --from=github-tmpfs-provider-smoke /tmp/kinvest-github-tmpfs-smoke-ok /tmp/kinvest-github-tmpfs-smoke-ok',
+      'COPY --from=access-preflight-linux-smoke /tmp/kinvest-access-preflight-linux-smoke-ok /tmp/kinvest-access-preflight-linux-smoke-ok'
     ],
-    'runtime stage must copy only production dependencies, built dist, and the non-secret smoke marker'
+    'runtime stage must copy only production dependencies, built dist, and non-secret smoke markers'
   )
   assert.match(
     runtimeStage,

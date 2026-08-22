@@ -73,6 +73,29 @@ async function runBuildArtifactsExist() {
     'server/utils/refresh-policy.js'
   ]
 
+  const dockerfile = fs.readFileSync(
+    path.join(repositoryRoot, 'Dockerfile'),
+    'utf8'
+  )
+  const linuxSmokePath = path.join(
+    repositoryRoot,
+    'scripts',
+    'docker-access-preflight-linux-smoke.js'
+  )
+  assert.equal(fs.existsSync(linuxSmokePath), true)
+  assert.match(
+    dockerfile,
+    /^FROM build AS access-preflight-linux-smoke[\s\S]*RUN node scripts\/docker-access-preflight-linux-smoke[.]js$/m
+  )
+  assert.match(
+    dockerfile,
+    /^COPY --from=access-preflight-linux-smoke \/tmp\/kinvest-access-preflight-linux-smoke-ok \/tmp\/kinvest-access-preflight-linux-smoke-ok$/m
+  )
+  const linuxSmoke = fs.readFileSync(linuxSmokePath, 'utf8')
+  assert.match(linuxSmoke, /process[.]platform[^\n]*linux/)
+  assert.match(linuxSmoke, /runAccessPreflight/)
+  assert.match(linuxSmoke, /KINVEST_ACCESS_PREFLIGHT_OK/)
+
   try {
     fs.writeFileSync(fixturePath, 'build leak fixture\n')
     execFileSync(process.execPath, [path.join(repositoryRoot, 'scripts', 'build.js')], {
