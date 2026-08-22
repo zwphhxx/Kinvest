@@ -826,6 +826,19 @@ PY
   } finally {
     fs.rmSync(identityReentry.base, { recursive: true, force: true })
   }
+
+  const v3Journal = fixture()
+  try {
+    const journal = path.join(v3Journal.serverRoot, 'state/install-v3.journal')
+    fs.writeFileSync(journal, 'private-v3\n', { mode: 0o600 })
+    const result = execute(v3Journal)
+    assert.equal(result.status, 76)
+    assert.match(result.stderr, /DEPLOY_INSTALL_INCOMPLETE/)
+    assert.equal(fs.existsSync(journal), true)
+    assertOld(v3Journal, true)
+  } finally {
+    fs.rmSync(v3Journal.base, { recursive: true, force: true })
+  }
 }
 
 module.exports = { run }

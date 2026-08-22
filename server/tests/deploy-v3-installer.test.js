@@ -29,6 +29,7 @@ function createFixture(installer, { existingTargets = true } = {}) {
   const target = path.join(fixture, 'target')
   const runRoot = path.join(fixture, 'run')
   const bin = path.join(fixture, 'bin')
+  const fsyncTrace = path.join(fixture, 'fsync.trace')
   fs.mkdirSync(source)
   fs.mkdirSync(target)
   fs.mkdirSync(runRoot)
@@ -47,7 +48,7 @@ exec /usr/bin/id "$@"
 `)
   write(
     path.join(bin, 'mv'),
-    '#!/usr/bin/env bash\nset -euo pipefail\nargs=()\nfor value in "$@"; do\n  [[ "$value" == "-fT" || "$value" == "--" ]] || args+=("$value")\ndone\nexec /bin/mv -f "${args[@]}"\n'
+    '#!/usr/bin/env bash\nset -euo pipefail\nargs=()\nfor value in "$@"; do\n  [[ "$value" == "-fT" || "$value" == "--" ]] || args+=("$value")\ndone\ncount="${#args[@]}"\nsource="${args[$((count - 2))]}"\ntarget="${args[$((count - 1))]}"\n[[ -z "${FSYNC_TRACE:-}" ]] || printf \'rename:%s:%s\\n\' "$source" "$target" >>"$FSYNC_TRACE"\nexec /bin/mv -f "${args[@]}"\n'
   )
   write(path.join(source, assetNames[0]), '#!/usr/bin/env bash\nexit 0\n')
   write(path.join(source, assetNames[1]), '#!/usr/bin/env python3\nimport sys\nprint("{}")\n')
@@ -74,6 +75,14 @@ exec /usr/bin/id "$@"
     .replace("GATE_ROOT_OWNER='0:0'", `GATE_ROOT_OWNER='${process.getuid()}:${process.getgid()}'`)
     .replaceAll('-o root -g "$GATE_GROUP"', `-o ${process.getuid()} -g ${process.getgid()}`)
     .replaceAll('chown root:"$GATE_GROUP"', `chown ${process.getuid()}:${process.getgid()}`)
+    .replace('fsync_file() {', `fsync_file() {
+  printf 'file:%s\\n' "$1" >>'${fsyncTrace}'`)
+    .replace('fsync_directory() {', `fsync_directory() {
+  printf 'dir:%s\\n' "$1" >>'${fsyncTrace}'`)
+    .replace('clear_install_journal() {', `clear_install_journal() {
+  printf 'journal-clear\\n' >>'${fsyncTrace}'`)
+    .replace('clear_gate_marker() {', `clear_gate_marker() {
+  printf 'marker-clear\\n' >>'${fsyncTrace}'`)
     .replace("INSTALL_OWNER='root'", `INSTALL_OWNER='${process.getuid()}'`)
     .replace("INSTALL_GROUP='root'", `INSTALL_GROUP='${process.getgid()}'`)
     .replace('V2_DEPLOY_TARGET="$LOCAL_SBIN/deploy-kinvest"', `V2_DEPLOY_TARGET='${path.join(target, 'v2-deployer')}'`)
@@ -90,7 +99,7 @@ exec /usr/bin/id "$@"
     )
   const script = path.join(fixture, 'install.sh')
   write(script, instrumented)
-  return { fixture, source, target, runRoot, bin, script }
+  return { fixture, source, target, runRoot, bin, script, fsyncTrace }
 }
 
 function runInstaller(context, source = context.source, script = context.script, overrides = {}) {
@@ -102,6 +111,7 @@ function runInstaller(context, source = context.source, script = context.script,
       KINVEST_DEPLOY_GATE_USER: 'lighthouse',
       KINVEST_DEPLOY_GATE_GROUP: 'lighthouse',
       SUDO_LOG: path.join(context.fixture, 'sudo.log'),
+      FSYNC_TRACE: context.fsyncTrace,
       PATH: `${context.bin}:${process.env.PATH}`,
       ...overrides
     }
@@ -119,6 +129,33 @@ function backupDirectories(context) {
   const backupRoot = path.join(context.target, 'install-backups/deploy-v3')
   if (!fs.existsSync(backupRoot)) return []
   return fs.readdirSync(backupRoot).filter((name) => name.startsWith('kinvest-deploy-v3-backup.'))
+}
+
+function installJournal(context) {
+  return path.join(context.target, 'state/install-v3.journal')
+}
+
+function assertDurableTargetRenames(context) {
+  const trace = fs.readFileSync(context.fsyncTrace, 'utf8').trimEnd().split('\n')
+  for (const targetName of targetNames) {
+    const target = path.join(context.target, targetName)
+    const renameIndex = trace.findIndex((entry) => entry.startsWith('rename:') && entry.endsWith(`:${target}`))
+    assert.ok(renameIndex >= 0, `missing rename: ${targetName}`)
+    const temporary = trace[renameIndex].slice('rename:'.length, -(target.length + 1))
+    assert.ok(trace.lastIndexOf(`file:${temporary}`, renameIndex) >= 0, `missing temp fsync: ${targetName}`)
+    assert.ok(trace.slice(renameIndex + 1).includes(`dir:${path.dirname(target)}`), `missing parent fsync: ${targetName}`)
+  }
+  const journal = installJournal(context)
+  const firstJournalRename = trace.findIndex((entry) => entry.startsWith('rename:') && entry.endsWith(`:${journal}`))
+  assert.ok(firstJournalRename > 0)
+  assert.ok(trace.slice(0, firstJournalRename).some((entry) => /file:.*manifest\.txt$/.test(entry)))
+  assert.ok(trace.slice(0, firstJournalRename).some((entry) => /dir:.*kinvest-deploy-v3-backup\./.test(entry)))
+  assert.ok(trace.slice(0, firstJournalRename).includes(`dir:${path.join(context.target, 'install-backups/deploy-v3')}`))
+  const journalClear = trace.lastIndexOf('journal-clear')
+  const markerClear = trace.lastIndexOf('marker-clear')
+  assert.ok(journalClear > firstJournalRename && markerClear > journalClear)
+  assert.ok(trace.lastIndexOf(`dir:${path.join(context.target, 'state')}`, markerClear) > journalClear)
+  assert.ok(trace.slice(markerClear + 1).includes(`dir:${path.join(context.fixture, 'gate-state')}`))
 }
 
 function waitFor(check, timeoutMs = 3000) {
@@ -226,6 +263,7 @@ async function run() {
     const gateState = path.join(success.fixture, 'gate-state')
     assert.equal(fs.statSync(gateState).mode & 0o777, 0o750)
     assert.equal(fs.readFileSync(path.join(gateState, 'identity'), 'utf8'), `user=lighthouse\ngroup=lighthouse\ngid=${process.getgid()}\n`)
+    assertDurableTargetRenames(success)
     const sudoCalls = fs.readFileSync(path.join(success.fixture, 'sudo.log'), 'utf8').trimEnd().split('\n')
     assert.deepEqual(sudoCalls, [
       `-n -U lighthouse -l ${path.join(success.target, 'deploy-kinvest')}`,
@@ -347,6 +385,76 @@ async function run() {
     'mv -fT -- "$sudoers_temporary" "$SUDOERS_TARGET"',
     'mv -fT -- "$wrapper_temporary" "$WRAPPER_TARGET"'
   ]
+
+  for (const [stage, injectionLine] of [...replacementLines.map((line, index) => [`replace-${index}`, line]), ['postcheck', 'visudo -cf "$SUDOERS_TARGET" >/dev/null']]) {
+    const interrupted = createFixture(installer)
+    try {
+      const killedScript = path.join(interrupted.fixture, `kill-${stage}.sh`)
+      const baseScript = fs.readFileSync(interrupted.script, 'utf8')
+      const injectedScript = baseScript.replace(
+        injectionLine,
+        () => `${injectionLine}\nkill -KILL $$ # injected ${stage}`
+      )
+      assert.notEqual(injectedScript, baseScript, `missing injection point: ${stage}`)
+      write(killedScript, injectedScript)
+      const killed = runInstaller(interrupted, interrupted.source, killedScript)
+      assert.equal(killed.signal, 'SIGKILL', `${stage}: status=${killed.status} stderr=${killed.stderr}`)
+      assert.equal(fs.existsSync(installJournal(interrupted)), true, stage)
+      assert.equal(fs.readFileSync(path.join(interrupted.fixture, 'gate-state/install-incomplete'), 'utf8'), 'ACTIVE\n', stage)
+      const journalText = fs.readFileSync(installJournal(interrupted), 'utf8')
+      assert.match(journalText, /^version=1$/m, stage)
+      assert.match(journalText, new RegExp(`^stage=${stage}$`, 'm'), stage)
+      assert.match(journalText, /^backup=.*kinvest-deploy-v3-backup\.[A-Za-z0-9]{6}$/m, stage)
+      assert.match(journalText, /^manifestHash=[0-9a-f]{64}$/m, stage)
+      assert.match(journalText, /^gateUser=lighthouse$/m, stage)
+      assert.match(journalText, /^gateGroup=lighthouse$/m, stage)
+      assert.doesNotMatch(journalText, /password|token|secret/i, stage)
+
+      const reconciled = runInstaller(interrupted)
+      assert.notEqual(reconciled.status, 0, stage)
+      assert.match(reconciled.stderr, /DEPLOY_V3_INSTALL_RECONCILED_RETRY_REQUIRED/, stage)
+      assertOldTargets(interrupted)
+      assert.equal(fs.existsSync(installJournal(interrupted)), false, stage)
+      assert.equal(fs.existsSync(path.join(interrupted.fixture, 'gate-state/install-incomplete')), false, stage)
+
+      const installed = runInstaller(interrupted)
+      assert.equal(installed.status, 0, `${stage}: ${installed.stderr}`)
+      for (let index = 0; index < targetNames.length; index += 1) {
+        const expected = index === 7
+          ? fs.readFileSync(path.join(interrupted.target, 'sudoers'), 'utf8')
+          : fs.readFileSync(path.join(interrupted.source, assetNames[index]), 'utf8')
+        assert.equal(fs.readFileSync(path.join(interrupted.target, targetNames[index]), 'utf8'), expected, `${stage}:${targetNames[index]}`)
+      }
+    } finally {
+      fs.rmSync(interrupted.fixture, { recursive: true, force: true })
+    }
+  }
+
+  for (const corruption of ['journal-mode', 'backup-path', 'manifest-hash']) {
+    const invalidJournal = createFixture(installer)
+    try {
+      const killedScript = path.join(invalidJournal.fixture, `invalid-${corruption}.sh`)
+      const baseScript = fs.readFileSync(invalidJournal.script, 'utf8')
+      write(killedScript, baseScript.replace(replacementLines[0], () => `${replacementLines[0]}\nkill -KILL $$`))
+      assert.equal(runInstaller(invalidJournal, invalidJournal.source, killedScript).signal, 'SIGKILL')
+      const journal = installJournal(invalidJournal)
+      if (corruption === 'journal-mode') fs.chmodSync(journal, 0o644)
+      if (corruption === 'backup-path') {
+        fs.writeFileSync(journal, fs.readFileSync(journal, 'utf8').replace(/^backup=.*$/m, `backup=${invalidJournal.fixture}/outside`), { mode: 0o600 })
+      }
+      if (corruption === 'manifest-hash') {
+        const backup = fs.readFileSync(journal, 'utf8').match(/^backup=(.*)$/m)[1]
+        fs.appendFileSync(path.join(backup, 'manifest.txt'), 'tampered\n')
+      }
+      const result = runInstaller(invalidJournal)
+      assert.notEqual(result.status, 0, corruption)
+      assert.match(result.stderr, /DEPLOY_V3_INSTALL_JOURNAL_INVALID/, corruption)
+      assert.equal(fs.existsSync(journal), true, corruption)
+      assert.equal(fs.existsSync(path.join(invalidJournal.fixture, 'gate-state/install-incomplete')), true, corruption)
+    } finally {
+      fs.rmSync(invalidJournal.fixture, { recursive: true, force: true })
+    }
+  }
   for (const replacementLine of replacementLines) {
     const failure = createFixture(installer)
     try {
@@ -355,10 +463,41 @@ async function run() {
       const result = runInstaller(failure, failure.source, failedScript)
       assert.notEqual(result.status, 0, `expected failure at ${replacementLine}`)
       assertOldTargets(failure)
+      assert.equal(fs.existsSync(installJournal(failure)), false)
+      assert.equal(fs.existsSync(path.join(failure.fixture, 'gate-state/install-incomplete')), false)
       assert.equal(backupDirectories(failure).length, 1)
     } finally {
       fs.rmSync(failure.fixture, { recursive: true, force: true })
     }
+  }
+
+  const postcheckFailure = createFixture(installer)
+  try {
+    const failedScript = path.join(postcheckFailure.fixture, 'postcheck-fails.sh')
+    write(failedScript, fs.readFileSync(postcheckFailure.script, 'utf8').replace(
+      'visudo -cf "$SUDOERS_TARGET" >/dev/null',
+      'false # injected installed sudoers postcheck failure'
+    ))
+    assert.notEqual(runInstaller(postcheckFailure, postcheckFailure.source, failedScript).status, 0)
+    assertOldTargets(postcheckFailure)
+    assert.equal(fs.existsSync(installJournal(postcheckFailure)), false)
+    assert.equal(fs.existsSync(path.join(postcheckFailure.fixture, 'gate-state/install-incomplete')), false)
+  } finally {
+    fs.rmSync(postcheckFailure.fixture, { recursive: true, force: true })
+  }
+
+  const v4Journal = createFixture(installer)
+  try {
+    const journal = path.join(v4Journal.target, 'state/install-v4.journal')
+    fs.mkdirSync(path.dirname(journal), { recursive: true })
+    fs.writeFileSync(journal, 'private-v4\n', { mode: 0o600 })
+    const result = runInstaller(v4Journal)
+    assert.equal(result.status, 76)
+    assert.match(result.stderr, /DEPLOY_INSTALL_INCOMPLETE/)
+    assert.equal(fs.existsSync(journal), true)
+    assertOldTargets(v4Journal)
+  } finally {
+    fs.rmSync(v4Journal.fixture, { recursive: true, force: true })
   }
 
   const absent = createFixture(installer, { existingTargets: false })

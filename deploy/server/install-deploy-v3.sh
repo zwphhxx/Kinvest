@@ -28,6 +28,8 @@ COMPOSE_TARGET="$SERVER_ROOT/docker-compose-v3.yml"
 SUDOERS_TARGET="$SUDOERS_DIR/kinvest-deploy-v3"
 DEPLOY_LOCK="$SERVER_ROOT/state/deploy.lock"
 INSTALL_BACKUP_ROOT="$SERVER_ROOT/install-backups/deploy-v3"
+INSTALL_JOURNAL="$SERVER_ROOT/state/install-v3.journal"
+V4_INSTALL_JOURNAL="$SERVER_ROOT/state/install-v4.journal"
 
 SOURCE_ASSETS=('deploy-kinvest-v2.sh' 'secret-version-config.py' 'offline-image-attestation.py' 'deploy-kinvest-v3.sh' 'kinvest-ssh-command-v3' 'deploy-v3-contract.py' 'docker-compose-v3.yml' 'kinvest-deploy-v4.sudoers.in')
 TARGETS=("$V2_DEPLOY_TARGET" "$V2_VALIDATOR_TARGET" "$V2_ATTESTATION_TARGET" "$DEPLOY_TARGET" "$WRAPPER_TARGET" "$HELPER_TARGET" "$COMPOSE_TARGET" "$SUDOERS_TARGET")
@@ -203,6 +205,7 @@ validate_or_publish_gate_identity() {
 validate_gate_marker() {
   [[ -f "$GATE_INSTALL_MARKER" && ! -L "$GATE_INSTALL_MARKER" ]] || return 1
   [[ "$(file_attributes "$GATE_INSTALL_MARKER")" == "${GATE_ROOT_OWNER%%:*}:$GATE_GROUP_GID:640" ]] || return 1
+  [[ "$(wc -c <"$GATE_INSTALL_MARKER" | tr -d '[:space:]')" == 7 ]] || return 1
   [[ "$(cat "$GATE_INSTALL_MARKER")" == ACTIVE ]]
 }
 
@@ -248,6 +251,8 @@ sudoers_temporary=''
 compile_cache=''
 staging_dir=''
 backup_dir=''
+manifest_hash=''
+journal_temporary=''
 transaction_started='false'
 transaction_committed='false'
 BACKUP_PRESENT=()
@@ -278,11 +283,13 @@ snapshot_targets() {
       fi
       BACKUP_HASHES[$index]="$target_hash"
       BACKUP_ATTRIBUTES[$index]="$target_attributes"
+      fsync_file "$backup_path"
     else
       BACKUP_PRESENT[$index]='false'
       : > "$backup_dir/${TARGET_NAMES[$index]}.absent"
       chmod 0600 "$backup_dir/${TARGET_NAMES[$index]}.absent"
       chown "$INSTALL_OWNER:$INSTALL_GROUP" "$backup_dir/${TARGET_NAMES[$index]}.absent"
+      fsync_file "$backup_dir/${TARGET_NAMES[$index]}.absent"
       BACKUP_HASHES[$index]=''
       BACKUP_ATTRIBUTES[$index]=''
     fi
@@ -295,6 +302,86 @@ snapshot_targets() {
   } >"$backup_dir/manifest.txt"
   chmod 0600 "$backup_dir/manifest.txt"
   chown "$INSTALL_OWNER:$INSTALL_GROUP" "$backup_dir/manifest.txt"
+  fsync_file "$backup_dir/manifest.txt"
+  fsync_directory "$backup_dir"
+  fsync_directory "$INSTALL_BACKUP_ROOT"
+  manifest_hash="$(file_hash "$backup_dir/manifest.txt")"
+}
+
+load_backup() {
+  local candidate="$1" expected_manifest_hash="$2" index line name present hash attributes extra backup_path
+  [[ "$candidate" == "$INSTALL_BACKUP_ROOT"/kinvest-deploy-v3-backup.[A-Za-z0-9][A-Za-z0-9][A-Za-z0-9][A-Za-z0-9][A-Za-z0-9][A-Za-z0-9] ]] || return 1
+  [[ -d "$candidate" && ! -L "$candidate" && "$(file_attributes "$candidate")" == "$expected_owner:$expected_group:700" ]] || return 1
+  [[ "$(python3 -c 'import os,sys; print(os.path.realpath(sys.argv[1]))' "$candidate")" == "$candidate" ]] || return 1
+  [[ -f "$candidate/manifest.txt" && ! -L "$candidate/manifest.txt" ]] || return 1
+  [[ "$(file_attributes "$candidate/manifest.txt")" == "$expected_owner:$expected_group:600" ]] || return 1
+  [[ "$(gate_inode_identity "$candidate/manifest.txt")" =~ ^[0-9]+:[0-9]+:${GATE_ROOT_OWNER%%:*}:1:1$ ]] || return 1
+  [[ "$(file_hash "$candidate/manifest.txt")" == "$expected_manifest_hash" ]] || return 1
+  [[ "$(wc -l <"$candidate/manifest.txt" | tr -d '[:space:]')" == 9 ]] || return 1
+  [[ "$(sed -n '1p' "$candidate/manifest.txt")" == kinvest-deploy-v3-install-backup-v1 ]] || return 1
+  BACKUP_PRESENT=()
+  BACKUP_HASHES=()
+  BACKUP_ATTRIBUTES=()
+  for index in "${!TARGETS[@]}"; do
+    line="$(sed -n "$((index + 2))p" "$candidate/manifest.txt")"
+    IFS='|' read -r name present hash attributes extra <<<"$line"
+    [[ "$name" == "${TARGET_NAMES[$index]}" && -z "$extra" && ( "$present" == true || "$present" == false ) ]] || return 1
+    if [[ "$present" == true ]]; then
+      [[ "$hash" =~ ^[0-9a-f]{64}$ && "$attributes" =~ ^[0-9]+:[0-9]+:[0-7]{3,4}$ ]] || return 1
+      backup_path="$candidate/${TARGET_NAMES[$index]}.asset"
+      [[ -f "$backup_path" && ! -L "$backup_path" ]] || return 1
+      [[ "$(gate_inode_identity "$backup_path")" =~ ^[0-9]+:[0-9]+:[0-9]+:1:1$ ]] || return 1
+      [[ "$(file_hash "$backup_path")" == "$hash" && "$(file_attributes "$backup_path")" == "$attributes" ]] || return 1
+    else
+      backup_path="$candidate/${TARGET_NAMES[$index]}.absent"
+      [[ -z "$hash" && -z "$attributes" && -f "$backup_path" && ! -L "$backup_path" ]] || return 1
+      [[ "$(gate_inode_identity "$backup_path")" =~ ^[0-9]+:[0-9]+:${GATE_ROOT_OWNER%%:*}:1:1$ ]] || return 1
+      [[ "$(file_attributes "$backup_path")" == "$expected_owner:$expected_group:600" ]] || return 1
+    fi
+    BACKUP_PRESENT[$index]="$present"
+    BACKUP_HASHES[$index]="$hash"
+    BACKUP_ATTRIBUTES[$index]="$attributes"
+  done
+  backup_dir="$candidate"
+  manifest_hash="$expected_manifest_hash"
+}
+
+write_install_journal() {
+  local stage="$1"
+  [[ "$stage" =~ ^(prepared|replace-[0-7]|postcheck)$ ]] || return 1
+  journal_temporary="$(mktemp "$SERVER_ROOT/state/.install-v3-journal.XXXXXX")" || return 1
+  {
+    printf 'version=1\n'
+    printf 'stage=%s\n' "$stage"
+    printf 'backup=%s\n' "$backup_dir"
+    printf 'manifestHash=%s\n' "$manifest_hash"
+    printf 'gateUser=%s\n' "$GATE_USER"
+    printf 'gateGroup=%s\n' "$GATE_GROUP"
+    printf 'gateGid=%s\n' "$GATE_GROUP_GID"
+  } >"$journal_temporary"
+  chown "$INSTALL_OWNER:$INSTALL_GROUP" "$journal_temporary"
+  chmod 0600 "$journal_temporary"
+  fsync_file "$journal_temporary"
+  mv -fT -- "$journal_temporary" "$INSTALL_JOURNAL"
+  journal_temporary=''
+  transaction_started='true'
+  fsync_directory "$SERVER_ROOT/state"
+}
+
+load_install_journal() {
+  local line version stage candidate manifest candidate_user candidate_group candidate_gid extra
+  [[ -f "$INSTALL_JOURNAL" && ! -L "$INSTALL_JOURNAL" ]] || return 1
+  [[ "$(file_attributes "$INSTALL_JOURNAL")" == "$expected_owner:$expected_group:600" ]] || return 1
+  [[ "$(gate_inode_identity "$INSTALL_JOURNAL")" =~ ^[0-9]+:[0-9]+:${GATE_ROOT_OWNER%%:*}:1:1$ ]] || return 1
+  [[ "$(wc -l <"$INSTALL_JOURNAL" | tr -d '[:space:]')" == 7 ]] || return 1
+  IFS='=' read -r line version extra < <(sed -n '1p' "$INSTALL_JOURNAL"); [[ "$line" == version && "$version" == 1 && -z "$extra" ]] || return 1
+  IFS='=' read -r line stage extra < <(sed -n '2p' "$INSTALL_JOURNAL"); [[ "$line" == stage && "$stage" =~ ^(prepared|replace-[0-7]|postcheck)$ && -z "$extra" ]] || return 1
+  IFS='=' read -r line candidate extra < <(sed -n '3p' "$INSTALL_JOURNAL"); [[ "$line" == backup && -z "$extra" ]] || return 1
+  IFS='=' read -r line manifest extra < <(sed -n '4p' "$INSTALL_JOURNAL"); [[ "$line" == manifestHash && "$manifest" =~ ^[0-9a-f]{64}$ && -z "$extra" ]] || return 1
+  IFS='=' read -r line candidate_user extra < <(sed -n '5p' "$INSTALL_JOURNAL"); [[ "$line" == gateUser && "$candidate_user" == "$GATE_USER" && -z "$extra" ]] || return 1
+  IFS='=' read -r line candidate_group extra < <(sed -n '6p' "$INSTALL_JOURNAL"); [[ "$line" == gateGroup && "$candidate_group" == "$GATE_GROUP" && -z "$extra" ]] || return 1
+  IFS='=' read -r line candidate_gid extra < <(sed -n '7p' "$INSTALL_JOURNAL"); [[ "$line" == gateGid && "$candidate_gid" == "$GATE_GROUP_GID" && -z "$extra" ]] || return 1
+  load_backup "$candidate" "$manifest"
 }
 
 rollback_targets() {
@@ -317,13 +404,17 @@ rollback_targets() {
       if [[ "$(file_hash "$restore_temporary")" != "${BACKUP_HASHES[$index]}" \
         || "$(file_attributes "$restore_temporary")" != "${BACKUP_ATTRIBUTES[$index]}" ]]; then
         rollback_failed='true'
+      elif ! fsync_file "$restore_temporary"; then
+        rollback_failed='true'
       elif ! mv -fT -- "$restore_temporary" "$target"; then
+        rollback_failed='true'
+      elif ! fsync_directory "$(dirname "$target")"; then
         rollback_failed='true'
       fi
       rm -f -- "$restore_temporary"
     elif [[ -e "$target" || -L "$target" ]]; then
       if [[ -f "$target" || -L "$target" ]]; then
-        rm -f -- "$target" || rollback_failed='true'
+        rm -f -- "$target" && fsync_directory "$(dirname "$target")" || rollback_failed='true'
       else
         rollback_failed='true'
       fi
@@ -345,6 +436,15 @@ rollback_targets() {
   [[ "$rollback_failed" == 'false' ]]
 }
 
+clear_install_journal() {
+  if [[ -e "$INSTALL_JOURNAL" || -L "$INSTALL_JOURNAL" ]]; then
+    [[ -f "$INSTALL_JOURNAL" && ! -L "$INSTALL_JOURNAL" ]] || return 1
+    rm -f "$INSTALL_JOURNAL" || return 1
+    fsync_directory "$SERVER_ROOT/state" || return 1
+  fi
+  clear_gate_marker
+}
+
 cleanup() {
   local cleanup_status="$?"
   local restore_status
@@ -354,12 +454,13 @@ cleanup() {
   restore_status=0
   if [[ "$transaction_started" == 'true' && "$transaction_committed" != 'true' ]]; then
     rollback_targets || restore_status=1
+    if [[ "$restore_status" -eq 0 ]]; then clear_install_journal || restore_status=1; fi
   fi
-  if [[ "$public_marker_published" == 'true' && "$restore_status" -eq 0 ]]; then
+  if [[ "$transaction_started" != 'true' && "$public_marker_published" == 'true' && "$restore_status" -eq 0 ]]; then
     clear_gate_marker || restore_status=1
   fi
   cleanup_gate_temporaries || restore_status=1
-  rm -f -- "$v2_deploy_temporary" "$v2_validator_temporary" "$v2_attestation_temporary" "$deploy_temporary" "$wrapper_temporary" "$helper_temporary" "$compose_temporary" "$sudoers_temporary"
+  rm -f -- "$journal_temporary" "$v2_deploy_temporary" "$v2_validator_temporary" "$v2_attestation_temporary" "$deploy_temporary" "$wrapper_temporary" "$helper_temporary" "$compose_temporary" "$sudoers_temporary"
   if [[ -n "$compile_cache" ]]; then
     rm -rf -- "$compile_cache"
   fi
@@ -389,11 +490,21 @@ exec 9>"$DEPLOY_LOCK"
 flock -n 9 || fail 'another Kinvest deployment is already running'
 [[ "$(file_attributes "$GATE_STATE_DIR")" == "${GATE_ROOT_OWNER%%:*}:$GATE_GROUP_GID:750" ]] || fail 'DEPLOY_V3_GATE_IDENTITY_MISMATCH'
 reconcile_gate_temporaries || fail 'DEPLOY_V3_GATE_TEMP_INVALID'
+validate_or_publish_gate_identity || fail 'DEPLOY_V3_GATE_IDENTITY_INVALID'
+if [[ -e "$V4_INSTALL_JOURNAL" || -L "$V4_INSTALL_JOURNAL" ]]; then
+  fail 'DEPLOY_INSTALL_INCOMPLETE' 76
+fi
+if [[ -e "$INSTALL_JOURNAL" || -L "$INSTALL_JOURNAL" ]]; then
+  validate_gate_marker || fail 'DEPLOY_V3_INSTALL_JOURNAL_INVALID'
+  load_install_journal || fail 'DEPLOY_V3_INSTALL_JOURNAL_INVALID'
+  rollback_targets || fail 'DEPLOY_V3_INSTALL_RECONCILE_FAILED'
+  clear_install_journal || fail 'DEPLOY_V3_INSTALL_RECONCILE_FAILED'
+  fail 'DEPLOY_V3_INSTALL_RECONCILED_RETRY_REQUIRED' 75
+fi
 if [[ -e "$GATE_INSTALL_MARKER" || -L "$GATE_INSTALL_MARKER" ]]; then
   validate_gate_marker || fail 'DEPLOY_V3_GATE_STATE_INVALID'
   fail 'DEPLOY_INSTALL_INCOMPLETE' 76
 fi
-validate_or_publish_gate_identity || fail 'DEPLOY_V3_GATE_IDENTITY_INVALID'
 
 for target in "${TARGETS[@]}"; do
   if [[ ( -e "$target" || -L "$target" ) && ( ! -f "$target" || -L "$target" ) ]]; then
@@ -457,6 +568,7 @@ visudo -cf "$sudoers_temporary" >/dev/null
 PYTHONPYCACHEPREFIX="$compile_cache" python3 -m py_compile "$v2_validator_temporary" "$v2_attestation_temporary"
 staged_path=("$v2_deploy_temporary" "$v2_validator_temporary" "$v2_attestation_temporary" "$deploy_temporary" "$wrapper_temporary" "$helper_temporary" "$compose_temporary" "$sudoers_temporary")
 for index in "${!TARGETS[@]}"; do
+  fsync_file "${staged_path[$index]}" || fail "staged deploy-v3 fsync failed: ${SOURCE_ASSETS[$index]}"
   if [[ ! -f "${staged_path[$index]}" || -L "${staged_path[$index]}" \
     || "$(file_hash "${staged_path[$index]}")" != "${INSTALL_HASHES[$index]}" \
     || "$(file_attributes "${staged_path[$index]}")" != "$expected_owner:$expected_group:${ASSET_MODES[$index]#0}" ]]; then
@@ -464,28 +576,46 @@ for index in "${!TARGETS[@]}"; do
   fi
 done
 
-snapshot_targets
 publish_gate_marker || fail 'DEPLOY_V3_GATE_MARKER_FAILED'
-transaction_started='true'
+snapshot_targets
+write_install_journal prepared || fail 'DEPLOY_V3_INSTALL_JOURNAL_WRITE_FAILED'
 
 # Install the root transaction program before its wrapper. No asset installation
 # invokes the deployer, Compose, Docker, or systemd.
+write_install_journal replace-0 || fail 'DEPLOY_V3_INSTALL_JOURNAL_WRITE_FAILED'
 mv -fT -- "$v2_deploy_temporary" "$V2_DEPLOY_TARGET"
+fsync_directory "$(dirname "$V2_DEPLOY_TARGET")"
 v2_deploy_temporary=''
+write_install_journal replace-1 || fail 'DEPLOY_V3_INSTALL_JOURNAL_WRITE_FAILED'
 mv -fT -- "$v2_validator_temporary" "$V2_VALIDATOR_TARGET"
+fsync_directory "$(dirname "$V2_VALIDATOR_TARGET")"
 v2_validator_temporary=''
+write_install_journal replace-2 || fail 'DEPLOY_V3_INSTALL_JOURNAL_WRITE_FAILED'
 mv -fT -- "$v2_attestation_temporary" "$V2_ATTESTATION_TARGET"
+fsync_directory "$(dirname "$V2_ATTESTATION_TARGET")"
 v2_attestation_temporary=''
+write_install_journal replace-3 || fail 'DEPLOY_V3_INSTALL_JOURNAL_WRITE_FAILED'
 mv -fT -- "$deploy_temporary" "$DEPLOY_TARGET"
+fsync_directory "$(dirname "$DEPLOY_TARGET")"
 deploy_temporary=''
+write_install_journal replace-4 || fail 'DEPLOY_V3_INSTALL_JOURNAL_WRITE_FAILED'
 mv -fT -- "$helper_temporary" "$HELPER_TARGET"
+fsync_directory "$(dirname "$HELPER_TARGET")"
 helper_temporary=''
+write_install_journal replace-5 || fail 'DEPLOY_V3_INSTALL_JOURNAL_WRITE_FAILED'
 mv -fT -- "$compose_temporary" "$COMPOSE_TARGET"
+fsync_directory "$(dirname "$COMPOSE_TARGET")"
 compose_temporary=''
+write_install_journal replace-6 || fail 'DEPLOY_V3_INSTALL_JOURNAL_WRITE_FAILED'
 mv -fT -- "$sudoers_temporary" "$SUDOERS_TARGET"
+fsync_directory "$(dirname "$SUDOERS_TARGET")"
 sudoers_temporary=''
+write_install_journal replace-7 || fail 'DEPLOY_V3_INSTALL_JOURNAL_WRITE_FAILED'
 mv -fT -- "$wrapper_temporary" "$WRAPPER_TARGET"
+fsync_directory "$(dirname "$WRAPPER_TARGET")"
 wrapper_temporary=''
+
+write_install_journal postcheck || fail 'DEPLOY_V3_INSTALL_JOURNAL_WRITE_FAILED'
 
 for index in "${!TARGETS[@]}"; do
   target="${TARGETS[$index]}"
@@ -504,7 +634,7 @@ visudo -cf "$SUDOERS_TARGET" >/dev/null
 sudo -n -U "$GATE_USER" -l "$LOCAL_SBIN/deploy-kinvest" >/dev/null
 sudo -n -U "$GATE_USER" -l "$LOCAL_SBIN/deploy-kinvest-v3" >/dev/null
 sudo -n -U "$GATE_USER" -l "$LOCAL_SBIN/deploy-kinvest-v4" >/dev/null
-clear_gate_marker || fail 'DEPLOY_V3_GATE_MARKER_CLEAR_FAILED'
+clear_install_journal || fail 'DEPLOY_V3_GATE_MARKER_CLEAR_FAILED'
 transaction_committed='true'
 
 sha256sum "$DEPLOY_TARGET" "$WRAPPER_TARGET" "$HELPER_TARGET" "$COMPOSE_TARGET" "$SUDOERS_TARGET"

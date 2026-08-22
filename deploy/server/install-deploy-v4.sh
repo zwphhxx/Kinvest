@@ -9,6 +9,7 @@ SUDOERS_DIR='/etc/sudoers.d'
 RUN_ROOT='/run'
 BACKUP_ROOT="$SERVER_ROOT/install-backups/deploy-v4"
 INSTALL_JOURNAL="$SERVER_ROOT/state/install-v4.journal"
+V3_INSTALL_JOURNAL="$SERVER_ROOT/state/install-v3.journal"
 GATE_STATE_DIR='/var/lib/kinvest-deploy-gate'
 GATE_INSTALL_MARKER="$GATE_STATE_DIR/install-incomplete"
 GATE_IDENTITY="$GATE_STATE_DIR/identity"
@@ -223,6 +224,9 @@ flock -n 9 || fail 'another Kinvest deployment is already running'
 [[ "$(file_attributes "$GATE_STATE_DIR")" == "${GATE_ROOT_OWNER%%:*}:$GATE_GROUP_GID:750" ]] || fail 'DEPLOY_V4_GATE_IDENTITY_MISMATCH'
 reconcile_gate_temporaries || fail 'DEPLOY_V4_GATE_TEMP_INVALID'
 validate_or_publish_gate_identity || fail 'DEPLOY_V4_GATE_IDENTITY_INVALID'
+if [[ -e "$V3_INSTALL_JOURNAL" || -L "$V3_INSTALL_JOURNAL" ]]; then
+  fail 'DEPLOY_INSTALL_INCOMPLETE' 76
+fi
 
 BACKUP_PRESENT=('')
 BACKUP_HASHES=('')

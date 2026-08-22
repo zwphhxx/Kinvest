@@ -145,6 +145,26 @@ successful install removes and fsyncs the private journal first, then removes
 and fsyncs the public marker. The private journal remains root-only `0600` and
 its backup directory remains root-only `0700`.
 
+The v3 installer provides the equivalent crash boundary with its distinct
+root-private `state/install-v3.journal` and deploy-v3 backup manifest. Before
+the first target rename it fsyncs every before-image or absent marker, the
+manifest, backup directory and backup parent, publishes and fsyncs the private
+journal, and keeps the public marker active. Install and restore both use
+fsynced same-directory temporary files, atomic rename, and immediate parent
+directory fsync. On reentry it validates the journal identity, path, owner,
+mode, manifest hash and every backup entry under both locks, restores the exact
+old target set, fsyncs it, clears and fsyncs the private journal, then clears and
+fsyncs the public marker. It returns
+`DEPLOY_V3_INSTALL_RECONCILED_RETRY_REQUIRED`; a separate invocation may then
+install the new closure.
+
+The v3 and v4 private journals have distinct names and formats. The shared gate
+directory lock serializes both installers. If either installer sees the other
+version's journal, it returns `DEPLOY_INSTALL_INCOMPLETE` without parsing,
+clearing, or modifying that journal or the public marker. These fsync boundaries
+provide ordered filesystem persistence but do not claim guarantees beyond the
+host filesystem and storage hardware.
+
 The v3 and v4 installers render the same reviewed sudoers template for the
 explicit gate user. With no historical sudoers present, that file grants only
 the three fixed, no-argument root commands `/usr/local/sbin/deploy-kinvest`,
