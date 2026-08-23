@@ -43,6 +43,7 @@ async function runBuildArtifactsExist() {
     'public/research.html',
     'public/research.js',
     'public/valuation-position.js',
+    'server/access-preflight.js',
     'server/adapters/ifindAdapter.js',
     'server/adapters/modelAdapter.js',
     'server/ai/model-quota.js',
@@ -55,6 +56,7 @@ async function runBuildArtifactsExist() {
     'server/domain/security-identity.js',
     'server/http/auth-http.js',
     'server/http/trusted-client.js',
+    'server/pre-listen-preparation.js',
     'server/secret-preflight.js',
     'server/security/access-control-runtime.js',
     'server/security/admin-auth.js',
@@ -70,6 +72,63 @@ async function runBuildArtifactsExist() {
     'server/services/refresh-rules.js',
     'server/utils/refresh-policy.js'
   ]
+
+  const dockerfile = fs.readFileSync(
+    path.join(repositoryRoot, 'Dockerfile'),
+    'utf8'
+  )
+  const linuxSmokePath = path.join(
+    repositoryRoot,
+    'scripts',
+    'docker-access-preflight-linux-smoke.js'
+  )
+  assert.equal(fs.existsSync(linuxSmokePath), true)
+  assert.match(
+    dockerfile,
+    /^FROM build AS access-preflight-linux-smoke[\s\S]*RUN node scripts\/docker-access-preflight-linux-smoke[.]js$/m
+  )
+  assert.match(
+    dockerfile,
+    /^COPY --from=access-preflight-linux-smoke \/tmp\/kinvest-access-preflight-linux-smoke-ok \/tmp\/kinvest-access-preflight-linux-smoke-ok$/m
+  )
+  const linuxSmoke = fs.readFileSync(linuxSmokePath, 'utf8')
+  assert.match(linuxSmoke, /process[.]platform[^\n]*linux/)
+  assert.match(linuxSmoke, /runAccessPreflight/)
+  assert.match(linuxSmoke, /KINVEST_ACCESS_PREFLIGHT_OK/)
+  const sourcePackageContract = JSON.parse(fs.readFileSync(
+    path.join(repositoryRoot, 'package.json'),
+    'utf8'
+  ))
+  const lockfileContract = JSON.parse(fs.readFileSync(
+    path.join(repositoryRoot, 'package-lock.json'),
+    'utf8'
+  ))
+  assert.equal(sourcePackageContract.engines.node, '>=22.16.0')
+  assert.equal(lockfileContract.packages[''].engines.node, '>=22.16.0')
+  assert.deepStrictEqual(dockerfile.match(/^FROM\b.*$/gm), [
+    'FROM node:22.16.0-alpine AS build',
+    'FROM build AS access-preflight-linux-smoke',
+    'FROM node:22.16.0-alpine AS github-tmpfs-provider-smoke',
+    'FROM node:22.16.0-alpine AS runtime-dependencies',
+    'FROM node:22.16.0-alpine AS runtime'
+  ])
+  const preflightSource = fs.readFileSync(
+    path.join(repositoryRoot, 'server', 'access-preflight.js'),
+    'utf8'
+  )
+  assert.doesNotMatch(preflightSource, /enableDefensive/)
+  assert.match(preflightSource, /new DatabaseSync/)
+  assert.match(preflightSource, /readOnly: true/)
+  assert.match(preflightSource, /PRAGMA query_only = ON/)
+  const deployWorkflow = fs.readFileSync(
+    path.join(repositoryRoot, '.github', 'workflows', 'deploy.yml'),
+    'utf8'
+  )
+  assert.equal(
+    Array.from(deployWorkflow.matchAll(/node-version: "22[.]16[.]0"/g)).length,
+    2
+  )
+  assert.doesNotMatch(deployWorkflow, /node-version: "22[.]13[.]0"/)
 
   try {
     fs.writeFileSync(fixturePath, 'build leak fixture\n')
@@ -99,6 +158,7 @@ async function runBuildArtifactsExist() {
       'tencentcloud-sdk-nodejs-common': '4.1.220',
       'tencentcloud-sdk-nodejs-ssm': '4.1.275'
     })
+    assert.equal(distPackage.scripts['access:preflight'], 'node server/access-preflight.js')
 
     const distServerPath = path.join(repositoryRoot, 'dist', 'server', 'server.js')
     delete require.cache[require.resolve(distServerPath)]

@@ -29,6 +29,7 @@ const tests = [
   require('./secret-bootstrap.test'),
   require('./server-secret-bootstrap.test'),
   require('./secret-preflight.test'),
+  require('./access-preflight.test'),
   require('./ssm-material-generator.test'),
   require('./docker-secret-bootstrap.test'),
   require('./metadata-firewall-contract.test'),
@@ -52,6 +53,11 @@ const tests = [
   require('./deploy-v3-state.test'),
   require('./deploy-v3-installer.test'),
   require('./deploy-v3-workflow.test'),
+  require('./deploy-v4.test'),
+  require('./deploy-v4-executor.test'),
+  require('./deploy-v4-installer.test'),
+  require('./deploy-v4-workflow.test'),
+  require('./nginx-fixed-ip-gate.test'),
   require('./data-lifecycle.test'),
   require('./workflow-contract.test')
 ]

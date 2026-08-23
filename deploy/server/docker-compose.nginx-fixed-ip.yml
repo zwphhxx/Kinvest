@@ -1,0 +1,9 @@
+services:
+  nginx:
+    networks: !override
+      web:
+        ipv4_address: ${KINVEST_NGINX_IPV4:?set the separately approved fixed Nginx IPv4}
+
+networks:
+  web:
+    external: true

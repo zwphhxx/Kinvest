@@ -238,4 +238,4 @@ visudo -cf "$temporary_sudoers" >/dev/null
 mv -f -- "$temporary_sudoers" "$SUDOERS_FILE"
 visudo -cf "$SUDOERS_FILE" >/dev/null
 
-printf '%s\n' "Kinvest server bootstrap is ready for container UID:GID $APP_UID:$APP_GID; no deployment was started."
+printf '%s\n' "Kinvest server bootstrap is ready for container UID:GID $APP_UID:$APP_GID; no deployment was started. Deploy-v4 assets require the separate reviewed installer."

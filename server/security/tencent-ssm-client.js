@@ -26,12 +26,32 @@ function validCredentials(credentials) {
     typeof credentials.token === 'string' && credentials.token.length > 0)
 }
 
+function awaitWithSignal(promise, signal) {
+  if (!signal) return promise
+  if (signal.aborted) return Promise.reject(signal.reason)
+  return new Promise((resolve, reject) => {
+    let settled = false
+    const settle = (callback, value) => {
+      if (settled) return
+      settled = true
+      signal.removeEventListener('abort', handleAbort)
+      callback(value)
+    }
+    const handleAbort = () => settle(reject, signal.reason)
+    signal.addEventListener('abort', handleAbort, { once: true })
+    Promise.resolve(promise).then(
+      (value) => settle(resolve, value),
+      (error) => settle(reject, error)
+    )
+  })
+}
+
 /**
  * @param {object} [options]
  * @param {string} [options.region]
  * @param {{secretId: string, secretKey: string, token: string}} [options.credentials]
  * @param {() => any} [options.sdkLoader]
- * @returns {{getSecretValue: (request: {SecretName: string, VersionId: string}) => Promise<any>}}
+ * @returns {{getSecretValue: (request: {SecretName: string, VersionId: string}, options?: {signal?: AbortSignal}) => Promise<any>}}
  */
 function createTencentSsmClient({
   region,
@@ -81,9 +101,13 @@ function createTencentSsmClient({
   }
 
   return Object.freeze({
-    async getSecretValue(request) {
+    async getSecretValue(
+      request,
+      options = /** @type {{signal?: AbortSignal}} */ ({})
+    ) {
+      const { signal } = options
       try {
-        return await client.GetSecretValue(request)
+        return await awaitWithSignal(client.GetSecretValue(request), signal)
       } catch {
         throw new TencentSsmClientError('SSM_REQUEST_FAILED')
       }

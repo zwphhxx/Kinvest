@@ -2324,6 +2324,124 @@ function run() {
   const publishTimeoutMinutes = Number.parseInt(publishTimeoutMatch[1], 10)
   assert.equal(publishTimeoutMinutes, 30)
   assert.match(workflow, /docker\/build-push-action@[0-9a-f]{40}/)
+  const accessPreflightSmokePath = path.join(rootDir, 'scripts/docker-access-preflight-runtime-smoke.sh')
+  assert.equal(fs.existsSync(accessPreflightSmokePath), true, 'container build must include the runtime access-preflight smoke')
+  const accessPreflightSmoke = fs.readFileSync(accessPreflightSmokePath, 'utf8')
+  assert.notEqual(fs.statSync(accessPreflightSmokePath).mode & 0o111, 0)
+  assert.equal(spawnSync('bash', ['-n', accessPreflightSmokePath], { encoding: 'utf8' }).status, 0)
+  assert.equal(
+    (accessPreflightSmoke.match(/--platform linux\/amd64/g) || []).length,
+    3,
+    'fixture preparation, runtime cases, and privileged cleanup must each pin the production platform'
+  )
+  const cleanupInlineScript = accessPreflightSmoke.match(/^ {2}cleanup_script='([^'\n]+)'$/m)?.[1] || ''
+  assert.notEqual(cleanupInlineScript, '', 'runtime smoke must define its constrained bundle cleanup script')
+  assert.doesNotMatch(
+    cleanupInlineScript,
+    /rmSync\(target\b/,
+    'cleanup container must not unlink the root-owned bundle from its runner-owned parent'
+  )
+  assert.match(cleanupInlineScript, /for\(const entry of fs[.]readdirSync\(target\)\)/)
+  assert.match(cleanupInlineScript, /fs[.]rmSync\(path[.]join\(target,entry\),\{recursive:true,force:true\}\)/)
+  assert.match(
+    cleanupInlineScript,
+    /fs[.]chmodSync\(target,0o755\)/,
+    'cleanup container must leave the empty bundle traversable so the runner can unlink it via the parent'
+  )
+  for (const fragment of [
+    'docker run --rm --platform linux/amd64 --user 0:0 --read-only --cap-drop ALL',
+    'docker run --rm --platform linux/amd64 --user 0:0',
+    'run --rm --platform linux/amd64 --user 10001:10001',
+    '--user 10001:10001', '--read-only', '--cap-drop ALL',
+    '--security-opt no-new-privileges:true', '--network none',
+    '--ulimit fsize=268435456:268435456',
+    '/tmp:rw,noexec,nosuid,nodev,uid=10001,gid=10001,mode=0700,size=512m',
+    'command+=(--env "KINVEST_DB_PATH=$production")',
+    '/data/kinvest.sqlite',
+    ':/preflight/candidate.sqlite:ro',
+    'command+=(--entrypoint node "$image" server/access-preflight.js)',
+    'command+=("$candidate_argument")'
+  ]) assert.match(accessPreflightSmoke, new RegExp(fragment.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')))
+  for (const negative of ['missing-candidate-argument', 'candidate-equals-production', 'missing-tmpfs', 'insufficient-tmpfs']) {
+    assert.match(accessPreflightSmoke, new RegExp(negative))
+  }
+  const cleanupHarnessRoot = fs.mkdtempSync(path.join(require('node:os').tmpdir(), 'kinvest-runtime-smoke-cleanup-'))
+  const cleanupHarnessBin = path.join(cleanupHarnessRoot, 'bin')
+  const cleanupFixtureLog = path.join(cleanupHarnessRoot, 'fixture.log')
+  fs.mkdirSync(cleanupHarnessBin)
+  const cleanupHarnessDocker = path.join(cleanupHarnessBin, 'docker')
+  fs.writeFileSync(cleanupHarnessDocker, `#!/usr/bin/env node
+const fs = require('node:fs')
+const path = require('node:path')
+const args = process.argv.slice(2)
+const volume = args.find((argument) => argument.endsWith(':/fixture'))
+const fixture = volume ? volume.slice(0, -'/fixture'.length - 1) : ''
+if (args.includes('/fixture/prepare.js')) {
+  fs.appendFileSync(process.env.KINVEST_SMOKE_FIXTURE_LOG, fixture + '\\n')
+  fs.mkdirSync(path.join(fixture, 'secrets'), { recursive: true })
+  fs.writeFileSync(path.join(fixture, 'candidate.sqlite'), 'fixture')
+  fs.writeFileSync(path.join(fixture, 'secrets', 'manifest.json'), '{}')
+  fs.chmodSync(path.join(fixture, 'secrets'), 0o550)
+  process.exit(0)
+}
+if (args.some((argument) => argument.includes('const target="/fixture/secrets"'))) {
+  const protectedBundle = path.join(fixture, 'secrets')
+  fs.chmodSync(protectedBundle, 0o750)
+  for (const entry of fs.readdirSync(protectedBundle)) {
+    fs.rmSync(path.join(protectedBundle, entry), { recursive: true, force: true })
+  }
+  fs.chmodSync(protectedBundle, 0o755)
+  process.exit(0)
+}
+const candidate = args.at(-1)
+const production = (args.find((argument) => argument.startsWith('KINVEST_DB_PATH=')) || '').slice('KINVEST_DB_PATH='.length)
+const tmpfsIndex = args.indexOf('--tmpfs')
+const tmpfs = tmpfsIndex === -1 ? '' : args[tmpfsIndex + 1]
+if (candidate !== '/preflight/candidate.sqlite') {
+  process.stderr.write('ACCESS_PREFLIGHT_DATABASE_PATH_REQUIRED\\n')
+  process.exit(1)
+}
+if (candidate === production || !tmpfs) {
+  process.stderr.write('ACCESS_PREFLIGHT_DATABASE_PATH_INVALID\\n')
+  process.exit(1)
+}
+if (tmpfs.includes('size=1m')) {
+  process.stderr.write('ACCESS_PREFLIGHT_DATABASE_SNAPSHOT_INVALID\\n')
+  process.exit(1)
+}
+process.stdout.write('KINVEST_ACCESS_PREFLIGHT_OK mode=device-approval references=2 database=ready proxy=ready\\n')
+`, { mode: 0o755 })
+  try {
+    /** @type {NodeJS.ProcessEnv} */
+    const cleanupEnvironment = {
+      ...process.env,
+      KINVEST_SMOKE_FIXTURE_LOG: cleanupFixtureLog,
+      PATH: `${cleanupHarnessBin}:${process.env.PATH}`
+    }
+    delete cleanupEnvironment.DOCKER_DEFAULT_PLATFORM
+    const cleanupResult = spawnSync('bash', [accessPreflightSmokePath, 'kinvest:test-cleanup'], {
+      encoding: 'utf8',
+      env: cleanupEnvironment
+    })
+    assert.equal(cleanupResult.status, 0, cleanupResult.stderr)
+    assert.equal(cleanupResult.stdout, 'KINVEST_ACCESS_PREFLIGHT_RUNTIME_SMOKE_OK\n')
+    assert.equal(cleanupResult.stderr, '')
+    const protectedFixture = fs.readFileSync(cleanupFixtureLog, 'utf8').trim()
+    assert.equal(fs.existsSync(protectedFixture), false, 'cleanup must remove a fixture containing a mode-0550 secret bundle')
+  } finally {
+    if (fs.existsSync(cleanupFixtureLog)) {
+      const protectedFixture = fs.readFileSync(cleanupFixtureLog, 'utf8').trim()
+      const protectedBundle = path.join(protectedFixture, 'secrets')
+      if (fs.existsSync(protectedBundle)) fs.chmodSync(protectedBundle, 0o750)
+    }
+    fs.rmSync(cleanupHarnessRoot, { recursive: true, force: true })
+  }
+  const containerBuildJob = workflow.match(/^ {2}container-build:\n[\s\S]*?(?=^ {2}[a-z][a-z-]+:)/m)?.[0] || ''
+  assert.match(containerBuildJob, /^ {10}load: true$/m)
+  assert.match(containerBuildJob, /^ {10}push: false$/m)
+  assert.match(containerBuildJob, /^ {10}tags: kinvest-access-preflight-smoke:\$\{\{ github\.sha \}\}$/m)
+  assert.match(containerBuildJob, /scripts\/docker-access-preflight-runtime-smoke\.sh "kinvest-access-preflight-smoke:\$\{\{ github\.sha \}\}"/)
+  assert.doesNotMatch(containerBuildJob, /secrets\.|environment:|packages: write/)
   assert.match(workflow, /docker\/login-action@[0-9a-f]{40}/)
   assert.match(workflow, /docker\/setup-buildx-action@[0-9a-f]{40}/)
   assert.match(workflow, /BUILD_DIGEST: \$\{\{ steps\.build\.outputs\.digest \}\}/)

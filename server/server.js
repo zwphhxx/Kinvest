@@ -10,13 +10,18 @@ const { prepareFinanceRows } = require('../public/finance-contract')
 const { isVerifiedDataBlock } = require('../public/data-source-contract')
 const { bootstrapSecrets } = require('./security/secret-bootstrap')
 const { createAccessControlRuntime } = require('./security/access-control-runtime')
-const { closeDb, openDb } = require('./db/refresh-db')
+const {
+  closeDb,
+  closeTrackedDatabase,
+  initializeRefreshDatabase,
+  openTrackedDb
+} = require('./db/refresh-db')
 const {
   HttpBoundaryError,
   createAuthHttpController,
   parseStrictJsonBody
 } = require('./http/auth-http')
-const { parseTrustedProxyAddresses } = require('./http/trusted-client')
+const { prepareApplication } = require('./pre-listen-preparation')
 
 const PORT = Number(process.env.PORT || 4173)
 const ROOT = path.join(__dirname, '..')
@@ -445,77 +450,88 @@ function stableStartupErrorCode(error) {
 /** @param {any} [options] */
 async function startServer({
   env = process.env,
+  prepare = prepareApplication,
   bootstrap = bootstrapSecrets,
   createAccessRuntime = createAccessControlRuntime,
-  openDatabase = openDb,
-  closeDatabase = closeDb,
+  openDatabase = openTrackedDb,
+  closeDatabase = closeTrackedDatabase,
+  closeApplicationDatabase = closeDb,
+  shutdownTimeoutMs = 5000,
+  initializeDatabase = initializeRefreshDatabase,
+  createHttpHandler = createRequestHandler,
   runtimeServer,
   port = PORT,
   processRef = process,
   logger = console
 } = {}) {
   applyRuntimeFileCreationMask()
-  const secretRuntime = await bootstrap({ env })
-  let accessRuntime
+  const prepared = await prepare({
+    env,
+    bootstrap,
+    createAccessRuntime,
+    openDatabase,
+    closeDatabase,
+    initializeDatabase,
+    createHandler: createHttpHandler
+  })
   try {
-    accessRuntime = createAccessRuntime({
-      env,
-      secretRuntime,
-      openDatabase,
-      closeDatabase
-    })
-  } catch (error) {
-    secretRuntime.clear()
-    throw error
-  }
-  let trustedProxyAddresses
-  try {
-    trustedProxyAddresses = parseTrustedProxyAddresses(
-      env.KINVEST_TRUSTED_PROXY_ADDRESSES,
-      { required: accessRuntime.status.mode === 'device-approval' }
-    )
+    if (!runtimeServer) runtimeServer = http.createServer(prepared.handler)
   } catch {
-    accessRuntime.clear()
-    secretRuntime.clear()
+    prepared.clear()
     throw Object.assign(new Error('HTTP security configuration invalid'), {
       code: 'HTTP_SECURITY_CONFIG_INVALID'
     })
   }
-  if (!runtimeServer) {
-    try {
-      runtimeServer = http.createServer(createRequestHandler({
-        accessRuntime,
-        trustedProxyAddresses
-      }))
-    } catch {
-      accessRuntime.clear()
-      secretRuntime.clear()
-      throw Object.assign(new Error('HTTP security configuration invalid'), {
-        code: 'HTTP_SECURITY_CONFIG_INVALID'
-      })
-    }
-  }
   let cleaned = false
+  let shutdownStarted = false
+  let shutdownTimer
   const cleanup = () => {
     if (cleaned) return
     cleaned = true
+    if (shutdownTimer) clearTimeout(shutdownTimer)
     processRef.removeListener('SIGTERM', handleSignal)
     processRef.removeListener('SIGINT', handleSignal)
     runtimeServer.removeListener('close', cleanup)
-    accessRuntime.clear()
-    secretRuntime.clear()
+    try {
+      prepared.clear()
+    } catch {
+      // Database cleanup must still run when another runtime cleanup fails.
+    }
+    try {
+      closeApplicationDatabase()
+    } catch {
+      // Shutdown cleanup is best-effort across every owned resource.
+    }
   }
   const handleSignal = () => {
-    cleanup()
+    if (shutdownStarted) return
+    shutdownStarted = true
     try {
-      runtimeServer.close()
+      runtimeServer.close(() => cleanup())
     } catch (error) {
-      if (!error || typeof error !== 'object' ||
-        !('code' in error) || error.code !== 'ERR_SERVER_NOT_RUNNING') {
-        throw Object.assign(new Error('Server close failed'), {
-          code: 'SERVER_CLOSE_FAILED'
-        })
+      cleanup()
+      if (error && typeof error === 'object' &&
+        'code' in error && error.code === 'ERR_SERVER_NOT_RUNNING') {
+        return
       }
+      throw Object.assign(new Error('Server close failed'), {
+        code: 'SERVER_CLOSE_FAILED'
+      })
+    }
+    if (!cleaned) {
+      const boundedTimeout = Number.isSafeInteger(shutdownTimeoutMs) &&
+        shutdownTimeoutMs >= 1 ? shutdownTimeoutMs : 5000
+      shutdownTimer = setTimeout(() => {
+        try {
+          if (typeof runtimeServer.closeAllConnections === 'function') {
+            runtimeServer.closeAllConnections()
+          }
+        } catch {
+          // Runtime and database cleanup must still complete at the deadline.
+        }
+        cleanup()
+      }, boundedTimeout)
+      if (typeof shutdownTimer.unref === 'function') shutdownTimer.unref()
     }
   }
   processRef.once('SIGTERM', handleSignal)
@@ -575,6 +591,7 @@ module.exports = {
   apiResearch,
   applyRuntimeFileCreationMask,
   createRequestHandler,
+  prepareApplication,
   runServerExecutable,
   stableStartupErrorCode,
   startServer,

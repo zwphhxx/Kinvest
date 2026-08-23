@@ -11,6 +11,8 @@ services:
       - KINVEST_SECRET_PROVIDER_MODE=${KINVEST_SECRET_PROVIDER_MODE:?set provider mode}
       - KINVEST_SECRET_VERSION_IDS=${KINVEST_SECRET_VERSION_IDS:?set canonical VersionId JSON}
       - KINVEST_SECRET_BUNDLE_PATH
+      - KINVEST_ACCESS_CONTROL_MODE=${KINVEST_ACCESS_CONTROL_MODE:?set access control mode}
+      - KINVEST_TRUSTED_PROXY_ADDRESSES=${KINVEST_TRUSTED_PROXY_ADDRESSES:?set canonical trusted proxy JSON}
     volumes:
       - type: bind
         source: /root/docker/kinvest/data

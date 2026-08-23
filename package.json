@@ -6,6 +6,7 @@
   "scripts": {
     "dev": "node server/server.js",
     "start": "node server/server.js",
+    "access:preflight": "node server/access-preflight.js",
     "test": "node server/tests/run-tests.js",
     "lint": "eslint server scripts public",
     "typecheck": "tsc -p jsconfig.json",
@@ -18,7 +19,7 @@
     "check": "npm run build && npm test && npm run lint && npm run typecheck"
   },
   "engines": {
-    "node": ">=22.13.0"
+    "node": ">=22.16.0"
   },
   "packageManager": "npm@11.12.1",
   "devDependencies": {
