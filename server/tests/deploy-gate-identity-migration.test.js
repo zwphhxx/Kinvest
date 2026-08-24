@@ -8,6 +8,7 @@ const { spawn, spawnSync } = require('node:child_process')
 const rootDir = path.resolve(__dirname, '../..')
 const sourcePath = path.join(rootDir, 'deploy/server/migrate-deploy-gate-identity.sh')
 const manifestPath = path.join(rootDir, 'deploy/server/deploy-gate-identity-migration.sha256')
+const runbookPath = path.join(rootDir, 'docs/operations/deploy-v4-access-control-runbook.md')
 const gateSource = fs.readFileSync(path.join(rootDir, 'deploy/server/kinvest-ssh-command-v3'), 'utf8')
 
 function writeExecutable(file, source) {
@@ -334,6 +335,21 @@ async function run() {
     manifestMatch[1],
     crypto.createHash('sha256').update(fs.readFileSync(sourcePath)).digest('hex')
   )
+  const runbook = fs.readFileSync(runbookPath, 'utf8')
+  const migrationSection = runbook.slice(
+    runbook.indexOf('## One-time gate identity migration'),
+    runbook.indexOf('If a protocol-v4 RESTORE')
+  )
+  const pinnedMatch = migrationSection.match(/PINNED_MIGRATION_SHA256='([0-9a-f]{64})'/)
+  assert.ok(pinnedMatch)
+  assert.equal(pinnedMatch[1], manifestMatch[1])
+  assert.equal(pinnedMatch[1], crypto.createHash('sha256').update(fs.readFileSync(sourcePath)).digest('hex'))
+  const serverInstructions = migrationSection.slice(migrationSection.indexOf('PINNED_MIGRATION_SHA256='))
+  assert.doesNotMatch(serverInstructions, /deploy-gate-identity-migration\.sha256/)
+  assert.doesNotMatch(serverInstructions, /\/root\/kinvest-reviewed\/[^\s`]*\.sha256/)
+  assert.match(serverInstructions, /root_staged_hash=.*sha256sum/)
+  assert.match(serverInstructions, /"\$root_staged_hash" = "\$PINNED_MIGRATION_SHA256"/)
+  assert.match(serverInstructions, /sudo \/usr\/bin\/env -i PATH=\/usr\/sbin:\/usr\/bin:\/sbin:\/bin/)
   assert.match(source, /GATE_STATE_DIR='\/var\/lib\/kinvest-deploy-gate'/)
   assert.match(source, /SERVER_ROOT='\/root\/docker\/kinvest'/)
   assert.match(source, /flock -n 8/)

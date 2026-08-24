@@ -250,33 +250,35 @@ commit. Verify them together before upload:
 (cd deploy/server && shasum -a 256 -c deploy-gate-identity-migration.sha256)
 ```
 
-Upload the script and manifest as inert files. Never execute a checkout, upload
-directory, or other path writable by `lighthouse`. On the server, first verify
-the uploaded pair, then copy both into the canonical root-only staging
-directory and verify owner, mode, and hash again:
+Upload only the script as an inert file. Never execute a checkout, upload
+directory, or other path writable by `lighthouse`. Obtain the pinned digest
+below from this exact merged runbook through the independent operator review
+channel; an uploaded manifest is not a server authenticity authority. On the
+server, compare the upload to that literal, copy only the script into the
+canonical root-only staging directory, verify type/owner/mode, and compare the
+root-staged script directly to the same literal:
 
 ```bash
 cd /home/lighthouse
-/usr/bin/sha256sum -c deploy-gate-identity-migration.sha256
+PINNED_MIGRATION_SHA256='ee1a95d1e2d9900b8f621376e900279cc99721f33643951ca7536fa48fa8ef66'
+uploaded_hash="$(/usr/bin/sha256sum migrate-deploy-gate-identity.sh | /usr/bin/awk '{print $1}')"
+test "$uploaded_hash" = "$PINNED_MIGRATION_SHA256" || exit 1
 
 sudo /usr/bin/install -d -o root -g root -m 0700 \
   /root/kinvest-reviewed/deploy-gate-identity-migration
 sudo /usr/bin/install -o root -g root -m 0500 \
   /home/lighthouse/migrate-deploy-gate-identity.sh \
   /root/kinvest-reviewed/deploy-gate-identity-migration/migrate-deploy-gate-identity.sh
-sudo /usr/bin/install -o root -g root -m 0400 \
-  /home/lighthouse/deploy-gate-identity-migration.sha256 \
-  /root/kinvest-reviewed/deploy-gate-identity-migration/deploy-gate-identity-migration.sha256
-sudo /usr/bin/stat -c '%U:%G %a %F' \
-  /root/kinvest-reviewed/deploy-gate-identity-migration \
-  /root/kinvest-reviewed/deploy-gate-identity-migration/migrate-deploy-gate-identity.sh \
-  /root/kinvest-reviewed/deploy-gate-identity-migration/deploy-gate-identity-migration.sha256
-sudo /usr/bin/env -i PATH=/usr/sbin:/usr/bin:/sbin:/bin \
-  /bin/bash -c 'cd /root/kinvest-reviewed/deploy-gate-identity-migration && /usr/bin/sha256sum -c deploy-gate-identity-migration.sha256'
+test "$(sudo /usr/bin/stat -c '%U:%G:%a:%F' /root/kinvest-reviewed/deploy-gate-identity-migration)" = \
+  'root:root:700:directory' || exit 1
+test "$(sudo /usr/bin/stat -c '%U:%G:%a:%F' /root/kinvest-reviewed/deploy-gate-identity-migration/migrate-deploy-gate-identity.sh)" = \
+  'root:root:500:regular file' || exit 1
+root_staged_hash="$(sudo /usr/bin/sha256sum /root/kinvest-reviewed/deploy-gate-identity-migration/migrate-deploy-gate-identity.sh | /usr/bin/awk '{print $1}')"
+test "$root_staged_hash" = "$PINNED_MIGRATION_SHA256" || exit 1
 ```
 
 The expected metadata is root ownership with directory mode `0700`, script mode
-`0500`, manifest mode `0400`, regular files, and an exact checksum success.
+`0500`, a regular script file, and an exact pinned-digest match.
 After a separate approval, invoke only that staged script with the explicit
 source and target identity and a cleared environment:
 
@@ -343,8 +345,7 @@ reentry check may the root staging copies be removed:
 
 ```bash
 sudo /usr/bin/rm -f -- \
-  /root/kinvest-reviewed/deploy-gate-identity-migration/migrate-deploy-gate-identity.sh \
-  /root/kinvest-reviewed/deploy-gate-identity-migration/deploy-gate-identity-migration.sha256
+  /root/kinvest-reviewed/deploy-gate-identity-migration/migrate-deploy-gate-identity.sh
 sudo /usr/bin/rmdir -- /root/kinvest-reviewed/deploy-gate-identity-migration
 ```
 
