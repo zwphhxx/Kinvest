@@ -242,11 +242,47 @@ not install assets. Before invocation, all of these preconditions are required:
 - `lighthouse:lighthouse` and `kinvest-deploy:kinvest-deploy` both resolve, and
   each user belongs to its named group.
 
-After a separate approval, invoke the repository-reviewed asset as root with
-the explicit source and target identity:
+The reviewed source and its checked-in
+`deploy-gate-identity-migration.sha256` manifest must come from the exact merged
+commit. Verify them together before upload:
 
 ```bash
-sudo /absolute/reviewed/path/migrate-deploy-gate-identity.sh \
+(cd deploy/server && shasum -a 256 -c deploy-gate-identity-migration.sha256)
+```
+
+Upload the script and manifest as inert files. Never execute a checkout, upload
+directory, or other path writable by `lighthouse`. On the server, first verify
+the uploaded pair, then copy both into the canonical root-only staging
+directory and verify owner, mode, and hash again:
+
+```bash
+cd /home/lighthouse
+/usr/bin/sha256sum -c deploy-gate-identity-migration.sha256
+
+sudo /usr/bin/install -d -o root -g root -m 0700 \
+  /root/kinvest-reviewed/deploy-gate-identity-migration
+sudo /usr/bin/install -o root -g root -m 0500 \
+  /home/lighthouse/migrate-deploy-gate-identity.sh \
+  /root/kinvest-reviewed/deploy-gate-identity-migration/migrate-deploy-gate-identity.sh
+sudo /usr/bin/install -o root -g root -m 0400 \
+  /home/lighthouse/deploy-gate-identity-migration.sha256 \
+  /root/kinvest-reviewed/deploy-gate-identity-migration/deploy-gate-identity-migration.sha256
+sudo /usr/bin/stat -c '%U:%G %a %F' \
+  /root/kinvest-reviewed/deploy-gate-identity-migration \
+  /root/kinvest-reviewed/deploy-gate-identity-migration/migrate-deploy-gate-identity.sh \
+  /root/kinvest-reviewed/deploy-gate-identity-migration/deploy-gate-identity-migration.sha256
+sudo /usr/bin/env -i PATH=/usr/sbin:/usr/bin:/sbin:/bin \
+  /bin/bash -c 'cd /root/kinvest-reviewed/deploy-gate-identity-migration && /usr/bin/sha256sum -c deploy-gate-identity-migration.sha256'
+```
+
+The expected metadata is root ownership with directory mode `0700`, script mode
+`0500`, manifest mode `0400`, regular files, and an exact checksum success.
+After a separate approval, invoke only that staged script with the explicit
+source and target identity and a cleared environment:
+
+```bash
+sudo /usr/bin/env -i PATH=/usr/sbin:/usr/bin:/sbin:/bin \
+  /bin/bash /root/kinvest-reviewed/deploy-gate-identity-migration/migrate-deploy-gate-identity.sh \
   lighthouse lighthouse kinvest-deploy kinvest-deploy
 ```
 
@@ -292,6 +328,25 @@ manual recovery. `DEPLOY_GATE_IDENTITY_MIGRATION_FAILED_FAIL_CLOSED` is emitted
 only after marker or tracked-temporary evidence is verified, while
 `DEPLOY_GATE_IDENTITY_MIGRATION_ROLLBACK_UNPROVEN` requires immediate manual
 incident handling.
+
+Automated default tests exercise real filesystem ownership changes with two
+distinct numeric GIDs when the invoking account has that capability, and Linux
+tests require real `flock` coverage for both locks. A separate
+`KINVEST_GATE_IDENTITY_ROOT_LINUX_INTEGRATION=1` test path uses two already
+existing system identity pairs when run as root; it never creates or modifies
+users or groups. Environments without two suitable existing identities retain
+a root-only end-to-end principal gap and must rely on the production preflight
+`getent`/`id` checks rather than claiming that integration was exercised.
+
+Only after final canonical target verification and the expected source-mismatch
+reentry check may the root staging copies be removed:
+
+```bash
+sudo /usr/bin/rm -f -- \
+  /root/kinvest-reviewed/deploy-gate-identity-migration/migrate-deploy-gate-identity.sh \
+  /root/kinvest-reviewed/deploy-gate-identity-migration/deploy-gate-identity-migration.sha256
+sudo /usr/bin/rmdir -- /root/kinvest-reviewed/deploy-gate-identity-migration
+```
 
 Only after the server migration verifies successfully, configure the GitHub
 `Production` Environment with Secret `SSH_USER` set to `kinvest-deploy` and

@@ -1,8 +1,12 @@
-#!/usr/bin/env bash
+#!/bin/bash
 set -uo pipefail
 
 umask 077
 exec 7>&2
+PATH='/usr/sbin:/usr/bin:/sbin:/bin'
+export PATH
+unset BASH_ENV ENV CDPATH PYTHONPATH PYTHONHOME PYTHONOPTIMIZE
+# migration-fixture-path-anchor
 
 GATE_STATE_DIR='/var/lib/kinvest-deploy-gate'
 SERVER_ROOT='/root/docker/kinvest'
@@ -22,6 +26,7 @@ target_gid=''
 marker_temporary=''
 identity_temporary=''
 migration_phase='forward'
+# migration-test-instrumentation-anchor
 
 die() {
   printf '%s\n' "$1" >&7
@@ -52,7 +57,7 @@ resolve_identity() {
 }
 
 fsync_file() {
-  python3 - "$1" >/dev/null 2>&1 <<'PY'
+  /usr/bin/python3 -I - "$1" >/dev/null 2>&1 <<'PY'
 import os, sys
 fd = os.open(sys.argv[1], os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0))
 try:
@@ -63,7 +68,7 @@ PY
 }
 
 fsync_directory() {
-  python3 - "$1" >/dev/null 2>&1 <<'PY'
+  /usr/bin/python3 -I - "$1" >/dev/null 2>&1 <<'PY'
 import os, sys
 fd = os.open(sys.argv[1], os.O_RDONLY | getattr(os, "O_DIRECTORY", 0))
 try:
@@ -74,50 +79,50 @@ PY
 }
 
 validate_directory() {
-  python3 - "$1" "$ROOT_UID" "$2" >/dev/null 2>&1 <<'PY'
+  /usr/bin/python3 -I - "$1" "$ROOT_UID" "$2" >/dev/null 2>&1 <<'PY'
 import os, stat, sys
 path, expected_uid, expected_gid = sys.argv[1], int(sys.argv[2]), int(sys.argv[3])
 info = os.lstat(path)
-assert stat.S_ISDIR(info.st_mode)
-assert not stat.S_ISLNK(info.st_mode)
-assert info.st_uid == expected_uid
-assert info.st_gid == expected_gid
-assert stat.S_IMODE(info.st_mode) == 0o750
-assert info.st_nlink >= 2
+if not stat.S_ISDIR(info.st_mode): raise SystemExit(1)
+if stat.S_ISLNK(info.st_mode): raise SystemExit(1)
+if info.st_uid != expected_uid: raise SystemExit(1)
+if info.st_gid != expected_gid: raise SystemExit(1)
+if stat.S_IMODE(info.st_mode) != 0o750: raise SystemExit(1)
+if info.st_nlink < 2: raise SystemExit(1)
 PY
 }
 
 validate_regular_file() {
   local path="$1" gid="$2" mode="$3" expected_kind="$4" expected_user="${5:-}" expected_group="${6:-}"
-  python3 - "$path" "$ROOT_UID" "$gid" "$mode" "$expected_kind" "$expected_user" "$expected_group" >/dev/null 2>&1 <<'PY'
+  /usr/bin/python3 -I - "$path" "$ROOT_UID" "$gid" "$mode" "$expected_kind" "$expected_user" "$expected_group" >/dev/null 2>&1 <<'PY'
 import os, stat, sys
 path = sys.argv[1]
 expected_uid, expected_gid = int(sys.argv[2]), int(sys.argv[3])
 expected_mode, kind = int(sys.argv[4], 8), sys.argv[5]
 user, group = sys.argv[6], sys.argv[7]
 info = os.lstat(path)
-assert stat.S_ISREG(info.st_mode) and not stat.S_ISLNK(info.st_mode)
-assert info.st_uid == expected_uid and info.st_gid == expected_gid
-assert stat.S_IMODE(info.st_mode) == expected_mode and info.st_nlink == 1
+if not stat.S_ISREG(info.st_mode) or stat.S_ISLNK(info.st_mode): raise SystemExit(1)
+if info.st_uid != expected_uid or info.st_gid != expected_gid: raise SystemExit(1)
+if stat.S_IMODE(info.st_mode) != expected_mode or info.st_nlink != 1: raise SystemExit(1)
 with open(path, "rb", buffering=0) as handle:
     value = handle.read(4097)
-assert len(value) <= 4096
+if len(value) > 4096: raise SystemExit(1)
 if kind == "identity":
     expected = f"user={user}\ngroup={group}\ngid={expected_gid}\n".encode("ascii")
 elif kind == "marker":
     expected = b"ACTIVE\n"
 else:
-    raise AssertionError("unknown kind")
-assert value == expected
+    raise SystemExit(1)
+if value != expected: raise SystemExit(1)
 PY
 }
 
 validate_entries() {
   local include_marker="$1"
-  python3 - "$GATE_STATE_DIR" "$include_marker" >/dev/null 2>&1 <<'PY'
+  /usr/bin/python3 -I - "$GATE_STATE_DIR" "$include_marker" >/dev/null 2>&1 <<'PY'
 import os, sys
 expected = ["identity"] if sys.argv[2] == "false" else ["identity", "install-incomplete"]
-assert sorted(os.listdir(sys.argv[1])) == expected
+if sorted(os.listdir(sys.argv[1])) != expected: raise SystemExit(1)
 PY
 }
 
@@ -137,12 +142,12 @@ clean_state_kind() {
     return 2
   fi
 
-  python3 - "$GATE_IDENTITY" "$ROOT_UID" >/dev/null 2>&1 <<'PY' || return 1
+  /usr/bin/python3 -I - "$GATE_IDENTITY" "$ROOT_UID" >/dev/null 2>&1 <<'PY' || return 1
 import os, stat, sys
 info = os.lstat(sys.argv[1])
-assert stat.S_ISREG(info.st_mode) and not stat.S_ISLNK(info.st_mode)
-assert info.st_uid == int(sys.argv[2])
-assert stat.S_IMODE(info.st_mode) == 0o640 and info.st_nlink == 1
+if not stat.S_ISREG(info.st_mode) or stat.S_ISLNK(info.st_mode): raise SystemExit(1)
+if info.st_uid != int(sys.argv[2]): raise SystemExit(1)
+if stat.S_IMODE(info.st_mode) != 0o640 or info.st_nlink != 1: raise SystemExit(1)
 PY
   return 3
 }
@@ -159,11 +164,11 @@ validate_tracked_temporary() {
   local candidate="$1" prefix="$2"
   [[ -n "$candidate" && "$(dirname "$candidate")" == "$GATE_STATE_DIR" ]] || return 1
   [[ "$(basename "$candidate")" =~ ^\.${prefix}\.[A-Za-z0-9]{6}$ ]] || return 1
-  python3 - "$candidate" "$ROOT_UID" >/dev/null 2>&1 <<'PY'
+  /usr/bin/python3 -I - "$candidate" "$ROOT_UID" >/dev/null 2>&1 <<'PY'
 import os, stat, sys
 info = os.lstat(sys.argv[1])
-assert stat.S_ISREG(info.st_mode) and not stat.S_ISLNK(info.st_mode)
-assert info.st_uid == int(sys.argv[2]) and info.st_nlink == 1
+if not stat.S_ISREG(info.st_mode) or stat.S_ISLNK(info.st_mode): raise SystemExit(1)
+if info.st_uid != int(sys.argv[2]) or info.st_nlink != 1: raise SystemExit(1)
 PY
 }
 
@@ -184,14 +189,16 @@ publish_marker() {
   fsync_file "$marker_temporary" || return 1
   validate_regular_file "$marker_temporary" "$marker_gid" 0640 marker || return 1
   if [[ "$migration_phase" == forward ]]; then
-    test_pause_if_requested marker-staged || return 1
+    # migration-boundary-forward-marker-staged
+    :
   fi
   mv -fT "$marker_temporary" "$INSTALL_MARKER" >/dev/null 2>&1 || return 1
   marker_temporary=''
   fsync_directory "$GATE_STATE_DIR" || return 1
   validate_regular_file "$INSTALL_MARKER" "$marker_gid" 0640 marker || return 1
   if [[ "$migration_phase" == forward ]]; then
-    test_pause_if_requested marker-published || return 1
+    # migration-boundary-forward-marker-published
+    :
   fi
 }
 
@@ -205,58 +212,39 @@ stage_and_replace_identity() {
   fsync_file "$identity_temporary" || return 1
   validate_regular_file "$identity_temporary" "$gid" 0640 identity "$user" "$group" || return 1
   if [[ "$migration_phase" == forward ]]; then
-    test_pause_if_requested identity-staged || return 1
+    # migration-boundary-forward-identity-staged
+    :
   fi
   mv -fT "$identity_temporary" "$GATE_IDENTITY" >/dev/null 2>&1 || return 1
   identity_temporary=''
   fsync_directory "$GATE_STATE_DIR"
 }
 
-test_failure_requested() {
-  [[ "${KINVEST_DEPLOY_GATE_MIGRATION_TEST_ONLY:-}" == 1 &&
-    "${KINVEST_DEPLOY_GATE_MIGRATION_FAIL_AT:-}" == "$1" ]]
-}
-
-test_pause_if_requested() {
-  local stage="$1" ready release
-  if [[ "${KINVEST_DEPLOY_GATE_MIGRATION_TEST_ONLY:-}" != 1 ||
-    "${KINVEST_DEPLOY_GATE_MIGRATION_PAUSE_AT:-}" != "$stage" ]]; then
-    return 0
-  fi
-  ready="${KINVEST_DEPLOY_GATE_MIGRATION_PAUSE_READY:-}"
-  release="${KINVEST_DEPLOY_GATE_MIGRATION_PAUSE_RELEASE:-}"
-  [[ "$ready" == /* && "$release" == /* && "$ready" != "$release" ]] || return 1
-  : >"$ready" || return 1
-  while [[ ! -e "$release" ]]; do sleep 0.01; done
-}
-
 perform_migration() {
   publish_marker || return 1
-  test_failure_requested after-marker && return 1
 
   chown "$ROOT_UID:$target_gid" "$GATE_STATE_DIR" >/dev/null 2>&1 || return 1
   chmod 0750 "$GATE_STATE_DIR" >/dev/null 2>&1 || return 1
   fsync_directory "$GATE_STATE_DIR" || return 1
-  test_pause_if_requested after-directory-group || return 1
-  test_failure_requested after-directory-group && return 1
+  # migration-boundary-forward-directory-owned
 
   stage_and_replace_identity "$target_user" "$target_group" "$target_gid" || return 1
-  test_pause_if_requested after-identity-replace || return 1
-  test_failure_requested after-identity-replace && return 1
+  # migration-boundary-forward-identity-replaced
 
   chown "$ROOT_UID:$target_gid" "$INSTALL_MARKER" >/dev/null 2>&1 || return 1
   chmod 0640 "$INSTALL_MARKER" >/dev/null 2>&1 || return 1
   fsync_file "$INSTALL_MARKER" || return 1
   fsync_directory "$GATE_STATE_DIR" || return 1
   validate_state_with_marker "$target_user" "$target_group" "$target_gid" || return 1
-  test_pause_if_requested before-marker-unlink || return 1
+  # migration-boundary-forward-marker-target-owned
 
   rm -f -- "$INSTALL_MARKER" >/dev/null 2>&1 || return 1
-  test_failure_requested after-marker-unlink && return 1
+  # migration-boundary-forward-marker-unlinked
   fsync_directory "$GATE_STATE_DIR" || return 1
+  # migration-boundary-forward-final-fsync
   clean_state_kind
   [[ "$?" -eq 2 ]] || return 1
-  test_failure_requested after-final-validation && return 1
+  # migration-boundary-forward-final-validated
   return 0
 }
 
@@ -328,27 +316,31 @@ ensure_verified_fail_closed_evidence() {
 rollback_to_current() {
   migration_phase='rollback'
   ensure_fail_closed_marker || return 1
-  if [[ "${KINVEST_DEPLOY_GATE_MIGRATION_TEST_ONLY:-}" == 1 &&
-    "${KINVEST_DEPLOY_GATE_MIGRATION_ROLLBACK_FAIL:-}" == 1 ]]; then
-    return 1
-  fi
 
   chown "$ROOT_UID:$current_gid" "$INSTALL_MARKER" >/dev/null 2>&1 || return 1
   chmod 0640 "$INSTALL_MARKER" >/dev/null 2>&1 || return 1
   fsync_file "$INSTALL_MARKER" || return 1
+  # migration-boundary-rollback-marker-owned
   chown "$ROOT_UID:$current_gid" "$GATE_STATE_DIR" >/dev/null 2>&1 || return 1
   chmod 0750 "$GATE_STATE_DIR" >/dev/null 2>&1 || return 1
   fsync_directory "$GATE_STATE_DIR" || return 1
+  # migration-boundary-rollback-directory-owned
   stage_and_replace_identity "$current_user" "$current_group" "$current_gid" || return 1
+  # migration-boundary-rollback-identity-replaced
   remove_tracked_temporary "$marker_temporary" install-incomplete || return 1
   marker_temporary=''
   remove_tracked_temporary "$identity_temporary" identity || return 1
   identity_temporary=''
+  # migration-boundary-rollback-temporaries-cleaned
   validate_state_with_marker "$current_user" "$current_group" "$current_gid" || return 1
   rm -f -- "$INSTALL_MARKER" >/dev/null 2>&1 || return 1
+  # migration-boundary-rollback-marker-unlinked
   fsync_directory "$GATE_STATE_DIR" || return 1
+  # migration-boundary-rollback-final-fsync
   clean_state_kind
-  [[ "$?" -eq 0 ]]
+  [[ "$?" -eq 0 ]] || return 1
+  # migration-boundary-rollback-final-validated
+  return 0
 }
 
 handle_interruption() {
