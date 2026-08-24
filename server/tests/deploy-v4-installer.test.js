@@ -267,17 +267,34 @@ function waitFor(check, timeoutMs = 2000) {
   })
 }
 
-function waitForExit(child, timeoutMs = 3000) {
+const childClosures = new WeakMap()
+
+function trackChild(child) {
+  childClosures.set(child, new Promise((resolve) => {
+    child.once('close', (status, signal) => resolve({ signal, status }))
+  }))
+  return child
+}
+
+function waitForExit(child, label, timeoutMs = 15000) {
   return new Promise((resolve, reject) => {
+    let timedOut = false
     const timeout = setTimeout(() => {
+      timedOut = true
       child.kill('SIGKILL')
-      reject(new Error('installer child did not exit'))
     }, timeoutMs)
-    child.once('exit', (status, signal) => {
+    childClosures.get(child).then(({ status, signal }) => {
       clearTimeout(timeout)
+      if (timedOut) return reject(new Error(`${label}: installer child did not exit within ${timeoutMs}ms`))
       resolve({ signal, status })
     })
   })
+}
+
+async function terminateAndWait(child, label) {
+  if (!child) return
+  if (child.exitCode === null && child.signalCode === null) child.kill('SIGKILL')
+  await waitForExit(child, `${label} cleanup`)
 }
 
 function assertOld(context, existing) {
@@ -326,6 +343,27 @@ async function run() {
   assert.doesNotMatch(gateSource, /timeout|sleep|retry/i)
   assert.match(gateSource, /\.identity\./)
 
+  const timeoutChild = trackChild(spawn(process.execPath, ['-e', 'setInterval(() => {}, 1000)'], { stdio: 'ignore' }))
+  let timeoutChildClosed = false
+  timeoutChild.once('close', () => { timeoutChildClosed = true })
+  try {
+    await assert.rejects(
+      waitForExit(timeoutChild, 'timeout regression', 25),
+      (error) => {
+        assert.ok(error instanceof Error)
+        assert.match(error.message, /timeout regression/)
+        assert.equal(timeoutChildClosed, true)
+        return true
+      }
+    )
+    assert.equal(timeoutChild.signalCode, 'SIGKILL')
+  } finally {
+    if (!timeoutChildClosed) {
+      timeoutChild.kill('SIGKILL')
+      await new Promise((resolve) => timeoutChild.once('close', resolve))
+    }
+  }
+
   const missingIdentity = fixture()
   try {
     const env = installerEnvironment(missingIdentity)
@@ -359,6 +397,7 @@ async function run() {
   }
 
   const gatePermissionBase = fs.mkdtempSync(path.join(os.tmpdir(), 'kinvest-v4-gate-'))
+  let holder
   try {
     const publicState = path.join(gatePermissionBase, 'public')
     const privateState = path.join(gatePermissionBase, 'private')
@@ -400,20 +439,20 @@ PY
     const idle = spawnSync(gate, [], { encoding: 'utf8', env: gateEnv })
     assert.equal(idle.status, 0, idle.stderr)
 
-    const holder = spawn('python3', ['-c', [
+    holder = trackChild(spawn('python3', ['-c', [
       'import fcntl,os,sys,time',
       'fd=os.open(sys.argv[1], os.O_RDONLY | os.O_DIRECTORY)',
       'fcntl.flock(fd, fcntl.LOCK_EX)',
       'open(sys.argv[2], "w").close()',
       'time.sleep(30)'
-    ].join(';'), publicState, ready], { stdio: 'ignore' })
+    ].join(';'), publicState, ready], { stdio: 'ignore' }))
     await waitFor(() => fs.existsSync(ready))
     const busy = spawnSync(gate, [], { encoding: 'utf8', env: gateEnv })
     assert.equal(busy.status, 76)
     assert.equal(busy.stderr, 'DEPLOY_INSTALL_INCOMPLETE\n')
     fs.writeFileSync(marker, 'ACTIVE\n', { mode: 0o640 })
     holder.kill('SIGKILL')
-    await waitForExit(holder)
+    await waitForExit(holder, 'exclusive gate lock holder')
     const stale = spawnSync(gate, [], { encoding: 'utf8', env: gateEnv })
     assert.equal(stale.status, 76)
     assert.equal(stale.stderr, 'DEPLOY_INSTALL_INCOMPLETE\n')
@@ -433,6 +472,7 @@ PY
     const reconciled = spawnSync(gate, [], { encoding: 'utf8', env: gateEnv })
     assert.equal(reconciled.status, 0, reconciled.stderr)
   } finally {
+    await terminateAndWait(holder, 'exclusive gate lock holder')
     fs.chmodSync(path.join(gatePermissionBase, 'private'), 0o700)
     fs.rmSync(gatePermissionBase, { recursive: true, force: true })
   }
@@ -605,6 +645,7 @@ PY
   }
 
   const concurrent = fixture()
+  let first
   try {
     const sharedEnvironment = {
       INSTALL_EVENTS: concurrent.eventLog,
@@ -613,26 +654,28 @@ PY
       INSTALL_LOCK_RELEASE: concurrent.lockRelease,
       INSTALL_TARGET_ROOT: concurrent.base
     }
-    const first = spawn('bash', [concurrent.script, sourceDir], {
+    first = trackChild(spawn('bash', [concurrent.script, sourceDir], {
       env: installerEnvironment(concurrent, { ...sharedEnvironment, HOLD_LOCK_KIND: 'install', INSTALLER_ID: 'first' }),
       stdio: 'ignore'
-    })
+    }))
     await waitFor(() => fs.existsSync(concurrent.eventLog) && fs.readFileSync(concurrent.eventLog, 'utf8').includes('first:install-lock'))
     const second = execute(concurrent, { ...sharedEnvironment, INSTALLER_ID: 'second' })
     assert.notEqual(second.status, 0)
     const whileLocked = fs.readFileSync(concurrent.eventLog, 'utf8').trim().split('\n')
     assert.equal(whileLocked.includes('second:target-read'), false)
     fs.writeFileSync(concurrent.lockRelease, '')
-    const firstExit = await waitForExit(first)
+    const firstExit = await waitForExit(first, 'concurrent primary installer')
     assert.equal(firstExit.status, 0)
     const events = fs.readFileSync(concurrent.eventLog, 'utf8').trim().split('\n')
     assert.ok(events.indexOf('first:install-lock') < events.indexOf('first:deploy-lock'))
     assert.ok(events.indexOf('first:deploy-lock') < events.indexOf('first:target-read'))
   } finally {
+    await terminateAndWait(first, 'concurrent primary installer')
     fs.rmSync(concurrent.base, { recursive: true, force: true })
   }
 
   const gateWindow = fixture({ pauseBeforeGate: true })
+  let gateWindowChild
   try {
     const lockEnvironment = {
       INSTALL_EVENTS: gateWindow.eventLog,
@@ -641,9 +684,9 @@ PY
       INSTALL_LOCK_RELEASE: gateWindow.lockRelease,
       INSTALLER_ID: 'installer'
     }
-    const child = spawn('bash', [gateWindow.script, sourceDir], {
+    gateWindowChild = trackChild(spawn('bash', [gateWindow.script, sourceDir], {
       env: installerEnvironment(gateWindow, lockEnvironment), stdio: 'ignore'
-    })
+    }))
     await waitFor(() => fs.existsSync(gateWindow.locksHeldMarker))
     const journal = path.join(gateWindow.serverRoot, 'state/install-v4.journal')
     assert.equal(fs.existsSync(journal), false)
@@ -655,7 +698,7 @@ PY
     assert.equal(blocked.status, 76)
     assert.equal(blocked.stderr, 'DEPLOY_INSTALL_INCOMPLETE\n')
     fs.writeFileSync(gateWindow.lockRelease, '')
-    assert.equal((await waitForExit(child)).status, 0)
+    assert.equal((await waitForExit(gateWindowChild, 'gate publication window installer')).status, 0)
     fs.rmSync(gateWindow.installerLockDir, { recursive: true, force: true })
     fs.rmSync(gateWindow.deployLockDir, { recursive: true, force: true })
     const installedGate = path.join(gateWindow.base, 'installed-gate')
@@ -673,24 +716,27 @@ PY
     assert.equal(delegated.status, 0, delegated.stderr)
     for (const target of gateWindow.targets) assert.doesNotMatch(fs.readFileSync(target, 'utf8'), /^old-/)
   } finally {
+    await terminateAndWait(gateWindowChild, 'gate publication window installer')
     fs.rmSync(gateWindow.base, { recursive: true, force: true })
   }
 
   const signalled = fixture({ replaceFailure: 3, rollbackPause: true })
+  let signalledChild
   try {
-    const child = spawn('bash', [signalled.script, sourceDir], {
+    signalledChild = trackChild(spawn('bash', [signalled.script, sourceDir], {
       env: installerEnvironment(signalled),
       stdio: 'ignore'
-    })
+    }))
     await waitFor(() => fs.existsSync(signalled.rollbackMarker))
-    child.kill('SIGTERM')
-    child.kill('SIGTERM')
+    signalledChild.kill('SIGTERM')
+    signalledChild.kill('SIGTERM')
     fs.writeFileSync(signalled.rollbackRelease, '')
-    const childExit = await waitForExit(child)
+    const childExit = await waitForExit(signalledChild, 'signalled rollback installer')
     assert.notEqual(childExit.status, 0)
     assert.equal(childExit.signal, null)
     assertOld(signalled, true)
   } finally {
+    await terminateAndWait(signalledChild, 'signalled rollback installer')
     fs.rmSync(signalled.base, { recursive: true, force: true })
   }
 
