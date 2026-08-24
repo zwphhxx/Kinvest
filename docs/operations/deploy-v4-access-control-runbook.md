@@ -115,12 +115,11 @@ delegates only after its complete asset closure exists. With a journal, both
 paths return `DEPLOY_INSTALL_INCOMPLETE` before executing any deploy asset.
 
 The installer requires both non-secret `KINVEST_DEPLOY_GATE_USER` and
-`KINVEST_DEPLOY_GATE_GROUP`; there are no guessed defaults. For the current
-Production host, set both to `lighthouse` only after read-only `getent` and `id`
-checks confirm that the `lighthouse` group exists and the `lighthouse` user is
-already a member. If its real primary or supplementary group differs, use that
-observed group instead. The installer never creates users or changes group
-membership.
+`KINVEST_DEPLOY_GATE_GROUP`; there are no guessed defaults. The current
+Production forced-command principal is `kinvest-deploy:kinvest-deploy`, not the
+separate `lighthouse` maintenance identity. Always confirm the account, group,
+numeric gid, and membership with read-only `getent` and `id` checks. The
+installer never creates users or changes group membership.
 
 The installer creates `/var/lib/kinvest-deploy-gate` as
 `root:<KINVEST_DEPLOY_GATE_GROUP>` `0750`. The directory itself is the flock
@@ -226,6 +225,136 @@ when the basename is exact and it is a direct root-owned regular non-symlink
 child with one link; partial mode or content is expected. An unexpected owner,
 symlink, malformed name, or additional hard link stops
 installation without deleting the suspicious file.
+
+## One-time gate identity migration
+
+`migrate-deploy-gate-identity.sh` is the only reviewed path for changing an
+already-installed gate identity. It does not change either installer and does
+not install assets. Before invocation, all of these preconditions are required:
+
+- Production deployment is disabled and no Production deployment is approved
+  or running.
+- `/var/lib/kinvest-deploy-gate` is a real `root:lighthouse` `0750` directory
+  containing only a real `root:lighthouse` `0640` `identity` file with the
+  canonical `lighthouse` identity content.
+- Neither `install-incomplete` nor any gate temporary exists.
+- Neither `state/install-v3.journal` nor `state/install-v4.journal` exists.
+- `lighthouse:lighthouse` and `kinvest-deploy:kinvest-deploy` both resolve, and
+  each user belongs to its named group.
+
+The reviewed source and its checked-in
+`deploy-gate-identity-migration.sha256` manifest must come from the exact merged
+commit. Verify them together before upload:
+
+```bash
+(cd deploy/server && shasum -a 256 -c deploy-gate-identity-migration.sha256)
+```
+
+Upload only the script as an inert file. Never execute a checkout, upload
+directory, or other path writable by `lighthouse`. Obtain the pinned digest
+below from this exact merged runbook through the independent operator review
+channel; an uploaded manifest is not a server authenticity authority. On the
+server, compare the upload to that literal, copy only the script into the
+canonical root-only staging directory, verify type/owner/mode, and compare the
+root-staged script directly to the same literal:
+
+```bash
+cd /home/lighthouse
+PINNED_MIGRATION_SHA256='ee1a95d1e2d9900b8f621376e900279cc99721f33643951ca7536fa48fa8ef66'
+uploaded_hash="$(/usr/bin/sha256sum migrate-deploy-gate-identity.sh | /usr/bin/awk '{print $1}')"
+test "$uploaded_hash" = "$PINNED_MIGRATION_SHA256" || exit 1
+
+sudo /usr/bin/install -d -o root -g root -m 0700 \
+  /root/kinvest-reviewed/deploy-gate-identity-migration
+sudo /usr/bin/install -o root -g root -m 0500 \
+  /home/lighthouse/migrate-deploy-gate-identity.sh \
+  /root/kinvest-reviewed/deploy-gate-identity-migration/migrate-deploy-gate-identity.sh
+test "$(sudo /usr/bin/stat -c '%U:%G:%a:%F' /root/kinvest-reviewed/deploy-gate-identity-migration)" = \
+  'root:root:700:directory' || exit 1
+test "$(sudo /usr/bin/stat -c '%U:%G:%a:%F' /root/kinvest-reviewed/deploy-gate-identity-migration/migrate-deploy-gate-identity.sh)" = \
+  'root:root:500:regular file' || exit 1
+root_staged_hash="$(sudo /usr/bin/sha256sum /root/kinvest-reviewed/deploy-gate-identity-migration/migrate-deploy-gate-identity.sh | /usr/bin/awk '{print $1}')"
+test "$root_staged_hash" = "$PINNED_MIGRATION_SHA256" || exit 1
+```
+
+The expected metadata is root ownership with directory mode `0700`, script mode
+`0500`, a regular script file, and an exact pinned-digest match.
+After a separate approval, invoke only that staged script with the explicit
+source and target identity and a cleared environment:
+
+```bash
+sudo /usr/bin/env -i PATH=/usr/sbin:/usr/bin:/sbin:/bin \
+  /bin/bash /root/kinvest-reviewed/deploy-gate-identity-migration/migrate-deploy-gate-identity.sh \
+  lighthouse lighthouse kinvest-deploy kinvest-deploy
+```
+
+The command acquires the gate directory exclusively before the shared deploy
+lock. It publishes and fsyncs the public fail-closed marker before changing
+group ownership, stages the new canonical identity on the same filesystem,
+atomically replaces it, and removes the marker only after the complete target
+state is verified and fsynced. Its sole success output is:
+
+```text
+DEPLOY_GATE_IDENTITY_MIGRATION_OK
+```
+
+Verify the final directory as `root:kinvest-deploy` `0750`, the identity as
+`root:kinvest-deploy` `0640` with canonical user, group, and numeric gid, and
+confirm that no marker, temporary, or install journal remains. A successful
+second invocation with the original source arguments must return
+`DEPLOY_GATE_IDENTITY_MIGRATION_SOURCE_MISMATCH`; it is never a silent no-op.
+
+On an ordinary failure, the tool reconstructs and verifies the exact canonical
+source state before removing the fail-closed marker and returns
+`DEPLOY_GATE_IDENTITY_MIGRATION_FAILED_ROLLED_BACK`. If rollback cannot be
+proved, it preserves the marker or temporary evidence and returns
+`DEPLOY_GATE_IDENTITY_MIGRATION_FAILED_FAIL_CLOSED`. Do not manually delete that
+evidence; stop and perform a separately reviewed recovery.
+
+Handled `HUP`, `INT`, and `TERM` follow the same verified rollback path while
+both locks remain held. The migration tool does not claim automatic recovery
+after `SIGKILL`, kernel failure, power loss, or storage failure. Before the
+`install-incomplete` marker is unlinked, a crash should leave that marker or a
+tracked temporary as fail-closed evidence. After the unlink, a crash may leave
+either fail-closed evidence or the exact canonical clean target state with no
+marker or temporary.
+
+Crash inspection must therefore verify the gate directory type, owner, target
+group and `0750` mode; the identity file type, owner, target group, `0640` mode
+and exact canonical target content; and the complete directory entry set. An
+exact clean target is the committed migration. Re-running with the old source
+identity must return `DEPLOY_GATE_IDENTITY_MIGRATION_SOURCE_MISMATCH`; do not
+attempt to convert it back automatically. Any mixed, unexpected, or unproven
+state remains fail-closed incident evidence and requires separately reviewed
+manual recovery. `DEPLOY_GATE_IDENTITY_MIGRATION_FAILED_FAIL_CLOSED` is emitted
+only after marker or tracked-temporary evidence is verified, while
+`DEPLOY_GATE_IDENTITY_MIGRATION_ROLLBACK_UNPROVEN` requires immediate manual
+incident handling.
+
+Automated default tests exercise real filesystem ownership changes with two
+distinct numeric GIDs when the invoking account has that capability, and Linux
+tests require real `flock` coverage for both locks. A separate
+`KINVEST_GATE_IDENTITY_ROOT_LINUX_INTEGRATION=1` test path uses two already
+existing system identity pairs when run as root; it never creates or modifies
+users or groups. Environments without two suitable existing identities retain
+a root-only end-to-end principal gap and must rely on the production preflight
+`getent`/`id` checks rather than claiming that integration was exercised.
+
+Only after final canonical target verification and the expected source-mismatch
+reentry check may the root staging copies be removed:
+
+```bash
+sudo /usr/bin/rm -f -- \
+  /root/kinvest-reviewed/deploy-gate-identity-migration/migrate-deploy-gate-identity.sh
+sudo /usr/bin/rmdir -- /root/kinvest-reviewed/deploy-gate-identity-migration
+```
+
+Only after the server migration verifies successfully, configure the GitHub
+`Production` Environment with Secret `SSH_USER` set to `kinvest-deploy` and
+Variable `KINVEST_DEPLOY_GATE_USER` set to `kinvest-deploy`. Do not put the SSH
+private key, passwords, tokens, or any other secret value in chat or the
+runbook. Keep `DEPLOY_V4_ENABLED=false` until the next separately approved
+baseline deployment.
 
 If a protocol-v4 RESTORE has already switched runtime to a newly approved tmpfs
 bundle and post-switch acceptance fails, the marker remains even though the raw

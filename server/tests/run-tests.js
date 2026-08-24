@@ -56,6 +56,7 @@ const tests = [
   require('./deploy-v4.test'),
   require('./deploy-v4-executor.test'),
   require('./deploy-v4-installer.test'),
+  require('./deploy-gate-identity-migration.test'),
   require('./deploy-v4-workflow.test'),
   require('./nginx-fixed-ip-gate.test'),
   require('./data-lifecycle.test'),
