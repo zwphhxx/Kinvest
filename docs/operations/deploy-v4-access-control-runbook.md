@@ -273,6 +273,16 @@ proved, it preserves the marker or temporary evidence and returns
 `DEPLOY_GATE_IDENTITY_MIGRATION_FAILED_FAIL_CLOSED`. Do not manually delete that
 evidence; stop and perform a separately reviewed recovery.
 
+Handled `HUP`, `INT`, and `TERM` follow the same verified rollback path while
+both locks remain held. The migration tool does not claim automatic recovery
+after `SIGKILL`, kernel failure, power loss, or storage failure. Those events
+must leave a marker or tracked temporary that keeps the forced-command gate
+closed; inspect the evidence and use a separately reviewed manual recovery.
+`DEPLOY_GATE_IDENTITY_MIGRATION_FAILED_FAIL_CLOSED` is emitted only after that
+evidence is verified. `DEPLOY_GATE_IDENTITY_MIGRATION_ROLLBACK_UNPROVEN` means
+the tool could not prove either rollback or fail-closed evidence and requires
+immediate manual incident handling.
+
 Only after the server migration verifies successfully, configure the GitHub
 `Production` Environment with Secret `SSH_USER` set to `kinvest-deploy` and
 Variable `KINVEST_DEPLOY_GATE_USER` set to `kinvest-deploy`. Do not put the SSH

@@ -2,6 +2,7 @@
 set -uo pipefail
 
 umask 077
+exec 7>&2
 
 GATE_STATE_DIR='/var/lib/kinvest-deploy-gate'
 SERVER_ROOT='/root/docker/kinvest'
@@ -20,10 +21,10 @@ current_gid=''
 target_gid=''
 marker_temporary=''
 identity_temporary=''
-migration_started='false'
+migration_phase='forward'
 
 die() {
-  printf '%s\n' "$1" >&2
+  printf '%s\n' "$1" >&7
   exit "${2:-76}"
 }
 
@@ -175,16 +176,23 @@ remove_tracked_temporary() {
 }
 
 publish_marker() {
+  local marker_gid="${1:-$current_gid}"
   marker_temporary="$(mktemp "$GATE_STATE_DIR/.install-incomplete.XXXXXX")" || return 1
   printf '%s\n' ACTIVE >"$marker_temporary" || return 1
-  chown "$ROOT_UID:$current_gid" "$marker_temporary" >/dev/null 2>&1 || return 1
+  chown "$ROOT_UID:$marker_gid" "$marker_temporary" >/dev/null 2>&1 || return 1
   chmod 0640 "$marker_temporary" >/dev/null 2>&1 || return 1
   fsync_file "$marker_temporary" || return 1
-  validate_regular_file "$marker_temporary" "$current_gid" 0640 marker || return 1
+  validate_regular_file "$marker_temporary" "$marker_gid" 0640 marker || return 1
+  if [[ "$migration_phase" == forward ]]; then
+    test_pause_if_requested marker-staged || return 1
+  fi
   mv -fT "$marker_temporary" "$INSTALL_MARKER" >/dev/null 2>&1 || return 1
   marker_temporary=''
   fsync_directory "$GATE_STATE_DIR" || return 1
-  validate_regular_file "$INSTALL_MARKER" "$current_gid" 0640 marker
+  validate_regular_file "$INSTALL_MARKER" "$marker_gid" 0640 marker || return 1
+  if [[ "$migration_phase" == forward ]]; then
+    test_pause_if_requested marker-published || return 1
+  fi
 }
 
 stage_and_replace_identity() {
@@ -196,6 +204,9 @@ stage_and_replace_identity() {
   chmod 0640 "$identity_temporary" >/dev/null 2>&1 || return 1
   fsync_file "$identity_temporary" || return 1
   validate_regular_file "$identity_temporary" "$gid" 0640 identity "$user" "$group" || return 1
+  if [[ "$migration_phase" == forward ]]; then
+    test_pause_if_requested identity-staged || return 1
+  fi
   mv -fT "$identity_temporary" "$GATE_IDENTITY" >/dev/null 2>&1 || return 1
   identity_temporary=''
   fsync_directory "$GATE_STATE_DIR"
@@ -206,17 +217,31 @@ test_failure_requested() {
     "${KINVEST_DEPLOY_GATE_MIGRATION_FAIL_AT:-}" == "$1" ]]
 }
 
+test_pause_if_requested() {
+  local stage="$1" ready release
+  if [[ "${KINVEST_DEPLOY_GATE_MIGRATION_TEST_ONLY:-}" != 1 ||
+    "${KINVEST_DEPLOY_GATE_MIGRATION_PAUSE_AT:-}" != "$stage" ]]; then
+    return 0
+  fi
+  ready="${KINVEST_DEPLOY_GATE_MIGRATION_PAUSE_READY:-}"
+  release="${KINVEST_DEPLOY_GATE_MIGRATION_PAUSE_RELEASE:-}"
+  [[ "$ready" == /* && "$release" == /* && "$ready" != "$release" ]] || return 1
+  : >"$ready" || return 1
+  while [[ ! -e "$release" ]]; do sleep 0.01; done
+}
+
 perform_migration() {
   publish_marker || return 1
-  migration_started='true'
   test_failure_requested after-marker && return 1
 
   chown "$ROOT_UID:$target_gid" "$GATE_STATE_DIR" >/dev/null 2>&1 || return 1
   chmod 0750 "$GATE_STATE_DIR" >/dev/null 2>&1 || return 1
   fsync_directory "$GATE_STATE_DIR" || return 1
+  test_pause_if_requested after-directory-group || return 1
   test_failure_requested after-directory-group && return 1
 
   stage_and_replace_identity "$target_user" "$target_group" "$target_gid" || return 1
+  test_pause_if_requested after-identity-replace || return 1
   test_failure_requested after-identity-replace && return 1
 
   chown "$ROOT_UID:$target_gid" "$INSTALL_MARKER" >/dev/null 2>&1 || return 1
@@ -224,32 +249,88 @@ perform_migration() {
   fsync_file "$INSTALL_MARKER" || return 1
   fsync_directory "$GATE_STATE_DIR" || return 1
   validate_state_with_marker "$target_user" "$target_group" "$target_gid" || return 1
+  test_pause_if_requested before-marker-unlink || return 1
 
   rm -f -- "$INSTALL_MARKER" >/dev/null 2>&1 || return 1
+  test_failure_requested after-marker-unlink && return 1
   fsync_directory "$GATE_STATE_DIR" || return 1
   clean_state_kind
-  [[ "$?" -eq 2 ]]
+  [[ "$?" -eq 2 ]] || return 1
+  test_failure_requested after-final-validation && return 1
+  return 0
 }
 
-rollback_to_current() {
-  if [[ "${KINVEST_DEPLOY_GATE_MIGRATION_TEST_ONLY:-}" == 1 &&
-    "${KINVEST_DEPLOY_GATE_MIGRATION_ROLLBACK_FAIL:-}" == 1 ]]; then
-    return 1
+directory_gate_gid() {
+  if validate_directory "$GATE_STATE_DIR" "$current_gid"; then
+    printf '%s\n' "$current_gid"
+    return 0
   fi
+  if validate_directory "$GATE_STATE_DIR" "$target_gid"; then
+    printf '%s\n' "$target_gid"
+    return 0
+  fi
+  return 1
+}
+
+ensure_fail_closed_marker() {
+  local gate_gid
+  gate_gid="$(directory_gate_gid)" || return 1
 
   if [[ -e "$INSTALL_MARKER" || -L "$INSTALL_MARKER" ]]; then
     validate_regular_file "$INSTALL_MARKER" "$current_gid" 0640 marker ||
       validate_regular_file "$INSTALL_MARKER" "$target_gid" 0640 marker || return 1
-  elif [[ -n "$marker_temporary" ]]; then
-    validate_tracked_temporary "$marker_temporary" install-incomplete || return 1
-  else
-    return 1
+    return 0
   fi
 
-  if [[ ! -e "$INSTALL_MARKER" ]]; then
-    remove_tracked_temporary "$marker_temporary" install-incomplete || return 1
+  if [[ -n "$marker_temporary" && ( -e "$marker_temporary" || -L "$marker_temporary" ) ]]; then
+    validate_tracked_temporary "$marker_temporary" install-incomplete || return 1
+    printf '%s\n' ACTIVE >"$marker_temporary" || return 1
+    chown "$ROOT_UID:$gate_gid" "$marker_temporary" >/dev/null 2>&1 || return 1
+    chmod 0640 "$marker_temporary" >/dev/null 2>&1 || return 1
+    fsync_file "$marker_temporary" || return 1
+    validate_regular_file "$marker_temporary" "$gate_gid" 0640 marker || return 1
+    mv -fT "$marker_temporary" "$INSTALL_MARKER" >/dev/null 2>&1 || return 1
     marker_temporary=''
-    publish_marker || return 1
+    fsync_directory "$GATE_STATE_DIR" || return 1
+    validate_regular_file "$INSTALL_MARKER" "$gate_gid" 0640 marker
+    return $?
+  fi
+
+  publish_marker "$gate_gid"
+}
+
+verified_fail_closed_evidence() {
+  local gate_gid candidate prefix
+  gate_gid="$(directory_gate_gid)" || return 1
+  if [[ -e "$INSTALL_MARKER" || -L "$INSTALL_MARKER" ]]; then
+    validate_regular_file "$INSTALL_MARKER" "$current_gid" 0640 marker ||
+      validate_regular_file "$INSTALL_MARKER" "$target_gid" 0640 marker
+    return $?
+  fi
+  for candidate in "$marker_temporary" "$identity_temporary"; do
+    [[ -n "$candidate" && ( -e "$candidate" || -L "$candidate" ) ]] || continue
+    if [[ "$(basename "$candidate")" == .install-incomplete.* ]]; then
+      prefix=install-incomplete
+    else
+      prefix=identity
+    fi
+    validate_tracked_temporary "$candidate" "$prefix" && return 0
+  done
+  return 1
+}
+
+ensure_verified_fail_closed_evidence() {
+  verified_fail_closed_evidence && return 0
+  ensure_fail_closed_marker || return 1
+  verified_fail_closed_evidence
+}
+
+rollback_to_current() {
+  migration_phase='rollback'
+  ensure_fail_closed_marker || return 1
+  if [[ "${KINVEST_DEPLOY_GATE_MIGRATION_TEST_ONLY:-}" == 1 &&
+    "${KINVEST_DEPLOY_GATE_MIGRATION_ROLLBACK_FAIL:-}" == 1 ]]; then
+    return 1
   fi
 
   chown "$ROOT_UID:$current_gid" "$INSTALL_MARKER" >/dev/null 2>&1 || return 1
@@ -272,10 +353,13 @@ rollback_to_current() {
 
 handle_interruption() {
   trap - HUP INT TERM
-  if [[ "$migration_started" == true ]] && rollback_to_current >/dev/null 2>&1; then
+  if rollback_to_current >/dev/null 2>&1; then
     die DEPLOY_GATE_IDENTITY_MIGRATION_FAILED_ROLLED_BACK
   fi
-  die DEPLOY_GATE_IDENTITY_MIGRATION_FAILED_FAIL_CLOSED
+  if ensure_verified_fail_closed_evidence >/dev/null 2>&1; then
+    die DEPLOY_GATE_IDENTITY_MIGRATION_FAILED_FAIL_CLOSED
+  fi
+  die DEPLOY_GATE_IDENTITY_MIGRATION_ROLLBACK_UNPROVEN
 }
 
 [[ "$(id -u)" -eq 0 ]] || die DEPLOY_GATE_IDENTITY_MIGRATION_ROOT_REQUIRED
@@ -342,4 +426,7 @@ trap - HUP INT TERM
 if rollback_to_current >/dev/null 2>&1; then
   die DEPLOY_GATE_IDENTITY_MIGRATION_FAILED_ROLLED_BACK
 fi
-die DEPLOY_GATE_IDENTITY_MIGRATION_FAILED_FAIL_CLOSED
+if ensure_verified_fail_closed_evidence >/dev/null 2>&1; then
+  die DEPLOY_GATE_IDENTITY_MIGRATION_FAILED_FAIL_CLOSED
+fi
+die DEPLOY_GATE_IDENTITY_MIGRATION_ROLLBACK_UNPROVEN

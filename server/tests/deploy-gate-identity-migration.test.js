@@ -2,24 +2,29 @@ const assert = require('node:assert/strict')
 const fs = require('node:fs')
 const os = require('node:os')
 const path = require('node:path')
-const { spawnSync } = require('node:child_process')
+const { spawn, spawnSync } = require('node:child_process')
 
 const rootDir = path.resolve(__dirname, '../..')
 const sourcePath = path.join(rootDir, 'deploy/server/migrate-deploy-gate-identity.sh')
+const gateSource = fs.readFileSync(path.join(rootDir, 'deploy/server/kinvest-ssh-command-v3'), 'utf8')
 
 function writeExecutable(file, source) {
   fs.writeFileSync(file, source, { mode: 0o755 })
 }
 
-function fixture() {
+function fixture({ distinctGids = false, realFlock = false } = {}) {
   const base = fs.mkdtempSync(path.join(os.tmpdir(), 'kinvest-gate-identity-migration-'))
   const gateDir = path.join(base, 'gate')
   const serverRoot = path.join(base, 'server')
   const stateDir = path.join(serverRoot, 'state')
   const bin = path.join(base, 'bin')
   const lockLog = path.join(base, 'locks.log')
-  const currentGid = process.getgid()
-  const targetGid = process.getgid()
+  const availableGids = [...new Set([process.getgid(), ...process.getgroups()])]
+  const currentGid = distinctGids && availableGids.length > 1 ? availableGids[0] : process.getgid()
+  const targetGid = distinctGids && availableGids.length > 1
+    ? availableGids.find((gid) => gid !== currentGid)
+    : distinctGids && process.getuid() === 0 ? currentGid + 1 : process.getgid()
+  if (distinctGids && currentGid === targetGid) throw new Error('distinct gid test path unavailable')
 
   fs.mkdirSync(gateDir, { mode: 0o750 })
   fs.mkdirSync(stateDir, { recursive: true, mode: 0o700 })
@@ -30,6 +35,8 @@ function fixture() {
     `user=current-user\ngroup=current-group\ngid=${currentGid}\n`,
     { mode: 0o640 }
   )
+  fs.chownSync(gateDir, process.getuid(), currentGid)
+  fs.chownSync(path.join(gateDir, 'identity'), process.getuid(), currentGid)
   fs.chmodSync(path.join(gateDir, 'identity'), 0o640)
   fs.writeFileSync(path.join(stateDir, 'deploy.lock'), '', { mode: 0o600 })
 
@@ -54,7 +61,7 @@ if [[ "$1" == -G && ( "$2" == current-user || "$2" == target-user ) ]]; then
 fi
 exec /usr/bin/id "$@"
 `)
-  writeExecutable(path.join(bin, 'flock'), `#!/usr/bin/env bash
+  if (!realFlock) writeExecutable(path.join(bin, 'flock'), `#!/usr/bin/env bash
 fd="\${*: -1}"
 printf '%s\\n' "$fd" >>"$MIGRATION_LOCK_LOG"
 if [[ "$fd" == 8 && "\${MIGRATION_BUSY_GATE:-}" == 1 ]]; then exit 1; fi
@@ -118,13 +125,79 @@ function assertTarget(context) {
   assert.deepEqual(fs.readdirSync(context.gateDir), ['identity'])
 }
 
-function withFixture(callback) {
-  const context = fixture()
+function withFixture(callback, options = {}) {
+  const context = fixture(options)
   try {
     return callback(context)
   } finally {
     fs.rmSync(context.base, { recursive: true, force: true })
   }
+}
+
+function waitFor(check, timeoutMs = 3000) {
+  const started = Date.now()
+  return new Promise((resolve, reject) => {
+    const poll = () => {
+      if (check()) return resolve()
+      if (Date.now() - started >= timeoutMs) return reject(new Error('timed out waiting for migration boundary'))
+      setTimeout(poll, 10)
+    }
+    poll()
+  })
+}
+
+function waitForExit(child, timeoutMs = 3000) {
+  return new Promise((resolve, reject) => {
+    const timeout = setTimeout(() => {
+      child.kill('SIGKILL')
+      reject(new Error('migration child did not exit'))
+    }, timeoutMs)
+    child.once('close', (status, signal) => {
+      clearTimeout(timeout)
+      resolve({ signal, status })
+    })
+  })
+}
+
+function startPaused(context, pauseAt) {
+  const ready = path.join(context.base, `${pauseAt}.ready`)
+  const release = path.join(context.base, `${pauseAt}.release`)
+  let stdout = ''
+  let stderr = ''
+  const child = spawn('bash', [context.script, 'current-user', 'current-group', 'target-user', 'target-group'], {
+    env: environment(context, {
+      KINVEST_DEPLOY_GATE_MIGRATION_TEST_ONLY: '1',
+      KINVEST_DEPLOY_GATE_MIGRATION_PAUSE_AT: pauseAt,
+      KINVEST_DEPLOY_GATE_MIGRATION_PAUSE_READY: ready,
+      KINVEST_DEPLOY_GATE_MIGRATION_PAUSE_RELEASE: release
+    }),
+    stdio: ['ignore', 'pipe', 'pipe']
+  })
+  child.stdout.on('data', (chunk) => { stdout += chunk })
+  child.stderr.on('data', (chunk) => { stderr += chunk })
+  return { child, ready, release, stderr: () => stderr, stdout: () => stdout }
+}
+
+function writeGateHarness(context) {
+  const harness = path.join(context.base, 'forced-command-gate')
+  writeExecutable(harness, gateSource
+    .replace("GATE_STATE_DIR='/var/lib/kinvest-deploy-gate'", `GATE_STATE_DIR='${context.gateDir}'`)
+    .replaceAll('directory_info.st_uid != 0', `directory_info.st_uid != ${process.getuid()}`)
+    .replaceAll('marker_info.st_uid != 0', `marker_info.st_uid != ${process.getuid()}`)
+    .replace(
+      'effective_groups = {os.getegid(), *os.getgroups()}',
+      `effective_groups = {${context.currentGid}, ${context.targetGid}}`
+    ))
+  return harness
+}
+
+function assertForcedCommandFailsClosed(context, harness) {
+  const result = spawnSync(harness, [], {
+    encoding: 'utf8',
+    env: { ...process.env, SSH_ORIGINAL_COMMAND: 'deploy-v4' }
+  })
+  assert.equal(result.status, 76)
+  assert.equal(result.stderr, 'DEPLOY_INSTALL_INCOMPLETE\n')
 }
 
 async function run() {
@@ -135,6 +208,12 @@ async function run() {
   assert.match(source, /flock -n 8/)
   assert.match(source, /flock -n 9/)
   assert.ok(source.indexOf('flock -n 8') < source.indexOf('flock -n 9'))
+  const directoryChown = source.indexOf('chown "$ROOT_UID:$target_gid" "$GATE_STATE_DIR"')
+  const identityReplace = source.indexOf('stage_and_replace_identity "$target_user"')
+  const markerChown = source.indexOf('chown "$ROOT_UID:$target_gid" "$INSTALL_MARKER"')
+  const markerUnlink = source.indexOf('rm -f -- "$INSTALL_MARKER"')
+  assert.ok(directoryChown > 0 && directoryChown < identityReplace)
+  assert.ok(identityReplace < markerChown && markerChown < markerUnlink)
   assert.doesNotMatch(source, /(?:^|\s)(?:docker|systemctl|sqlite3)(?:\s|$)|compose\s|authorized_keys|sudoers/im)
   assert.doesNotMatch(source, /install-deploy-v4\.sh/)
 
@@ -231,7 +310,13 @@ async function run() {
     })
   }
 
-  for (const failurePoint of ['after-marker', 'after-directory-group', 'after-identity-replace']) {
+  for (const failurePoint of [
+    'after-marker',
+    'after-directory-group',
+    'after-identity-replace',
+    'after-marker-unlink',
+    'after-final-validation'
+  ]) {
     withFixture((context) => {
       const result = execute(context, {
         KINVEST_DEPLOY_GATE_MIGRATION_TEST_ONLY: '1',
@@ -263,12 +348,100 @@ async function run() {
   })
 
   withFixture((context) => {
+    const result = execute(context, {
+      KINVEST_DEPLOY_GATE_MIGRATION_TEST_ONLY: '1',
+      KINVEST_DEPLOY_GATE_MIGRATION_FAIL_AT: 'after-marker-unlink',
+      KINVEST_DEPLOY_GATE_MIGRATION_ROLLBACK_FAIL: '1'
+    })
+    assert.notEqual(result.status, 0)
+    assert.equal(result.stderr, 'DEPLOY_GATE_IDENTITY_MIGRATION_FAILED_FAIL_CLOSED\n')
+    const marker = path.join(context.gateDir, 'install-incomplete')
+    assert.equal(fs.existsSync(marker), true)
+    assert.equal(fs.readFileSync(marker, 'utf8'), 'ACTIVE\n')
+  })
+
+  withFixture((context) => {
     const identity = path.join(context.gateDir, 'identity')
     fs.linkSync(identity, path.join(context.base, 'identity-hardlink'))
     const result = execute(context)
     assert.notEqual(result.status, 0)
     assert.equal(result.stderr, 'DEPLOY_GATE_IDENTITY_MIGRATION_UNSAFE_STATE\n')
   })
+
+  for (const pauseAt of ['marker-staged', 'after-directory-group']) {
+    const context = fixture()
+    try {
+      const paused = startPaused(context, pauseAt)
+      await waitFor(() => fs.existsSync(paused.ready))
+      paused.child.kill('SIGTERM')
+      const result = await waitForExit(paused.child)
+      assert.equal(result.signal, null, pauseAt)
+      assert.equal(result.status, 76, pauseAt)
+      assert.equal(paused.stdout(), '', pauseAt)
+      assert.equal(paused.stderr(), 'DEPLOY_GATE_IDENTITY_MIGRATION_FAILED_ROLLED_BACK\n', pauseAt)
+      assertCurrent(context)
+    } finally {
+      fs.rmSync(context.base, { recursive: true, force: true })
+    }
+  }
+
+  if (spawnSync('flock', ['--version'], { stdio: 'ignore' }).status === 0) {
+    const context = fixture({ realFlock: true })
+    const ready = path.join(context.base, 'real-flock.ready')
+    const holder = spawn('flock', ['-x', context.gateDir, 'sh', '-c', `: >'${ready}'; sleep 30`], { stdio: 'ignore' })
+    try {
+      await waitFor(() => fs.existsSync(ready))
+      const result = execute(context)
+      assert.notEqual(result.status, 0)
+      assert.equal(result.stderr, 'DEPLOY_GATE_IDENTITY_MIGRATION_BUSY\n')
+      assertCurrent(context)
+    } finally {
+      holder.kill('SIGKILL')
+      await waitForExit(holder).catch(() => {})
+      fs.rmSync(context.base, { recursive: true, force: true })
+    }
+  }
+
+  const distinctGidsAvailable = new Set([process.getgid(), ...process.getgroups()]).size > 1 || process.getuid() === 0
+  if (distinctGidsAvailable) {
+    const boundaries = [
+      { pauseAt: 'marker-staged', directory: 'current', identity: 'current', marker: null, temporary: ['.install-incomplete.', 'current'] },
+      { pauseAt: 'marker-published', directory: 'current', identity: 'current', marker: 'current', temporary: null },
+      { pauseAt: 'after-directory-group', directory: 'target', identity: 'current', marker: 'current', temporary: null },
+      { pauseAt: 'identity-staged', directory: 'target', identity: 'current', marker: 'current', temporary: ['.identity.', 'target'] },
+      { pauseAt: 'after-identity-replace', directory: 'target', identity: 'target', marker: 'current', temporary: null },
+      { pauseAt: 'before-marker-unlink', directory: 'target', identity: 'target', marker: 'target', temporary: null }
+    ]
+    for (const boundary of boundaries) {
+      const context = fixture({ distinctGids: true })
+      try {
+        const paused = startPaused(context, boundary.pauseAt)
+        await waitFor(() => fs.existsSync(paused.ready))
+        const gids = { current: context.currentGid, target: context.targetGid }
+        assert.notEqual(gids.current, gids.target)
+        assert.equal(fs.statSync(context.gateDir).gid, gids[boundary.directory], boundary.pauseAt)
+        assert.equal(fs.lstatSync(path.join(context.gateDir, 'identity')).gid, gids[boundary.identity], boundary.pauseAt)
+        if (boundary.marker) {
+          assert.equal(fs.lstatSync(path.join(context.gateDir, 'install-incomplete')).gid, gids[boundary.marker], boundary.pauseAt)
+        } else {
+          assert.equal(fs.existsSync(path.join(context.gateDir, 'install-incomplete')), false, boundary.pauseAt)
+        }
+        if (boundary.temporary) {
+          const temporary = fs.readdirSync(context.gateDir).find((name) => name.startsWith(boundary.temporary[0]))
+          assert.ok(temporary, boundary.pauseAt)
+          assert.equal(fs.lstatSync(path.join(context.gateDir, temporary)).gid, gids[boundary.temporary[1]], boundary.pauseAt)
+        }
+        assertForcedCommandFailsClosed(context, writeGateHarness(context))
+        paused.child.kill('SIGTERM')
+        const result = await waitForExit(paused.child)
+        assert.equal(result.status, 76, boundary.pauseAt)
+        assert.equal(paused.stderr(), 'DEPLOY_GATE_IDENTITY_MIGRATION_FAILED_ROLLED_BACK\n', boundary.pauseAt)
+        assertCurrent(context)
+      } finally {
+        fs.rmSync(context.base, { recursive: true, force: true })
+      }
+    }
+  }
 }
 
 module.exports = { run }
