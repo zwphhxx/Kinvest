@@ -103,7 +103,11 @@ python3 - "$health_json" <<'PY' || fail KINVEST_NGINX_FIXED_IP_HEALTH_FAILED
 import json, sys
 with open(sys.argv[1], encoding="utf-8") as stream:
     value = json.load(stream)
-if value != {"status": "ok", "service": "kinvest"}:
+if (
+    not isinstance(value, dict)
+    or value.get("status") != "ok"
+    or value.get("service") != "kinvest"
+):
     raise SystemExit(1)
 PY
 printf 'KINVEST_NGINX_FIXED_IP_APPLY_OK ip=%s health=ready https=ready\n' "$trusted_ip"

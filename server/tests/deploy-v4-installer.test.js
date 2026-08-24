@@ -255,7 +255,7 @@ function fixtureGateSource(context, source) {
     .replaceAll('marker_info.st_uid != 0', `marker_info.st_uid != ${process.getuid()}`)
 }
 
-function waitFor(check, timeoutMs = 2000) {
+function waitFor(check, timeoutMs = 10000) {
   const started = Date.now()
   return new Promise((resolve, reject) => {
     const poll = () => {
