@@ -275,13 +275,23 @@ evidence; stop and perform a separately reviewed recovery.
 
 Handled `HUP`, `INT`, and `TERM` follow the same verified rollback path while
 both locks remain held. The migration tool does not claim automatic recovery
-after `SIGKILL`, kernel failure, power loss, or storage failure. Those events
-must leave a marker or tracked temporary that keeps the forced-command gate
-closed; inspect the evidence and use a separately reviewed manual recovery.
-`DEPLOY_GATE_IDENTITY_MIGRATION_FAILED_FAIL_CLOSED` is emitted only after that
-evidence is verified. `DEPLOY_GATE_IDENTITY_MIGRATION_ROLLBACK_UNPROVEN` means
-the tool could not prove either rollback or fail-closed evidence and requires
-immediate manual incident handling.
+after `SIGKILL`, kernel failure, power loss, or storage failure. Before the
+`install-incomplete` marker is unlinked, a crash should leave that marker or a
+tracked temporary as fail-closed evidence. After the unlink, a crash may leave
+either fail-closed evidence or the exact canonical clean target state with no
+marker or temporary.
+
+Crash inspection must therefore verify the gate directory type, owner, target
+group and `0750` mode; the identity file type, owner, target group, `0640` mode
+and exact canonical target content; and the complete directory entry set. An
+exact clean target is the committed migration. Re-running with the old source
+identity must return `DEPLOY_GATE_IDENTITY_MIGRATION_SOURCE_MISMATCH`; do not
+attempt to convert it back automatically. Any mixed, unexpected, or unproven
+state remains fail-closed incident evidence and requires separately reviewed
+manual recovery. `DEPLOY_GATE_IDENTITY_MIGRATION_FAILED_FAIL_CLOSED` is emitted
+only after marker or tracked-temporary evidence is verified, while
+`DEPLOY_GATE_IDENTITY_MIGRATION_ROLLBACK_UNPROVEN` requires immediate manual
+incident handling.
 
 Only after the server migration verifies successfully, configure the GitHub
 `Production` Environment with Secret `SSH_USER` set to `kinvest-deploy` and
