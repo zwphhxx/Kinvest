@@ -53,6 +53,7 @@ async function runBuildArtifactsExist() {
     'server/db/admin-auth-repository.js',
     'server/db/database-identity.js',
     'server/db/device-auth-repository.js',
+    'server/db/ifind-diagnostic-repository.js',
     'server/db/refresh-db.js',
     'server/domain/security-identity.js',
     'server/http/auth-http.js',
@@ -72,6 +73,7 @@ async function runBuildArtifactsExist() {
     'server/security/tencent-ssm-client.js',
     'server/server.js',
     'server/services/health.js',
+    'server/services/ifind-diagnostic-service.js',
     'server/services/refresh-rules.js',
     'server/utils/refresh-policy.js'
   ]
