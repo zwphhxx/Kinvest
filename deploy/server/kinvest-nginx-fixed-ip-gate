@@ -12,6 +12,8 @@ ROOT_UID='0'
 ROOT_GID='0'
 FIXED_OVERLAY_SHA256='b15073063d733d997a3bf22159a024df3caeb4eaea1bc458c176b127ab48c60a'
 PUBLIC_HEALTH_URL='https://dearmina.cn/api/health'
+HEALTH_CONNECT_ATTEMPTS='15'
+HEALTH_RETRY_DELAY_SECONDS='1'
 
 fail() { printf '%s\n' "$1" >&2; exit "${2:-1}"; }
 [[ "$#" -eq 1 && ( "$1" == render || "$1" == apply ) ]] || fail KINVEST_NGINX_FIXED_IP_ARGUMENTS_INVALID 2
@@ -96,7 +98,19 @@ fi
 [[ "$(docker inspect --format '{{.State.Running}}' "$nginx_container")" == true ]] || fail KINVEST_NGINX_FIXED_IP_INSPECT_FAILED
 actual_ip="$(docker inspect --format "{{with index .NetworkSettings.Networks \"$web_network\"}}{{.IPAddress}}{{end}}" "$nginx_container")" || fail KINVEST_NGINX_FIXED_IP_INSPECT_FAILED
 [[ "$actual_ip" == "$trusted_ip" ]] || fail KINVEST_NGINX_FIXED_IP_INSPECT_FAILED
-health_result="$(curl -sS --max-time 15 -o "$health_json" -w '%{http_code} %{content_type}' "$PUBLIC_HEALTH_URL")" || fail KINVEST_NGINX_FIXED_IP_HEALTH_FAILED
+health_result=''
+health_connected='false'
+for (( attempt = 1; attempt <= HEALTH_CONNECT_ATTEMPTS; attempt++ )); do
+  if health_result="$(curl -sS --connect-timeout 1 --max-time 2 -o "$health_json" -w '%{http_code} %{content_type}' "$PUBLIC_HEALTH_URL" 2>/dev/null)"; then
+    health_connected='true'
+    break
+  else
+    curl_status="$?"
+  fi
+  [[ "$curl_status" -eq 7 ]] || fail KINVEST_NGINX_FIXED_IP_HEALTH_FAILED
+  (( attempt < HEALTH_CONNECT_ATTEMPTS )) && sleep "$HEALTH_RETRY_DELAY_SECONDS"
+done
+[[ "$health_connected" == true ]] || fail KINVEST_NGINX_FIXED_IP_HEALTH_FAILED
 read -r health_status health_type <<<"$health_result"
 [[ "$health_status" == 200 && ( "$health_type" == application/json || "$health_type" == application/json\;* ) ]] || fail KINVEST_NGINX_FIXED_IP_HEALTH_FAILED
 python3 - "$health_json" <<'PY' || fail KINVEST_NGINX_FIXED_IP_HEALTH_FAILED
