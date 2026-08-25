@@ -183,7 +183,14 @@ function createRawRequestStub(scenarios) {
     call.outgoing = outgoing
     outgoing.destroy = () => { call.requestDestroyCount += 1 }
     outgoing.end = () => {
-      if (scenario.connected) outgoing.emit('connected')
+      if (scenario.connected) {
+        outgoing.emit('connected')
+        if (scenario.afterConnected) scenario.afterConnected()
+      }
+      if (scenario.emitRequestTimeout) {
+        outgoing.emit('timeout')
+        if (scenario.afterRequestTimeout) scenario.afterRequestTimeout()
+      }
       if (scenario.preConnectStall) return
       if (scenario.connectionTimeout) {
         if (call.connectionTimeoutMs === null) {
@@ -229,6 +236,42 @@ function createRawRequestStub(scenarios) {
         }
       })
     }
+    return outgoing
+  }
+
+  return { calls, request }
+}
+
+function createManualRequestTransport() {
+  const calls = []
+
+  function request(url, options, callback) {
+    const call = {
+      url: String(url),
+      options,
+      callback,
+      writeCount: 0,
+      endCount: 0,
+      destroyCount: 0
+    }
+    const outgoing = new EventEmitter()
+    call.outgoing = outgoing
+    outgoing.write = () => { call.writeCount += 1 }
+    outgoing.end = () => { call.endCount += 1 }
+    outgoing.destroy = () => { call.destroyCount += 1 }
+    outgoing.setTimeout = () => {}
+    call.respond = ({ statusCode = 200, chunks = [], event = 'end' }) => {
+      const incoming = new EventEmitter()
+      incoming.statusCode = statusCode
+      incoming.destroyCount = 0
+      incoming.destroy = () => { incoming.destroyCount += 1 }
+      incoming.on('error', () => {})
+      callback(incoming)
+      for (const chunk of chunks) incoming.emit('data', Buffer.from(chunk))
+      incoming.emit(event)
+      return incoming
+    }
+    calls.push(call)
     return outgoing
   }
 
@@ -928,6 +971,247 @@ async function run() {
   assert.equal(preConnectTransport.calls[0].outgoing.listenerCount('connected'), 0)
   assert.equal(preConnectTransport.calls[0].outgoing.listenerCount('error'), 0)
   assert.equal(preConnectTransport.calls[0].outgoing.listenerCount('timeout'), 0)
+
+  const lateResponseTimers = []
+  const lateResponseTransport = createManualRequestTransport()
+  const lateResponseClient = createIfindHttpClient({
+    request: lateResponseTransport.request,
+    setTimer(handler, milliseconds) {
+      const timer = { handler, milliseconds, cleared: false }
+      lateResponseTimers.push(timer)
+      return timer
+    },
+    clearTimer(timer) {
+      timer.cleared = true
+    }
+  })
+  const lateDiagnosis = lateResponseClient.diagnose({ refreshToken: REFRESH_TOKEN })
+  lateResponseTimers.find((timer) => timer.milliseconds === 2000).handler()
+  await assert.rejects(
+    () => lateDiagnosis,
+    (error) => error.code === 'IFIND_CONNECTION_TIMEOUT' && error.class === 'NETWORK'
+  )
+  const lateIncoming = lateResponseTransport.calls[0].respond({
+    chunks: [JSON.stringify(accessTokenSuccess)]
+  })
+  assert.equal(lateIncoming.destroyCount, 1)
+  assert.equal(lateIncoming.listenerCount('data'), 0)
+  assert.equal(lateIncoming.listenerCount('end'), 0)
+  assert.equal(lateIncoming.listenerCount('aborted'), 0)
+  assert.equal(lateIncoming.listenerCount('error'), 1)
+
+  const duplicateResponseTransport = createManualRequestTransport()
+  const duplicateResponseClient = createIfindHttpClient({
+    request: duplicateResponseTransport.request,
+    now: () => new Date('2026-08-25T16:30:00.000Z')
+  })
+  const duplicateDiagnosis = duplicateResponseClient.diagnose({ refreshToken: REFRESH_TOKEN })
+  duplicateResponseTransport.calls[0].respond({
+    chunks: [JSON.stringify(accessTokenSuccess)]
+  })
+  const duplicateIncoming = duplicateResponseTransport.calls[0].respond({
+    chunks: [JSON.stringify(accessTokenSuccess)]
+  })
+  await new Promise((resolve) => setImmediate(resolve))
+  duplicateResponseTransport.calls[1].respond({
+    chunks: [JSON.stringify(tradeDatesSuccess)]
+  })
+  const duplicateResult = await duplicateDiagnosis
+  assert.equal(duplicateResult.dataVol, 11)
+  assert.equal(duplicateIncoming.destroyCount, 1)
+  assert.equal(duplicateIncoming.listenerCount('data'), 0)
+  assert.equal(duplicateIncoming.listenerCount('end'), 0)
+  assert.equal(duplicateIncoming.listenerCount('aborted'), 0)
+  assert.equal(duplicateIncoming.listenerCount('error'), 1)
+
+  const synchronousTimerTransport = createManualRequestTransport()
+  const synchronousTimers = []
+  const synchronousTimerClient = createIfindHttpClient({
+    request: synchronousTimerTransport.request,
+    setTimer(handler, milliseconds) {
+      const timer = { milliseconds, cleared: false }
+      synchronousTimers.push(timer)
+      handler()
+      return timer
+    },
+    clearTimer(timer) {
+      timer.cleared = true
+    }
+  })
+  await assert.rejects(
+    () => synchronousTimerClient.diagnose({ refreshToken: REFRESH_TOKEN }),
+    (error) => error.code === 'IFIND_CONNECTION_TIMEOUT' && error.class === 'NETWORK'
+  )
+  assert.equal(synchronousTimerTransport.calls[0].writeCount, 0)
+  assert.equal(synchronousTimerTransport.calls[0].endCount, 0)
+  assert.equal(synchronousTimerTransport.calls[0].destroyCount, 1)
+  assert.equal(synchronousTimers.every((timer) => timer.cleared), true)
+  assert.equal(synchronousTimerTransport.calls[0].outgoing.listenerCount('socket'), 0)
+  assert.equal(synchronousTimerTransport.calls[0].outgoing.listenerCount('connected'), 0)
+  assert.equal(synchronousTimerTransport.calls[0].outgoing.listenerCount('timeout'), 0)
+  assert.equal(synchronousTimerTransport.calls[0].outgoing.listenerCount('error'), 0)
+
+  const connectedSlowTimers = []
+  let inactivityDisabledAtConnection = false
+  const connectedSlowScenario = {
+    connected: true,
+    noResponse: true,
+    emitRequestTimeout: true,
+    afterConnected() {
+      inactivityDisabledAtConnection = connectedSlowTransport.calls[0].requestTimeoutCleared
+    },
+    afterRequestTimeout() {
+      const totalTimer = connectedSlowTimers.find((timer) => timer.milliseconds === 5000)
+      if (!totalTimer.cleared) totalTimer.handler()
+    }
+  }
+  const connectedSlowTransport = createRawRequestStub([connectedSlowScenario])
+  const connectedSlowClient = createIfindHttpClient({
+    request: connectedSlowTransport.request,
+    setTimer(handler, milliseconds) {
+      const timer = { handler, milliseconds, cleared: false }
+      connectedSlowTimers.push(timer)
+      return timer
+    },
+    clearTimer(timer) {
+      timer.cleared = true
+    }
+  })
+  await assert.rejects(
+    () => connectedSlowClient.diagnose({ refreshToken: REFRESH_TOKEN }),
+    (error) => error.code === 'IFIND_TIMEOUT' && error.class === 'NETWORK'
+  )
+  assert.equal(inactivityDisabledAtConnection, true)
+  assert.equal(connectedSlowTimers.every((timer) => timer.cleared), true)
+  assert.equal(connectedSlowTransport.calls[0].outgoing.listenerCount('timeout'), 0)
+
+  const pendingClearTransport = createManualRequestTransport()
+  const pendingClearClient = createIfindHttpClient({
+    request: pendingClearTransport.request,
+    now: () => new Date('2026-08-25T16:30:00.000Z')
+  })
+  const primingDiagnosis = pendingClearClient.diagnose({ refreshToken: REFRESH_TOKEN })
+  pendingClearTransport.calls[0].respond({ chunks: [JSON.stringify(accessTokenSuccess)] })
+  await new Promise((resolve) => setImmediate(resolve))
+  pendingClearTransport.calls[1].respond({ chunks: [JSON.stringify(tradeDatesSuccess)] })
+  await primingDiagnosis
+
+  const originalPendingClearFill = Buffer.prototype.fill
+  let zeroedPendingClearToken = null
+  Buffer.prototype.fill = function capturePendingClear(value, ...args) {
+    if (this.toString('utf8') === ACCESS_TOKEN) zeroedPendingClearToken = this
+    return originalPendingClearFill.call(this, value, ...args)
+  }
+  try {
+    const pendingClearDiagnosis = pendingClearClient.diagnose({ refreshToken: REFRESH_TOKEN })
+    const pendingClearRejection = assert.rejects(
+      () => pendingClearDiagnosis,
+      (error) => error.code === 'IFIND_CLIENT_CLEARED' && error.class === 'CONFIG'
+    )
+    pendingClearTransport.calls[2].respond({
+      chunks: [JSON.stringify({ errorcode: -401, errmsg: 'documented auth rejection' })]
+    })
+    await new Promise((resolve) => setImmediate(resolve))
+    assert.equal(pendingClearTransport.calls.length, 4)
+    pendingClearClient.clear()
+    pendingClearTransport.calls[3].respond({ chunks: [JSON.stringify(accessTokenSuccess)] })
+    await new Promise((resolve) => setImmediate(resolve))
+    if (pendingClearTransport.calls[4]) {
+      pendingClearTransport.calls[4].respond({ chunks: [JSON.stringify(tradeDatesSuccess)] })
+    }
+    await pendingClearRejection
+  } finally {
+    Buffer.prototype.fill = originalPendingClearFill
+  }
+  assert.ok(Buffer.isBuffer(zeroedPendingClearToken))
+  assert.equal(zeroedPendingClearToken.every((byte) => byte === 0), true)
+  assert.equal(pendingClearTransport.calls.length, 4)
+
+  const conflictingPermissionTransport = createRequestStub([
+    accessTokenSuccess,
+    { errorcode: -403, errmsg: 'invalid token but documented permission code' }
+  ])
+  const conflictingPermissionClient = createIfindHttpClient({
+    request: conflictingPermissionTransport.request
+  })
+  await assert.rejects(
+    () => conflictingPermissionClient.diagnose({ refreshToken: REFRESH_TOKEN }),
+    (error) => error.class === 'PERMISSION' && error.code === 'IFIND_PERMISSION_REJECTED'
+  )
+  assert.equal(conflictingPermissionTransport.calls.length, 2)
+
+  const conflictingQuotaTransport = createRequestStub([
+    accessTokenSuccess,
+    { errorcode: -429, errmsg: 'authentication token expired but documented quota code' }
+  ])
+  const conflictingQuotaClient = createIfindHttpClient({ request: conflictingQuotaTransport.request })
+  await assert.rejects(
+    () => conflictingQuotaClient.diagnose({ refreshToken: REFRESH_TOKEN }),
+    (error) => error.class === 'QUOTA' && error.code === 'IFIND_QUOTA_REJECTED'
+  )
+  assert.equal(conflictingQuotaTransport.calls.length, 2)
+
+  const conflictingAuthTransport = createRequestStub([
+    accessTokenSuccess,
+    { errorcode: -401, errmsg: 'permission denied but documented auth code' },
+    accessTokenSuccess,
+    tradeDatesSuccess
+  ])
+  const conflictingAuthClient = createIfindHttpClient({ request: conflictingAuthTransport.request })
+  const conflictingAuthResult = await conflictingAuthClient.diagnose({ refreshToken: REFRESH_TOKEN })
+  assert.equal(conflictingAuthResult.requestCount, 4)
+
+  const unknownCodeTransport = createRequestStub([
+    accessTokenSuccess,
+    { errorcode: -999, errmsg: 'invalid access token expired authentication' }
+  ])
+  const unknownCodeClient = createIfindHttpClient({ request: unknownCodeTransport.request })
+  await assert.rejects(
+    () => unknownCodeClient.diagnose({ refreshToken: REFRESH_TOKEN }),
+    (error) => error.class === 'API' && error.code === 'IFIND_PROBE_REJECTED'
+  )
+  assert.equal(unknownCodeTransport.calls.length, 2)
+
+  const invalidRefreshTokens = [
+    '',
+    'refresh\r\ntoken',
+    '刷新令牌',
+    ' refresh-token',
+    'r'.repeat(4097)
+  ]
+  for (const invalidRefreshToken of invalidRefreshTokens) {
+    const invalidRefreshTransport = createRequestStub([])
+    const invalidRefreshClient = createIfindHttpClient({ request: invalidRefreshTransport.request })
+    await assert.rejects(
+      () => invalidRefreshClient.diagnose({ refreshToken: invalidRefreshToken }),
+      (error) => error.code === 'IFIND_CONFIG_INVALID' && error.class === 'CONFIG'
+    )
+    assert.equal(invalidRefreshTransport.calls.length, 0)
+  }
+
+  const invalidAccessTokens = [
+    'access\r\ntoken',
+    '访问令牌',
+    '',
+    'a'.repeat(4097)
+  ]
+  for (const invalidAccessToken of invalidAccessTokens) {
+    const invalidAccessTransport = createRequestStub([{
+      errorcode: 0,
+      errmsg: 'success',
+      data: { access_token: invalidAccessToken }
+    }])
+    const invalidAccessClient = createIfindHttpClient({ request: invalidAccessTransport.request })
+    await assert.rejects(
+      () => invalidAccessClient.diagnose({ refreshToken: REFRESH_TOKEN }),
+      (error) => error.code === 'IFIND_RESPONSE_SHAPE' && error.class === 'API'
+    )
+    assert.equal(invalidAccessTransport.calls.length, 1)
+    assert.equal(
+      new URL(invalidAccessTransport.calls[0].url).pathname,
+      '/api/v1/get_access_token'
+    )
+  }
 }
 
 module.exports = { run }

@@ -2,9 +2,19 @@ const https = require('node:https')
 const { TextDecoder } = require('node:util')
 
 const ORIGIN = 'https://quantapi.51ifind.com'
+const AUTH_ERROR_CODES = new Set([-401])
+const PERMISSION_ERROR_CODES = new Set([-403])
+const QUOTA_ERROR_CODES = new Set([-429])
 
 function isRecord(value) {
   return typeof value === 'object' && value !== null && !Array.isArray(value)
+}
+
+function isHeaderSafeToken(value) {
+  return typeof value === 'string' &&
+    value.length > 0 &&
+    Buffer.byteLength(value, 'utf8') <= 4096 &&
+    /^[\x21-\x7e]+$/.test(value)
 }
 
 function safeError(code, errorClass, message, dataVol) {
@@ -34,6 +44,7 @@ function requestJson(request, path, headers, body, setTimer, clearTimer) {
     let connectionTimer
     let totalTimer
     let settled = false
+    let connected = false
 
     const removeListener = (emitter, event, handler) => {
       try {
@@ -72,9 +83,17 @@ function requestJson(request, path, headers, body, setTimer, clearTimer) {
       removeListener(connectionSocket, 'secureConnect', onSecureConnect)
     }
 
+    function disableRequestInactivityTimeout() {
+      removeListener(outgoing, 'timeout', onRequestTimeout)
+      try {
+        if (outgoing && typeof outgoing.setTimeout === 'function') outgoing.setTimeout(0)
+      } catch {}
+    }
+
     function connectionEstablished() {
-      if (connectionTimer === undefined) return
+      connected = true
       clearConnectionLifecycle()
+      disableRequestInactivityTimeout()
     }
 
     function cleanup() {
@@ -82,10 +101,7 @@ function requestJson(request, path, headers, body, setTimer, clearTimer) {
       clearOwnedTimer(totalTimer)
       totalTimer = undefined
       removeListener(outgoing, 'error', onRequestError)
-      removeListener(outgoing, 'timeout', onRequestTimeout)
-      try {
-        if (outgoing && typeof outgoing.setTimeout === 'function') outgoing.setTimeout(0)
-      } catch {}
+      disableRequestInactivityTimeout()
       removeListener(incoming, 'data', onResponseData)
       removeListener(incoming, 'end', onResponseEnd)
       removeListener(incoming, 'error', onResponseError)
@@ -113,8 +129,16 @@ function requestJson(request, path, headers, body, setTimer, clearTimer) {
           ...headers
         }
       }, (response) => {
+        if (settled) {
+          destroy(response)
+          return
+        }
         incoming = response
         connectionEstablished()
+        if (settled) {
+          destroy(response)
+          return
+        }
         const successfulStatus = Number.isInteger(incoming.statusCode) &&
           incoming.statusCode >= 200 && incoming.statusCode <= 299
         const chunks = []
@@ -170,8 +194,11 @@ function requestJson(request, path, headers, body, setTimer, clearTimer) {
         }
         try {
           incoming.on('data', onResponseData)
+          if (settled) return
           incoming.on('end', onResponseEnd)
+          if (settled) return
           incoming.on('error', onResponseError)
+          if (settled) return
           incoming.on('aborted', onResponseAborted)
         } catch {
           fail(safeError('IFIND_RESPONSE_FAILED', 'NETWORK', 'iFinD response failed'))
@@ -212,23 +239,55 @@ function requestJson(request, path, headers, body, setTimer, clearTimer) {
         }
       }
       outgoing.on('error', onRequestError)
+      if (settled) return
       outgoing.on('socket', onRequestSocket)
+      if (settled) return
       outgoing.on('connected', onTransportConnected)
+      if (settled) return
+      let connectionTimerStarting = true
+      let connectionTimerFired = false
       connectionTimer = setTimer(() => {
+        connectionTimerFired = true
+        if (!connectionTimerStarting) {
+          fail(safeError(
+            'IFIND_CONNECTION_TIMEOUT',
+            'NETWORK',
+            'iFinD connection timed out'
+          ))
+        }
+      }, 2000)
+      connectionTimerStarting = false
+      if (connectionTimerFired) {
         fail(safeError(
           'IFIND_CONNECTION_TIMEOUT',
           'NETWORK',
           'iFinD connection timed out'
         ))
-      }, 2000)
-      if (typeof outgoing.setTimeout === 'function') {
-        outgoing.on('timeout', onRequestTimeout)
-        outgoing.setTimeout(2000)
       }
+      if (settled) return
+      if (!connected && typeof outgoing.setTimeout === 'function') {
+        outgoing.on('timeout', onRequestTimeout)
+        if (settled) return
+        outgoing.setTimeout(2000)
+        if (settled) return
+      }
+      let totalTimerStarting = true
+      let totalTimerFired = false
       totalTimer = setTimer(() => {
-        fail(safeError('IFIND_TIMEOUT', 'NETWORK', 'iFinD request timed out'))
+        totalTimerFired = true
+        if (!totalTimerStarting) {
+          fail(safeError('IFIND_TIMEOUT', 'NETWORK', 'iFinD request timed out'))
+        }
       }, 5000)
-      if (body !== undefined) outgoing.write(JSON.stringify(body))
+      totalTimerStarting = false
+      if (totalTimerFired) {
+        fail(safeError('IFIND_TIMEOUT', 'NETWORK', 'iFinD request timed out'))
+      }
+      if (settled) return
+      if (body !== undefined) {
+        outgoing.write(JSON.stringify(body))
+        if (settled) return
+      }
       outgoing.end()
     } catch {
       fail(safeError('IFIND_NETWORK_FAILED', 'NETWORK', 'iFinD request failed'))
@@ -237,17 +296,9 @@ function requestJson(request, path, headers, body, setTimer, clearTimer) {
 }
 
 function classifyProbeFailure(response) {
-  const message = typeof response.errmsg === 'string' ? response.errmsg : ''
-  if (response.errorcode === -401 ||
-      /unauthori[sz]ed|authentication|invalid.{0,24}token|token.{0,24}invalid|expired.{0,24}token|token.{0,24}expired/i.test(message)) {
-    return 'AUTH'
-  }
-  if (response.errorcode === -403 || /permission|forbidden|authority/i.test(message)) {
-    return 'PERMISSION'
-  }
-  if (response.errorcode === -429 || /quota|rate.{0,12}limit|frequency|too many/i.test(message)) {
-    return 'QUOTA'
-  }
+  if (PERMISSION_ERROR_CODES.has(response.errorcode)) return 'PERMISSION'
+  if (QUOTA_ERROR_CODES.has(response.errorcode)) return 'QUOTA'
+  if (AUTH_ERROR_CODES.has(response.errorcode)) return 'AUTH'
   return 'API'
 }
 
@@ -258,10 +309,22 @@ function createIfindHttpClient({
   clearTimer = clearTimeout
 } = {}) {
   let accessToken = null
+  let generation = 0
 
   function discardAccessToken() {
     if (Buffer.isBuffer(accessToken)) accessToken.fill(0)
     accessToken = null
+  }
+
+  function clear() {
+    generation += 1
+    discardAccessToken()
+  }
+
+  function requireCurrentGeneration(expectedGeneration) {
+    if (generation !== expectedGeneration) {
+      throw safeError('IFIND_CLIENT_CLEARED', 'CONFIG', 'iFinD client was cleared')
+    }
   }
 
   function readNow() {
@@ -287,18 +350,18 @@ function createIfindHttpClient({
       } else {
         refreshToken = input.refreshToken
       }
-      if (typeof refreshToken !== 'string' || refreshToken.length === 0 ||
-          Buffer.byteLength(refreshToken, 'utf8') > 4096 ||
-          /[\u0000-\u001f\u007f]/.test(refreshToken)) {
+      if (!isHeaderSafeToken(refreshToken)) {
         throw new Error('invalid')
       }
     } catch {
       throw safeError('IFIND_CONFIG_INVALID', 'CONFIG', 'iFinD client configuration was invalid')
     }
+    const operationGeneration = generation
     const startedAt = readNow()
     let requestCount = 0
 
     async function authenticate() {
+      requireCurrentGeneration(operationGeneration)
       requestCount += 1
       const tokenResponse = await requestJson(
         request,
@@ -308,6 +371,7 @@ function createIfindHttpClient({
         setTimer,
         clearTimer
       )
+      requireCurrentGeneration(operationGeneration)
       if (!isRecord(tokenResponse) || typeof tokenResponse.errorcode !== 'number') {
         throw safeError('IFIND_RESPONSE_SHAPE', 'API', 'iFinD response shape was invalid')
       }
@@ -315,19 +379,19 @@ function createIfindHttpClient({
         throw safeError('IFIND_AUTH_REJECTED', 'AUTH', 'iFinD access-token request failed')
       }
       if (!isRecord(tokenResponse.data) ||
-          typeof tokenResponse.data.access_token !== 'string' ||
-          tokenResponse.data.access_token.length === 0 ||
-          /[\u0000-\u001f\u007f]/.test(tokenResponse.data.access_token)) {
+          !isHeaderSafeToken(tokenResponse.data.access_token)) {
         throw safeError('IFIND_RESPONSE_SHAPE', 'API', 'iFinD response shape was invalid')
       }
       discardAccessToken()
       accessToken = Buffer.from(tokenResponse.data.access_token, 'utf8')
+      requireCurrentGeneration(operationGeneration)
     }
 
     if (accessToken === null) await authenticate()
 
     let probeResponse
     for (let attempt = 0; attempt < 2; attempt += 1) {
+      requireCurrentGeneration(operationGeneration)
       requestCount += 1
       probeResponse = await requestJson(
         request,
@@ -350,6 +414,7 @@ function createIfindHttpClient({
         setTimer,
         clearTimer
       )
+      requireCurrentGeneration(operationGeneration)
       if (!isRecord(probeResponse) || typeof probeResponse.errorcode !== 'number') {
         throw safeError('IFIND_RESPONSE_SHAPE', 'API', 'iFinD response shape was invalid')
       }
@@ -397,6 +462,7 @@ function createIfindHttpClient({
     }
 
     const retrievedAt = readNow()
+    requireCurrentGeneration(operationGeneration)
     const hasDataVol = Object.hasOwn(probeResponse, 'dataVol')
     return {
       route: '/api/v1/get_trade_dates',
@@ -412,7 +478,7 @@ function createIfindHttpClient({
   }
 
   const client = { diagnose }
-  Object.defineProperty(client, 'clear', { value: discardAccessToken })
+  Object.defineProperty(client, 'clear', { value: clear })
   return client
 }
 
