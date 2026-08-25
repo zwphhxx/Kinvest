@@ -60,6 +60,7 @@ const tests = [
   require('./deploy-gate-identity-migration.test'),
   require('./deploy-v4-workflow.test'),
   require('./nginx-fixed-ip-gate.test'),
+  require('./nginx-config-installer.test'),
   require('./data-lifecycle.test'),
   require('./workflow-contract.test')
 ]

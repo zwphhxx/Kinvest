@@ -7,3 +7,4 @@ adf011acd3cb7b242bfa0f3e3c863999980e41c011320b04cbea723e137f677c  kinvest-ssh-co
 cef9b242ad3de3c2134e2a4e7e1ae1693ce55cd63bb9ac9d65710ec796309594  access-control-network.conf.example
 a60bcd4346ccc4b0b6031f8b908bd404a78044c539f80100fba14822abe6b11b  kinvest-nginx-fixed-ip-gate
 b15073063d733d997a3bf22159a024df3caeb4eaea1bc458c176b127ab48c60a  docker-compose.nginx-fixed-ip.yml
+107cd9d910780d650b3aacd848ddd8ad46194f5d060ebe5e29f2649eba3c2295  kinvest-nginx-config-installer-v1

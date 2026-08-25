@@ -8,7 +8,7 @@ const rootDir = path.resolve(__dirname, '../..')
 const sourceDir = path.join(rootDir, 'deploy/server')
 const installerSource = fs.readFileSync(path.join(sourceDir, 'install-deploy-v4.sh'), 'utf8')
 const gateSource = fs.readFileSync(path.join(sourceDir, 'kinvest-ssh-command-v3'), 'utf8')
-const targetCount = 9
+const targetCount = 10
 
 function writeExecutable(file, source) {
   fs.writeFileSync(file, source, { mode: 0o755 })
@@ -112,7 +112,8 @@ exec /bin/mv -f "\${args[@]}"
     path.join(sudoers, 'kinvest-deploy-v4'),
     path.join(serverRoot, 'access-control-network.conf.example'),
     path.join(sbin, 'kinvest-nginx-fixed-ip-gate'),
-    path.join(serverRoot, 'docker-compose.nginx-fixed-ip.yml')
+    path.join(serverRoot, 'docker-compose.nginx-fixed-ip.yml'),
+    path.join(sbin, 'kinvest-nginx-config-installer-v1')
   ]
   if (existing) {
     for (let index = 0; index < targets.length; index += 1) {
@@ -844,6 +845,7 @@ PY
     assert.equal(fs.readFileSync(success.targets[2], 'utf8'), fs.readFileSync(success.targets[3], 'utf8'))
     assert.equal(fs.readFileSync(success.targets[7], 'utf8'), fs.readFileSync(path.join(sourceDir, 'kinvest-nginx-fixed-ip-gate'), 'utf8'))
     assert.equal(fs.readFileSync(success.targets[8], 'utf8'), fs.readFileSync(path.join(sourceDir, 'docker-compose.nginx-fixed-ip.yml'), 'utf8'))
+    assert.equal(fs.readFileSync(success.targets[9], 'utf8'), fs.readFileSync(path.join(sourceDir, 'kinvest-nginx-config-installer-v1'), 'utf8'))
     assert.equal(fs.readFileSync(success.targets[5], 'utf8'),
       'lighthouse ALL=(root) NOPASSWD: /usr/local/sbin/deploy-kinvest ""\n' +
       'lighthouse ALL=(root) NOPASSWD: /usr/local/sbin/deploy-kinvest-v3 ""\n' +

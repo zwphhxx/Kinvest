@@ -1,6 +1,6 @@
 # Kinvest 生产运维手册
 
-更新日期：2026-07-29
+更新日期：2026-08-25
 
 ## 1. 适用范围与当前状态
 
@@ -161,13 +161,11 @@ docker network inspect web
 docker exec nginx nginx -t
 ```
 
-只有语法检查成功后才允许重载：
-
-```sh
-docker exec nginx nginx -s reload
-```
-
-不要先重载再检查，也不要为 Kinvest 创建第二个公网 Nginx。
+该命令只诊断容器当前已绑定的配置，不安装宿主机候选。生产将单个宿主机文件
+`/root/docker/nginx/conf/nginx.conf` bind mount 到容器；宿主机路径被原子替换后，
+运行中的容器仍引用旧 inode。因此禁止“原子替换后仅 reload”，也禁止把原位写入
+当作已经修复 inode 分离。配置变更必须使用第 5 节的版本化安装器，由安装器调用
+固定 IP gate 只重建 Nginx。不要为 Kinvest 创建第二个公网 Nginx。
 
 ## 5. Nginx 职责
 
@@ -187,12 +185,39 @@ docker exec nginx nginx -s reload
 
 修改 `/root/docker/nginx/conf/nginx.conf` 时：
 
-1. 先把当前文件复制到 root-only 的时间戳备份目录。
-2. 用临时文件写入候选配置，不原地截断生产文件。
-3. 执行 `docker exec nginx nginx -t`。
-4. 检查成功后再原子替换并 reload。
-5. 立即检查 `www` HTTPS 跳转、公网首页、健康接口和安全响应头。
-6. 任一检查失败，恢复刚才的配置备份，再次执行 `nginx -t` 后 reload。
+固定接口是：
+
+```sh
+candidate=/root/kinvest-reviewed/nginx/nginx.conf
+candidate_sha256="$(sha256sum "$candidate" | awk '{print $1}')"
+sudo /usr/local/sbin/kinvest-nginx-config-installer-v1 "$candidate" "$candidate_sha256"
+```
+
+不得照抄候选路径；候选必须是本次评审的普通非符号链接文件，第二个参数必须是其
+精确小写 SHA-256。安装器只能由 root 执行，拒绝超过 1 MiB 的配置，并固定写入
+`/root/docker/nginx/conf/nginx.conf`。它在修改宿主机目标前把候选复制到当前 Nginx
+容器的临时路径并执行 `nginx -t -c`，随后把旧配置保存到 root-only 的
+`/root/docker/nginx/config-install-backups/install-<UTC>.*`，备份文件为
+`root:root 0600`。
+
+候选落盘后，安装器必须调用已经安装的
+`/usr/local/sbin/kinvest-nginx-fixed-ip-gate apply`，不得只 reload。该 gate 从受信
+配置导出 `KINVEST_NGINX_IPV4`、只 force-recreate Nginx，并执行公网健康检查。安装器
+还要求 Nginx 容器 ID 改变、Kinvest 容器 ID 不变、固定 IP 不变、宿主机和容器配置
+哈希都等于候选，并再次执行 `nginx -t`。gate 非零立即触发回滚；旧 Nginx 仍为
+running 绝不构成成功。
+
+任一候选安装后的失败都会原子恢复备份，并再次调用同一 fixed-IP gate 重建旧
+Nginx，再核对旧哈希、固定 IP 和 `nginx -t`。成功或失败证据都保留在带 UTC
+时间戳的备份目录；输出仅含稳定状态码、该目录和配置哈希。若输出
+`KINVEST_NGINX_CONFIG_ROLLBACK_FAILED`，停止操作并保留证据，不要手工 reload 或
+继续覆盖配置。
+
+运行该命令需要单独批准一次“仅重建 Nginx”的生产变更；批准范围不包括重建
+Kinvest、修改应用、数据库、Secrets、防火墙或访问模式。安装器成功后，调用方仍须
+验收 HTTP 到 HTTPS 跳转、`www` 规范跳转、公网首页、`/api/health` 和安全响应头；
+任一边界失败都按独立生产事件处理，不得把安装器成功输出扩展解释为这些外部边界
+全部通过。
 
 ## 6. SQLite 权限、备份与恢复
 
@@ -464,17 +489,19 @@ curl -fsS https://dearmina.cn/api/health
 3. 人工核对备份内的 Nginx 配置、Compose 文件和静态文件清单。
 4. 不复制备份之外的 `.env`、证书私钥、日志或数据库。
 
-入口恢复采用候选文件、语法检查、原子替换：
+入口恢复也必须使用同一个版本化安装器，并单独批准“仅重建 Nginx”：
 
 ```sh
 backup=/root/docker/backups/kinvest-pre-cutover-20260729T082131Z
-install -o root -g root -m 600 "$backup/nginx.conf" /root/docker/nginx/conf/nginx.conf.restore
-docker cp /root/docker/nginx/conf/nginx.conf.restore nginx:/tmp/nginx.conf.restore
-docker exec nginx nginx -t -c /tmp/nginx.conf.restore
+candidate="$backup/nginx.conf"
+candidate_sha256="$(sha256sum "$candidate" | awk '{print $1}')"
+sudo /usr/local/sbin/kinvest-nginx-config-installer-v1 "$candidate" "$candidate_sha256"
 ```
 
-只有确认备份内路径和候选语法都正确后，才替换
-`/root/docker/nginx/conf/nginx.conf` 并 reload。恢复后分别检查 HTTP 跳转、HTTPS 页面和 Nginx 状态。若备份中的实际文件名与示例不同，停止并按备份清单操作，不猜测路径。
+安装器负责容器内候选预检、备份、替换、通过 fixed-IP gate 重建和失败回滚；禁止在
+它之后用 reload 代替重建。恢复后分别检查 HTTP 跳转、HTTPS 页面、健康接口、安全
+响应头和 Nginx 状态。若备份中的实际文件名与示例不同，停止并按备份清单操作，
+不猜测路径。
 
 ## 9. 镜像仓库与拉取（TCR 主用，GHCR 备份）
 
