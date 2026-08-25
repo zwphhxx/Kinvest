@@ -174,6 +174,9 @@ docker exec nginx nginx -s reload
 生产入口的 Nginx 负责：
 
 - HTTPS 终止及 HTTP 到 HTTPS 跳转。
+- 将 `https://www.dearmina.cn$request_uri` 直接跳转到规范来源
+  `https://dearmina.cn$request_uri`；只有 `dearmina.cn` 反向代理应用，避免浏览器
+  `Origin` 与应用严格同源策略不一致。
 - 将应用和 API 请求反向代理到 `web` 网络内的 Kinvest 容器。
 - 对可安全缓存的静态资源设置缓存策略，不缓存个性化或健康状态响应。
 - 限制请求体大小，降低异常上传和资源耗尽风险。
@@ -188,7 +191,7 @@ docker exec nginx nginx -s reload
 2. 用临时文件写入候选配置，不原地截断生产文件。
 3. 执行 `docker exec nginx nginx -t`。
 4. 检查成功后再原子替换并 reload。
-5. 立即检查公网首页、健康接口和安全响应头。
+5. 立即检查 `www` HTTPS 跳转、公网首页、健康接口和安全响应头。
 6. 任一检查失败，恢复刚才的配置备份，再次执行 `nginx -t` 后 reload。
 
 ## 6. SQLite 权限、备份与恢复

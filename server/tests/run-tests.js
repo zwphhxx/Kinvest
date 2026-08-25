@@ -45,6 +45,7 @@ const tests = [
   require('./model-security-contract.test'),
   require('./offline-image-attestation.test'),
   require('./deploy-contract.test'),
+  require('./nginx-canonical-origin.test'),
   require('./deploy-secret-version-config.test'),
   require('./deploy-v2-contract.test'),
   require('./deploy-v2-secret-state.test'),
