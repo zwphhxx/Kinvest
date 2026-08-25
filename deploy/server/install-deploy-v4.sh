@@ -21,9 +21,10 @@ GATE_IDENTITY_CONTENT=''
 GATE_SOURCE="$SOURCE_DIR/kinvest-ssh-command-v3"
 GATE_TARGET="$LOCAL_SBIN/kinvest-ssh-command"
 GATE_EXPECTED_HASH='adf011acd3cb7b242bfa0f3e3c863999980e41c011320b04cbea723e137f677c'
-SOURCE_ASSETS=('deploy-kinvest-v4' 'deploy-kinvest-v3.sh' 'deploy-v3-contract.py' 'deploy-v3-contract.py' 'docker-compose-v3.yml' 'kinvest-deploy-v4.sudoers.in' 'access-control-network.conf.example' 'kinvest-nginx-fixed-ip-gate' 'docker-compose.nginx-fixed-ip.yml')
-TARGETS=("$LOCAL_SBIN/deploy-kinvest-v4" "$LOCAL_SBIN/deploy-kinvest-v3" "$LOCAL_LIBEXEC/kinvest-deploy-v4-contract" "$LOCAL_LIBEXEC/kinvest-deploy-v3-contract" "$SERVER_ROOT/docker-compose-v4.yml" "$SUDOERS_DIR/kinvest-deploy-v4" "$SERVER_ROOT/access-control-network.conf.example" "$LOCAL_SBIN/kinvest-nginx-fixed-ip-gate" "$SERVER_ROOT/docker-compose.nginx-fixed-ip.yml")
-MODES=('0755' '0755' '0755' '0755' '0644' '0440' '0600' '0755' '0644')
+SOURCE_ASSETS=('deploy-kinvest-v4' 'deploy-kinvest-v3.sh' 'deploy-v3-contract.py' 'deploy-v3-contract.py' 'docker-compose-v3.yml' 'kinvest-deploy-v4.sudoers.in' 'access-control-network.conf.example' 'kinvest-nginx-fixed-ip-gate' 'docker-compose.nginx-fixed-ip.yml' 'kinvest-nginx-config-installer-v1')
+TARGETS=("$LOCAL_SBIN/deploy-kinvest-v4" "$LOCAL_SBIN/deploy-kinvest-v3" "$LOCAL_LIBEXEC/kinvest-deploy-v4-contract" "$LOCAL_LIBEXEC/kinvest-deploy-v3-contract" "$SERVER_ROOT/docker-compose-v4.yml" "$SUDOERS_DIR/kinvest-deploy-v4" "$SERVER_ROOT/access-control-network.conf.example" "$LOCAL_SBIN/kinvest-nginx-fixed-ip-gate" "$SERVER_ROOT/docker-compose.nginx-fixed-ip.yml" "$LOCAL_SBIN/kinvest-nginx-config-installer-v1")
+TARGET_KEYS=('deploy-kinvest-v4' 'deploy-kinvest-v3' 'kinvest-deploy-v4-contract' 'kinvest-deploy-v3-contract' 'docker-compose-v4.yml' 'kinvest-deploy-v4.sudoers' 'access-control-network.conf.example' 'kinvest-nginx-fixed-ip-gate' 'docker-compose.nginx-fixed-ip.yml' 'kinvest-nginx-config-installer-v1')
+MODES=('0755' '0755' '0755' '0755' '0644' '0440' '0600' '0755' '0644' '0755')
 EXPECTED_ASSET_HASHES=(
   'fb25bd314ab46e3af56fe46e83564000d7388d6f7670b63d370b4047d2d4e86d'
   '3bb3abdfee9b33cd9bd703730c3eb4fc7c1a25d3b6dc3e1ae00e2a775dd36bb1'
@@ -34,6 +35,7 @@ EXPECTED_ASSET_HASHES=(
   'cef9b242ad3de3c2134e2a4e7e1ae1693ce55cd63bb9ac9d65710ec796309594'
   'a60bcd4346ccc4b0b6031f8b908bd404a78044c539f80100fba14822abe6b11b'
   'b15073063d733d997a3bf22159a024df3caeb4eaea1bc458c176b127ab48c60a'
+  '7d3e1737688f990a29541106052942054faa30e78741b823b8447596fae1951c'
 )
 
 fail() { printf '%s\n' "$1" >&2; exit "${2:-1}"; }
@@ -198,6 +200,7 @@ bash -n "$SOURCE_DIR/deploy-kinvest-v4"
 bash -n "$SOURCE_DIR/deploy-kinvest-v3.sh"
 bash -n "$SOURCE_DIR/kinvest-ssh-command-v3"
 bash -n "$SOURCE_DIR/kinvest-nginx-fixed-ip-gate"
+bash -n "$SOURCE_DIR/kinvest-nginx-config-installer-v1"
 PYTHONDONTWRITEBYTECODE=1 python3 -m py_compile "$SOURCE_DIR/deploy-v3-contract.py"
 [[ -f "$GATE_SOURCE" && ! -L "$GATE_SOURCE" ]] || fail 'invalid deploy-v4 forced-command gate'
 [[ "$(file_hash "$GATE_SOURCE")" == "$GATE_EXPECTED_HASH" ]] || fail 'untrusted deploy-v4 forced-command gate hash'
@@ -234,6 +237,7 @@ fi
 BACKUP_PRESENT=('')
 BACKUP_HASHES=('')
 BACKUP_ATTRIBUTES=('')
+BACKUP_FILES=('')
 backup=''
 stage=''
 temporary=''
@@ -242,26 +246,50 @@ transaction_committed='false'
 public_marker_published='false'
 
 load_backup() {
-  local candidate="$1" line present hash attributes extra line_count index manifest_index
+  local candidate="$1" line present hash attributes extra line_count index manifest_key header record_count matched file_key
   [[ "$candidate" == "$BACKUP_ROOT"/kinvest-deploy-v4-backup.* && -d "$candidate" && ! -L "$candidate" ]] || return 1
   [[ "$(realpath -e "$candidate")" == "$candidate" ]] || return 1
   [[ -f "$candidate/manifest.txt" && ! -L "$candidate/manifest.txt" ]] || return 1
   line_count="$(wc -l <"$candidate/manifest.txt" | tr -d '[:space:]')"
-  [[ "$line_count" == "$((${#TARGETS[@]} + 1))" && "$(sed -n '1p' "$candidate/manifest.txt")" == kinvest-deploy-v4-install-backup-v1 ]] || return 1
-  for index in "${!TARGETS[@]}"; do
-    line="$(sed -n "$((index + 2))p" "$candidate/manifest.txt")"
-    IFS='|' read -r manifest_index present hash attributes extra <<<"$line"
-    [[ "$manifest_index" == "$index" && -z "$extra" && ( "$present" == true || "$present" == false ) ]] || return 1
+  header="$(sed -n '1p' "$candidate/manifest.txt")"
+  BACKUP_PRESENT=('')
+  BACKUP_HASHES=('')
+  BACKUP_ATTRIBUTES=('')
+  BACKUP_FILES=('')
+  for index in "${!TARGETS[@]}"; do BACKUP_PRESENT[$index]='untouched'; done
+  record_count="$((line_count - 1))"
+  [[ "$record_count" -ge 0 ]] || return 1
+  for (( manifest_line = 2; manifest_line <= line_count; manifest_line++ )); do
+    line="$(sed -n "${manifest_line}p" "$candidate/manifest.txt")"
+    IFS='|' read -r manifest_key present hash attributes extra <<<"$line"
+    [[ -z "$extra" && ( "$present" == true || "$present" == false ) ]] || return 1
+    if [[ "$header" == kinvest-deploy-v4-install-backup-v1 ]]; then
+      [[ ( "$record_count" -eq 9 || "$record_count" -eq 10 ) && "$manifest_key" =~ ^[0-9]+$ ]] || return 1
+      index="$manifest_key"
+      [[ "$index" -lt "${#TARGETS[@]}" && "$index" -eq "$((manifest_line - 2))" ]] || return 1
+      file_key="$index"
+    elif [[ "$header" == kinvest-deploy-v4-install-backup-v2 ]]; then
+      [[ "$record_count" -ge 10 && "$record_count" -le "${#TARGETS[@]}" && "$manifest_key" =~ ^[a-zA-Z0-9._-]+$ ]] || return 1
+      matched='false'
+      for index in "${!TARGET_KEYS[@]}"; do
+        if [[ "${TARGET_KEYS[$index]}" == "$manifest_key" ]]; then matched='true'; break; fi
+      done
+      [[ "$matched" == true && "${BACKUP_PRESENT[$index]}" == untouched ]] || return 1
+      file_key="$manifest_key"
+    else
+      return 1
+    fi
     if [[ "$present" == true ]]; then
       [[ "$hash" =~ ^[0-9a-f]{64}$ && "$attributes" =~ ^[0-9]+:[0-9]+:[0-7]{3,4}$ ]] || return 1
-      [[ -f "$candidate/$index.asset" && ! -L "$candidate/$index.asset" ]] || return 1
-      [[ "$(file_hash "$candidate/$index.asset")" == "$hash" && "$(file_attributes "$candidate/$index.asset")" == "$attributes" ]] || return 1
+      [[ -f "$candidate/$file_key.asset" && ! -L "$candidate/$file_key.asset" ]] || return 1
+      [[ "$(file_hash "$candidate/$file_key.asset")" == "$hash" && "$(file_attributes "$candidate/$file_key.asset")" == "$attributes" ]] || return 1
     else
-      [[ -z "$hash" && -z "$attributes" && -f "$candidate/$index.absent" && ! -L "$candidate/$index.absent" ]] || return 1
+      [[ -z "$hash" && -z "$attributes" && -f "$candidate/$file_key.absent" && ! -L "$candidate/$file_key.absent" ]] || return 1
     fi
     BACKUP_PRESENT[$index]="$present"
     BACKUP_HASHES[$index]="$hash"
     BACKUP_ATTRIBUTES[$index]="$attributes"
+    BACKUP_FILES[$index]="$file_key"
   done
   backup="$candidate"
 }
@@ -272,7 +300,7 @@ rollback_targets() {
     target="${TARGETS[$index]}"
     if [[ "${BACKUP_PRESENT[$index]}" == true ]]; then
       restored="$(mktemp "$(dirname "$target")/.kinvest-v4-restore.XXXXXX")" || { rollback_failed='true'; continue; }
-      cp -p "$backup/$index.asset" "$restored" || rollback_failed='true'
+      cp -p "$backup/${BACKUP_FILES[$index]}.asset" "$restored" || rollback_failed='true'
       IFS=: read -r owner group mode <<<"${BACKUP_ATTRIBUTES[$index]}"
       chown "$owner:$group" "$restored" || rollback_failed='true'
       chmod "$mode" "$restored" || rollback_failed='true'
@@ -286,7 +314,7 @@ rollback_targets() {
         rollback_failed='true'
       fi
       rm -f "$restored"
-    elif [[ -e "$target" || -L "$target" ]]; then
+    elif [[ "${BACKUP_PRESENT[$index]}" == false && ( -e "$target" || -L "$target" ) ]]; then
       if [[ -f "$target" || -L "$target" ]]; then
         rm -f "$target" && fsync_directory "$(dirname "$target")" || rollback_failed='true'
       else
@@ -299,7 +327,7 @@ rollback_targets() {
     target="${TARGETS[$index]}"
     if [[ "${BACKUP_PRESENT[$index]}" == true ]]; then
       [[ -f "$target" && ! -L "$target" && "$(file_hash "$target")" == "${BACKUP_HASHES[$index]}" && "$(file_attributes "$target")" == "${BACKUP_ATTRIBUTES[$index]}" ]] || rollback_failed='true'
-    else
+    elif [[ "${BACKUP_PRESENT[$index]}" == false ]]; then
       [[ ! -e "$target" && ! -L "$target" ]] || rollback_failed='true'
     fi
   done
@@ -347,6 +375,7 @@ if [[ -e "$INSTALL_JOURNAL" || -L "$INSTALL_JOURNAL" ]]; then
   BACKUP_PRESENT=('')
   BACKUP_HASHES=('')
   BACKUP_ATTRIBUTES=('')
+  BACKUP_FILES=('')
   backup=''
 elif [[ -e "$GATE_INSTALL_MARKER" || -L "$GATE_INSTALL_MARKER" ]]; then
   validate_gate_marker || fail 'DEPLOY_V4_GATE_STATE_INVALID'
@@ -364,17 +393,18 @@ backup="$(mktemp -d "$BACKUP_ROOT/kinvest-deploy-v4-backup.XXXXXX")"
 chmod 0700 "$stage" "$backup"
 for index in "${!TARGETS[@]}"; do
   target="${TARGETS[$index]}"
+  BACKUP_FILES[$index]="${TARGET_KEYS[$index]}"
   if [[ -f "$target" ]]; then
     BACKUP_PRESENT[$index]='true'
     BACKUP_HASHES[$index]="$(file_hash "$target")"
     BACKUP_ATTRIBUTES[$index]="$(file_attributes "$target")"
-    cp -p "$target" "$backup/$index.asset"
-    [[ "$(file_hash "$backup/$index.asset")" == "${BACKUP_HASHES[$index]}" ]] || fail "deploy-v4 backup hash mismatch: $target"
-    [[ "$(file_attributes "$backup/$index.asset")" == "${BACKUP_ATTRIBUTES[$index]}" ]] || fail "deploy-v4 backup attribute mismatch: $target"
+    cp -p "$target" "$backup/${BACKUP_FILES[$index]}.asset"
+    [[ "$(file_hash "$backup/${BACKUP_FILES[$index]}.asset")" == "${BACKUP_HASHES[$index]}" ]] || fail "deploy-v4 backup hash mismatch: $target"
+    [[ "$(file_attributes "$backup/${BACKUP_FILES[$index]}.asset")" == "${BACKUP_ATTRIBUTES[$index]}" ]] || fail "deploy-v4 backup attribute mismatch: $target"
   else
     BACKUP_PRESENT[$index]='false'
-    : >"$backup/$index.absent"
-    chmod 0600 "$backup/$index.absent"
+    : >"$backup/${BACKUP_FILES[$index]}.absent"
+    chmod 0600 "$backup/${BACKUP_FILES[$index]}.absent"
   fi
   if [[ "$index" == 5 ]]; then
     sed "s/@KINVEST_DEPLOY_GATE_USER@/$GATE_USER/g" "$SOURCE_DIR/${SOURCE_ASSETS[$index]}" >"$stage/$index"
@@ -387,9 +417,9 @@ for index in "${!TARGETS[@]}"; do
   fi
 done
 {
-  printf '%s\n' kinvest-deploy-v4-install-backup-v1
+  printf '%s\n' kinvest-deploy-v4-install-backup-v2
   for index in "${!TARGETS[@]}"; do
-    printf '%s|%s|%s|%s\n' "$index" "${BACKUP_PRESENT[$index]}" "${BACKUP_HASHES[$index]:-}" "${BACKUP_ATTRIBUTES[$index]:-}"
+    printf '%s|%s|%s|%s\n' "${TARGET_KEYS[$index]}" "${BACKUP_PRESENT[$index]}" "${BACKUP_HASHES[$index]:-}" "${BACKUP_ATTRIBUTES[$index]:-}"
   done
 } >"$backup/manifest.txt"
 chmod 0600 "$backup/manifest.txt"
@@ -458,6 +488,7 @@ bash -n "$LOCAL_SBIN/deploy-kinvest-v4"
 bash -n "$LOCAL_SBIN/deploy-kinvest-v3"
 bash -n "$GATE_TARGET"
 bash -n "$LOCAL_SBIN/kinvest-nginx-fixed-ip-gate"
+bash -n "$LOCAL_SBIN/kinvest-nginx-config-installer-v1"
 PYTHONDONTWRITEBYTECODE=1 python3 -m py_compile "$LOCAL_LIBEXEC/kinvest-deploy-v4-contract"
 visudo -cf "$SUDOERS_DIR/kinvest-deploy-v4" >/dev/null
 sudo -n -U "$GATE_USER" -l "$LOCAL_SBIN/deploy-kinvest" >/dev/null

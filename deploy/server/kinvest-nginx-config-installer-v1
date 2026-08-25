@@ -1,0 +1,290 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+TARGET='/root/docker/nginx/conf/nginx.conf'
+TARGET_DIR='/root/docker/nginx/conf'
+BACKUP_ROOT='/root/docker/nginx/config-install-backups'
+RUN_ROOT='/run'
+GATE='/usr/local/sbin/kinvest-nginx-fixed-ip-gate'
+DEPLOY_LOCK='/root/docker/kinvest/state/deploy.lock'
+LOCK_FILE='/run/kinvest-nginx-config-installer.lock'
+ROOT_UID='0'
+ROOT_GID='0'
+MAX_CONFIG_BYTES='1048576'
+NGINX_CONTAINER='nginx'
+KINVEST_CONTAINER='kinvest'
+WEB_NETWORK='web'
+CONTAINER_CLEANUP_TIMEOUT_SECONDS='5'
+
+fail() { printf '%s\n' "$1" >&2; exit "${2:-1}"; }
+file_hash() { sha256sum "$1" | awk '{print $1}'; }
+fsync_file() {
+  python3 -c 'import os,sys; descriptor=os.open(sys.argv[1],os.O_RDONLY|os.O_NOFOLLOW); os.fsync(descriptor); os.close(descriptor)' "$1"
+}
+fsync_directory() {
+  python3 -c 'import os,sys; descriptor=os.open(sys.argv[1],os.O_RDONLY|os.O_DIRECTORY); os.fsync(descriptor); os.close(descriptor)' "$1"
+}
+file_identity() {
+  python3 -c 'import os,stat,sys; value=os.lstat(sys.argv[1]); print(f"{value.st_uid}:{value.st_gid}:{stat.S_IMODE(value.st_mode):o}:{int(stat.S_ISREG(value.st_mode))}:{value.st_nlink}")' "$1"
+}
+directory_identity() {
+  python3 -c 'import os,stat,sys; value=os.lstat(sys.argv[1]); print(f"{value.st_uid}:{value.st_gid}:{stat.S_IMODE(value.st_mode):o}:{int(stat.S_ISDIR(value.st_mode))}")' "$1"
+}
+container_id() {
+  docker inspect --format '{{.Id}}' "$1" 2>/dev/null
+}
+nginx_ip() {
+  docker inspect --format "{{with index .NetworkSettings.Networks \"$WEB_NETWORK\"}}{{.IPAddress}}{{end}}" "$NGINX_CONTAINER" 2>/dev/null
+}
+container_config_hash() {
+  local output
+  output="$(docker exec "$NGINX_CONTAINER" sha256sum /etc/nginx/nginx.conf 2>/dev/null)" || return 1
+  printf '%s\n' "${output%% *}"
+}
+
+[[ "$#" -eq 2 ]] || fail KINVEST_NGINX_CONFIG_ARGUMENTS_INVALID 2
+candidate="$1"
+expected_hash="$2"
+[[ "$(id -u)" -eq "$ROOT_UID" ]] || fail KINVEST_NGINX_CONFIG_ROOT_REQUIRED
+[[ "$expected_hash" =~ ^[0-9a-f]{64}$ ]] || fail KINVEST_NGINX_CONFIG_HASH_INVALID
+[[ "$candidate" == /* && -f "$candidate" && ! -L "$candidate" ]] || fail KINVEST_NGINX_CONFIG_CANDIDATE_INVALID
+[[ -d "$TARGET_DIR" && ! -L "$TARGET_DIR" ]] || fail KINVEST_NGINX_CONFIG_TARGET_INVALID
+[[ "$(directory_identity "$TARGET_DIR" 2>/dev/null)" =~ ^$ROOT_UID:$ROOT_GID:[0-7]{3,4}:1$ ]] || fail KINVEST_NGINX_CONFIG_TARGET_INVALID
+[[ -f "$TARGET" && ! -L "$TARGET" ]] || fail KINVEST_NGINX_CONFIG_TARGET_INVALID
+[[ "$(file_identity "$TARGET" 2>/dev/null)" =~ ^$ROOT_UID:$ROOT_GID:[0-7]{3,4}:1:1$ ]] || fail KINVEST_NGINX_CONFIG_TARGET_INVALID
+[[ -f "$GATE" && ! -L "$GATE" && -x "$GATE" ]] || fail KINVEST_NGINX_CONFIG_GATE_INVALID
+
+install -d -o "$ROOT_UID" -g "$ROOT_GID" -m 0700 "$BACKUP_ROOT"
+[[ -d "$(dirname "$DEPLOY_LOCK")" && ! -L "$(dirname "$DEPLOY_LOCK")" ]] || fail KINVEST_NGINX_CONFIG_DEPLOY_LOCK_INVALID
+exec 8>"$DEPLOY_LOCK"
+flock -n 8 || fail KINVEST_NGINX_CONFIG_DEPLOY_LOCKED
+exec 9>"$LOCK_FILE"
+flock -n 9 || fail KINVEST_NGINX_CONFIG_LOCKED
+
+snapshot=''
+snapshot_prefix="$RUN_ROOT/kinvest-nginx-config.candidate.$$."
+temporary=''
+backup=''
+container_candidate="/tmp/kinvest-nginx-config-installer-v1.$$"
+installed='false'
+completed='false'
+failure_code=''
+old_hash=''
+old_nginx_id=''
+old_kinvest_id=''
+old_ip=''
+old_uid=''
+old_gid=''
+old_mode=''
+old_metadata=''
+
+write_evidence() {
+  local status="$1" error="${2:-none}" evidence_temporary
+  evidence_temporary="$(mktemp "$backup/.evidence.XXXXXX")" || return 1
+  {
+    printf 'version=1\n'
+    printf 'status=%s\n' "$status"
+    [[ "$error" == none ]] || printf 'error=%s\n' "$error"
+    printf 'old_sha256=%s\n' "$old_hash"
+    printf 'candidate_sha256=%s\n' "$expected_hash"
+  } >"$evidence_temporary" || return 1
+  chown "$ROOT_UID:$ROOT_GID" "$evidence_temporary" || return 1
+  chmod 0600 "$evidence_temporary" || return 1
+  fsync_file "$evidence_temporary" || return 1
+  mv -fT "$evidence_temporary" "$backup/evidence" || return 1
+  fsync_directory "$backup"
+}
+
+restore_previous_config() {
+  local rollback_start_id rollback_nginx_id rollback_kinvest_id rollback_ip rollback_host_hash rollback_container_hash
+  rollback_start_id="$(container_id "$NGINX_CONTAINER")" || return 1
+  [[ "$rollback_start_id" =~ ^[0-9a-f]{64}$ ]] || return 1
+  [[ -f "$backup/nginx.conf.before.metadata" && ! -L "$backup/nginx.conf.before.metadata" ]] || return 1
+  [[ "$(file_identity "$backup/nginx.conf.before" 2>/dev/null)" == "$ROOT_UID:$ROOT_GID:600:1:1" ]] || return 1
+  [[ "$(file_identity "$backup/nginx.conf.before.metadata" 2>/dev/null)" == "$ROOT_UID:$ROOT_GID:600:1:1" ]] || return 1
+  [[ "$(cat "$backup/nginx.conf.before.metadata")" == "$old_metadata" ]] || return 1
+  temporary="$(mktemp "$TARGET_DIR/.nginx.conf.rollback.XXXXXX")" || return 1
+  install -o "$old_uid" -g "$old_gid" -m "$old_mode" "$backup/nginx.conf.before" "$temporary" || return 1
+  [[ "$(file_hash "$temporary")" == "$old_hash" ]] || return 1
+  [[ "$(file_identity "$temporary" 2>/dev/null)" == "$old_uid:$old_gid:$old_mode:1:1" ]] || return 1
+  fsync_file "$temporary" || return 1
+  mv -fT "$temporary" "$TARGET" || return 1
+  temporary=''
+  fsync_directory "$TARGET_DIR" || return 1
+  [[ "$(file_identity "$TARGET" 2>/dev/null)" == "$old_uid:$old_gid:$old_mode:1:1" ]] || return 1
+  "$GATE" apply >/dev/null 2>&1 || return 1
+  rollback_nginx_id="$(container_id "$NGINX_CONTAINER")" || return 1
+  [[ "$rollback_nginx_id" =~ ^[0-9a-f]{64}$ && "$rollback_nginx_id" != "$rollback_start_id" ]] || return 1
+  rollback_kinvest_id="$(container_id "$KINVEST_CONTAINER")" || return 1
+  [[ "$rollback_kinvest_id" == "$old_kinvest_id" ]] || return 1
+  rollback_ip="$(nginx_ip)" || return 1
+  [[ "$rollback_ip" == "$old_ip" ]] || return 1
+  rollback_host_hash="$(file_hash "$TARGET")" || return 1
+  rollback_container_hash="$(container_config_hash)" || return 1
+  [[ "$rollback_host_hash" == "$old_hash" && "$rollback_container_hash" == "$old_hash" ]] || return 1
+  docker exec "$NGINX_CONTAINER" nginx -t >/dev/null 2>&1 || return 1
+  installed='false'
+  write_evidence rolled-back "$failure_code"
+}
+
+cleanup_container_candidate() {
+  [[ -n "$container_candidate" ]] || return 0
+  python3 - "$CONTAINER_CLEANUP_TIMEOUT_SECONDS" "$NGINX_CONTAINER" "$container_candidate" >/dev/null 2>&1 <<'PY'
+import os
+import signal
+import subprocess
+import sys
+
+timeout = float(sys.argv[1])
+process = subprocess.Popen(
+    ["docker", "exec", sys.argv[2], "rm", "-f", "--", sys.argv[3]],
+    stdout=subprocess.DEVNULL,
+    stderr=subprocess.DEVNULL,
+    start_new_session=True,
+)
+try:
+    status = process.wait(timeout=timeout)
+except subprocess.TimeoutExpired:
+    os.killpg(process.pid, signal.SIGTERM)
+    try:
+        process.wait(timeout=1)
+    except subprocess.TimeoutExpired:
+        os.killpg(process.pid, signal.SIGKILL)
+        process.wait()
+    raise SystemExit(124)
+raise SystemExit(0 if status == 0 else 1)
+PY
+}
+
+cleanup() {
+  local result=$? rollback_required='false' rollback_ok='true' container_cleanup_ok='true'
+  trap - EXIT
+  trap '' HUP INT TERM
+  set +e
+  if [[ "$installed" == true && "$completed" != true ]]; then
+    rollback_required='true'
+    [[ -n "$failure_code" ]] || failure_code=KINVEST_NGINX_CONFIG_INTERRUPTED
+    restore_previous_config || rollback_ok='false'
+  fi
+  rm -f -- "$snapshot" "$temporary" "${snapshot_prefix}"*
+  temporary=''
+  cleanup_container_candidate || container_cleanup_ok='false'
+  container_candidate=''
+  if [[ "$rollback_required" == true ]]; then
+    [[ "$container_cleanup_ok" == true ]] || rollback_ok='false'
+    if [[ "$rollback_ok" == true ]]; then
+      printf '%s backup=%s sha256=%s\n' "$failure_code" "$backup" "$expected_hash" >&2
+    else
+      [[ -z "$backup" ]] || write_evidence rollback-failed "$failure_code" >/dev/null 2>&1
+      printf 'KINVEST_NGINX_CONFIG_ROLLBACK_FAILED backup=%s sha256=%s\n' "$backup" "$expected_hash" >&2
+    fi
+    exit 1
+  fi
+  [[ "$container_cleanup_ok" == true ]] || result=1
+  exit "$result"
+}
+trap cleanup EXIT
+trap 'failure_code=KINVEST_NGINX_CONFIG_INTERRUPTED; exit 129' HUP
+trap 'failure_code=KINVEST_NGINX_CONFIG_INTERRUPTED; exit 130' INT
+trap 'failure_code=KINVEST_NGINX_CONFIG_INTERRUPTED; exit 143' TERM
+
+snapshot="$(mktemp "${snapshot_prefix}XXXXXX")" || fail KINVEST_NGINX_CONFIG_TEMPORARY_FAILED
+set +e
+python3 - "$candidate" "$snapshot" "$MAX_CONFIG_BYTES" >/dev/null 2>&1 <<'PY'
+import os
+import stat
+import sys
+
+source_path, destination_path, maximum_text = sys.argv[1:]
+maximum = int(maximum_text)
+source = os.open(source_path, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK)
+try:
+    metadata = os.fstat(source)
+    if not stat.S_ISREG(metadata.st_mode):
+        raise SystemExit(2)
+    if metadata.st_size > maximum:
+        raise SystemExit(3)
+    destination = os.open(destination_path, os.O_WRONLY | os.O_TRUNC | os.O_NOFOLLOW)
+    try:
+        total = 0
+        while True:
+            chunk = os.read(source, 65536)
+            if not chunk:
+                break
+            total += len(chunk)
+            if total > maximum:
+                raise SystemExit(3)
+            view = memoryview(chunk)
+            while view:
+                written = os.write(destination, view)
+                view = view[written:]
+        os.fsync(destination)
+    finally:
+        os.close(destination)
+finally:
+    os.close(source)
+PY
+snapshot_status=$?
+set -e
+[[ "$snapshot_status" -ne 3 ]] || fail KINVEST_NGINX_CONFIG_CANDIDATE_TOO_LARGE
+[[ "$snapshot_status" -eq 0 ]] || fail KINVEST_NGINX_CONFIG_CANDIDATE_INVALID
+chown "$ROOT_UID:$ROOT_GID" "$snapshot"
+chmod 0600 "$snapshot"
+actual_hash="$(file_hash "$snapshot")" || fail KINVEST_NGINX_CONFIG_CANDIDATE_INVALID
+[[ "$actual_hash" == "$expected_hash" ]] || fail KINVEST_NGINX_CONFIG_HASH_MISMATCH
+
+old_nginx_id="$(container_id "$NGINX_CONTAINER")" || fail KINVEST_NGINX_CONFIG_STATE_INVALID
+old_kinvest_id="$(container_id "$KINVEST_CONTAINER")" || fail KINVEST_NGINX_CONFIG_STATE_INVALID
+old_ip="$(nginx_ip)" || fail KINVEST_NGINX_CONFIG_STATE_INVALID
+old_hash="$(file_hash "$TARGET")" || fail KINVEST_NGINX_CONFIG_STATE_INVALID
+old_identity="$(file_identity "$TARGET" 2>/dev/null)" || fail KINVEST_NGINX_CONFIG_STATE_INVALID
+IFS=: read -r old_uid old_gid old_mode old_regular old_links <<<"$old_identity"
+[[ "$old_uid" == "$ROOT_UID" && "$old_gid" == "$ROOT_GID" && "$old_mode" =~ ^[0-7]{3,4}$ && "$old_regular" == 1 && "$old_links" == 1 ]] || fail KINVEST_NGINX_CONFIG_STATE_INVALID
+old_metadata="$old_uid:$old_gid:$old_mode"
+old_container_hash="$(container_config_hash)" || fail KINVEST_NGINX_CONFIG_STATE_INVALID
+[[ "$old_nginx_id" =~ ^[0-9a-f]{64}$ && "$old_kinvest_id" =~ ^[0-9a-f]{64}$ ]] || fail KINVEST_NGINX_CONFIG_STATE_INVALID
+[[ "$old_ip" =~ ^([0-9]{1,3}\.){3}[0-9]{1,3}$ ]] || fail KINVEST_NGINX_CONFIG_STATE_INVALID
+[[ "$old_hash" == "$old_container_hash" ]] || fail KINVEST_NGINX_CONFIG_STATE_INVALID
+
+docker cp "$snapshot" "$NGINX_CONTAINER:$container_candidate" >/dev/null 2>&1 || fail KINVEST_NGINX_CONFIG_PREFLIGHT_COPY_FAILED
+docker exec "$NGINX_CONTAINER" nginx -t -c "$container_candidate" >/dev/null 2>&1 || fail KINVEST_NGINX_CONFIG_PREFLIGHT_FAILED
+
+timestamp="$(date -u +%Y%m%dT%H%M%SZ)"
+backup="$(mktemp -d "$BACKUP_ROOT/install-$timestamp.XXXXXX")" || fail KINVEST_NGINX_CONFIG_BACKUP_FAILED
+chown "$ROOT_UID:$ROOT_GID" "$backup"
+chmod 0700 "$backup"
+install -o "$ROOT_UID" -g "$ROOT_GID" -m 0600 "$TARGET" "$backup/nginx.conf.before" || fail KINVEST_NGINX_CONFIG_BACKUP_FAILED
+printf '%s\n' "$old_metadata" >"$backup/nginx.conf.before.metadata" || fail KINVEST_NGINX_CONFIG_BACKUP_FAILED
+chown "$ROOT_UID:$ROOT_GID" "$backup/nginx.conf.before.metadata" || fail KINVEST_NGINX_CONFIG_BACKUP_FAILED
+chmod 0600 "$backup/nginx.conf.before.metadata" || fail KINVEST_NGINX_CONFIG_BACKUP_FAILED
+[[ "$(file_hash "$backup/nginx.conf.before")" == "$old_hash" ]] || fail KINVEST_NGINX_CONFIG_BACKUP_FAILED
+[[ "$(cat "$backup/nginx.conf.before.metadata")" == "$old_metadata" ]] || fail KINVEST_NGINX_CONFIG_BACKUP_FAILED
+fsync_file "$backup/nginx.conf.before" || fail KINVEST_NGINX_CONFIG_BACKUP_FAILED
+fsync_file "$backup/nginx.conf.before.metadata" || fail KINVEST_NGINX_CONFIG_BACKUP_FAILED
+fsync_directory "$backup" || fail KINVEST_NGINX_CONFIG_BACKUP_FAILED
+fsync_directory "$BACKUP_ROOT" || fail KINVEST_NGINX_CONFIG_BACKUP_FAILED
+
+temporary="$(mktemp "$TARGET_DIR/.nginx.conf.install.XXXXXX")" || fail KINVEST_NGINX_CONFIG_INSTALL_FAILED
+install -o "$ROOT_UID" -g "$ROOT_GID" -m 0600 "$snapshot" "$temporary" || fail KINVEST_NGINX_CONFIG_INSTALL_FAILED
+[[ "$(file_hash "$temporary")" == "$expected_hash" ]] || fail KINVEST_NGINX_CONFIG_INSTALL_FAILED
+fsync_file "$temporary" || fail KINVEST_NGINX_CONFIG_INSTALL_FAILED
+installed='true'
+mv -fT "$temporary" "$TARGET" || { failure_code=KINVEST_NGINX_CONFIG_INSTALL_FAILED; exit 1; }
+temporary=''
+fsync_directory "$TARGET_DIR" || { failure_code=KINVEST_NGINX_CONFIG_INSTALL_FAILED; exit 1; }
+
+"$GATE" apply >/dev/null 2>&1 || { failure_code=KINVEST_NGINX_CONFIG_GATE_APPLY_FAILED; exit 1; }
+new_nginx_id="$(container_id "$NGINX_CONTAINER")" || { failure_code=KINVEST_NGINX_CONFIG_STATE_INVALID; exit 1; }
+new_kinvest_id="$(container_id "$KINVEST_CONTAINER")" || { failure_code=KINVEST_NGINX_CONFIG_STATE_INVALID; exit 1; }
+new_ip="$(nginx_ip)" || { failure_code=KINVEST_NGINX_CONFIG_STATE_INVALID; exit 1; }
+[[ "$new_nginx_id" =~ ^[0-9a-f]{64}$ && "$new_nginx_id" != "$old_nginx_id" ]] || { failure_code=KINVEST_NGINX_CONFIG_NGINX_ID_UNCHANGED; exit 1; }
+[[ "$new_kinvest_id" == "$old_kinvest_id" ]] || { failure_code=KINVEST_NGINX_CONFIG_KINVEST_ID_CHANGED; exit 1; }
+[[ "$new_ip" == "$old_ip" ]] || { failure_code=KINVEST_NGINX_CONFIG_IP_CHANGED; exit 1; }
+[[ "$(file_hash "$TARGET")" == "$expected_hash" ]] || { failure_code=KINVEST_NGINX_CONFIG_HOST_HASH_MISMATCH; exit 1; }
+[[ "$(container_config_hash)" == "$expected_hash" ]] || { failure_code=KINVEST_NGINX_CONFIG_CONTAINER_HASH_MISMATCH; exit 1; }
+docker exec "$NGINX_CONTAINER" nginx -t >/dev/null 2>&1 || { failure_code=KINVEST_NGINX_CONFIG_NGINX_TEST_FAILED; exit 1; }
+cleanup_container_candidate || { failure_code=KINVEST_NGINX_CONFIG_CONTAINER_CLEANUP_FAILED; exit 1; }
+container_candidate=''
+write_evidence success || { failure_code=KINVEST_NGINX_CONFIG_EVIDENCE_FAILED; exit 1; }
+completed='true'
+printf 'KINVEST_NGINX_CONFIG_INSTALL_OK backup=%s sha256=%s\n' "$backup" "$expected_hash"
