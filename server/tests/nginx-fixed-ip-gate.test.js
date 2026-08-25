@@ -14,7 +14,20 @@ function write(file, contents, mode = 0o644) {
   fs.writeFileSync(file, contents, { mode })
 }
 
-function fixture({ missingOverlay = false, tamperOverlay = false, missingIp = false, renderMismatch = false, oldCompose = false } = {}) {
+function fixture({
+  missingOverlay = false,
+  tamperOverlay = false,
+  missingIp = false,
+  renderMismatch = false,
+  oldCompose = false,
+  healthPayload = JSON.stringify({
+    status: 'ok',
+    service: 'kinvest',
+    dataMode: 'mock',
+    database: 'ready',
+    timestamp: '2026-08-25T00:00:00.000Z'
+  })
+} = {}) {
   const base = fs.mkdtempSync(path.join(os.tmpdir(), 'kinvest-nginx-fixed-ip-'))
   const project = path.join(base, 'docker')
   const kinvest = path.join(project, 'kinvest')
@@ -68,7 +81,7 @@ set -euo pipefail
 out=''
 previous=''
 for value in "$@"; do [[ "$previous" == -o ]] && out="$value"; previous="$value"; done
-printf '%s' '{"status":"ok","service":"kinvest"}' >"$out"
+printf '%s' '${healthPayload}' >"$out"
 printf '%s' '200 application/json'
 `, 0o755)
   write(operations, '')
@@ -120,6 +133,19 @@ async function run() {
     assert.match(operations, /inspect --format \{\{\.State\.Running\}\} nginx/)
     assert.match(operations, /NetworkSettings\.Networks "web"/)
   } finally { fs.rmSync(apply.base, { recursive: true, force: true }) }
+
+  for (const invalid of [
+    { name: 'health-status', payload: JSON.stringify({ status: 'degraded', service: 'kinvest' }) },
+    { name: 'health-service', payload: JSON.stringify({ status: 'ok', service: 'other' }) },
+    { name: 'health-shape', payload: JSON.stringify(['ok', 'kinvest']) }
+  ]) {
+    const context = fixture({ healthPayload: invalid.payload })
+    try {
+      const result = execute(context, 'apply')
+      assert.notEqual(result.status, 0, invalid.name)
+      assert.equal(result.stderr, 'KINVEST_NGINX_FIXED_IP_HEALTH_FAILED\n', invalid.name)
+    } finally { fs.rmSync(context.base, { recursive: true, force: true }) }
+  }
 
   for (const invalid of [
     { name: 'overlay-missing', options: { missingOverlay: true } },

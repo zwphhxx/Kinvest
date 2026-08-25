@@ -304,6 +304,17 @@ confirm that no marker, temporary, or install journal remains. A successful
 second invocation with the original source arguments must return
 `DEPLOY_GATE_IDENTITY_MIGRATION_SOURCE_MISMATCH`; it is never a silent no-op.
 
+The identity migration intentionally changes only the gate state. It does not
+rewrite `/etc/sudoers.d/kinvest-deploy-v4`. Before changing GitHub Production
+settings or approving a deployment, stage the exact reviewed deploy-v4 assets
+from the same merged commit and rerun `install-deploy-v4.sh` with both
+`KINVEST_DEPLOY_GATE_USER` and `KINVEST_DEPLOY_GATE_GROUP` set to
+`kinvest-deploy`. The installer must complete its atomic backup, `visudo`, and
+`sudo -n -U kinvest-deploy -l /usr/local/sbin/deploy-kinvest-v4` checks. Confirm
+that the installed sudoers rule names `kinvest-deploy`, no install journal or
+public marker remains, and no container was restarted. Do not hand-edit the
+sudoers file.
+
 On an ordinary failure, the tool reconstructs and verifies the exact canonical
 source state before removing the fail-closed marker and returns
 `DEPLOY_GATE_IDENTITY_MIGRATION_FAILED_ROLLED_BACK`. If rollback cannot be
