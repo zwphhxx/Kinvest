@@ -125,7 +125,7 @@ function safeClientResultRequestCount(value) {
     if (!descriptor || !descriptor.enumerable || !Object.hasOwn(descriptor, 'value')) {
       return 1
     }
-    return isCount(descriptor.value, 0, MAX_DIAGNOSTIC_REQUEST_COUNT)
+    return isCount(descriptor.value, 1, MAX_DIAGNOSTIC_REQUEST_COUNT)
       ? descriptor.value
       : 1
   } catch {
@@ -154,7 +154,7 @@ function validateClientResult(value) {
       typeof result.retrievedAt !== 'string' ||
       !Number.isFinite(Date.parse(result.retrievedAt)) ||
       !Number.isSafeInteger(result.elapsedMs) || result.elapsedMs < 0 ||
-      !isCount(result.requestCount, 0, MAX_DIAGNOSTIC_REQUEST_COUNT) ||
+      !isCount(result.requestCount, 1, MAX_DIAGNOSTIC_REQUEST_COUNT) ||
       !dataVolValid ||
       (result.completeness !== 'complete' && result.completeness !== 'partial') ||
       (result.dataVol === 'unavailable' && result.completeness !== 'partial') ||
@@ -504,7 +504,10 @@ function createIfindDiagnosticService(options) {
       }
       outcomeStatus = 'completed'
     } catch (error) {
-      const fields = readErrorFields(error, clientInvoked ? 1 : 0)
+      const observedFields = readErrorFields(error, clientInvoked ? 1 : 0)
+      const fields = clientInvoked
+        ? observedFields
+        : { ...observedFields, requestCount: 0 }
       const statuses = mapFailureStatuses(fields.errorClass, fields.stage)
       let completedAt = startedAt
       try { completedAt = readTimestamp(config.clock) } catch {}

@@ -211,6 +211,31 @@ async function run() {
   )
   invalidSecret.database.close()
 
+  let throwingSecretClientCalls = 0
+  const throwingSecretError = new Error('throwing secret provider raw marker')
+  throwingSecretError.class = 'CONFIG'
+  throwingSecretError.requestCount = 4
+  const throwingSecret = createEnabledService({
+    secretProvider: {
+      readRefreshToken() { throw throwingSecretError }
+    },
+    client: {
+      diagnose: async () => {
+        throwingSecretClientCalls += 1
+        return successResult()
+      },
+      clear() {}
+    }
+  })
+  const throwingSecretOutcome = await throwingSecret.service.run()
+  assert.equal(throwingSecretOutcome.status, 'failed')
+  assert.equal(throwingSecretOutcome.diagnostic.safeErrorClass, 'CONFIG')
+  assert.equal(throwingSecretOutcome.diagnostic.requestCount, 0)
+  assert.equal(throwingSecretClientCalls, 0)
+  assert.equal(throwingSecret.repository.latest().requestCount, 0)
+  assert.equal(JSON.stringify(throwingSecretOutcome).includes('raw marker'), false)
+  throwingSecret.database.close()
+
   const busyState = createEnabledService()
   const occupied = busyState.repository.reserve({
     diagnosticId: 'diag_999999999999999999999999',
@@ -309,6 +334,15 @@ async function run() {
   assert.equal(malformedCountOutcome.diagnostic.requestCount, 4)
   assert.equal(malformedCount.repository.latest().requestCount, 4)
   malformedCount.database.close()
+
+  const hostileSuccessZero = createEnabledService()
+  hostileSuccessZero.client.diagnose = async () => successResult({ requestCount: 0 })
+  const hostileSuccessZeroOutcome = await hostileSuccessZero.service.run()
+  assert.equal(hostileSuccessZeroOutcome.status, 'failed')
+  assert.equal(hostileSuccessZeroOutcome.diagnostic.safeErrorClass, 'API')
+  assert.equal(hostileSuccessZeroOutcome.diagnostic.requestCount, 1)
+  assert.equal(hostileSuccessZero.repository.latest().requestCount, 1)
+  hostileSuccessZero.database.close()
 
   const invalidResponse = createEnabledService()
   invalidResponse.client.diagnose = async () => ({
