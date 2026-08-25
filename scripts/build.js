@@ -21,6 +21,7 @@ const runtimeFiles = [
   'server/domain/security-identity.js',
   'server/http/auth-http.js',
   'server/http/trusted-client.js',
+  'server/ifind-diagnostic-runtime.js',
   'server/security/access-control-runtime.js',
   'server/security/admin-auth.js',
   'server/security/device-approval.js',

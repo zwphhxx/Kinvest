@@ -8,6 +8,9 @@ const {
   openTrackedDb
 } = require('./db/refresh-db')
 const { parseTrustedProxyAddresses } = require('./http/trusted-client')
+const {
+  createIfindDiagnosticRuntime
+} = require('./ifind-diagnostic-runtime')
 
 function httpSecurityConfigurationError() {
   return Object.assign(new Error('HTTP security configuration invalid'), {
@@ -19,7 +22,12 @@ function defaultCreateHandler(options) {
   return require('./server').createRequestHandler(options)
 }
 
-function clearRuntimes(accessRuntime, secretRuntime) {
+function clearRuntimes(ifindDiagnosticRuntime, accessRuntime, secretRuntime) {
+  try {
+    if (ifindDiagnosticRuntime) ifindDiagnosticRuntime.clear()
+  } catch {
+    // Cleanup remains best-effort so every secret container is reached.
+  }
   try {
     if (accessRuntime) accessRuntime.clear()
   } catch {
@@ -47,17 +55,22 @@ async function prepareApplication({
   loadSecrets,
   signal,
   createAccessRuntime = createAccessControlRuntime,
+  createIfindRuntime = createIfindDiagnosticRuntime,
   openDatabase = openTrackedDb,
   closeDatabase = closeTrackedDatabase,
   initializeDatabase = initializeRefreshDatabase,
-  createHandler = defaultCreateHandler
+  createHandler = defaultCreateHandler,
+  loadIfindSecrets,
+  createIfindRepository,
+  createIfindClient,
+  createIfindService
 } = {}) {
   throwIfAborted(signal)
   const secretRuntime = await bootstrap({ env, loadSecrets, signal })
   try {
     throwIfAborted(signal)
   } catch (error) {
-    clearRuntimes(null, secretRuntime)
+    clearRuntimes(null, null, secretRuntime)
     throw error
   }
   let accessRuntime
@@ -70,23 +83,46 @@ async function prepareApplication({
       initializeDatabase
     })
   } catch (error) {
-    clearRuntimes(null, secretRuntime)
+    clearRuntimes(null, null, secretRuntime)
     throw error
   }
 
   let trustedProxyAddresses
-  let handler
   try {
     trustedProxyAddresses = parseTrustedProxyAddresses(
       env.KINVEST_TRUSTED_PROXY_ADDRESSES,
       { required: accessRuntime.status.mode === 'device-approval' }
     )
+  } catch {
+    clearRuntimes(null, accessRuntime, secretRuntime)
+    throw httpSecurityConfigurationError()
+  }
+
+  let ifindDiagnosticRuntime
+  try {
+    ifindDiagnosticRuntime = await createIfindRuntime({
+      env,
+      accessRuntime,
+      openDatabase,
+      ...(loadIfindSecrets ? { loadSecrets: loadIfindSecrets } : {}),
+      ...(createIfindRepository ? { createRepository: createIfindRepository } : {}),
+      ...(createIfindClient ? { createClient: createIfindClient } : {}),
+      ...(createIfindService ? { createService: createIfindService } : {})
+    })
+  } catch (error) {
+    clearRuntimes(null, accessRuntime, secretRuntime)
+    throw error
+  }
+
+  let handler
+  try {
     handler = createHandler({
       accessRuntime,
-      trustedProxyAddresses
+      trustedProxyAddresses,
+      ifindDiagnosticRuntime
     })
   } catch {
-    clearRuntimes(accessRuntime, secretRuntime)
+    clearRuntimes(ifindDiagnosticRuntime, accessRuntime, secretRuntime)
     throw httpSecurityConfigurationError()
   }
 
@@ -94,7 +130,7 @@ async function prepareApplication({
     secretRuntime.status.referenceCount
   if (!Number.isSafeInteger(references) || references < 0 ||
     (accessRuntime.status.mode === 'device-approval' && references !== 2)) {
-    clearRuntimes(accessRuntime, secretRuntime)
+    clearRuntimes(ifindDiagnosticRuntime, accessRuntime, secretRuntime)
     throw Object.assign(new Error('Access control configuration invalid'), {
       code: 'ACCESS_CONTROL_CONFIG_INVALID'
     })
@@ -110,11 +146,12 @@ async function prepareApplication({
         : 'not-required',
       proxy: 'ready'
     }),
+    ifindDiagnosticStatus: ifindDiagnosticRuntime.status,
     handler,
     clear() {
       if (cleared) return
       cleared = true
-      clearRuntimes(accessRuntime, secretRuntime)
+      clearRuntimes(ifindDiagnosticRuntime, accessRuntime, secretRuntime)
     }
   })
 }

@@ -30,6 +30,7 @@ const tests = [
   require('./tencent-ssm-client.test'),
   require('./secret-bootstrap.test'),
   require('./server-secret-bootstrap.test'),
+  require('./server-ifind-bootstrap.test'),
   require('./secret-preflight.test'),
   require('./access-preflight.test'),
   require('./ifind-http-client.test'),

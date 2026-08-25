@@ -19,6 +19,14 @@ const ACCESS_PREFLIGHT_ERROR_CODES = new Set([
   'GITHUB_TMPFS_BUNDLE_INVALID',
   'GITHUB_TMPFS_CONFIG_INVALID',
   'HTTP_SECURITY_CONFIG_INVALID',
+  'IFIND_DIAGNOSTIC_ACCESS_REQUIRED',
+  'IFIND_DIAGNOSTIC_DATABASE_INVALID',
+  'IFIND_DIAGNOSTIC_PROVIDER_INVALID',
+  'IFIND_DIAGNOSTIC_RUNTIME_INVALID',
+  'IFIND_DIAGNOSTIC_SCHEMA_INCOMPATIBLE',
+  'IFIND_REFRESH_TOKEN_UNAVAILABLE',
+  'IFIND_SECRET_CONFIG_INVALID',
+  'IFIND_TMPFS_BUNDLE_INVALID',
   'SECRET_BOOTSTRAP_CONFIG_INVALID',
   'SECRET_MATERIAL_INVALID',
   'SECRET_MATERIAL_LOAD_FAILED',
@@ -257,6 +265,17 @@ function successLine(status) {
   return 'KINVEST_ACCESS_PREFLIGHT_OK mode=device-approval references=2 database=ready proxy=ready\n'
 }
 
+function ifindSuccessLine(status) {
+  if (status === undefined || (status && status.mode === 'disabled' &&
+    status.configured === false && status.versionId === null)) return ''
+  if (!status || status.mode !== 'admin-diagnostic' ||
+    status.configured !== true || typeof status.versionId !== 'string' ||
+    !/^v[0-9]{8}-[0-9]{3}$/.test(status.versionId)) {
+    throw preflightError('IFIND_DIAGNOSTIC_RUNTIME_INVALID')
+  }
+  return 'KINVEST_IFIND_PREFLIGHT_OK mode=admin-diagnostic configured=true\n'
+}
+
 /** @param {any} [options] */
 async function runAccessPreflight({
   env = process.env,
@@ -267,6 +286,11 @@ async function runAccessPreflight({
   loadSecrets,
   createAccessRuntime,
   createHandler,
+  createIfindRuntime,
+  loadIfindSecrets,
+  createIfindRepository,
+  createIfindClient,
+  createIfindService,
   backupDatabase = backup,
   sourceDescriptorPath = defaultSourceDescriptorPath,
   openSourceDatabase = defaultOpenSourceDatabase,
@@ -304,18 +328,35 @@ async function runAccessPreflight({
         removePrivateDirectory
       }
     )
+    let sharedDatabase
+    const openSharedDatabase = () => {
+      if (!sharedDatabase) {
+        sharedDatabase = openDbAtPath(candidateDatabase.databasePath)
+      }
+      return sharedDatabase
+    }
+    const closeSharedDatabase = (database) => {
+      if (sharedDatabase === database) sharedDatabase = undefined
+      closeDatabase(database)
+    }
     prepared = await prepare({
       env,
       ...(bootstrap ? { bootstrap } : {}),
       ...(loadSecrets ? { loadSecrets } : {}),
       ...(createAccessRuntime ? { createAccessRuntime } : {}),
       ...(createHandler ? { createHandler } : {}),
+      ...(createIfindRuntime ? { createIfindRuntime } : {}),
+      ...(loadIfindSecrets ? { loadIfindSecrets } : {}),
+      ...(createIfindRepository ? { createIfindRepository } : {}),
+      ...(createIfindClient ? { createIfindClient } : {}),
+      ...(createIfindService ? { createIfindService } : {}),
       signal: abortController.signal,
-      openDatabase: () => openDbAtPath(candidateDatabase.databasePath),
-      closeDatabase
+      openDatabase: openSharedDatabase,
+      closeDatabase: closeSharedDatabase
     })
     if (interrupted) throw preflightError('ACCESS_PREFLIGHT_INTERRUPTED')
-    resultLine = successLine(prepared.status)
+    resultLine = successLine(prepared.status) +
+      ifindSuccessLine(prepared.ifindDiagnosticStatus)
   } catch (error) {
     failure = error
   } finally {
@@ -354,6 +395,7 @@ if (require.main === module) {
 
 module.exports = {
   linuxSourceDescriptorPath,
+  ifindSuccessLine,
   runAccessPreflight,
   stableAccessPreflightErrorCode,
   successLine,
