@@ -1,6 +1,5 @@
 const assert = require('node:assert/strict')
 const { EventEmitter } = require('node:events')
-const { inspect } = require('node:util')
 
 const accessTokenSuccess = require('./fixtures/ifind/access-token-success.json')
 const tradeDatesSuccess = require('./fixtures/ifind/trade-dates-success.json')
@@ -10,6 +9,8 @@ const REFRESH_TOKEN = 'fake-refresh-token-for-contract-tests'
 const ACCESS_TOKEN = accessTokenSuccess.data.access_token
 const SYNTHETIC_REQUEST_ID = 'synthetic-request-id-for-contract-tests'
 const ORIGIN = 'https://quantapi.51ifind.com'
+const AUTH_PROVIDER_MARKER = 'Synthetic authentication rejection'
+const PROBE_PROVIDER_MARKER = 'Synthetic probe rejection'
 
 function normalizeHeaders(headers) {
   return Object.fromEntries(Object.entries(headers).map(([name, value]) => [
@@ -25,6 +26,95 @@ function createCapturingLogger() {
     logger[level] = (...args) => entries.push({ level, args })
   }
   return { entries, logger }
+}
+
+async function captureGlobalOutput(action) {
+  const entries = []
+  const consoleMethods = ['debug', 'info', 'log', 'warn', 'error']
+  const originalConsoleMethods = Object.fromEntries(
+    consoleMethods.map((method) => [method, console[method]])
+  )
+  const originalStdoutWrite = process.stdout.write
+  const originalStderrWrite = process.stderr.write
+
+  for (const method of consoleMethods) {
+    console[method] = (...args) => entries.push({ channel: `console.${method}`, args })
+  }
+
+  function captureWrite(channel) {
+    return function write(chunk, encoding, callback) {
+      entries.push({
+        channel,
+        chunk: Buffer.isBuffer(chunk) ? Buffer.from(chunk) : String(chunk)
+      })
+      const done = typeof encoding === 'function' ? encoding : callback
+      if (typeof done === 'function') queueMicrotask(done)
+      return true
+    }
+  }
+
+  process.stdout.write = captureWrite('process.stdout')
+  process.stderr.write = captureWrite('process.stderr')
+
+  try {
+    return {
+      status: 'fulfilled',
+      value: await action(),
+      entries
+    }
+  } catch (reason) {
+    return {
+      status: 'rejected',
+      reason,
+      entries
+    }
+  } finally {
+    for (const method of consoleMethods) {
+      console[method] = originalConsoleMethods[method]
+    }
+    process.stdout.write = originalStdoutWrite
+    process.stderr.write = originalStderrWrite
+  }
+}
+
+function containsSentinel(root, sentinel) {
+  if (!sentinel) return false
+
+  const seen = new Set()
+  const pending = [root]
+  while (pending.length > 0) {
+    const value = pending.pop()
+    if (typeof value === 'string') {
+      if (value.includes(sentinel)) return true
+      continue
+    }
+    if (typeof value === 'symbol') {
+      if (String(value).includes(sentinel)) return true
+      continue
+    }
+    if ((typeof value !== 'object' || value === null) && typeof value !== 'function') {
+      continue
+    }
+    if (Buffer.isBuffer(value)) {
+      if (value.toString('utf8').includes(sentinel)) return true
+      continue
+    }
+    if (seen.has(value)) continue
+    seen.add(value)
+
+    let descriptors
+    try {
+      descriptors = Object.getOwnPropertyDescriptors(value)
+    } catch {
+      continue
+    }
+    for (const key of Reflect.ownKeys(descriptors)) {
+      pending.push(key)
+      const descriptor = descriptors[key]
+      if (Object.hasOwn(descriptor, 'value')) pending.push(descriptor.value)
+    }
+  }
+  return false
 }
 
 function createRequestStub(responseBodies) {
@@ -45,7 +135,8 @@ function createRequestStub(responseBodies) {
     outgoing.write = (chunk) => {
       rawBody += String(chunk)
     }
-    outgoing.end = () => {
+    outgoing.end = (chunk) => {
+      if (chunk !== undefined) outgoing.write(chunk)
       call.body = rawBody ? JSON.parse(rawBody) : null
       const body = pending.shift()
       queueMicrotask(() => {
@@ -62,9 +153,13 @@ function createRequestStub(responseBodies) {
   return { calls, request }
 }
 
-function assertNoProviderLeak({ scenario, value, logEntries, rawProviderMarkers = [] }) {
-  const serialized = `${value instanceof Error ? value.message : ''}\n${inspect(value, { depth: 10 })}`
-  const serializedLogs = inspect(logEntries, { depth: 10 })
+function assertNoProviderLeak({
+  scenario,
+  value,
+  logEntries,
+  globalOutputEntries,
+  rawProviderMarkers = []
+}) {
   const markers = [
     ['refresh token', REFRESH_TOKEN],
     ['access token', ACCESS_TOKEN],
@@ -75,26 +170,33 @@ function assertNoProviderLeak({ scenario, value, logEntries, rawProviderMarkers 
   for (const [category, marker] of markers) {
     if (!marker) continue
     assert.equal(
-      serialized.includes(marker),
+      containsSentinel(value, marker),
       false,
       `${scenario}: returned result or error leaked ${category}`
     )
     assert.equal(
-      serializedLogs.includes(marker),
+      containsSentinel(logEntries, marker),
       false,
       `${scenario}: captured logs leaked ${category}`
     )
+    assert.equal(
+      containsSentinel(globalOutputEntries, marker),
+      false,
+      `${scenario}: console or process output leaked ${category}`
+    )
   }
-  assert.equal(
-    serialized.includes('RequestId'),
-    false,
-    `${scenario}: returned result or error leaked RequestId label`
-  )
-  assert.equal(
-    serializedLogs.includes('RequestId'),
-    false,
-    `${scenario}: captured logs leaked RequestId label`
-  )
+
+  for (const [channel, candidate] of [
+    ['returned result or error', value],
+    ['captured logs', logEntries],
+    ['console or process output', globalOutputEntries]
+  ]) {
+    assert.equal(
+      containsSentinel(candidate, 'RequestId'),
+      false,
+      `${scenario}: ${channel} leaked RequestId label`
+    )
+  }
 }
 
 async function run() {
@@ -112,7 +214,11 @@ async function run() {
   })
 
   assert.deepEqual(Object.keys(client), ['diagnose'])
-  const result = await client.diagnose({ refreshToken: REFRESH_TOKEN })
+  const successExecution = await captureGlobalOutput(
+    () => client.diagnose({ refreshToken: REFRESH_TOKEN })
+  )
+  assert.equal(successExecution.status, 'fulfilled', 'successful diagnostic: expected fulfillment')
+  const result = successExecution.value
 
   assert.deepEqual(successTransport.calls, [
     {
@@ -149,7 +255,8 @@ async function run() {
   assertNoProviderLeak({
     scenario: 'successful diagnostic',
     value: result,
-    logEntries: successLogger.entries
+    logEntries: successLogger.entries,
+    globalOutputEntries: successExecution.entries
   })
 
   const authFailureTransport = createRequestStub([providerErrors.accessToken])
@@ -159,21 +266,21 @@ async function run() {
     now: () => new Date('2026-08-25T16:30:00.000Z'),
     logger: authFailureLogger.logger
   })
-  await assert.rejects(
-    authFailureClient.diagnose({ refreshToken: REFRESH_TOKEN }),
-    (error) => {
-      assert.equal(error.code, 'IFIND_AUTH_REJECTED')
-      assert.equal(error.message, 'iFinD access-token request failed')
-      assert.equal('cause' in error, false)
-      assertNoProviderLeak({
-        scenario: 'access-token rejection',
-        value: error,
-        logEntries: authFailureLogger.entries,
-        rawProviderMarkers: [providerErrors.accessToken.errmsg]
-      })
-      return true
-    }
+  const authFailureExecution = await captureGlobalOutput(
+    () => authFailureClient.diagnose({ refreshToken: REFRESH_TOKEN })
   )
+  assert.equal(authFailureExecution.status, 'rejected', 'access-token rejection: expected rejection')
+  const authError = authFailureExecution.reason
+  assert.equal(authError.code, 'IFIND_AUTH_REJECTED')
+  assert.equal(authError.message, 'iFinD access-token request failed')
+  assert.equal('cause' in authError, false)
+  assertNoProviderLeak({
+    scenario: 'access-token rejection',
+    value: authError,
+    logEntries: authFailureLogger.entries,
+    globalOutputEntries: authFailureExecution.entries,
+    rawProviderMarkers: [AUTH_PROVIDER_MARKER, providerErrors.accessToken.errmsg]
+  })
   assert.equal(authFailureTransport.calls.length, 1)
 
   const probeFailureTransport = createRequestStub([
@@ -186,22 +293,22 @@ async function run() {
     now: () => new Date('2026-08-25T16:30:00.000Z'),
     logger: probeFailureLogger.logger
   })
-  await assert.rejects(
-    probeFailureClient.diagnose({ refreshToken: REFRESH_TOKEN }),
-    (error) => {
-      assert.equal(error.code, 'IFIND_PROBE_REJECTED')
-      assert.equal(error.message, 'iFinD trade-date probe failed')
-      assert.equal(error.dataVol, 3)
-      assert.equal('cause' in error, false)
-      assertNoProviderLeak({
-        scenario: 'trade-date rejection',
-        value: error,
-        logEntries: probeFailureLogger.entries,
-        rawProviderMarkers: [providerErrors.tradeDates.errmsg]
-      })
-      return true
-    }
+  const probeFailureExecution = await captureGlobalOutput(
+    () => probeFailureClient.diagnose({ refreshToken: REFRESH_TOKEN })
   )
+  assert.equal(probeFailureExecution.status, 'rejected', 'trade-date rejection: expected rejection')
+  const probeError = probeFailureExecution.reason
+  assert.equal(probeError.code, 'IFIND_PROBE_REJECTED')
+  assert.equal(probeError.message, 'iFinD trade-date probe failed')
+  assert.equal(probeError.dataVol, 3)
+  assert.equal('cause' in probeError, false)
+  assertNoProviderLeak({
+    scenario: 'trade-date rejection',
+    value: probeError,
+    logEntries: probeFailureLogger.entries,
+    globalOutputEntries: probeFailureExecution.entries,
+    rawProviderMarkers: [PROBE_PROVIDER_MARKER, providerErrors.tradeDates.errmsg]
+  })
 }
 
 module.exports = { run }
