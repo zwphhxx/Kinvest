@@ -361,14 +361,21 @@ async function run() {
   const httpsDefaultServer = httpServers.find(
     (block) => /^\s*listen 443 ssl default_server;$/m.test(block)
   )
+  const httpsRedirectServer = httpServers.find(
+    (block) => /^\s*listen 443 ssl;$/m.test(block) &&
+      /^\s*server_name www\.dearmina\.cn;$/m.test(block)
+  )
   const httpsServer = httpServers.find(
-    (block) => /^\s*listen 443 ssl;$/m.test(block) && !/default_server/.test(block)
+    (block) => /^\s*listen 443 ssl;$/m.test(block) &&
+      /^\s*server_name dearmina\.cn;$/m.test(block)
   )
 
-  assert.equal(httpServers.length, 4, 'Nginx must define default and canonical HTTP/HTTPS virtual hosts')
+  assert.equal(httpServers.length, 5,
+    'Nginx must define default, redirect, and canonical HTTP/HTTPS virtual hosts')
   assert.ok(httpDefaultServer, 'Nginx must reject unknown HTTP hosts')
   assert.ok(httpRedirectServer, 'Nginx must define the HTTP redirect virtual host')
   assert.ok(httpsDefaultServer, 'Nginx must reject unknown HTTPS hosts after TLS negotiation')
+  assert.ok(httpsRedirectServer, 'Nginx must redirect the HTTPS www alias')
   assert.ok(httpsServer, 'Nginx must define the HTTPS application virtual host')
 
   assert.deepEqual(
@@ -656,8 +663,17 @@ async function run() {
   assert.match(httpsDefaultServer, /^\s*ssl_certificate \/etc\/letsencrypt\/live\/dearmina\.cn\/fullchain\.pem;$/m)
   assert.match(httpsDefaultServer, /^\s*ssl_certificate_key \/etc\/letsencrypt\/live\/dearmina\.cn\/privkey\.pem;$/m)
   assert.match(httpsDefaultServer, /^\s*return 444;$/m)
+  assert.match(httpsRedirectServer, /^\s*listen \[::\]:443 ssl;$/m)
+  assert.match(httpsRedirectServer, /^\s*server_name www\.dearmina\.cn;$/m)
+  assert.match(httpsRedirectServer, /^\s*ssl_certificate \/etc\/letsencrypt\/live\/dearmina\.cn\/fullchain\.pem;$/m)
+  assert.match(httpsRedirectServer, /^\s*ssl_certificate_key \/etc\/letsencrypt\/live\/dearmina\.cn\/privkey\.pem;$/m)
+  assert.match(httpsRedirectServer, /^\s*ssl_protocols TLSv1\.2 TLSv1\.3;$/m)
+  assert.match(httpsRedirectServer, /^\s*add_header Strict-Transport-Security "max-age=86400" always;$/m)
+  assert.match(httpsRedirectServer, /^\s*add_header X-Content-Type-Options "nosniff" always;$/m)
+  assert.match(httpsRedirectServer, /^\s*return 301 https:\/\/dearmina\.cn\$request_uri;$/m)
+  assert.doesNotMatch(httpsRedirectServer, /proxy_pass|\$kinvest_upstream|https:\/\/\$host/)
   assert.match(httpsServer, /^\s*listen \[::\]:443 ssl;$/m)
-  assert.match(httpsServer, /^\s*server_name dearmina\.cn www\.dearmina\.cn;$/m)
+  assert.match(httpsServer, /^\s*server_name dearmina\.cn;$/m)
   assert.match(httpsServer, /^\s*ssl_certificate \/etc\/letsencrypt\/live\/dearmina\.cn\/fullchain\.pem;$/m)
   assert.match(httpsServer, /^\s*ssl_certificate_key \/etc\/letsencrypt\/live\/dearmina\.cn\/privkey\.pem;$/m)
   assert.match(httpsServer, /^\s*ssl_protocols TLSv1\.2 TLSv1\.3;$/m)
