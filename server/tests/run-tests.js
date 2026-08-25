@@ -30,6 +30,7 @@ const tests = [
   require('./server-secret-bootstrap.test'),
   require('./secret-preflight.test'),
   require('./access-preflight.test'),
+  require('./ifind-http-client.test'),
   require('./ssm-material-generator.test'),
   require('./docker-secret-bootstrap.test'),
   require('./metadata-firewall-contract.test'),

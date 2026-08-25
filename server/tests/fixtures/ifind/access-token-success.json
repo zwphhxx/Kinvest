@@ -1,0 +1,8 @@
+{
+  "errorcode": 0,
+  "errmsg": "success",
+  "data": {
+    "access_token": "fake-access-token-for-contract-tests",
+    "expired_time": "2099-01-08 08:00:00"
+  }
+}
