@@ -51,7 +51,9 @@ The gate requires Docker Compose `2.24.4` or newer for `!override`, parses the
 IP only through the strict root-owned access-control config contract, runs
 `docker compose config --format json`, and requires the rendered
 `services.nginx.networks.web.ipv4_address` to equal that exact IP. The only
-success output is `KINVEST_NGINX_FIXED_IP_RENDER_OK ip=<approved-ip>`.
+success output is `KINVEST_NGINX_FIXED_IP_RENDER_OK ip=<approved-ip>`. The gate
+selects contract protocol v4 only for the config-validation subprocess; it does
+not inherit a caller-selected deploy protocol or export that setting to Compose.
 
 Stop here. After a separate Docker/network approval, Gate 2 is:
 

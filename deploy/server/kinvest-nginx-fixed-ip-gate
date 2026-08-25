@@ -47,7 +47,7 @@ health_json="$(mktemp "$RUN_ROOT/kinvest-nginx-fixed-ip.health.XXXXXX")"
 cleanup() { rm -f -- "$network_json" "$render_json" "$health_json"; }
 trap cleanup EXIT HUP INT TERM
 chmod 0600 "$network_json" "$render_json" "$health_json"
-"$CONTRACT" validate-network-config "$ACCESS_NETWORK_CONFIG" >"$network_json" || fail KINVEST_NGINX_FIXED_IP_CONFIG_INVALID
+KINVEST_DEPLOY_PROTOCOL=4 "$CONTRACT" validate-network-config "$ACCESS_NETWORK_CONFIG" >"$network_json" 2>/dev/null || fail KINVEST_NGINX_FIXED_IP_CONFIG_INVALID
 IFS=$'\t' read -r nginx_container web_network trusted_ip < <(python3 - "$network_json" <<'PY'
 import json, sys
 with open(sys.argv[1], encoding="ascii") as stream:
