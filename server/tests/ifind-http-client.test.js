@@ -159,16 +159,32 @@ function createRawRequestStub(scenarios) {
 
   function request(url, options, callback) {
     const scenario = pending.shift() || {}
-    const call = { url: String(url), options, connectionTimeoutMs: null }
+    const call = {
+      url: String(url),
+      options,
+      connectionTimeoutMs: null,
+      requestTimeoutCleared: false,
+      requestDestroyCount: 0,
+      responseDestroyCount: 0,
+      outgoing: null,
+      incoming: null
+    }
     calls.push(call)
     const outgoing = new EventEmitter()
     outgoing.write = () => {}
     outgoing.setTimeout = (milliseconds, handler) => {
-      call.connectionTimeoutMs = milliseconds
-      if (scenario.connectionTimeout) queueMicrotask(handler)
+      if (milliseconds > 0) call.connectionTimeoutMs = milliseconds
+      if (milliseconds === 0) call.requestTimeoutCleared = true
+      if (typeof handler === 'function') outgoing.on('timeout', handler)
+      if (scenario.connectionTimeout && milliseconds > 0) {
+        queueMicrotask(() => outgoing.emit('timeout'))
+      }
     }
-    outgoing.destroy = () => {}
+    call.outgoing = outgoing
+    outgoing.destroy = () => { call.requestDestroyCount += 1 }
     outgoing.end = () => {
+      if (scenario.connected) outgoing.emit('connected')
+      if (scenario.preConnectStall) return
       if (scenario.connectionTimeout) {
         if (call.connectionTimeoutMs === null) {
           queueMicrotask(() => outgoing.emit('error', new Error('raw timeout sentinel')))
@@ -176,7 +192,11 @@ function createRawRequestStub(scenarios) {
         return
       }
       if (scenario.noResponse) {
-        setImmediate(() => outgoing.emit('error', new Error('raw stalled response sentinel')))
+        setImmediate(() => {
+          if (call.requestDestroyCount === 0) {
+            outgoing.emit('error', new Error('raw stalled response sentinel'))
+          }
+        })
         return
       }
       queueMicrotask(() => {
@@ -185,11 +205,24 @@ function createRawRequestStub(scenarios) {
           return
         }
         const incoming = new EventEmitter()
+        call.incoming = incoming
         incoming.statusCode = scenario.statusCode === undefined ? 200 : scenario.statusCode
-        incoming.destroy = () => {}
+        incoming.destroy = () => { call.responseDestroyCount += 1 }
+        incoming.on('error', () => {})
         try {
           callback(incoming)
+          if (scenario.beforeChunks) scenario.beforeChunks()
           for (const chunk of scenario.chunks || []) incoming.emit('data', Buffer.from(chunk))
+          if (scenario.responseError) {
+            incoming.emit('error', new Error(scenario.responseError))
+            if (scenario.afterEvents) scenario.afterEvents()
+            return
+          }
+          if (scenario.responseAborted) {
+            incoming.emit('aborted')
+            if (scenario.afterEvents) scenario.afterEvents()
+            return
+          }
           incoming.emit('end')
         } catch (error) {
           if (!scenario.swallowResponseErrors) throw error
@@ -494,16 +527,21 @@ async function run() {
 
   let totalTimeoutMs = null
   let clearedTotalTimer = false
-  const totalTimeoutTransport = createRawRequestStub([{ noResponse: true }])
+  const totalTimeoutTransport = createRawRequestStub([{ noResponse: true, connected: true }])
   const totalTimeoutClient = createIfindHttpClient({
     request: totalTimeoutTransport.request,
     setTimer(handler, milliseconds) {
-      totalTimeoutMs = milliseconds
-      queueMicrotask(handler)
-      return 'synthetic-total-timer'
+      totalTimeoutMs = Math.max(totalTimeoutMs || 0, milliseconds)
+      const timer = { handler, milliseconds, cleared: false }
+      if (milliseconds === 5000) {
+        queueMicrotask(() => {
+          if (!timer.cleared) handler()
+        })
+      }
+      return timer
     },
     clearTimer(timer) {
-      assert.equal(timer, 'synthetic-total-timer')
+      timer.cleared = true
       clearedTotalTimer = true
     }
   })
@@ -731,6 +769,165 @@ async function run() {
   ])
   assert.notEqual(hostileTimerOutcome, 'stalled')
   assert.equal(hostileTimerOutcome.dataVol, 11)
+
+  const responseErrorMarker = `raw response error ${ACCESS_TOKEN} ${SYNTHETIC_REQUEST_ID}`
+  const responseErrorTimers = []
+  const responseErrorScenario = {
+    responseError: responseErrorMarker,
+    chunks: ['{"partial":'],
+    afterEvents() {
+      for (const timer of responseErrorTimers) {
+        if (!timer.cleared) timer.handler()
+      }
+    }
+  }
+  const responseErrorTransport = createRawRequestStub([responseErrorScenario])
+  const responseErrorClient = createIfindHttpClient({
+    request: responseErrorTransport.request,
+    setTimer(handler, milliseconds) {
+      const timer = { handler, milliseconds, cleared: false }
+      responseErrorTimers.push(timer)
+      return timer
+    },
+    clearTimer(timer) {
+      timer.cleared = true
+    }
+  })
+  let responseErrorRejections = 0
+  const responseErrorExecution = await captureGlobalOutput(
+    () => responseErrorClient.diagnose({ refreshToken: REFRESH_TOKEN }).catch((error) => {
+      responseErrorRejections += 1
+      throw error
+    })
+  )
+  assert.equal(responseErrorExecution.status, 'rejected')
+  assert.equal(responseErrorExecution.reason.code, 'IFIND_RESPONSE_FAILED')
+  assert.equal(responseErrorExecution.reason.class, 'NETWORK')
+  assert.equal(responseErrorRejections, 1)
+  assert.equal(responseErrorTransport.calls[0].requestDestroyCount, 1)
+  assert.equal(responseErrorTransport.calls[0].responseDestroyCount, 1)
+  assert.equal(responseErrorTimers.every((timer) => timer.cleared), true)
+  assert.equal(responseErrorTransport.calls[0].outgoing.listenerCount('error'), 0)
+  assert.equal(responseErrorTransport.calls[0].incoming.listenerCount('data'), 0)
+  assert.equal(responseErrorTransport.calls[0].incoming.listenerCount('end'), 0)
+  assert.equal(responseErrorTransport.calls[0].incoming.listenerCount('aborted'), 0)
+  assert.equal(responseErrorTransport.calls[0].incoming.listenerCount('error'), 1)
+  assertNoProviderLeak({
+    scenario: 'response error',
+    value: responseErrorExecution.reason,
+    logEntries: [],
+    globalOutputEntries: responseErrorExecution.entries,
+    rawProviderMarkers: [responseErrorMarker]
+  })
+
+  const abortedTimers = []
+  const abortedScenario = {
+    responseAborted: true,
+    chunks: ['{"partial":'],
+    afterEvents() {
+      for (const timer of abortedTimers) {
+        if (!timer.cleared) timer.handler()
+      }
+    }
+  }
+  const abortedTransport = createRawRequestStub([abortedScenario])
+  const abortedClient = createIfindHttpClient({
+    request: abortedTransport.request,
+    setTimer(handler, milliseconds) {
+      const timer = { handler, milliseconds, cleared: false }
+      abortedTimers.push(timer)
+      return timer
+    },
+    clearTimer(timer) {
+      timer.cleared = true
+    }
+  })
+  let abortedRejections = 0
+  const abortedExecution = await captureGlobalOutput(
+    () => abortedClient.diagnose({ refreshToken: REFRESH_TOKEN }).catch((error) => {
+      abortedRejections += 1
+      throw error
+    })
+  )
+  assert.equal(abortedExecution.status, 'rejected')
+  assert.equal(abortedExecution.reason.code, 'IFIND_RESPONSE_ABORTED')
+  assert.equal(abortedExecution.reason.class, 'NETWORK')
+  assert.equal(abortedRejections, 1)
+  assert.deepEqual(abortedExecution.entries, [])
+  assert.equal(abortedTransport.calls[0].requestDestroyCount, 1)
+  assert.equal(abortedTransport.calls[0].responseDestroyCount, 1)
+  assert.equal(abortedTimers.every((timer) => timer.cleared), true)
+  assert.equal(abortedTransport.calls[0].outgoing.listenerCount('error'), 0)
+  assert.equal(abortedTransport.calls[0].incoming.listenerCount('data'), 0)
+  assert.equal(abortedTransport.calls[0].incoming.listenerCount('end'), 0)
+  assert.equal(abortedTransport.calls[0].incoming.listenerCount('aborted'), 0)
+  assert.equal(abortedTransport.calls[0].incoming.listenerCount('error'), 1)
+
+  const oversizedStatusTimers = []
+  let statusTimerActiveDuringBody = false
+  const oversizedStatusScenario = {
+    statusCode: 503,
+    chunks: [Buffer.alloc(128 * 1024), Buffer.alloc(128 * 1024), Buffer.alloc(1)],
+    beforeChunks() {
+      statusTimerActiveDuringBody = oversizedStatusTimers.some((timer) => !timer.cleared)
+    }
+  }
+  const oversizedStatusTransport = createRawRequestStub([oversizedStatusScenario])
+  const oversizedStatusClient = createIfindHttpClient({
+    request: oversizedStatusTransport.request,
+    setTimer(handler, milliseconds) {
+      const timer = { handler, milliseconds, cleared: false }
+      oversizedStatusTimers.push(timer)
+      return timer
+    },
+    clearTimer(timer) {
+      timer.cleared = true
+    }
+  })
+  await assert.rejects(
+    () => oversizedStatusClient.diagnose({ refreshToken: REFRESH_TOKEN }),
+    (error) => error.code === 'IFIND_RESPONSE_TOO_LARGE' && error.class === 'API'
+  )
+  assert.equal(statusTimerActiveDuringBody, true)
+  assert.equal(oversizedStatusTransport.calls[0].requestDestroyCount, 1)
+  assert.equal(oversizedStatusTransport.calls[0].responseDestroyCount, 1)
+  assert.equal(oversizedStatusTimers.every((timer) => timer.cleared), true)
+  assert.equal(oversizedStatusTransport.calls[0].outgoing.listenerCount('error'), 0)
+  assert.equal(oversizedStatusTransport.calls[0].incoming.listenerCount('data'), 0)
+  assert.equal(oversizedStatusTransport.calls[0].incoming.listenerCount('end'), 0)
+
+  const preConnectTimers = []
+  const preConnectTransport = createRawRequestStub([{ preConnectStall: true }])
+  const preConnectClient = createIfindHttpClient({
+    request: preConnectTransport.request,
+    setTimer(handler, milliseconds) {
+      const timer = { handler, milliseconds, cleared: false }
+      preConnectTimers.push(timer)
+      return timer
+    },
+    clearTimer(timer) {
+      timer.cleared = true
+    }
+  })
+  const preConnectExecution = await captureGlobalOutput(async () => {
+    const pendingDiagnosis = preConnectClient.diagnose({ refreshToken: REFRESH_TOKEN })
+    await Promise.resolve()
+    const activeTimers = preConnectTimers
+      .filter((timer) => !timer.cleared)
+      .sort((left, right) => left.milliseconds - right.milliseconds)
+    assert.deepEqual(activeTimers.map((timer) => timer.milliseconds), [2000, 5000])
+    activeTimers[0].handler()
+    return pendingDiagnosis
+  })
+  assert.equal(preConnectExecution.status, 'rejected')
+  assert.equal(preConnectExecution.reason.code, 'IFIND_CONNECTION_TIMEOUT')
+  assert.equal(preConnectExecution.reason.class, 'NETWORK')
+  assert.equal(preConnectTransport.calls[0].requestDestroyCount, 1)
+  assert.equal(preConnectTimers.every((timer) => timer.cleared), true)
+  assert.equal(preConnectTransport.calls[0].outgoing.listenerCount('socket'), 0)
+  assert.equal(preConnectTransport.calls[0].outgoing.listenerCount('connected'), 0)
+  assert.equal(preConnectTransport.calls[0].outgoing.listenerCount('error'), 0)
+  assert.equal(preConnectTransport.calls[0].outgoing.listenerCount('timeout'), 0)
 }
 
 module.exports = { run }

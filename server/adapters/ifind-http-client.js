@@ -28,21 +28,83 @@ function shanghaiDate(date) {
 
 function requestJson(request, path, headers, body, setTimer, clearTimer) {
   return new Promise((resolve, reject) => {
-    let outgoing
+    let outgoing = null
+    let incoming = null
+    let connectionSocket = null
+    let connectionTimer
     let totalTimer
     let settled = false
-    function settle(action, value) {
+
+    const removeListener = (emitter, event, handler) => {
+      try {
+        if (emitter && typeof emitter.removeListener === 'function' && handler) {
+          emitter.removeListener(event, handler)
+        }
+      } catch {}
+    }
+    const destroy = (stream) => {
+      try {
+        if (stream && typeof stream.destroy === 'function') stream.destroy()
+      } catch {}
+    }
+    let onRequestError
+    let onRequestTimeout
+    let onRequestSocket
+    let onTransportConnected
+    let onSecureConnect
+    let onResponseData
+    let onResponseEnd
+    let onResponseError
+    let onResponseAborted
+
+    function clearOwnedTimer(timer) {
+      if (timer === undefined) return
+      try {
+        clearTimer(timer)
+      } catch {}
+    }
+
+    function clearConnectionLifecycle() {
+      clearOwnedTimer(connectionTimer)
+      connectionTimer = undefined
+      removeListener(outgoing, 'socket', onRequestSocket)
+      removeListener(outgoing, 'connected', onTransportConnected)
+      removeListener(connectionSocket, 'secureConnect', onSecureConnect)
+    }
+
+    function connectionEstablished() {
+      if (connectionTimer === undefined) return
+      clearConnectionLifecycle()
+    }
+
+    function cleanup() {
+      clearConnectionLifecycle()
+      clearOwnedTimer(totalTimer)
+      totalTimer = undefined
+      removeListener(outgoing, 'error', onRequestError)
+      removeListener(outgoing, 'timeout', onRequestTimeout)
+      try {
+        if (outgoing && typeof outgoing.setTimeout === 'function') outgoing.setTimeout(0)
+      } catch {}
+      removeListener(incoming, 'data', onResponseData)
+      removeListener(incoming, 'end', onResponseEnd)
+      removeListener(incoming, 'error', onResponseError)
+      removeListener(incoming, 'aborted', onResponseAborted)
+    }
+
+    function settle(action, value, destroyStreams) {
       if (settled) return
       settled = true
-      if (totalTimer !== undefined) {
-        try {
-          clearTimer(totalTimer)
-        } catch {}
+      cleanup()
+      if (destroyStreams) {
+        destroy(incoming)
+        destroy(outgoing)
       }
       action(value)
     }
-    const succeed = (value) => settle(resolve, value)
-    const fail = (error) => settle(reject, error)
+    const succeed = (value) => settle(resolve, value, false)
+    const fail = (error) => settle(reject, error, true)
+
     try {
       outgoing = request(`${ORIGIN}${path}`, {
         method: 'POST',
@@ -50,22 +112,24 @@ function requestJson(request, path, headers, body, setTimer, clearTimer) {
           'content-type': 'application/json',
           ...headers
         }
-      }, (incoming) => {
-        if (!Number.isInteger(incoming.statusCode) ||
-            incoming.statusCode < 200 || incoming.statusCode > 299) {
-          incoming.on('data', () => {})
-          incoming.on('end', () => {})
-          fail(safeError('IFIND_HTTP_STATUS', 'API', 'iFinD HTTP request failed'))
-          return
-        }
+      }, (response) => {
+        incoming = response
+        connectionEstablished()
+        const successfulStatus = Number.isInteger(incoming.statusCode) &&
+          incoming.statusCode >= 200 && incoming.statusCode <= 299
         const chunks = []
         let responseBytes = 0
-        incoming.on('data', (chunk) => {
+        onResponseData = (chunk) => {
           if (settled) return
-          const buffer = Buffer.from(chunk)
+          let buffer
+          try {
+            buffer = Buffer.from(chunk)
+          } catch {
+            fail(safeError('IFIND_RESPONSE_FAILED', 'NETWORK', 'iFinD response failed'))
+            return
+          }
           responseBytes += buffer.length
           if (responseBytes > 256 * 1024) {
-            if (typeof incoming.destroy === 'function') incoming.destroy()
             fail(safeError(
               'IFIND_RESPONSE_TOO_LARGE',
               'API',
@@ -74,9 +138,13 @@ function requestJson(request, path, headers, body, setTimer, clearTimer) {
             return
           }
           chunks.push(buffer)
-        })
-        incoming.on('end', () => {
+        }
+        onResponseEnd = () => {
           if (settled) return
+          if (!successfulStatus) {
+            fail(safeError('IFIND_HTTP_STATUS', 'API', 'iFinD HTTP request failed'))
+            return
+          }
           let text
           try {
             text = new TextDecoder('utf-8', { fatal: true }).decode(Buffer.concat(chunks))
@@ -93,29 +161,71 @@ function requestJson(request, path, headers, body, setTimer, clearTimer) {
           } catch {
             fail(safeError('IFIND_RESPONSE_JSON', 'API', 'iFinD response JSON was invalid'))
           }
-        })
+        }
+        onResponseError = () => {
+          fail(safeError('IFIND_RESPONSE_FAILED', 'NETWORK', 'iFinD response failed'))
+        }
+        onResponseAborted = () => {
+          fail(safeError('IFIND_RESPONSE_ABORTED', 'NETWORK', 'iFinD response was aborted'))
+        }
+        try {
+          incoming.on('data', onResponseData)
+          incoming.on('end', onResponseEnd)
+          incoming.on('error', onResponseError)
+          incoming.on('aborted', onResponseAborted)
+        } catch {
+          fail(safeError('IFIND_RESPONSE_FAILED', 'NETWORK', 'iFinD response failed'))
+        }
       })
     } catch {
       fail(safeError('IFIND_NETWORK_FAILED', 'NETWORK', 'iFinD request failed'))
       return
     }
 
+    if (settled) {
+      destroy(outgoing)
+      return
+    }
+
     try {
-      outgoing.on('error', () => {
+      onRequestError = () => {
         fail(safeError('IFIND_NETWORK_FAILED', 'NETWORK', 'iFinD request failed'))
-      })
+      }
+      onRequestTimeout = () => {
+        fail(safeError('IFIND_TIMEOUT', 'NETWORK', 'iFinD request timed out'))
+      }
+      onSecureConnect = () => connectionEstablished()
+      onTransportConnected = () => connectionEstablished()
+      onRequestSocket = (socket) => {
+        try {
+          connectionSocket = socket
+          if (socket && socket.encrypted === true &&
+              socket.connecting === false && socket.secureConnecting === false) {
+            connectionEstablished()
+            return
+          }
+          if (socket && typeof socket.on === 'function') {
+            socket.on('secureConnect', onSecureConnect)
+          }
+        } catch {
+          fail(safeError('IFIND_NETWORK_FAILED', 'NETWORK', 'iFinD request failed'))
+        }
+      }
+      outgoing.on('error', onRequestError)
+      outgoing.on('socket', onRequestSocket)
+      outgoing.on('connected', onTransportConnected)
+      connectionTimer = setTimer(() => {
+        fail(safeError(
+          'IFIND_CONNECTION_TIMEOUT',
+          'NETWORK',
+          'iFinD connection timed out'
+        ))
+      }, 2000)
       if (typeof outgoing.setTimeout === 'function') {
-        outgoing.setTimeout(2000, () => {
-          try {
-            if (typeof outgoing.destroy === 'function') outgoing.destroy()
-          } catch {}
-          fail(safeError('IFIND_TIMEOUT', 'NETWORK', 'iFinD request timed out'))
-        })
+        outgoing.on('timeout', onRequestTimeout)
+        outgoing.setTimeout(2000)
       }
       totalTimer = setTimer(() => {
-        try {
-          if (typeof outgoing.destroy === 'function') outgoing.destroy()
-        } catch {}
         fail(safeError('IFIND_TIMEOUT', 'NETWORK', 'iFinD request timed out'))
       }, 5000)
       if (body !== undefined) outgoing.write(JSON.stringify(body))
