@@ -1,4 +1,5 @@
 const assert = require('node:assert/strict')
+const crypto = require('node:crypto')
 const fs = require('node:fs')
 const os = require('node:os')
 const path = require('node:path')
@@ -9,6 +10,10 @@ const sourceDir = path.join(rootDir, 'deploy/server')
 const installerSource = fs.readFileSync(path.join(sourceDir, 'install-deploy-v4.sh'), 'utf8')
 const gateSource = fs.readFileSync(path.join(sourceDir, 'kinvest-ssh-command-v3'), 'utf8')
 const targetCount = 10
+
+function sha256(contents) {
+  return crypto.createHash('sha256').update(contents).digest('hex')
+}
 
 function writeExecutable(file, source) {
   fs.writeFileSync(file, source, { mode: 0o755 })
@@ -752,6 +757,43 @@ PY
     for (const target of markerOnly.targets) assert.doesNotMatch(fs.readFileSync(target, 'utf8'), /^old-/)
   } finally {
     fs.rmSync(markerOnly.base, { recursive: true, force: true })
+  }
+
+  const legacyV1 = fixture({ replaceFailure: 0 })
+  try {
+    const backupRoot = path.join(legacyV1.serverRoot, 'install-backups/deploy-v4')
+    fs.mkdirSync(backupRoot, { recursive: true, mode: 0o700 })
+    const backup = fs.mkdtempSync(path.join(backupRoot, 'kinvest-deploy-v4-backup.'))
+    fs.chmodSync(backup, 0o700)
+    const manifest = ['kinvest-deploy-v4-install-backup-v1']
+    for (let index = 0; index < 9; index += 1) {
+      const contents = `legacy-${index}\n`
+      const asset = path.join(backup, `${index}.asset`)
+      fs.writeFileSync(asset, contents, { mode: 0o700 })
+      fs.chmodSync(asset, 0o700)
+      const metadata = fs.statSync(asset)
+      manifest.push(`${index}|true|${sha256(contents)}|${metadata.uid}:${metadata.gid}:700`)
+      fs.writeFileSync(legacyV1.targets[index], `interrupted-${index}\n`, { mode: 0o600 })
+    }
+    fs.writeFileSync(legacyV1.targets[9], 'legacy-transaction-untouched\n', { mode: 0o644 })
+    fs.chmodSync(legacyV1.targets[9], 0o644)
+    fs.writeFileSync(path.join(backup, 'manifest.txt'), `${manifest.join('\n')}\n`, { mode: 0o600 })
+    fs.writeFileSync(
+      path.join(legacyV1.serverRoot, 'state/install-v4.journal'),
+      `backup=${backup}\n`,
+      { mode: 0o600 }
+    )
+
+    const resumed = execute(legacyV1)
+    assert.notEqual(resumed.status, 0)
+    for (let index = 0; index < 9; index += 1) {
+      assert.equal(fs.readFileSync(legacyV1.targets[index], 'utf8'), `legacy-${index}\n`)
+      assert.equal(fs.statSync(legacyV1.targets[index]).mode & 0o777, 0o700)
+    }
+    assert.equal(fs.readFileSync(legacyV1.targets[9], 'utf8'), 'legacy-transaction-untouched\n')
+    assert.equal(fs.statSync(legacyV1.targets[9]).mode & 0o777, 0o644)
+  } finally {
+    fs.rmSync(legacyV1.base, { recursive: true, force: true })
   }
 
   for (const killStage of ['before-gate', 'after-gate', 'after-journal']) {

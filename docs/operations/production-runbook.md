@@ -207,6 +207,11 @@ sudo /usr/local/sbin/kinvest-nginx-config-installer-v1 "$candidate" "$candidate_
 哈希都等于候选，并再次执行 `nginx -t`。gate 非零立即触发回滚；旧 Nginx 仍为
 running 绝不构成成功。
 
+安装器先获取 `/root/docker/kinvest/state/deploy.lock`，再获取自身配置安装锁；任一锁
+被占用都必须停止，不得绕过或重试覆盖。正常安装后的目标固定为 `root:root 0600`；
+备份仍为 `root:root 0600`，但会另行记录事务前目标的 uid、gid 和 mode。若事务失败，
+回滚必须恢复原内容和原 uid、gid、mode，并在锁释放前完成验证。
+
 任一候选安装后的失败都会原子恢复备份，并再次调用同一 fixed-IP gate 重建旧
 Nginx，再核对旧哈希、固定 IP 和 `nginx -t`。成功或失败证据都保留在带 UTC
 时间戳的备份目录；输出仅含稳定状态码、该目录和配置哈希。若输出
