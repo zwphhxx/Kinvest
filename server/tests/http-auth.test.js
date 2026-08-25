@@ -359,6 +359,87 @@ async function testAdminFlowAndCsrf() {
   const running = await start(runtime)
   const adminCookie = `__Host-kinvest-admin=${ADMIN_TOKEN}`
   try {
+    const anonymousMalformedApproval = await request(
+      running.baseUrl,
+      `/api/admin/device-requests/${REQUEST_ID}/approve`,
+      {
+        method: 'POST',
+        headers: proxyHeaders({ 'content-type': 'application/json' }),
+        body: '{'
+      }
+    )
+    assert.equal(anonymousMalformedApproval.status, 401)
+    assert.deepEqual(anonymousMalformedApproval.body, { error: 'ADMIN_AUTH_REQUIRED' })
+
+    const anonymousInvalidApproval = await request(
+      running.baseUrl,
+      `/api/admin/device-requests/${REQUEST_ID}/approve`,
+      { method: 'POST', headers: proxyHeaders(), json: {} }
+    )
+    assert.equal(anonymousInvalidApproval.status, 401)
+    assert.deepEqual(anonymousInvalidApproval.body, { error: 'ADMIN_AUTH_REQUIRED' })
+
+    const anonymousMalformedRevokeAll = await request(
+      running.baseUrl,
+      '/api/admin/devices/revoke-all',
+      {
+        method: 'POST',
+        headers: proxyHeaders({ 'content-type': 'application/json' }),
+        body: '{'
+      }
+    )
+    assert.equal(anonymousMalformedRevokeAll.status, 401)
+    assert.deepEqual(anonymousMalformedRevokeAll.body, { error: 'ADMIN_AUTH_REQUIRED' })
+
+    const anonymousInvalidRevokeAll = await request(
+      running.baseUrl,
+      '/api/admin/devices/revoke-all',
+      { method: 'POST', headers: proxyHeaders(), json: {} }
+    )
+    assert.equal(anonymousInvalidRevokeAll.status, 401)
+    assert.deepEqual(anonymousInvalidRevokeAll.body, { error: 'ADMIN_AUTH_REQUIRED' })
+
+    const anonymousInvalidRevoke = await request(
+      running.baseUrl,
+      '/api/admin/devices/credential-1/revoke',
+      { method: 'POST', headers: proxyHeaders(), json: { unexpected: true } }
+    )
+    assert.equal(anonymousInvalidRevoke.status, 401)
+    assert.deepEqual(anonymousInvalidRevoke.body, { error: 'ADMIN_AUTH_REQUIRED' })
+
+    const crossOriginMalformedApproval = await request(
+      running.baseUrl,
+      `/api/admin/device-requests/${REQUEST_ID}/approve`,
+      {
+        method: 'POST',
+        headers: proxyHeaders({
+          origin: 'https://evil.example',
+          'content-type': 'application/json'
+        }),
+        body: '{'
+      }
+    )
+    assert.equal(crossOriginMalformedApproval.status, 403)
+    assert.deepEqual(crossOriginMalformedApproval.body, { error: 'ORIGIN_INVALID' })
+
+    for (const pathname of [
+      '/api/admin/devices/revoke-all',
+      '/api/admin/devices/credential-1/revoke'
+    ]) {
+      const crossOrigin = await request(running.baseUrl, pathname, {
+        method: 'POST',
+        headers: proxyHeaders({
+          origin: 'https://evil.example',
+          cookie: adminCookie,
+          'x-kinvest-csrf': CSRF_TOKEN,
+          'content-type': 'application/json'
+        }),
+        body: '{'
+      })
+      assert.equal(crossOrigin.status, 403)
+      assert.deepEqual(crossOrigin.body, { error: 'ORIGIN_INVALID' })
+    }
+
     const login = await request(running.baseUrl, '/api/admin/login', {
       method: 'POST', headers: proxyHeaders(), json: { password: 'correct-password' }
     })
@@ -382,9 +463,51 @@ async function testAdminFlowAndCsrf() {
     const missingCsrf = await request(
       running.baseUrl,
       `/api/admin/device-requests/${REQUEST_ID}/approve`,
-      { method: 'POST', headers: proxyHeaders({ cookie: adminCookie }), json: { requestCode: '123456' } }
+      {
+        method: 'POST',
+        headers: proxyHeaders({
+          cookie: adminCookie,
+          'content-type': 'application/json'
+        }),
+        body: '{'
+      }
     )
     assert.equal(missingCsrf.status, 403)
+    assert.deepEqual(missingCsrf.body, { error: 'ADMIN_CSRF_INVALID' })
+
+    for (const pathname of [
+      '/api/admin/devices/revoke-all',
+      '/api/admin/devices/credential-1/revoke'
+    ]) {
+      const missingMutationCsrf = await request(running.baseUrl, pathname, {
+        method: 'POST',
+        headers: proxyHeaders({
+          cookie: adminCookie,
+          'content-type': 'application/json'
+        }),
+        body: '{'
+      })
+      assert.equal(missingMutationCsrf.status, 403)
+      assert.deepEqual(missingMutationCsrf.body, { error: 'ADMIN_CSRF_INVALID' })
+    }
+
+    for (const pathname of [
+      `/api/admin/device-requests/${REQUEST_ID}/approve`,
+      '/api/admin/devices/revoke-all',
+      '/api/admin/devices/credential-1/revoke'
+    ]) {
+      const authenticatedMalformed = await request(running.baseUrl, pathname, {
+        method: 'POST',
+        headers: proxyHeaders({
+          cookie: adminCookie,
+          'x-kinvest-csrf': CSRF_TOKEN,
+          'content-type': 'application/json'
+        }),
+        body: '{'
+      })
+      assert.equal(authenticatedMalformed.status, 400)
+      assert.deepEqual(authenticatedMalformed.body, { error: 'JSON_INVALID' })
+    }
 
     const approved = await request(
       running.baseUrl,
