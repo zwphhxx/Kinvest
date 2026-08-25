@@ -30,7 +30,7 @@ directory_attributes() {
 [[ "$(directory_attributes "$PROJECT_ROOT" 2>/dev/null)" == "$ROOT_UID:$ROOT_GID:755:1" ]] || fail KINVEST_NGINX_FIXED_IP_PROJECT_INVALID
 for specification in \
   "$BASE_COMPOSE:644" \
-  "$NGINX_OVERLAY:644" \
+  "$NGINX_OVERLAY:600" \
   "$FIXED_OVERLAY:644" \
   "$ACCESS_NETWORK_CONFIG:600" \
   "$CONTRACT:755"; do

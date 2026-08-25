@@ -36,7 +36,9 @@ The reviewed root project is fixed to workdir `/root/docker`, base file
 `/root/docker/docker-compose.kinvest-nginx.yml`, and trusted fixed-IP overlay
 `/root/docker/kinvest/docker-compose.nginx-fixed-ip.yml`. The v4 installer owns
 and hashes the last file but never applies it, invokes Compose, or restarts a
-container.
+container. The pre-existing Nginx overlay must remain a root-owned, regular,
+single-linked `0600` file; the gate rejects broader permissions instead of
+weakening the production file to satisfy the check.
 
 Gate 1 is read-only:
 

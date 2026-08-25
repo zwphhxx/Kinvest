@@ -12,6 +12,7 @@ const overlaySource = path.join(rootDir, 'deploy/server/docker-compose.nginx-fix
 function write(file, contents, mode = 0o644) {
   fs.mkdirSync(path.dirname(file), { recursive: true })
   fs.writeFileSync(file, contents, { mode })
+  fs.chmodSync(file, mode)
 }
 
 function fixture({
@@ -20,6 +21,7 @@ function fixture({
   missingIp = false,
   renderMismatch = false,
   oldCompose = false,
+  nginxOverlayMode = 0o600,
   healthPayload = JSON.stringify({
     status: 'ok',
     service: 'kinvest',
@@ -41,8 +43,9 @@ function fixture({
   const networkConfig = path.join(etc, 'access-control-network.conf')
   const contract = path.join(bin, 'contract')
   for (const directory of [kinvest, etc, bin, runRoot]) fs.mkdirSync(directory, { recursive: true })
+  fs.chmodSync(project, 0o755)
   write(baseCompose, 'services:\n  nginx:\n    image: nginx\n')
-  write(nginxOverlay, 'services:\n  nginx:\n    networks:\n      - web\n')
+  write(nginxOverlay, 'services:\n  nginx:\n    networks:\n      - web\n', nginxOverlayMode)
   if (!missingOverlay) {
     fs.copyFileSync(overlaySource, fixedOverlay)
     fs.chmodSync(fixedOverlay, 0o644)
@@ -150,6 +153,7 @@ async function run() {
   for (const invalid of [
     { name: 'overlay-missing', options: { missingOverlay: true } },
     { name: 'overlay-hash', options: { tamperOverlay: true } },
+    { name: 'nginx-overlay-mode', options: { nginxOverlayMode: 0o644 } },
     { name: 'env-missing', options: { missingIp: true } },
     { name: 'config-mismatch', options: { renderMismatch: true } },
     { name: 'compose-version', options: { oldCompose: true } }
