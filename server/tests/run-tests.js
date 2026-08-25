@@ -24,6 +24,8 @@ const tests = [
   require('./device-auth-cli.test'),
   require('./cvm-ssm-secret-provider.test'),
   require('./github-tmpfs-secret-provider.test'),
+  require('./ifind-secret-contract.test'),
+  require('./ifind-tmpfs-secret-provider.test'),
   require('./secret-bootstrap-contract.test'),
   require('./tencent-ssm-client.test'),
   require('./secret-bootstrap.test'),
