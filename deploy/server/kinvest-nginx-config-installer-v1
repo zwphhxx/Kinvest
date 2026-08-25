@@ -56,7 +56,8 @@ install -d -o "$ROOT_UID" -g "$ROOT_GID" -m 0700 "$BACKUP_ROOT"
 exec 9>"$LOCK_FILE"
 flock -n 9 || fail KINVEST_NGINX_CONFIG_LOCKED
 
-snapshot="$(mktemp "$RUN_ROOT/kinvest-nginx-config.candidate.XXXXXX")"
+snapshot=''
+snapshot_prefix="$RUN_ROOT/kinvest-nginx-config.candidate.$$."
 temporary=''
 backup=''
 container_candidate="/tmp/kinvest-nginx-config-installer-v1.$$"
@@ -116,7 +117,7 @@ cleanup() {
   trap - EXIT HUP INT TERM
   set +e
   docker exec "$NGINX_CONTAINER" rm -f -- "$container_candidate" >/dev/null 2>&1
-  rm -f -- "$snapshot" "$temporary"
+  rm -f -- "$snapshot" "$temporary" "${snapshot_prefix}"*
   if [[ "$installed" == true && "$completed" != true ]]; then
     [[ -n "$failure_code" ]] || failure_code=KINVEST_NGINX_CONFIG_INTERRUPTED
     restore_previous_config || rollback_ok='false'
@@ -137,6 +138,7 @@ trap 'failure_code=KINVEST_NGINX_CONFIG_INTERRUPTED; exit 129' HUP
 trap 'failure_code=KINVEST_NGINX_CONFIG_INTERRUPTED; exit 130' INT
 trap 'failure_code=KINVEST_NGINX_CONFIG_INTERRUPTED; exit 143' TERM
 
+snapshot="$(mktemp "${snapshot_prefix}XXXXXX")" || fail KINVEST_NGINX_CONFIG_TEMPORARY_FAILED
 set +e
 python3 - "$candidate" "$snapshot" "$MAX_CONFIG_BYTES" >/dev/null 2>&1 <<'PY'
 import os
@@ -207,9 +209,9 @@ temporary="$(mktemp "$TARGET_DIR/.nginx.conf.install.XXXXXX")" || fail KINVEST_N
 install -o "$ROOT_UID" -g "$ROOT_GID" -m 0600 "$snapshot" "$temporary" || fail KINVEST_NGINX_CONFIG_INSTALL_FAILED
 [[ "$(file_hash "$temporary")" == "$expected_hash" ]] || fail KINVEST_NGINX_CONFIG_INSTALL_FAILED
 fsync_file "$temporary" || fail KINVEST_NGINX_CONFIG_INSTALL_FAILED
-mv -fT "$temporary" "$TARGET" || fail KINVEST_NGINX_CONFIG_INSTALL_FAILED
-temporary=''
 installed='true'
+mv -fT "$temporary" "$TARGET" || { failure_code=KINVEST_NGINX_CONFIG_INSTALL_FAILED; exit 1; }
+temporary=''
 fsync_directory "$TARGET_DIR" || { failure_code=KINVEST_NGINX_CONFIG_INSTALL_FAILED; exit 1; }
 
 "$GATE" apply >/dev/null 2>&1 || { failure_code=KINVEST_NGINX_CONFIG_GATE_APPLY_FAILED; exit 1; }

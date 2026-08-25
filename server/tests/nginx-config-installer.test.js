@@ -65,11 +65,26 @@ if [ "\${1:-}" = -u ]; then printf '%s\\n' "\${FAKE_UID:-${process.getuid()}}"; 
 exec /usr/bin/id "$@"
 `)
   writeExecutable(path.join(bin, 'flock'), '#!/bin/sh\n[ "${LOCK_FAIL:-0}" = 1 ] && exit 1\nexit 0\n')
+  writeExecutable(path.join(bin, 'mktemp'), `#!/usr/bin/env bash
+set -euo pipefail
+created="$(/usr/bin/mktemp "$@")"
+printf '%s\\n' "$created"
+if [[ -n "\${SIGNAL_AFTER_SNAPSHOT_CREATE:-}" && "$*" == *kinvest-nginx-config.candidate.* ]]; then
+  kill -s "$SIGNAL_AFTER_SNAPSHOT_CREATE" "$PPID"
+  sleep 1
+fi
+`)
   writeExecutable(path.join(bin, 'mv'), `#!/usr/bin/env bash
 if [[ "\${FAIL_ROLLBACK_MV:-0}" == 1 && "$*" == *'.nginx.conf.rollback.'* ]]; then exit 1; fi
 args=()
 for argument in "$@"; do [[ "$argument" == -fT || "$argument" == -f ]] || args+=("$argument"); done
-exec /bin/mv -f "\${args[@]}"
+/bin/mv -f "\${args[@]}"
+status=$?
+if [[ -n "\${SIGNAL_AFTER_INSTALL_MV:-}" && "$*" == *'.nginx.conf.install.'* ]]; then
+  kill -s "$SIGNAL_AFTER_INSTALL_MV" "$PPID"
+  sleep 1
+fi
+exit "$status"
 `)
   writeExecutable(path.join(bin, 'docker'), `#!/usr/bin/env bash
 set -euo pipefail
@@ -139,7 +154,7 @@ printf 'KINVEST_NGINX_FIXED_IP_APPLY_OK ip=%s health=ready https=ready\\n' "$(ca
   writeExecutable(installer, source)
   return {
     base, backupRoot, candidate, containerHash, gateCount, installer, kinvestId,
-    nginxId, nginxIp, operations, target, targetDir, containerCandidate
+    nginxId, nginxIp, operations, target, targetDir, runRoot, containerCandidate
   }
 }
 
@@ -167,6 +182,10 @@ function assertStableFailure(result, code) {
 
 function assertTemporaryFilesCleaned(context) {
   assert.equal(fs.existsSync(context.containerCandidate), false)
+  assert.deepEqual(
+    fs.readdirSync(context.runRoot).filter((entry) => entry.startsWith('kinvest-nginx-config.candidate.')),
+    []
+  )
   assert.deepEqual(
     fs.readdirSync(context.targetDir).filter((entry) => entry.startsWith('.nginx.conf.')),
     []
@@ -216,6 +235,33 @@ async function run() {
     assert.equal(fs.readFileSync(locked.gateCount, 'utf8'), '0\n')
     assert.equal(backupDirectories(locked).length, 0)
   } finally { fs.rmSync(locked.base, { recursive: true, force: true }) }
+
+  const signalCase = process.env.KINVEST_NGINX_CONFIG_SIGNAL_CASE || 'all'
+  if (signalCase !== 'install-move') {
+    const snapshotSignal = fixture()
+    try {
+      const result = execute(snapshotSignal, snapshotSignal.candidate, undefined, {
+        SIGNAL_AFTER_SNAPSHOT_CREATE: 'TERM'
+      })
+      assert.notEqual(result.status, 0)
+      assertOldState(snapshotSignal)
+      assert.equal(fs.readFileSync(snapshotSignal.gateCount, 'utf8'), '0\n')
+      assertTemporaryFilesCleaned(snapshotSignal)
+    } finally { fs.rmSync(snapshotSignal.base, { recursive: true, force: true }) }
+  }
+
+  if (signalCase !== 'snapshot') {
+    const installMoveSignal = fixture()
+    try {
+      const result = execute(installMoveSignal, installMoveSignal.candidate, undefined, {
+        SIGNAL_AFTER_INSTALL_MV: 'TERM'
+      })
+      assertStableFailure(result, 'KINVEST_NGINX_CONFIG_INTERRUPTED')
+      assertOldState(installMoveSignal)
+      assert.equal(fs.readFileSync(installMoveSignal.gateCount, 'utf8'), '1\n')
+      assertTemporaryFilesCleaned(installMoveSignal)
+    } finally { fs.rmSync(installMoveSignal.base, { recursive: true, force: true }) }
+  }
 
   for (const scenario of [
     { code: 'KINVEST_NGINX_CONFIG_GATE_APPLY_FAILED', env: { FAIL_GATE_CALLS: '1' } },
