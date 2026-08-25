@@ -142,6 +142,7 @@ function createRequestStub(responseBodies) {
       queueMicrotask(() => {
         const incoming = new EventEmitter()
         incoming.statusCode = 200
+        incoming.destroy = () => {}
         callback(incoming)
         incoming.emit('data', Buffer.from(JSON.stringify(body)))
         incoming.emit('end')
@@ -242,7 +243,7 @@ function createRawRequestStub(scenarios) {
   return { calls, request }
 }
 
-function createManualRequestTransport() {
+function createManualRequestTransport({ synchronousConnectedOnListener = false } = {}) {
   const calls = []
 
   function request(url, options, callback) {
@@ -255,6 +256,12 @@ function createManualRequestTransport() {
       destroyCount: 0
     }
     const outgoing = new EventEmitter()
+    const addListener = outgoing.on
+    outgoing.on = function on(event, listener) {
+      const result = addListener.call(this, event, listener)
+      if (synchronousConnectedOnListener && event === 'connected') listener()
+      return result
+    }
     call.outgoing = outgoing
     outgoing.write = () => { call.writeCount += 1 }
     outgoing.end = () => { call.endCount += 1 }
@@ -268,7 +275,7 @@ function createManualRequestTransport() {
       incoming.on('error', () => {})
       callback(incoming)
       for (const chunk of chunks) incoming.emit('data', Buffer.from(chunk))
-      incoming.emit(event)
+      if (event) incoming.emit(event)
       return incoming
     }
     calls.push(call)
@@ -1206,12 +1213,185 @@ async function run() {
       () => invalidAccessClient.diagnose({ refreshToken: REFRESH_TOKEN }),
       (error) => error.code === 'IFIND_RESPONSE_SHAPE' && error.class === 'API'
     )
-    assert.equal(invalidAccessTransport.calls.length, 1)
+  assert.equal(invalidAccessTransport.calls.length, 1)
     assert.equal(
       new URL(invalidAccessTransport.calls[0].url).pathname,
       '/api/v1/get_access_token'
     )
   }
+
+  const overlappingTimers = []
+  const overlappingTransport = createManualRequestTransport()
+  const overlappingClient = createIfindHttpClient({
+    request: overlappingTransport.request,
+    setTimer(handler, milliseconds) {
+      const timer = { handler, milliseconds, cleared: false }
+      overlappingTimers.push(timer)
+      return timer
+    },
+    clearTimer(timer) {
+      timer.cleared = true
+    }
+  })
+  const overlappingDiagnosis = overlappingClient.diagnose({ refreshToken: REFRESH_TOKEN })
+  const firstOverlappingResponse = overlappingTransport.calls[0].respond({ event: null })
+  const secondOverlappingResponse = overlappingTransport.calls[0].respond({ event: null })
+  const overlappingTotalTimer = overlappingTimers.find((timer) => timer.milliseconds === 5000)
+  if (!overlappingTotalTimer.cleared) overlappingTotalTimer.handler()
+  await assert.rejects(
+    () => overlappingDiagnosis,
+    (error) => error.code === 'IFIND_DUPLICATE_RESPONSE' && error.class === 'NETWORK'
+  )
+  assert.equal(overlappingTransport.calls[0].destroyCount, 1)
+  assert.equal(firstOverlappingResponse.destroyCount, 1)
+  assert.equal(secondOverlappingResponse.destroyCount, 1)
+  assert.equal(firstOverlappingResponse.listenerCount('data'), 0)
+  assert.equal(firstOverlappingResponse.listenerCount('end'), 0)
+  assert.equal(firstOverlappingResponse.listenerCount('aborted'), 0)
+  assert.equal(firstOverlappingResponse.listenerCount('error'), 1)
+  assert.equal(secondOverlappingResponse.listenerCount('data'), 0)
+  assert.equal(secondOverlappingResponse.listenerCount('end'), 0)
+  assert.equal(secondOverlappingResponse.listenerCount('aborted'), 0)
+  assert.equal(secondOverlappingResponse.listenerCount('error'), 1)
+  assert.equal(overlappingTimers.every((timer) => timer.cleared), true)
+
+  const earlyConnectedTimers = []
+  const earlyConnectedTransport = createManualRequestTransport({
+    synchronousConnectedOnListener: true
+  })
+  const earlyConnectedClient = createIfindHttpClient({
+    request: earlyConnectedTransport.request,
+    now: () => new Date('2026-08-25T16:30:00.000Z'),
+    setTimer(handler, milliseconds) {
+      const timer = { handler, milliseconds, cleared: false }
+      earlyConnectedTimers.push(timer)
+      return timer
+    },
+    clearTimer(timer) {
+      timer.cleared = true
+    }
+  })
+  const earlyConnectedDiagnosis = earlyConnectedClient.diagnose({ refreshToken: REFRESH_TOKEN })
+  assert.deepEqual(earlyConnectedTimers.map((timer) => timer.milliseconds), [5000])
+  earlyConnectedTransport.calls[0].respond({ chunks: [JSON.stringify(accessTokenSuccess)] })
+  await new Promise((resolve) => setImmediate(resolve))
+  earlyConnectedTransport.calls[1].respond({ chunks: [JSON.stringify(tradeDatesSuccess)] })
+  await earlyConnectedDiagnosis
+  assert.equal(earlyConnectedTimers.every((timer) => timer.cleared), true)
+
+  const duringTimerTransport = createManualRequestTransport()
+  const duringTimerHandles = []
+  const duringTimerClient = createIfindHttpClient({
+    request: duringTimerTransport.request,
+    now: () => new Date('2026-08-25T16:30:00.000Z'),
+    setTimer(handler, milliseconds) {
+      const timer = { handler, milliseconds, cleared: false }
+      duringTimerHandles.push(timer)
+      if (milliseconds === 2000) duringTimerTransport.calls[0].outgoing.emit('connected')
+      return timer
+    },
+    clearTimer(timer) {
+      timer.cleared = true
+    }
+  })
+  const duringTimerDiagnosis = duringTimerClient.diagnose({ refreshToken: REFRESH_TOKEN })
+  assert.equal(duringTimerHandles[0].milliseconds, 2000)
+  assert.equal(duringTimerHandles[0].cleared, true)
+  duringTimerTransport.calls[0].respond({ chunks: [JSON.stringify(accessTokenSuccess)] })
+  await new Promise((resolve) => setImmediate(resolve))
+  duringTimerTransport.calls[1].respond({ chunks: [JSON.stringify(tradeDatesSuccess)] })
+  await duringTimerDiagnosis
+  assert.equal(duringTimerHandles.every((timer) => timer.cleared), true)
+
+  const hostileResponseMarker = `hostile response metadata ${ACCESS_TOKEN} ${SYNTHETIC_REQUEST_ID}`
+  const hostileResponseEmitter = new EventEmitter()
+  hostileResponseEmitter.destroy = () => {}
+  const hostileResponseValues = [
+    null,
+    42,
+    {},
+    new Proxy(hostileResponseEmitter, {
+      get(target, property, receiver) {
+        if (property === 'statusCode') throw new Error(hostileResponseMarker)
+        return Reflect.get(target, property, receiver)
+      }
+    })
+  ]
+  for (const hostileResponse of hostileResponseValues) {
+    const hostileResponseTimers = []
+    const hostileResponseTransport = createManualRequestTransport()
+    const hostileResponseClient = createIfindHttpClient({
+      request: hostileResponseTransport.request,
+      setTimer(handler, milliseconds) {
+        const timer = { handler, milliseconds, cleared: false }
+        hostileResponseTimers.push(timer)
+        return timer
+      },
+      clearTimer(timer) {
+        timer.cleared = true
+      }
+    })
+    let callbackThrown = null
+    const hostileResponseExecution = await captureGlobalOutput(async () => {
+      const diagnosis = hostileResponseClient.diagnose({ refreshToken: REFRESH_TOKEN })
+      try {
+        hostileResponseTransport.calls[0].callback(hostileResponse)
+      } catch (error) {
+        callbackThrown = error
+      }
+      const totalTimer = hostileResponseTimers.find((timer) => timer.milliseconds === 5000)
+      if (totalTimer && !totalTimer.cleared) totalTimer.handler()
+      return diagnosis
+    })
+    assert.equal(callbackThrown, null)
+    assert.equal(hostileResponseExecution.status, 'rejected')
+    assert.equal(hostileResponseExecution.reason.code, 'IFIND_RESPONSE_INVALID')
+    assert.equal(hostileResponseExecution.reason.class, 'NETWORK')
+    assert.equal(hostileResponseTransport.calls[0].destroyCount, 1)
+    assert.equal(hostileResponseTimers.every((timer) => timer.cleared), true)
+    assert.equal(hostileResponseTransport.calls[0].outgoing.listenerCount('error'), 0)
+    assertNoProviderLeak({
+      scenario: 'hostile response metadata',
+      value: hostileResponseExecution.reason,
+      logEntries: [],
+      globalOutputEntries: hostileResponseExecution.entries,
+      rawProviderMarkers: [hostileResponseMarker]
+    })
+  }
+
+  const synchronousResponseBodies = [accessTokenSuccess, tradeDatesSuccess]
+  const synchronousResponseCalls = []
+  function synchronousResponseRequest(url, options, callback) {
+    const call = { url: String(url), options, destroyCount: 0 }
+    const outgoing = new EventEmitter()
+    outgoing.write = () => {}
+    outgoing.end = () => {}
+    outgoing.destroy = () => { call.destroyCount += 1 }
+    outgoing.setTimeout = () => {}
+    call.outgoing = outgoing
+    synchronousResponseCalls.push(call)
+    const incoming = new EventEmitter()
+    incoming.statusCode = 200
+    incoming.destroy = () => {}
+    incoming.on('error', () => {})
+    callback(incoming)
+    incoming.emit('data', Buffer.from(JSON.stringify(synchronousResponseBodies.shift())))
+    incoming.emit('end')
+    return outgoing
+  }
+  const synchronousResponseClient = createIfindHttpClient({
+    request: synchronousResponseRequest,
+    now: () => new Date('2026-08-25T16:30:00.000Z'),
+    setTimer() {
+      throw new Error('timer must not arm after synchronous response')
+    }
+  })
+  const synchronousResponseResult = await synchronousResponseClient.diagnose({
+    refreshToken: REFRESH_TOKEN
+  })
+  assert.equal(synchronousResponseResult.dataVol, 11)
+  assert.equal(synchronousResponseCalls.length, 2)
+  assert.equal(synchronousResponseCalls.every((call) => call.destroyCount === 1), true)
 }
 
 module.exports = { run }

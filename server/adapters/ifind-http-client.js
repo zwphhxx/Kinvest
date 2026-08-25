@@ -129,70 +129,88 @@ function requestJson(request, path, headers, body, setTimer, clearTimer) {
           ...headers
         }
       }, (response) => {
-        if (settled) {
-          destroy(response)
-          return
-        }
-        incoming = response
-        connectionEstablished()
-        if (settled) {
-          destroy(response)
-          return
-        }
-        const successfulStatus = Number.isInteger(incoming.statusCode) &&
-          incoming.statusCode >= 200 && incoming.statusCode <= 299
-        const chunks = []
-        let responseBytes = 0
-        onResponseData = (chunk) => {
-          if (settled) return
-          let buffer
-          try {
-            buffer = Buffer.from(chunk)
-          } catch {
-            fail(safeError('IFIND_RESPONSE_FAILED', 'NETWORK', 'iFinD response failed'))
-            return
-          }
-          responseBytes += buffer.length
-          if (responseBytes > 256 * 1024) {
-            fail(safeError(
-              'IFIND_RESPONSE_TOO_LARGE',
-              'API',
-              'iFinD response exceeded the size limit'
-            ))
-            return
-          }
-          chunks.push(buffer)
-        }
-        onResponseEnd = () => {
-          if (settled) return
-          if (!successfulStatus) {
-            fail(safeError('IFIND_HTTP_STATUS', 'API', 'iFinD HTTP request failed'))
-            return
-          }
-          let text
-          try {
-            text = new TextDecoder('utf-8', { fatal: true }).decode(Buffer.concat(chunks))
-          } catch {
-            fail(safeError(
-              'IFIND_RESPONSE_ENCODING',
-              'API',
-              'iFinD response encoding was invalid'
-            ))
-            return
-          }
-          try {
-            succeed(JSON.parse(text))
-          } catch {
-            fail(safeError('IFIND_RESPONSE_JSON', 'API', 'iFinD response JSON was invalid'))
-          }
-        }
-        onResponseError = () => {
-          fail(safeError('IFIND_RESPONSE_FAILED', 'NETWORK', 'iFinD response failed'))
-        }
-        onResponseAborted = () => {
-          fail(safeError('IFIND_RESPONSE_ABORTED', 'NETWORK', 'iFinD response was aborted'))
-        }
         try {
+          if (settled) {
+            destroy(response)
+            return
+          }
+          if (incoming !== null) {
+            destroy(response)
+            fail(safeError(
+              'IFIND_DUPLICATE_RESPONSE',
+              'NETWORK',
+              'iFinD returned duplicate responses'
+            ))
+            return
+          }
+          const responseType = typeof response
+          if ((responseType !== 'object' && responseType !== 'function') ||
+              response === null ||
+              typeof response.on !== 'function' ||
+              typeof response.removeListener !== 'function' ||
+              typeof response.destroy !== 'function') {
+            throw new Error('invalid response')
+          }
+          incoming = response
+          connectionEstablished()
+          if (settled) {
+            destroy(response)
+            return
+          }
+          const statusCode = incoming.statusCode
+          const successfulStatus = Number.isInteger(statusCode) &&
+            statusCode >= 200 && statusCode <= 299
+          const chunks = []
+          let responseBytes = 0
+          onResponseData = (chunk) => {
+            if (settled) return
+            let buffer
+            try {
+              buffer = Buffer.from(chunk)
+            } catch {
+              fail(safeError('IFIND_RESPONSE_FAILED', 'NETWORK', 'iFinD response failed'))
+              return
+            }
+            responseBytes += buffer.length
+            if (responseBytes > 256 * 1024) {
+              fail(safeError(
+                'IFIND_RESPONSE_TOO_LARGE',
+                'API',
+                'iFinD response exceeded the size limit'
+              ))
+              return
+            }
+            chunks.push(buffer)
+          }
+          onResponseEnd = () => {
+            if (settled) return
+            if (!successfulStatus) {
+              fail(safeError('IFIND_HTTP_STATUS', 'API', 'iFinD HTTP request failed'))
+              return
+            }
+            let text
+            try {
+              text = new TextDecoder('utf-8', { fatal: true }).decode(Buffer.concat(chunks))
+            } catch {
+              fail(safeError(
+                'IFIND_RESPONSE_ENCODING',
+                'API',
+                'iFinD response encoding was invalid'
+              ))
+              return
+            }
+            try {
+              succeed(JSON.parse(text))
+            } catch {
+              fail(safeError('IFIND_RESPONSE_JSON', 'API', 'iFinD response JSON was invalid'))
+            }
+          }
+          onResponseError = () => {
+            fail(safeError('IFIND_RESPONSE_FAILED', 'NETWORK', 'iFinD response failed'))
+          }
+          onResponseAborted = () => {
+            fail(safeError('IFIND_RESPONSE_ABORTED', 'NETWORK', 'iFinD response was aborted'))
+          }
           incoming.on('data', onResponseData)
           if (settled) return
           incoming.on('end', onResponseEnd)
@@ -201,7 +219,12 @@ function requestJson(request, path, headers, body, setTimer, clearTimer) {
           if (settled) return
           incoming.on('aborted', onResponseAborted)
         } catch {
-          fail(safeError('IFIND_RESPONSE_FAILED', 'NETWORK', 'iFinD response failed'))
+          if (response !== incoming) destroy(response)
+          fail(safeError(
+            'IFIND_RESPONSE_INVALID',
+            'NETWORK',
+            'iFinD response metadata was invalid'
+          ))
         }
       })
     } catch {
@@ -244,25 +267,29 @@ function requestJson(request, path, headers, body, setTimer, clearTimer) {
       if (settled) return
       outgoing.on('connected', onTransportConnected)
       if (settled) return
-      let connectionTimerStarting = true
-      let connectionTimerFired = false
-      connectionTimer = setTimer(() => {
-        connectionTimerFired = true
-        if (!connectionTimerStarting) {
+      if (!connected) {
+        let connectionTimerStarting = true
+        let connectionTimerFired = false
+        connectionTimer = setTimer(() => {
+          connectionTimerFired = true
+          if (!connectionTimerStarting) {
+            fail(safeError(
+              'IFIND_CONNECTION_TIMEOUT',
+              'NETWORK',
+              'iFinD connection timed out'
+            ))
+          }
+        }, 2000)
+        connectionTimerStarting = false
+        if (connected) {
+          clearConnectionLifecycle()
+        } else if (connectionTimerFired) {
           fail(safeError(
             'IFIND_CONNECTION_TIMEOUT',
             'NETWORK',
             'iFinD connection timed out'
           ))
         }
-      }, 2000)
-      connectionTimerStarting = false
-      if (connectionTimerFired) {
-        fail(safeError(
-          'IFIND_CONNECTION_TIMEOUT',
-          'NETWORK',
-          'iFinD connection timed out'
-        ))
       }
       if (settled) return
       if (!connected && typeof outgoing.setTimeout === 'function') {
