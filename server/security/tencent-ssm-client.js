@@ -1,3 +1,5 @@
+/// <reference path="./tencentcloud-sdk-nodejs-ssm.d.ts" />
+
 const REGION = 'ap-shanghai'
 const ENDPOINT = 'ssm.tencentcloudapi.com'
 
@@ -16,8 +18,7 @@ class TencentSsmClientError extends Error {
 
 /** @returns {any} */
 function defaultSdkLoader() {
-  const moduleName = ['tencentcloud-sdk-nodejs', 'ssm'].join('-')
-  return require(moduleName)
+  return require('tencentcloud-sdk-nodejs-ssm')
 }
 
 function validCredentials(credentials) {
