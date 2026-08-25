@@ -1,4 +1,5 @@
 const assert = require('node:assert/strict')
+const { EventEmitter } = require('node:events')
 const { DatabaseSync } = require('node:sqlite')
 
 const VERSION_ID = 'v20260826-001'
@@ -73,6 +74,30 @@ function clientFailure(errorClass, overrides = {}) {
   error.RequestId = 'raw-request-id'
   Object.assign(error, overrides)
   return error
+}
+
+function createRequestStub(responseBodies) {
+  const pending = [...responseBodies]
+  const calls = []
+  function request(url, options, callback) {
+    calls.push(String(url))
+    const outgoing = new EventEmitter()
+    outgoing.write = () => {}
+    outgoing.end = () => {
+      const body = pending.shift()
+      queueMicrotask(() => {
+        const incoming = new EventEmitter()
+        incoming.statusCode = 200
+        incoming.destroy = () => {}
+        callback(incoming)
+        incoming.emit('data', Buffer.from(JSON.stringify(body)))
+        incoming.emit('end')
+      })
+    }
+    outgoing.destroy = () => {}
+    return outgoing
+  }
+  return { calls, request }
 }
 
 async function run() {
@@ -184,6 +209,14 @@ async function run() {
     {
       error: clientFailure('NOT_APPROVED', { requestCount: 1 }),
       expected: { authStatus: 'unknown', probeStatus: 'failed', safeErrorClass: 'API', requestCount: 1 }
+    },
+    {
+      error: clientFailure('NETWORK', { requestCount: Number.MAX_SAFE_INTEGER }),
+      expected: { authStatus: 'unknown', probeStatus: 'failed', safeErrorClass: 'NETWORK', requestCount: 1 }
+    },
+    {
+      error: clientFailure('NETWORK', { requestCount: -1 }),
+      expected: { authStatus: 'unknown', probeStatus: 'failed', safeErrorClass: 'NETWORK', requestCount: 1 }
     }
   ]) {
     const state = createEnabledService()
@@ -200,6 +233,31 @@ async function run() {
     assert.equal(state.repository.latest().safeErrorClass, scenario.expected.safeErrorClass)
     state.database.close()
   }
+
+  const { createIfindHttpClient } = require('../adapters/ifind-http-client')
+  const exhaustedTransport = createRequestStub([
+    { errorcode: 0, data: { access_token: 'synthetic-access-token' } },
+    { errorcode: -401, errmsg: 'synthetic first rejection' },
+    { errorcode: 0, data: { access_token: 'synthetic-recovered-access-token' } },
+    { errorcode: -401, errmsg: 'synthetic exhausted rejection' }
+  ])
+  const realClient = createIfindHttpClient({
+    request: exhaustedTransport.request,
+    now: () => new Date('2026-08-26T02:00:00.000Z')
+  })
+  const integrated = createEnabledService({ client: realClient })
+  const integratedOutcome = await integrated.service.run()
+  assert.equal(integratedOutcome.status, 'failed')
+  assert.equal(integratedOutcome.diagnostic.safeErrorClass, 'AUTH')
+  assert.equal(integratedOutcome.diagnostic.requestCount, 4)
+  assert.equal(integratedOutcome.localAttemptCount, 1)
+  assert.equal(integrated.repository.latest().requestCount, 4)
+  assert.equal(
+    integrated.repository.status(Date.parse('2026-08-26T02:00:00.000Z')).localAttemptCount,
+    1
+  )
+  assert.equal(exhaustedTransport.calls.length, 4)
+  integrated.database.close()
 
   const invalidResponse = createEnabledService()
   invalidResponse.client.diagnose = async () => ({

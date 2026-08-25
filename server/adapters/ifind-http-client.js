@@ -5,6 +5,7 @@ const ORIGIN = 'https://quantapi.51ifind.com'
 const AUTH_ERROR_CODES = new Set([-401])
 const PERMISSION_ERROR_CODES = new Set([-403])
 const QUOTA_ERROR_CODES = new Set([-429])
+const SAFE_ERRORS = new WeakSet()
 
 function isRecord(value) {
   return typeof value === 'object' && value !== null && !Array.isArray(value)
@@ -22,7 +23,24 @@ function safeError(code, errorClass, message, dataVol) {
   error.code = code
   error.class = errorClass
   if (Number.isSafeInteger(dataVol) && dataVol >= 0) error.dataVol = dataVol
+  SAFE_ERRORS.add(error)
   return error
+}
+
+function withRequestCount(error, requestCount) {
+  const safeCount = Number.isSafeInteger(requestCount) && requestCount >= 0
+    ? requestCount
+    : 0
+  const sanitized = SAFE_ERRORS.has(error)
+    ? error
+    : safeError('IFIND_CLIENT_FAILED', 'API', 'iFinD diagnostic failed')
+  Object.defineProperty(sanitized, 'requestCount', {
+    value: safeCount,
+    enumerable: true,
+    configurable: false,
+    writable: false
+  })
+  return sanitized
 }
 
 function shanghaiDate(date) {
@@ -366,6 +384,8 @@ function createIfindHttpClient({
   }
 
   async function diagnose(input) {
+    let requestCount = 0
+    try {
     let refreshToken
     try {
       const keys = isRecord(input) ? Object.keys(input) : []
@@ -385,7 +405,6 @@ function createIfindHttpClient({
     }
     const operationGeneration = generation
     const startedAt = readNow()
-    let requestCount = 0
 
     async function authenticate() {
       requireCurrentGeneration(operationGeneration)
@@ -501,6 +520,9 @@ function createIfindHttpClient({
       dataVol: hasDataVol ? probeResponse.dataVol : 'unavailable',
       officialQuotaStatus: 'unavailable',
       completeness: hasDataVol ? 'complete' : 'partial'
+    }
+    } catch (error) {
+      throw withRequestCount(error, requestCount)
     }
   }
 

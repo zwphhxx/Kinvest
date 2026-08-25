@@ -422,6 +422,7 @@ async function run() {
   assert.equal(authError.code, 'IFIND_AUTH_REJECTED')
   assert.equal(authError.class, 'AUTH')
   assert.equal(authError.message, 'iFinD access-token request failed')
+  assert.equal(authError.requestCount, 1)
   assert.equal('cause' in authError, false)
   assertNoProviderLeak({
     scenario: 'access-token rejection',
@@ -451,6 +452,7 @@ async function run() {
   assert.equal(probeError.class, 'API')
   assert.equal(probeError.message, 'iFinD trade-date probe failed')
   assert.equal(probeError.dataVol, 3)
+  assert.equal(probeError.requestCount, 2)
   assert.equal('cause' in probeError, false)
   assertNoProviderLeak({
     scenario: 'trade-date rejection',
@@ -502,7 +504,8 @@ async function run() {
       assert.equal(error.code, 'IFIND_AUTH_REJECTED')
       assert.equal(error.class, 'AUTH')
       assert.equal(error.message, 'iFinD authentication failed')
-      assert.deepEqual(Object.keys(error).sort(), ['class', 'code'])
+      assert.equal(error.requestCount, 4)
+      assert.deepEqual(Object.keys(error).sort(), ['class', 'code', 'requestCount'])
       return true
     }
   )
@@ -525,6 +528,7 @@ async function run() {
   assert.equal(permissionExecution.status, 'rejected')
   assert.equal(permissionExecution.reason.code, 'IFIND_PERMISSION_REJECTED')
   assert.equal(permissionExecution.reason.class, 'PERMISSION')
+  assert.equal(permissionExecution.reason.requestCount, 2)
   assert.equal(permissionTransport.calls.length, 2)
   assertNoProviderLeak({
     scenario: 'permission rejection',

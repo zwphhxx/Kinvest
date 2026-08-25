@@ -7,6 +7,7 @@ const ROUTE = '/api/v1/get_trade_dates'
 const SCOPE = 'market-trade-dates:212001:D:-10'
 const VERSION_ID_PATTERN = /^v[0-9]{8}-[0-9]{3}$/
 const DIAGNOSTIC_ID_PATTERN = /^diag_[a-f0-9]{24,64}$/
+const MAX_DIAGNOSTIC_REQUEST_COUNT = 4
 const SAFE_ERROR_CLASSES = new Set([
   'AUTH',
   'PERMISSION',
@@ -88,7 +89,8 @@ function readErrorFields(error) {
     const candidateStage = readData('stage')
     return {
       errorClass: SAFE_ERROR_CLASSES.has(candidateClass) ? candidateClass : 'API',
-      requestCount: Number.isSafeInteger(candidateCount) && candidateCount >= 0
+      requestCount: Number.isSafeInteger(candidateCount) && candidateCount >= 0 &&
+        candidateCount <= MAX_DIAGNOSTIC_REQUEST_COUNT
         ? candidateCount
         : 1,
       dataVol: Number.isSafeInteger(candidateDataVol) && candidateDataVol >= 0
