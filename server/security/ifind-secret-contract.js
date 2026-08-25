@@ -15,31 +15,48 @@ function failConfig() {
   throw new IfindSecretContractError()
 }
 
-function hasExactKeys(value, expected) {
-  return value !== null &&
-    typeof value === 'object' &&
-    !Array.isArray(value) &&
-    Object.keys(value).sort().join('\0') === [...expected].sort().join('\0')
+function snapshotExactDataObject(value, expected) {
+  if (value === null || typeof value !== 'object' || Array.isArray(value)) return null
+  const prototype = Reflect.getPrototypeOf(value)
+  if (prototype !== Object.prototype && prototype !== null) return null
+  const keys = Reflect.ownKeys(value)
+  if (keys.length !== expected.length ||
+    keys.some((key) => typeof key !== 'string' || !expected.includes(key))) {
+    return null
+  }
+  const snapshot = Object.create(null)
+  for (const key of expected) {
+    const descriptor = Reflect.getOwnPropertyDescriptor(value, key)
+    if (!descriptor || !descriptor.enumerable || !Object.hasOwn(descriptor, 'value')) {
+      return null
+    }
+    snapshot[key] = descriptor.value
+  }
+  return snapshot
 }
 
 function createIfindSecretContract(value) {
   try {
-    if (hasExactKeys(value, ['mode']) &&
-      value.mode === IFIND_DIAGNOSTIC_MODE_DISABLED) {
+    const disabledFields = snapshotExactDataObject(value, ['mode'])
+    if (disabledFields && disabledFields.mode === IFIND_DIAGNOSTIC_MODE_DISABLED) {
       return Object.freeze({ mode: IFIND_DIAGNOSTIC_MODE_DISABLED })
     }
 
-    if (!hasExactKeys(value, ['mode', 'versionId', 'bundlePath']) ||
-      value.mode !== IFIND_DIAGNOSTIC_MODE_ADMIN ||
-      typeof value.versionId !== 'string' ||
-      !VERSION_ID_PATTERN.test(value.versionId) ||
-      value.bundlePath !== IFIND_BUNDLE_PATH) {
+    const adminFields = snapshotExactDataObject(
+      value,
+      ['mode', 'versionId', 'bundlePath']
+    )
+    if (!adminFields ||
+      adminFields.mode !== IFIND_DIAGNOSTIC_MODE_ADMIN ||
+      typeof adminFields.versionId !== 'string' ||
+      !VERSION_ID_PATTERN.test(adminFields.versionId) ||
+      adminFields.bundlePath !== IFIND_BUNDLE_PATH) {
       failConfig()
     }
 
     return Object.freeze({
       mode: IFIND_DIAGNOSTIC_MODE_ADMIN,
-      versionId: value.versionId,
+      versionId: adminFields.versionId,
       bundlePath: IFIND_BUNDLE_PATH
     })
   } catch (error) {

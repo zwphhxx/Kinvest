@@ -189,7 +189,9 @@ async function run() {
 
   await withBundle(() => {}, async ({ bundlePath, token }) => {
     const originalBufferFrom = Buffer.from
+    const originalBufferToString = Buffer.prototype.toString
     const ownedCandidates = []
+    let tokenDecodeCalls = 0
     Buffer.from = function from(...args) {
       const value = originalBufferFrom.apply(Buffer, args)
       if (Buffer.isBuffer(args[0]) && args[0].equals(token) && args[0] !== token) {
@@ -197,12 +199,21 @@ async function run() {
       }
       return value
     }
+    Buffer.prototype.toString = function toString(...args) {
+      if (this.equals(token)) {
+        tokenDecodeCalls += 1
+        throw new Error('secret token bytes were decoded as text')
+      }
+      return originalBufferToString.apply(this, args)
+    }
     let provider
     try {
       provider = await loadTestBundle(bundlePath)
     } finally {
       Buffer.from = originalBufferFrom
+      Buffer.prototype.toString = originalBufferToString
     }
+    assert.equal(tokenDecodeCalls, 0)
     assert.equal(Reflect.ownKeys(provider).length, 0)
     const first = provider.readRefreshToken()
     const second = provider.readRefreshToken()

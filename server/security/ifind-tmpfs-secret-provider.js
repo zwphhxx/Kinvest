@@ -39,11 +39,24 @@ function failBundle() {
   throw new IfindTmpfsSecretProviderError('IFIND_TMPFS_BUNDLE_INVALID')
 }
 
-function hasExactKeys(value, expected) {
-  return value !== null &&
-    typeof value === 'object' &&
-    !Array.isArray(value) &&
-    Object.keys(value).sort().join('\0') === [...expected].sort().join('\0')
+function snapshotExactDataObject(value, expected) {
+  if (value === null || typeof value !== 'object' || Array.isArray(value)) return null
+  const prototype = Reflect.getPrototypeOf(value)
+  if (prototype !== Object.prototype && prototype !== null) return null
+  const keys = Reflect.ownKeys(value)
+  if (keys.length !== expected.length ||
+    keys.some((key) => typeof key !== 'string' || !expected.includes(key))) {
+    return null
+  }
+  const snapshot = Object.create(null)
+  for (const key of expected) {
+    const descriptor = Reflect.getOwnPropertyDescriptor(value, key)
+    if (!descriptor || !descriptor.enumerable || !Object.hasOwn(descriptor, 'value')) {
+      return null
+    }
+    snapshot[key] = descriptor.value
+  }
+  return snapshot
 }
 
 function hasExactMetadata(stat, { expectedUid, expectedGid, mode, type }) {
@@ -162,12 +175,18 @@ function parseManifest(raw, versionId) {
     const text = raw.toString('utf8')
     if (!Buffer.from(text, 'utf8').equals(raw)) failBundle()
     const value = JSON.parse(text)
-    if (!hasExactKeys(value, ['format', 'refreshToken']) ||
-      value.format !== 'kinvest-ifind-tmpfs-v1' ||
-      !hasExactKeys(value.refreshToken, ['file', 'versionId', 'sha256']) ||
-      value.refreshToken.file !== TOKEN_FILE ||
-      value.refreshToken.versionId !== versionId ||
-      !SHA256_PATTERN.test(value.refreshToken.sha256)) {
+    const manifestFields = snapshotExactDataObject(value, ['format', 'refreshToken'])
+    const tokenFields = manifestFields && snapshotExactDataObject(
+      manifestFields.refreshToken,
+      ['file', 'versionId', 'sha256']
+    )
+    if (!manifestFields ||
+      manifestFields.format !== 'kinvest-ifind-tmpfs-v1' ||
+      !tokenFields ||
+      tokenFields.file !== TOKEN_FILE ||
+      tokenFields.versionId !== versionId ||
+      typeof tokenFields.sha256 !== 'string' ||
+      !SHA256_PATTERN.test(tokenFields.sha256)) {
       failBundle()
     }
     const normalized = {
@@ -175,7 +194,7 @@ function parseManifest(raw, versionId) {
       refreshToken: {
         file: TOKEN_FILE,
         versionId,
-        sha256: value.refreshToken.sha256
+        sha256: tokenFields.sha256
       }
     }
     if (text !== JSON.stringify(normalized)) failBundle()
@@ -187,10 +206,59 @@ function parseManifest(raw, versionId) {
 }
 
 function validateToken(raw) {
-  const text = raw.toString('utf8')
-  if (!Buffer.from(text, 'utf8').equals(raw) ||
-    text.length === 0 ||
-    /[\u0000-\u001f\u007f-\u009f]/u.test(text)) {
+  if (raw.length === 0) failBundle()
+  let offset = 0
+  while (offset < raw.length) {
+    const first = raw[offset]
+    if (first <= 0x7f) {
+      if (first <= 0x1f || first === 0x7f) failBundle()
+      offset += 1
+      continue
+    }
+
+    if (first >= 0xc2 && first <= 0xdf) {
+      if (offset + 1 >= raw.length) failBundle()
+      const second = raw[offset + 1]
+      if (second < 0x80 || second > 0xbf) failBundle()
+      const codePoint = ((first & 0x1f) << 6) | (second & 0x3f)
+      if (codePoint >= 0x80 && codePoint <= 0x9f) failBundle()
+      offset += 2
+      continue
+    }
+
+    if (first >= 0xe0 && first <= 0xef) {
+      if (offset + 2 >= raw.length) failBundle()
+      const second = raw[offset + 1]
+      const third = raw[offset + 2]
+      const secondIsValid = first === 0xe0
+        ? second >= 0xa0 && second <= 0xbf
+        : first === 0xed
+          ? second >= 0x80 && second <= 0x9f
+          : second >= 0x80 && second <= 0xbf
+      if (!secondIsValid || third < 0x80 || third > 0xbf) failBundle()
+      offset += 3
+      continue
+    }
+
+    if (first >= 0xf0 && first <= 0xf4) {
+      if (offset + 3 >= raw.length) failBundle()
+      const second = raw[offset + 1]
+      const third = raw[offset + 2]
+      const fourth = raw[offset + 3]
+      const secondIsValid = first === 0xf0
+        ? second >= 0x90 && second <= 0xbf
+        : first === 0xf4
+          ? second >= 0x80 && second <= 0x8f
+          : second >= 0x80 && second <= 0xbf
+      if (!secondIsValid ||
+        third < 0x80 || third > 0xbf ||
+        fourth < 0x80 || fourth > 0xbf) {
+        failBundle()
+      }
+      offset += 4
+      continue
+    }
+
     failBundle()
   }
 }
@@ -362,9 +430,10 @@ async function loadIfindTmpfsSecretsFromBundle({
 
 async function loadIfindTmpfsSecrets(config) {
   const contract = createIfindSecretContract(config)
-  if (contract.mode === IFIND_DIAGNOSTIC_MODE_DISABLED) return null
+  const { mode, versionId } = contract
+  if (mode === IFIND_DIAGNOSTIC_MODE_DISABLED) return null
   return loadIfindTmpfsSecretsFromBundle({
-    versionId: contract.versionId,
+    versionId,
     bundlePath: BUNDLE_PATH,
     expectedUid: BUNDLE_OWNER_UID,
     expectedGid: BUNDLE_GROUP_GID

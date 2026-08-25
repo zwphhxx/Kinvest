@@ -38,6 +38,35 @@ async function run() {
   })
   assert.equal(Object.isFrozen(enabled), true)
 
+  const symbolExtra = { mode: 'disabled' }
+  symbolExtra[Symbol('hidden')] = true
+  const nonEnumerableExtra = { mode: 'disabled' }
+  Object.defineProperty(nonEnumerableExtra, 'hidden', { value: true })
+  const unsafePrototype = Object.assign(Object.create({ inherited: true }), {
+    mode: 'disabled'
+  })
+  let accessorReads = 0
+  const changingAccessor = {}
+  Object.defineProperties(changingAccessor, {
+    mode: {
+      enumerable: true,
+      get() {
+        accessorReads += 1
+        return accessorReads === 1 ? 'admin-diagnostic' : 'disabled'
+      }
+    },
+    versionId: { enumerable: true, value: VERSION_ID },
+    bundlePath: { enumerable: true, value: IFIND_BUNDLE_PATH }
+  })
+  const nulNameCollision = Object.create({
+    mode: 'admin-diagnostic',
+    bundlePath: IFIND_BUNDLE_PATH
+  })
+  Object.defineProperties(nulNameCollision, {
+    ['bundlePath\0mode']: { enumerable: true, value: true },
+    versionId: { enumerable: true, value: VERSION_ID }
+  })
+
   const invalidValues = [
     undefined,
     null,
@@ -55,7 +84,12 @@ async function run() {
     { mode: 'admin-diagnostic', versionId: 'v20260826-01', bundlePath: IFIND_BUNDLE_PATH },
     { mode: 'admin-diagnostic', versionId: `${VERSION_ID}\n`, bundlePath: IFIND_BUNDLE_PATH },
     { mode: 'admin-diagnostic', versionId: VERSION_ID, bundlePath: '/tmp/ifind' },
-    { mode: 'admin-diagnostic', versionId: VERSION_ID, bundlePath: IFIND_BUNDLE_PATH, extra: true }
+    { mode: 'admin-diagnostic', versionId: VERSION_ID, bundlePath: IFIND_BUNDLE_PATH, extra: true },
+    symbolExtra,
+    nonEnumerableExtra,
+    unsafePrototype,
+    changingAccessor,
+    nulNameCollision
   ]
 
   for (const value of invalidValues) {
@@ -71,6 +105,7 @@ async function run() {
       }
     )
   }
+  assert.equal(accessorReads, 0)
 }
 
 module.exports = { run }
