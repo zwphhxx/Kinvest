@@ -1,11 +1,11 @@
 {
   "accessToken": {
     "errorcode": -1,
-    "errmsg": "Synthetic authentication rejection: fake-refresh-token-for-contract-tests"
+    "errmsg": "Synthetic authentication rejection: fake-refresh-token-for-contract-tests; trace synthetic-request-id-for-contract-tests"
   },
   "tradeDates": {
     "errorcode": -1,
-    "errmsg": "Synthetic probe rejection: fake-access-token-for-contract-tests",
+    "errmsg": "Synthetic probe rejection: fake-access-token-for-contract-tests; trace synthetic-request-id-for-contract-tests",
     "dataVol": 3
   }
 }

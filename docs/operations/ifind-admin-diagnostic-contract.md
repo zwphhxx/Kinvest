@@ -43,6 +43,7 @@ The JSON body is fixed except for `startdate`, which is the current calendar dat
 - `tables`, dates, `datatype`, `inputParams`, `perf`, `data.access_token`, and `data.expired_time` are not returned by the diagnostic API.
 - Neither token may appear in a result, error message, enumerable error metadata, log, or nested cause.
 - Provider text and `RequestId` values are discarded. Caller-visible failures use stable Kinvest error codes and messages.
+- The client accepts an injected logger; success and failure logging must use sanitized messages and metadata only.
 
 ## Fixture policy
 
