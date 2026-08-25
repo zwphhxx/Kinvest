@@ -7,6 +7,7 @@ const runtimeFiles = [
   'server/server.js',
   'server/access-preflight.js',
   'server/pre-listen-preparation.js',
+  'server/adapters/ifind-http-client.js',
   'server/adapters/modelAdapter.js',
   'server/ai/model-quota.js',
   'server/ai/research-safety.js',

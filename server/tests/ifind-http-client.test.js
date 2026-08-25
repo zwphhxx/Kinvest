@@ -153,6 +153,55 @@ function createRequestStub(responseBodies) {
   return { calls, request }
 }
 
+function createRawRequestStub(scenarios) {
+  const pending = [...scenarios]
+  const calls = []
+
+  function request(url, options, callback) {
+    const scenario = pending.shift() || {}
+    const call = { url: String(url), options, connectionTimeoutMs: null }
+    calls.push(call)
+    const outgoing = new EventEmitter()
+    outgoing.write = () => {}
+    outgoing.setTimeout = (milliseconds, handler) => {
+      call.connectionTimeoutMs = milliseconds
+      if (scenario.connectionTimeout) queueMicrotask(handler)
+    }
+    outgoing.destroy = () => {}
+    outgoing.end = () => {
+      if (scenario.connectionTimeout) {
+        if (call.connectionTimeoutMs === null) {
+          queueMicrotask(() => outgoing.emit('error', new Error('raw timeout sentinel')))
+        }
+        return
+      }
+      if (scenario.noResponse) {
+        setImmediate(() => outgoing.emit('error', new Error('raw stalled response sentinel')))
+        return
+      }
+      queueMicrotask(() => {
+        if (scenario.networkError) {
+          outgoing.emit('error', new Error(scenario.networkError))
+          return
+        }
+        const incoming = new EventEmitter()
+        incoming.statusCode = scenario.statusCode === undefined ? 200 : scenario.statusCode
+        incoming.destroy = () => {}
+        try {
+          callback(incoming)
+          for (const chunk of scenario.chunks || []) incoming.emit('data', Buffer.from(chunk))
+          incoming.emit('end')
+        } catch (error) {
+          if (!scenario.swallowResponseErrors) throw error
+        }
+      })
+    }
+    return outgoing
+  }
+
+  return { calls, request }
+}
+
 function assertNoProviderLeak({
   scenario,
   value,
@@ -204,6 +253,7 @@ async function run() {
 
   const successTransport = createRequestStub([
     accessTokenSuccess,
+    tradeDatesSuccess,
     tradeDatesSuccess
   ])
   const successLogger = createCapturingLogger()
@@ -251,13 +301,28 @@ async function run() {
       }
     }
   ])
-  assert.deepEqual(result, { ok: true, dataVol: 11 })
+  assert.deepEqual(result, {
+    route: '/api/v1/get_trade_dates',
+    scope: 'market-trade-dates:212001:D:-10',
+    retrievedAt: '2026-08-25T16:30:00.000Z',
+    timezone: 'Asia/Shanghai',
+    elapsedMs: 0,
+    requestCount: 2,
+    dataVol: 11,
+    officialQuotaStatus: 'unavailable',
+    completeness: 'complete'
+  })
   assertNoProviderLeak({
     scenario: 'successful diagnostic',
     value: result,
     logEntries: successLogger.entries,
     globalOutputEntries: successExecution.entries
   })
+
+  const cachedResult = await client.diagnose({ refreshToken: REFRESH_TOKEN })
+  assert.equal(successTransport.calls.length, 3)
+  assert.equal(successTransport.calls[2].url, `${ORIGIN}/api/v1/get_trade_dates`)
+  assert.equal(cachedResult.requestCount, 1)
 
   const authFailureTransport = createRequestStub([providerErrors.accessToken])
   const authFailureLogger = createCapturingLogger()
@@ -272,6 +337,7 @@ async function run() {
   assert.equal(authFailureExecution.status, 'rejected', 'access-token rejection: expected rejection')
   const authError = authFailureExecution.reason
   assert.equal(authError.code, 'IFIND_AUTH_REJECTED')
+  assert.equal(authError.class, 'AUTH')
   assert.equal(authError.message, 'iFinD access-token request failed')
   assert.equal('cause' in authError, false)
   assertNoProviderLeak({
@@ -299,6 +365,7 @@ async function run() {
   assert.equal(probeFailureExecution.status, 'rejected', 'trade-date rejection: expected rejection')
   const probeError = probeFailureExecution.reason
   assert.equal(probeError.code, 'IFIND_PROBE_REJECTED')
+  assert.equal(probeError.class, 'API')
   assert.equal(probeError.message, 'iFinD trade-date probe failed')
   assert.equal(probeError.dataVol, 3)
   assert.equal('cause' in probeError, false)
@@ -309,6 +376,361 @@ async function run() {
     globalOutputEntries: probeFailureExecution.entries,
     rawProviderMarkers: [PROBE_PROVIDER_MARKER, providerErrors.tradeDates.errmsg]
   })
+  assert.equal(probeFailureTransport.calls.length, 2)
+
+  const retryTransport = createRequestStub([
+    accessTokenSuccess,
+    {
+      errorcode: -401,
+      errmsg: `Synthetic access token invalid: ${ACCESS_TOKEN}; ${SYNTHETIC_REQUEST_ID}`
+    },
+    accessTokenSuccess,
+    tradeDatesSuccess
+  ])
+  const retryClient = createIfindHttpClient({
+    request: retryTransport.request,
+    now: () => new Date('2026-08-25T16:30:00.000Z')
+  })
+  const retryResult = await retryClient.diagnose({ refreshToken: REFRESH_TOKEN })
+  assert.equal(retryResult.requestCount, 4)
+  assert.deepEqual(
+    retryTransport.calls.map((call) => new URL(call.url).pathname),
+    [
+      '/api/v1/get_access_token',
+      '/api/v1/get_trade_dates',
+      '/api/v1/get_access_token',
+      '/api/v1/get_trade_dates'
+    ]
+  )
+
+  const exhaustedRetryTransport = createRequestStub([
+    accessTokenSuccess,
+    { errorcode: -401, errmsg: `Invalid token ${SYNTHETIC_REQUEST_ID}` },
+    accessTokenSuccess,
+    { errorcode: -401, errmsg: `Invalid token again ${SYNTHETIC_REQUEST_ID}` }
+  ])
+  const exhaustedRetryClient = createIfindHttpClient({
+    request: exhaustedRetryTransport.request,
+    now: () => new Date('2026-08-25T16:30:00.000Z')
+  })
+  await assert.rejects(
+    () => exhaustedRetryClient.diagnose({ refreshToken: REFRESH_TOKEN }),
+    (error) => {
+      assert.equal(error.code, 'IFIND_AUTH_REJECTED')
+      assert.equal(error.class, 'AUTH')
+      assert.equal(error.message, 'iFinD authentication failed')
+      assert.deepEqual(Object.keys(error).sort(), ['class', 'code'])
+      return true
+    }
+  )
+  assert.equal(exhaustedRetryTransport.calls.length, 4)
+
+  const permissionMarker = `Synthetic permission denied ${SYNTHETIC_REQUEST_ID}`
+  const permissionTransport = createRequestStub([
+    accessTokenSuccess,
+    { errorcode: -403, errmsg: permissionMarker }
+  ])
+  const permissionLogger = createCapturingLogger()
+  const permissionClient = createIfindHttpClient({
+    request: permissionTransport.request,
+    now: () => new Date('2026-08-25T16:30:00.000Z'),
+    logger: permissionLogger.logger
+  })
+  const permissionExecution = await captureGlobalOutput(
+    () => permissionClient.diagnose({ refreshToken: REFRESH_TOKEN })
+  )
+  assert.equal(permissionExecution.status, 'rejected')
+  assert.equal(permissionExecution.reason.code, 'IFIND_PERMISSION_REJECTED')
+  assert.equal(permissionExecution.reason.class, 'PERMISSION')
+  assert.equal(permissionTransport.calls.length, 2)
+  assertNoProviderLeak({
+    scenario: 'permission rejection',
+    value: permissionExecution.reason,
+    logEntries: permissionLogger.entries,
+    globalOutputEntries: permissionExecution.entries,
+    rawProviderMarkers: [permissionMarker]
+  })
+
+  const quotaTransport = createRequestStub([
+    accessTokenSuccess,
+    { errorcode: -429, errmsg: `Synthetic quota exceeded ${SYNTHETIC_REQUEST_ID}` }
+  ])
+  const quotaClient = createIfindHttpClient({
+    request: quotaTransport.request,
+    now: () => new Date('2026-08-25T16:30:00.000Z')
+  })
+  await assert.rejects(
+    () => quotaClient.diagnose({ refreshToken: REFRESH_TOKEN }),
+    (error) => error.code === 'IFIND_QUOTA_REJECTED' && error.class === 'QUOTA'
+  )
+  assert.equal(quotaTransport.calls.length, 2)
+
+  const nonSuccessMarker = `Synthetic non-success ${SYNTHETIC_REQUEST_ID}`
+  const nonSuccessTransport = createRawRequestStub([{
+    statusCode: 503,
+    chunks: [JSON.stringify({ errorcode: 0, errmsg: nonSuccessMarker, data: { access_token: ACCESS_TOKEN } })]
+  }])
+  const nonSuccessClient = createIfindHttpClient({ request: nonSuccessTransport.request })
+  await assert.rejects(
+    () => nonSuccessClient.diagnose({ refreshToken: REFRESH_TOKEN }),
+    (error) => {
+      assert.equal(error.code, 'IFIND_HTTP_STATUS')
+      assert.equal(error.class, 'API')
+      assert.equal(containsSentinel(error, nonSuccessMarker), false)
+      assert.equal(containsSentinel(error, ORIGIN), false)
+      return true
+    }
+  )
+  assert.equal(nonSuccessTransport.calls.length, 1)
+
+  const timeoutTransport = createRawRequestStub([{ connectionTimeout: true }])
+  const timeoutClient = createIfindHttpClient({ request: timeoutTransport.request })
+  await assert.rejects(
+    () => timeoutClient.diagnose({ refreshToken: REFRESH_TOKEN }),
+    (error) => error.code === 'IFIND_TIMEOUT' && error.class === 'NETWORK'
+  )
+  assert.ok(timeoutTransport.calls[0].connectionTimeoutMs > 0)
+  assert.ok(timeoutTransport.calls[0].connectionTimeoutMs <= 5000)
+
+  let totalTimeoutMs = null
+  let clearedTotalTimer = false
+  const totalTimeoutTransport = createRawRequestStub([{ noResponse: true }])
+  const totalTimeoutClient = createIfindHttpClient({
+    request: totalTimeoutTransport.request,
+    setTimer(handler, milliseconds) {
+      totalTimeoutMs = milliseconds
+      queueMicrotask(handler)
+      return 'synthetic-total-timer'
+    },
+    clearTimer(timer) {
+      assert.equal(timer, 'synthetic-total-timer')
+      clearedTotalTimer = true
+    }
+  })
+  await assert.rejects(
+    () => totalTimeoutClient.diagnose({ refreshToken: REFRESH_TOKEN }),
+    (error) => error.code === 'IFIND_TIMEOUT' && error.class === 'NETWORK'
+  )
+  assert.ok(totalTimeoutMs > timeoutTransport.calls[0].connectionTimeoutMs)
+  assert.ok(totalTimeoutMs <= 10000)
+  assert.equal(clearedTotalTimer, true)
+
+  const oversizedTransport = createRawRequestStub([{
+    chunks: [Buffer.alloc((256 * 1024) + 1, 0x61)]
+  }])
+  const oversizedClient = createIfindHttpClient({ request: oversizedTransport.request })
+  await assert.rejects(
+    () => oversizedClient.diagnose({ refreshToken: REFRESH_TOKEN }),
+    (error) => error.code === 'IFIND_RESPONSE_TOO_LARGE' && error.class === 'API'
+  )
+  assert.equal(oversizedTransport.calls.length, 1)
+
+  const invalidUtf8Transport = createRawRequestStub([{
+    chunks: [Buffer.from([0x7b, 0x22, 0xc3, 0x28, 0x22, 0x7d])]
+  }])
+  const invalidUtf8Client = createIfindHttpClient({ request: invalidUtf8Transport.request })
+  await assert.rejects(
+    () => invalidUtf8Client.diagnose({ refreshToken: REFRESH_TOKEN }),
+    (error) => error.code === 'IFIND_RESPONSE_ENCODING' && error.class === 'API'
+  )
+
+  const invalidJsonTransport = createRawRequestStub([{ chunks: ['{"errorcode":'] }])
+  const invalidJsonClient = createIfindHttpClient({ request: invalidJsonTransport.request })
+  await assert.rejects(
+    () => invalidJsonClient.diagnose({ refreshToken: REFRESH_TOKEN }),
+    (error) => error.code === 'IFIND_RESPONSE_JSON' && error.class === 'API'
+  )
+
+  const malformedTokenTransport = createRequestStub([{
+    errorcode: 0,
+    errmsg: 'success',
+    data: {}
+  }])
+  const malformedTokenClient = createIfindHttpClient({ request: malformedTokenTransport.request })
+  await assert.rejects(
+    () => malformedTokenClient.diagnose({ refreshToken: REFRESH_TOKEN }),
+    (error) => error.code === 'IFIND_RESPONSE_SHAPE' && error.class === 'API'
+  )
+  assert.equal(malformedTokenTransport.calls.length, 1)
+
+  const unsupportedShapeTransport = createRequestStub([
+    accessTokenSuccess,
+    { errorcode: 0, errmsg: 'success', tables: 'unsupported', dataVol: 11 }
+  ])
+  const unsupportedShapeClient = createIfindHttpClient({ request: unsupportedShapeTransport.request })
+  await assert.rejects(
+    () => unsupportedShapeClient.diagnose({ refreshToken: REFRESH_TOKEN }),
+    (error) => error.code === 'IFIND_RESPONSE_SHAPE' && error.class === 'API'
+  )
+  assert.equal(unsupportedShapeTransport.calls.length, 2)
+
+  const missingVolumeResponse = JSON.parse(JSON.stringify(tradeDatesSuccess))
+  delete missingVolumeResponse.dataVol
+  const missingVolumeTransport = createRequestStub([
+    accessTokenSuccess,
+    missingVolumeResponse
+  ])
+  const missingVolumeClient = createIfindHttpClient({
+    request: missingVolumeTransport.request,
+    now: () => new Date('2026-08-25T16:30:00.000Z')
+  })
+  const missingVolumeResult = await missingVolumeClient.diagnose({ refreshToken: REFRESH_TOKEN })
+  assert.equal(missingVolumeResult.dataVol, 'unavailable')
+  assert.equal(missingVolumeResult.completeness, 'partial')
+
+  const parameterTransport = createRequestStub([])
+  const parameterClient = createIfindHttpClient({ request: parameterTransport.request })
+  await assert.rejects(
+    () => parameterClient.diagnose({
+      refreshToken: REFRESH_TOKEN,
+      marketcode: 'browser-controlled-market'
+    }),
+    (error) => error.code === 'IFIND_CONFIG_INVALID' && error.class === 'CONFIG'
+  )
+  assert.equal(parameterTransport.calls.length, 0)
+
+  const networkTransport = createRawRequestStub([
+    { chunks: [JSON.stringify(accessTokenSuccess)] },
+    { networkError: `Synthetic network failure ${SYNTHETIC_REQUEST_ID}` }
+  ])
+  const networkClient = createIfindHttpClient({ request: networkTransport.request })
+  await assert.rejects(
+    () => networkClient.diagnose({ refreshToken: REFRESH_TOKEN }),
+    (error) => error.code === 'IFIND_NETWORK_FAILED' && error.class === 'NETWORK'
+  )
+  assert.equal(networkTransport.calls.length, 2)
+
+  const hostileMarker = `${REFRESH_TOKEN} ${ACCESS_TOKEN} ${SYNTHETIC_REQUEST_ID}`
+  const hostileLogger = new Proxy({}, {
+    get() {
+      throw new Error(`logger must remain untouched ${hostileMarker}`)
+    }
+  })
+  const hostileClient = createIfindHttpClient({
+    request() {
+      return new Proxy({}, {
+        get() {
+          throw new Error(`hostile transport ${hostileMarker}`)
+        }
+      })
+    },
+    logger: hostileLogger,
+    now: () => new Date('2026-08-25T16:30:00.000Z')
+  })
+  const hostileExecution = await captureGlobalOutput(
+    () => hostileClient.diagnose({ refreshToken: REFRESH_TOKEN })
+  )
+  assert.equal(hostileExecution.status, 'rejected')
+  assert.equal(hostileExecution.reason.code, 'IFIND_NETWORK_FAILED')
+  assert.equal(hostileExecution.reason.class, 'NETWORK')
+  assertNoProviderLeak({
+    scenario: 'hostile dependencies',
+    value: hostileExecution.reason,
+    logEntries: [],
+    globalOutputEntries: hostileExecution.entries,
+    rawProviderMarkers: [hostileMarker]
+  })
+
+  const clearTransport = createRequestStub([
+    accessTokenSuccess,
+    tradeDatesSuccess,
+    accessTokenSuccess,
+    tradeDatesSuccess
+  ])
+  const clearClient = createIfindHttpClient({
+    request: clearTransport.request,
+    now: () => new Date('2026-08-25T16:30:00.000Z')
+  })
+  await clearClient.diagnose({ refreshToken: REFRESH_TOKEN })
+  const originalBufferFill = Buffer.prototype.fill
+  let clearedTokenBuffer = null
+  Buffer.prototype.fill = function captureTokenClear(value, ...args) {
+    if (this.toString('utf8') === ACCESS_TOKEN) clearedTokenBuffer = this
+    return originalBufferFill.call(this, value, ...args)
+  }
+  try {
+    clearClient.clear()
+    clearClient.clear()
+  } finally {
+    Buffer.prototype.fill = originalBufferFill
+  }
+  assert.ok(Buffer.isBuffer(clearedTokenBuffer))
+  assert.equal(clearedTokenBuffer.every((byte) => byte === 0), true)
+  assert.deepEqual(Object.keys(clearClient), ['diagnose'])
+  assert.equal(Object.getOwnPropertyDescriptor(clearClient, 'clear').enumerable, false)
+  await clearClient.diagnose({ refreshToken: REFRESH_TOKEN })
+  assert.equal(clearTransport.calls.length, 4)
+
+  const refreshTokenBuffer = Buffer.from(REFRESH_TOKEN, 'utf8')
+  const environmentBefore = { ...process.env }
+  const bufferTransport = createRequestStub([accessTokenSuccess, tradeDatesSuccess])
+  const bufferClient = createIfindHttpClient({
+    request: bufferTransport.request,
+    now: () => new Date('2026-08-25T16:30:00.000Z')
+  })
+  await bufferClient.diagnose({ refreshToken: refreshTokenBuffer })
+  assert.equal(refreshTokenBuffer.toString('utf8'), REFRESH_TOKEN)
+  assert.equal(bufferTransport.calls[0].headers.refresh_token, REFRESH_TOKEN)
+  assert.deepEqual({ ...process.env }, environmentBefore)
+
+  const hostileClockTransport = createRequestStub([])
+  const hostileClockClient = createIfindHttpClient({
+    request: hostileClockTransport.request,
+    now() {
+      throw new Error(`hostile clock ${REFRESH_TOKEN} ${SYNTHETIC_REQUEST_ID}`)
+    }
+  })
+  const hostileClockExecution = await captureGlobalOutput(
+    () => hostileClockClient.diagnose({ refreshToken: REFRESH_TOKEN })
+  )
+  assert.equal(hostileClockExecution.status, 'rejected')
+  assert.equal(hostileClockExecution.reason.code, 'IFIND_CONFIG_INVALID')
+  assert.equal(hostileClockExecution.reason.class, 'CONFIG')
+  assert.equal(hostileClockTransport.calls.length, 0)
+  assertNoProviderLeak({
+    scenario: 'hostile clock',
+    value: hostileClockExecution.reason,
+    logEntries: [],
+    globalOutputEntries: hostileClockExecution.entries
+  })
+
+  const hostileDataVolMarker = `hostile dataVol ${ACCESS_TOKEN} ${SYNTHETIC_REQUEST_ID}`
+  const hostileDataVolTransport = createRequestStub([
+    accessTokenSuccess,
+    { errorcode: -500, errmsg: 'Synthetic API rejection', dataVol: hostileDataVolMarker }
+  ])
+  const hostileDataVolClient = createIfindHttpClient({ request: hostileDataVolTransport.request })
+  const hostileDataVolExecution = await captureGlobalOutput(
+    () => hostileDataVolClient.diagnose({ refreshToken: REFRESH_TOKEN })
+  )
+  assert.equal(hostileDataVolExecution.status, 'rejected')
+  assert.equal('dataVol' in hostileDataVolExecution.reason, false)
+  assertNoProviderLeak({
+    scenario: 'hostile failure metadata',
+    value: hostileDataVolExecution.reason,
+    logEntries: [],
+    globalOutputEntries: hostileDataVolExecution.entries,
+    rawProviderMarkers: [hostileDataVolMarker]
+  })
+
+  const hostileTimerTransport = createRawRequestStub([
+    { chunks: [JSON.stringify(accessTokenSuccess)], swallowResponseErrors: true },
+    { chunks: [JSON.stringify(tradeDatesSuccess)], swallowResponseErrors: true }
+  ])
+  const hostileTimerClient = createIfindHttpClient({
+    request: hostileTimerTransport.request,
+    now: () => new Date('2026-08-25T16:30:00.000Z'),
+    setTimer: () => 'hostile-timer',
+    clearTimer() {
+      throw new Error(`hostile timer cleanup ${SYNTHETIC_REQUEST_ID}`)
+    }
+  })
+  const hostileTimerOutcome = await Promise.race([
+    hostileTimerClient.diagnose({ refreshToken: REFRESH_TOKEN }),
+    new Promise((resolve) => setImmediate(() => resolve('stalled')))
+  ])
+  assert.notEqual(hostileTimerOutcome, 'stalled')
+  assert.equal(hostileTimerOutcome.dataVol, 11)
 }
 
 module.exports = { run }

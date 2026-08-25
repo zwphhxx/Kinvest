@@ -44,6 +44,7 @@ async function runBuildArtifactsExist() {
     'public/research.js',
     'public/valuation-position.js',
     'server/access-preflight.js',
+    'server/adapters/ifind-http-client.js',
     'server/adapters/ifindAdapter.js',
     'server/adapters/modelAdapter.js',
     'server/ai/model-quota.js',
