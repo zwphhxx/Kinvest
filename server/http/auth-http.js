@@ -450,8 +450,9 @@ function createAuthHttpController({
       REQUEST_ID_PATTERN.test(segments[3] || '') && segments[4] === 'approve' &&
       segments.length === 5 && req.method === 'POST') {
       requireEnabled()
-      const body = exactObject(await jsonMutation(req), ['requestCode'])
+      requireOrigin(req, publicOrigin)
       authenticateMutation(req, res)
+      const body = exactObject(await parseStrictJsonBody(req), ['requestCode'])
       sendJson(res, device.approveRequest({
         requestId: segments[3],
         requestCode: body.requestCode,
@@ -472,8 +473,9 @@ function createAuthHttpController({
       segments[3] === 'revoke-all' && segments.length === 4 &&
       req.method === 'POST') {
       requireEnabled()
-      const body = exactObject(await jsonMutation(req), ['password'])
+      requireOrigin(req, publicOrigin)
       authenticateMutation(req, res)
+      const body = exactObject(await parseStrictJsonBody(req), ['password'])
       await admin.reauthenticate(body.password, clientIdentity(req))
       sendJson(res, { credentialsRevoked: device.revokeAllCredentials() })
       return true
@@ -483,8 +485,9 @@ function createAuthHttpController({
       segments[3] && segments[4] === 'revoke' && segments.length === 5 &&
       req.method === 'POST') {
       requireEnabled()
-      exactObject(await jsonMutation(req), [], [])
+      requireOrigin(req, publicOrigin)
       authenticateMutation(req, res)
+      exactObject(await parseStrictJsonBody(req), [], [])
       sendJson(res, device.revokeCredential(segments[3]))
       return true
     }
