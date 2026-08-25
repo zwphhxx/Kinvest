@@ -64,7 +64,11 @@ sudo /usr/local/sbin/kinvest-nginx-fixed-ip-gate apply
 
 Gate 2 repeats Gate 1 before `up -d --no-deps --force-recreate nginx`, then
 requires Nginx running on exactly network `web` at the configured IP and an
-HTTPS `200 application/json` Kinvest health body. Its only success output is
+HTTPS `200 application/json` Kinvest health body. Only curl exit code `7`
+(initial connection failure) is retried with fixed one-second connection timeouts, two-second request
+timeouts, and a maximum of 15 attempts; once HTTPS accepts a connection, the
+status, content type, and JSON body are validated once and fail closed. DNS,
+TLS, transfer, and timeout errors fail immediately. Its only success output is
 `KINVEST_NGINX_FIXED_IP_APPLY_OK ip=<approved-ip> health=ready https=ready`.
 Stop again; device approval remains a separate Production approval.
 

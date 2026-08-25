@@ -28,6 +28,10 @@ function fixture({
   renderMismatch = false,
   oldCompose = false,
   nginxOverlayMode = 0o600,
+  healthFailures = 0,
+  healthFailureCode = 7,
+  healthStatus = '200',
+  healthType = 'application/json',
   healthPayload = JSON.stringify({
     status: 'ok',
     service: 'kinvest',
@@ -43,6 +47,7 @@ function fixture({
   const bin = path.join(base, 'bin')
   const runRoot = path.join(base, 'run')
   const operations = path.join(base, 'operations')
+  const healthAttempts = path.join(base, 'health-attempts')
   const baseCompose = path.join(project, 'docker-compose.yml')
   const nginxOverlay = path.join(project, 'docker-compose.kinvest-nginx.yml')
   const fixedOverlay = path.join(kinvest, 'docker-compose.nginx-fixed-ip.yml')
@@ -81,13 +86,18 @@ exit 1
 `, 0o755)
   write(path.join(bin, 'curl'), `#!/usr/bin/env bash
 set -euo pipefail
+attempt=$(cat '${healthAttempts}')
+attempt=$((attempt + 1))
+printf '%s\n' "$attempt" >'${healthAttempts}'
+(( attempt > ${healthFailures} )) || exit ${healthFailureCode}
 out=''
 previous=''
 for value in "$@"; do [[ "$previous" == -o ]] && out="$value"; previous="$value"; done
 printf '%s' '${healthPayload}' >"$out"
-printf '%s' '200 application/json'
+printf '%s' '${healthStatus} ${healthType}'
 `, 0o755)
   write(operations, '')
+  write(healthAttempts, '0\n')
   const source = fs.readFileSync(gatePath, 'utf8')
     .replace("PROJECT_ROOT='/root/docker'", `PROJECT_ROOT='${project}'`)
     .replace("ACCESS_NETWORK_CONFIG='/etc/kinvest/access-control-network.conf'", `ACCESS_NETWORK_CONFIG='${networkConfig}'`)
@@ -97,7 +107,7 @@ printf '%s' '200 application/json'
     .replace("ROOT_GID='0'", `ROOT_GID='${process.getgid()}'`)
   const gate = path.join(base, 'gate')
   write(gate, source, 0o755)
-  return { base, bin, gate, operations }
+  return { base, bin, gate, operations, healthAttempts }
 }
 
 function execute(context, mode, extraEnv = {}) {
@@ -167,7 +177,7 @@ async function run() {
     } finally { fs.rmSync(context.base, { recursive: true, force: true }) }
   })
 
-  const apply = fixture()
+  const apply = fixture({ healthFailures: 2 })
   try {
     const result = execute(apply, 'apply')
     assert.equal(result.status, 0, result.stderr)
@@ -176,18 +186,30 @@ async function run() {
     assert.match(operations, /up -d --no-deps --force-recreate nginx/)
     assert.match(operations, /inspect --format \{\{\.State\.Running\}\} nginx/)
     assert.match(operations, /NetworkSettings\.Networks "web"/)
+    assert.equal(fs.readFileSync(apply.healthAttempts, 'utf8'), '3\n')
   } finally { fs.rmSync(apply.base, { recursive: true, force: true }) }
 
+  const nonConnectionFailure = fixture({ healthFailures: 2, healthFailureCode: 35 })
+  try {
+    const result = execute(nonConnectionFailure, 'apply')
+    assert.notEqual(result.status, 0)
+    assert.equal(result.stderr, 'KINVEST_NGINX_FIXED_IP_HEALTH_FAILED\n')
+    assert.equal(fs.readFileSync(nonConnectionFailure.healthAttempts, 'utf8'), '1\n')
+  } finally { fs.rmSync(nonConnectionFailure.base, { recursive: true, force: true }) }
+
   for (const invalid of [
+    { name: 'health-http', options: { healthStatus: '503' } },
+    { name: 'health-content-type', options: { healthType: 'text/html' } },
     { name: 'health-status', payload: JSON.stringify({ status: 'degraded', service: 'kinvest' }) },
     { name: 'health-service', payload: JSON.stringify({ status: 'ok', service: 'other' }) },
     { name: 'health-shape', payload: JSON.stringify(['ok', 'kinvest']) }
   ]) {
-    const context = fixture({ healthPayload: invalid.payload })
+    const context = fixture({ healthPayload: invalid.payload, ...invalid.options })
     try {
       const result = execute(context, 'apply')
       assert.notEqual(result.status, 0, invalid.name)
       assert.equal(result.stderr, 'KINVEST_NGINX_FIXED_IP_HEALTH_FAILED\n', invalid.name)
+      assert.equal(fs.readFileSync(context.healthAttempts, 'utf8'), '1\n', invalid.name)
     } finally { fs.rmSync(context.base, { recursive: true, force: true }) }
   }
 
