@@ -1,3 +1,5 @@
+const { types } = require('node:util')
+
 const IFIND_BUNDLE_PATH = '/run/secrets/kinvest-ifind'
 const IFIND_DIAGNOSTIC_MODE_DISABLED = 'disabled'
 const IFIND_DIAGNOSTIC_MODE_ADMIN = 'admin-diagnostic'
@@ -37,32 +39,32 @@ function snapshotExactDataObject(value, expected) {
 
 function createIfindSecretContract(value) {
   try {
-    const disabledFields = snapshotExactDataObject(value, ['mode'])
-    if (disabledFields && disabledFields.mode === IFIND_DIAGNOSTIC_MODE_DISABLED) {
-      return Object.freeze({ mode: IFIND_DIAGNOSTIC_MODE_DISABLED })
-    }
+    if (!types.isProxy(value)) {
+      const disabledFields = snapshotExactDataObject(value, ['mode'])
+      if (disabledFields && disabledFields.mode === IFIND_DIAGNOSTIC_MODE_DISABLED) {
+        return Object.freeze({ mode: IFIND_DIAGNOSTIC_MODE_DISABLED })
+      }
 
-    const adminFields = snapshotExactDataObject(
-      value,
-      ['mode', 'versionId', 'bundlePath']
-    )
-    if (!adminFields ||
-      adminFields.mode !== IFIND_DIAGNOSTIC_MODE_ADMIN ||
-      typeof adminFields.versionId !== 'string' ||
-      !VERSION_ID_PATTERN.test(adminFields.versionId) ||
-      adminFields.bundlePath !== IFIND_BUNDLE_PATH) {
-      failConfig()
+      const adminFields = snapshotExactDataObject(
+        value,
+        ['mode', 'versionId', 'bundlePath']
+      )
+      if (adminFields &&
+        adminFields.mode === IFIND_DIAGNOSTIC_MODE_ADMIN &&
+        typeof adminFields.versionId === 'string' &&
+        VERSION_ID_PATTERN.test(adminFields.versionId) &&
+        adminFields.bundlePath === IFIND_BUNDLE_PATH) {
+        return Object.freeze({
+          mode: IFIND_DIAGNOSTIC_MODE_ADMIN,
+          versionId: adminFields.versionId,
+          bundlePath: IFIND_BUNDLE_PATH
+        })
+      }
     }
-
-    return Object.freeze({
-      mode: IFIND_DIAGNOSTIC_MODE_ADMIN,
-      versionId: adminFields.versionId,
-      bundlePath: IFIND_BUNDLE_PATH
-    })
-  } catch (error) {
-    if (error instanceof IfindSecretContractError) throw error
+  } catch {
     failConfig()
   }
+  failConfig()
 }
 
 module.exports = {

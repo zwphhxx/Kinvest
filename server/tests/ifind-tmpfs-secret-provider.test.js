@@ -100,8 +100,8 @@ function createFsAdapter(bundlePath, overrides = {}) {
       directoryDescriptors.delete(descriptor)
       return fs.closeSync(descriptor)
     },
-    fstatSync: (descriptor) => fs.fstatSync(descriptor),
-    lstatSync: (input) => fs.lstatSync(mapProcPath(input)),
+    fstatSync: (descriptor, options) => fs.fstatSync(descriptor, options),
+    lstatSync: (input, options) => fs.lstatSync(mapProcPath(input), options),
     readSync: (descriptor, buffer, offset, length, position) =>
       fs.readSync(descriptor, buffer, offset, length, position),
     readdirSync: (input) => fs.readdirSync(mapProcPath(input))
@@ -322,10 +322,11 @@ async function run() {
     const adapter = createFsAdapter(bundlePath)
     const originalLstat = adapter.lstatSync
     let tokenStats = 0
-    adapter.lstatSync = (input) => {
-      const stat = originalLstat(input)
+    adapter.lstatSync = (input, options) => {
+      const stat = originalLstat(input, options)
       if (String(input).endsWith(`/${TOKEN_FILE}`) && ++tokenStats === 2) {
-        Object.defineProperty(stat, 'ino', { value: stat.ino + 1 })
+        const one = typeof stat.ino === 'bigint' ? 1n : 1
+        Object.defineProperty(stat, 'ino', { value: stat.ino + one })
       }
       return stat
     }
@@ -335,10 +336,11 @@ async function run() {
     const adapter = createFsAdapter(bundlePath)
     const originalLstat = adapter.lstatSync
     let directoryStats = 0
-    adapter.lstatSync = (input) => {
-      const stat = originalLstat(input)
+    adapter.lstatSync = (input, options) => {
+      const stat = originalLstat(input, options)
       if (input === bundlePath && ++directoryStats === 2) {
-        Object.defineProperty(stat, 'ino', { value: stat.ino + 1 })
+        const one = typeof stat.ino === 'bigint' ? 1n : 1
+        Object.defineProperty(stat, 'ino', { value: stat.ino + one })
       }
       return stat
     }
@@ -355,10 +357,14 @@ async function run() {
       return value
     }
     const adapter = createFsAdapter(bundlePath)
-    adapter.fstatSync = (descriptor) => {
-      const stat = fs.fstatSync(descriptor)
+    adapter.fstatSync = (descriptor, options) => {
+      const stat = fs.fstatSync(descriptor, options)
       fstatCalls += 1
-      if (fstatCalls === 5) Object.defineProperty(stat, 'nlink', { value: 2 })
+      if (fstatCalls === 5) {
+        Object.defineProperty(stat, 'nlink', {
+          value: typeof stat.nlink === 'bigint' ? 2n : 2
+        })
+      }
       return stat
     }
     try {
@@ -369,6 +375,45 @@ async function run() {
       Buffer.alloc = originalAlloc
     }
   })
+
+  for (const rewrite of [
+    (tokenPath, token) => {
+      fs.chmodSync(tokenPath, 0o640)
+      fs.appendFileSync(tokenPath, Buffer.from('x'))
+      fs.truncateSync(tokenPath, token.length)
+      fs.utimesSync(tokenPath, new Date('2020-01-01T00:00:00.000Z'), new Date('2020-01-01T00:00:00.000Z'))
+      fs.chmodSync(tokenPath, 0o440)
+    },
+    (tokenPath, token) => {
+      fs.chmodSync(tokenPath, 0o640)
+      fs.writeFileSync(tokenPath, Buffer.alloc(token.length, 0x78))
+      fs.writeFileSync(tokenPath, token)
+      fs.utimesSync(tokenPath, new Date('2021-01-01T00:00:00.000Z'), new Date('2021-01-01T00:00:00.000Z'))
+      fs.chmodSync(tokenPath, 0o440)
+    }
+  ]) {
+    await withBundle(() => {}, async ({ bundlePath, token }) => {
+      const tokenPath = path.join(bundlePath, TOKEN_FILE)
+      const initialStat = fs.statSync(tokenPath, { bigint: true })
+      const adapter = createFsAdapter(bundlePath)
+      const originalOpen = adapter.openSync
+      let didRewrite = false
+      adapter.openSync = (input, flags, mode) => {
+        if (!didRewrite && String(input).endsWith(`/${TOKEN_FILE}`)) {
+          didRewrite = true
+          rewrite(tokenPath, token)
+          const rewrittenStat = fs.statSync(tokenPath, { bigint: true })
+          assert.equal(rewrittenStat.ino, initialStat.ino)
+        }
+        return originalOpen(input, flags, mode)
+      }
+      await assert.rejects(
+        loadTestBundle(bundlePath, { fsApi: adapter }),
+        hasCode('IFIND_TMPFS_BUNDLE_INVALID')
+      )
+      assert.equal(didRewrite, true)
+    })
+  }
 }
 
 module.exports = { run }

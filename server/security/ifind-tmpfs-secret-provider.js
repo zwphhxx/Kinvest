@@ -60,14 +60,18 @@ function snapshotExactDataObject(value, expected) {
 }
 
 function hasExactMetadata(stat, { expectedUid, expectedGid, mode, type }) {
-  return stat.uid === expectedUid &&
-    stat.gid === expectedGid &&
-    (stat.mode & 0o7777) === mode &&
+  return stat.uid === BigInt(expectedUid) &&
+    stat.gid === BigInt(expectedGid) &&
+    (stat.mode & 0o7777n) === BigInt(mode) &&
     (type === 'directory' ? stat.isDirectory() : stat.isFile())
 }
 
-function sameIdentity(left, right) {
-  return left.dev === right.dev && left.ino === right.ino
+function sameStableStat(left, right) {
+  return left.dev === right.dev &&
+    left.ino === right.ino &&
+    left.size === right.size &&
+    left.mtimeNs === right.mtimeNs &&
+    left.ctimeNs === right.ctimeNs
 }
 
 function validateFileStat(stat, initialStat, expectedUid, expectedGid, maxBytes) {
@@ -77,10 +81,10 @@ function validateFileStat(stat, initialStat, expectedUid, expectedGid, maxBytes)
     mode: BUNDLE_FILE_MODE,
     type: 'file'
   }) ||
-    stat.nlink !== 1 ||
-    stat.size < 1 ||
-    stat.size > maxBytes ||
-    !sameIdentity(stat, initialStat)) {
+    stat.nlink !== 1n ||
+    stat.size < 1n ||
+    stat.size > BigInt(maxBytes) ||
+    !sameStableStat(stat, initialStat)) {
     failBundle()
   }
 }
@@ -110,7 +114,7 @@ function readBoundedFile(
       filePath,
       fs.constants.O_RDONLY | fs.constants.O_NOFOLLOW
     )
-    const openedStat = fsApi.fstatSync(descriptor)
+    const openedStat = fsApi.fstatSync(descriptor, { bigint: true })
     validateFileStat(
       openedStat,
       initialStat,
@@ -135,7 +139,7 @@ function readBoundedFile(
     }
     if (bytesRead > maxBytes) failBundle()
 
-    const finalStat = fsApi.fstatSync(descriptor)
+    const finalStat = fsApi.fstatSync(descriptor, { bigint: true })
     validateFileStat(
       finalStat,
       initialStat,
@@ -143,9 +147,9 @@ function readBoundedFile(
       expectedGid,
       MAX_FILE_BYTES[fileName]
     )
-    if (bytesRead !== finalStat.size) failBundle()
+    if (BigInt(bytesRead) !== finalStat.size) failBundle()
 
-    const finalPathStat = fsApi.lstatSync(filePath)
+    const finalPathStat = fsApi.lstatSync(filePath, { bigint: true })
     validateFileStat(
       finalPathStat,
       initialStat,
@@ -319,27 +323,29 @@ async function loadIfindTmpfsSecretsFromBundle({
   const loaded = []
   let directoryDescriptor
   try {
+    const directoryInitialStat = fsApi.lstatSync(bundlePath, { bigint: true })
+    if (!hasExactMetadata(directoryInitialStat, {
+      expectedUid,
+      expectedGid,
+      mode: BUNDLE_DIRECTORY_MODE,
+      type: 'directory'
+    })) {
+      failBundle()
+    }
     directoryDescriptor = fsApi.openSync(
       bundlePath,
       fs.constants.O_RDONLY |
         fs.constants.O_DIRECTORY |
         fs.constants.O_NOFOLLOW
     )
-    const directoryStat = fsApi.fstatSync(directoryDescriptor)
-    const directoryPathStat = fsApi.lstatSync(bundlePath)
-    if (!hasExactMetadata(directoryStat, {
+    const directoryOpenedStat = fsApi.fstatSync(directoryDescriptor, { bigint: true })
+    if (!hasExactMetadata(directoryOpenedStat, {
       expectedUid,
       expectedGid,
       mode: BUNDLE_DIRECTORY_MODE,
       type: 'directory'
     }) ||
-      !hasExactMetadata(directoryPathStat, {
-        expectedUid,
-        expectedGid,
-        mode: BUNDLE_DIRECTORY_MODE,
-        type: 'directory'
-      }) ||
-      !sameIdentity(directoryStat, directoryPathStat)) {
+      !sameStableStat(directoryInitialStat, directoryOpenedStat)) {
       failBundle()
     }
 
@@ -351,7 +357,10 @@ async function loadIfindTmpfsSecretsFromBundle({
 
     const fileSnapshots = new Map()
     for (const fileName of REQUIRED_FILES) {
-      const stat = fsApi.lstatSync(path.join(anchoredBundlePath, fileName))
+      const stat = fsApi.lstatSync(
+        path.join(anchoredBundlePath, fileName),
+        { bigint: true }
+      )
       validateFileStat(
         stat,
         stat,
@@ -385,8 +394,8 @@ async function loadIfindTmpfsSecretsFromBundle({
     validateToken(refreshToken)
     verifyDigest(refreshToken, manifest.refreshToken.sha256)
 
-    const finalDirectoryStat = fsApi.fstatSync(directoryDescriptor)
-    const finalDirectoryPathStat = fsApi.lstatSync(bundlePath)
+    const finalDirectoryStat = fsApi.fstatSync(directoryDescriptor, { bigint: true })
+    const finalDirectoryPathStat = fsApi.lstatSync(bundlePath, { bigint: true })
     if (!hasExactMetadata(finalDirectoryStat, {
       expectedUid,
       expectedGid,
@@ -399,14 +408,17 @@ async function loadIfindTmpfsSecretsFromBundle({
         mode: BUNDLE_DIRECTORY_MODE,
         type: 'directory'
       }) ||
-      !sameIdentity(directoryStat, finalDirectoryStat) ||
-      !sameIdentity(directoryStat, finalDirectoryPathStat) ||
+      !sameStableStat(directoryInitialStat, finalDirectoryStat) ||
+      !sameStableStat(directoryInitialStat, finalDirectoryPathStat) ||
       fsApi.readdirSync(anchoredBundlePath).sort().join('\0') !== REQUIRED_FILES.join('\0')) {
       failBundle()
     }
 
     for (const fileName of REQUIRED_FILES) {
-      const finalStat = fsApi.lstatSync(path.join(anchoredBundlePath, fileName))
+      const finalStat = fsApi.lstatSync(
+        path.join(anchoredBundlePath, fileName),
+        { bigint: true }
+      )
       validateFileStat(
         finalStat,
         fileSnapshots.get(fileName),

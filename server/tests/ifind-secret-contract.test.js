@@ -38,6 +38,52 @@ async function run() {
   })
   assert.equal(Object.isFrozen(enabled), true)
 
+  let proxyTrapCalls = 0
+  const hostileProxy = new Proxy({ mode: 'disabled' }, {
+    get() {
+      proxyTrapCalls += 1
+      throw new Error('proxy get trap ran')
+    },
+    getOwnPropertyDescriptor() {
+      proxyTrapCalls += 1
+      throw new Error('proxy descriptor trap ran')
+    },
+    getPrototypeOf() {
+      proxyTrapCalls += 1
+      throw new Error('proxy prototype trap ran')
+    },
+    ownKeys() {
+      proxyTrapCalls += 1
+      throw new Error('proxy keys trap ran')
+    }
+  })
+  assert.throws(
+    () => createIfindSecretContract(hostileProxy),
+    hasCode('IFIND_SECRET_CONFIG_INVALID')
+  )
+  assert.equal(proxyTrapCalls, 0)
+
+  const attackerError = new IfindSecretContractError()
+  attackerError.message = 'attacker-sensitive-message'
+  attackerError.code = 'ATTACKER_CONTROLLED_CODE'
+  const originalGetPrototypeOf = Reflect.getPrototypeOf
+  Reflect.getPrototypeOf = () => { throw attackerError }
+  try {
+    assert.throws(
+      () => createIfindSecretContract({ mode: 'disabled' }),
+      (error) => {
+        assert.notStrictEqual(error, attackerError)
+        assert.equal(error.name, 'IfindSecretContractError')
+        assert.equal(error.message, 'The iFinD secret configuration is invalid')
+        assert.equal(error.code, 'IFIND_SECRET_CONFIG_INVALID')
+        assert.equal(`${error.name}:${error.message}:${error.code}`.includes('attacker'), false)
+        return true
+      }
+    )
+  } finally {
+    Reflect.getPrototypeOf = originalGetPrototypeOf
+  }
+
   const symbolExtra = { mode: 'disabled' }
   symbolExtra[Symbol('hidden')] = true
   const nonEnumerableExtra = { mode: 'disabled' }
