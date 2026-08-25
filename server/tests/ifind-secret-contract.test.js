@@ -2,8 +2,15 @@ const assert = require('node:assert/strict')
 
 const VERSION_ID = 'v20260826-001'
 
+/** @returns {Record<string, any>} */
+function errorRecord(error) {
+  return error !== null && typeof error === 'object'
+    ? /** @type {Record<string, any>} */ (error)
+    : Object.create(null)
+}
+
 function hasCode(code) {
-  return (error) => error instanceof Error && error.code === code
+  return (/**  {any} */ error) => error instanceof Error && errorRecord(error).code === code
 }
 
 async function run() {
@@ -71,12 +78,12 @@ async function run() {
   try {
     assert.throws(
       () => createIfindSecretContract({ mode: 'disabled' }),
-      (error) => {
+      (/**  {any} */ error) => {
         assert.notStrictEqual(error, attackerError)
-        assert.equal(error.name, 'IfindSecretContractError')
-        assert.equal(error.message, 'The iFinD secret configuration is invalid')
-        assert.equal(error.code, 'IFIND_SECRET_CONFIG_INVALID')
-        assert.equal(`${error.name}:${error.message}:${error.code}`.includes('attacker'), false)
+        assert.equal(errorRecord(error).name, 'IfindSecretContractError')
+        assert.equal(errorRecord(error).message, 'The iFinD secret configuration is invalid')
+        assert.equal(errorRecord(error).code, 'IFIND_SECRET_CONFIG_INVALID')
+        assert.equal(`${errorRecord(error).name}:${errorRecord(error).message}:${errorRecord(error).code}`.includes('attacker'), false)
         return true
       }
     )
@@ -141,12 +148,12 @@ async function run() {
   for (const value of invalidValues) {
     assert.throws(
       () => createIfindSecretContract(value),
-      (error) => {
+      (/**  {any} */ error) => {
         assert.equal(hasCode('IFIND_SECRET_CONFIG_INVALID')(error), true)
-        const serialized = `${error.name}:${error.message}:${error.code}`
+        const serialized = `${errorRecord(error).name}:${errorRecord(error).message}:${errorRecord(error).code}`
         assert.equal(serialized.includes(VERSION_ID), false)
         assert.equal(serialized.includes(IFIND_BUNDLE_PATH), false)
-        assert.equal('cause' in error, false)
+        assert.equal('cause' in errorRecord(error), false)
         return true
       }
     )

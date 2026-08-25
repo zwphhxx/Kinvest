@@ -169,7 +169,9 @@ function readBoundedFile(
     if (scratch) scratch.fill(0)
     if (value && !transferred) value.fill(0)
     if (descriptor !== undefined) {
-      try { fsApi.closeSync(descriptor) } catch {}
+      try { fsApi.closeSync(descriptor) } catch {
+        // Best-effort defensive cleanup must not replace the stable result.
+      }
     }
   }
 }
@@ -303,13 +305,22 @@ class LoadedIfindTmpfsSecretProvider {
   }
 }
 
+/**
+ * @param {{
+ *   versionId: string,
+ *   bundlePath: string,
+ *   expectedUid: number,
+ *   expectedGid: number,
+ *   fsApi?: typeof fs
+ * }} options
+ */
 async function loadIfindTmpfsSecretsFromBundle({
   versionId,
   bundlePath,
   expectedUid,
   expectedGid,
   fsApi = fs
-} = {}) {
+}) {
   if (typeof versionId !== 'string' ||
     !VERSION_ID_PATTERN.test(versionId) ||
     typeof bundlePath !== 'string' ||
@@ -435,17 +446,18 @@ async function loadIfindTmpfsSecretsFromBundle({
   } finally {
     for (const value of loaded) value.fill(0)
     if (directoryDescriptor !== undefined) {
-      try { fsApi.closeSync(directoryDescriptor) } catch {}
+      try { fsApi.closeSync(directoryDescriptor) } catch {
+        // Best-effort defensive cleanup must not replace the stable result.
+      }
     }
   }
 }
 
 async function loadIfindTmpfsSecrets(config) {
   const contract = createIfindSecretContract(config)
-  const { mode, versionId } = contract
-  if (mode === IFIND_DIAGNOSTIC_MODE_DISABLED) return null
+  if (contract.mode === IFIND_DIAGNOSTIC_MODE_DISABLED) return null
   return loadIfindTmpfsSecretsFromBundle({
-    versionId,
+    versionId: contract.versionId,
     bundlePath: BUNDLE_PATH,
     expectedUid: BUNDLE_OWNER_UID,
     expectedGid: BUNDLE_GROUP_GID

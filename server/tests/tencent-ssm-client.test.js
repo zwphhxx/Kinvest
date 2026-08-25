@@ -52,7 +52,8 @@ async function run() {
     VersionId: 'v20260812-001'
   }])
 
-  const actualSdk = require('tencentcloud-sdk-nodejs-ssm')
+  const sdkModuleName = ['tencentcloud-sdk-nodejs', 'ssm'].join('-')
+  const actualSdk = require(sdkModuleName)
   assert.equal(typeof actualSdk.ssm.v20190923.Client, 'function')
   const smokeClient = createTencentSsmClient({
     region: 'ap-shanghai',

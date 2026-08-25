@@ -12,6 +12,13 @@ const TOKEN_FILE = 'refresh-token'
 const FORMAT = 'kinvest-ifind-tmpfs-v1'
 const TOKEN = Buffer.from('synthetic-ifind-refresh-token-for-tests')
 
+/** @returns {Record<string, any>} */
+function errorRecord(error) {
+  return error !== null && typeof error === 'object'
+    ? /** @type {Record<string, any>} */ (error)
+    : Object.create(null)
+}
+
 function sha256(value) {
   return crypto.createHash('sha256').update(value).digest('hex')
 }
@@ -28,6 +35,10 @@ function canonicalManifest(token = TOKEN, overrides = {}) {
   })
 }
 
+/**
+ * @param {string} root
+ * @param {(input: {bundlePath: string, token: Buffer}) => void} [mutate]
+ */
 function createBundle(root, mutate = () => {}) {
   const bundlePath = path.join(root, 'bundle-sensitive-path-marker')
   const token = Buffer.from(TOKEN)
@@ -52,7 +63,9 @@ async function withBundle(mutate, assertion) {
   try {
     await assertion(createBundle(root, mutate), root)
   } finally {
-    try { fs.chmodSync(path.join(root, 'bundle-sensitive-path-marker'), 0o700) } catch {}
+    try { fs.chmodSync(path.join(root, 'bundle-sensitive-path-marker'), 0o700) } catch {
+        // Best-effort defensive cleanup must not replace the stable result.
+      }
     fs.rmSync(root, { recursive: true, force: true })
   }
 }
@@ -120,7 +133,7 @@ function loadTestBundle(bundlePath, options = {}) {
 }
 
 function hasCode(code) {
-  return (error) => error instanceof Error && error.code === code
+  return (/**  {any} */ error) => error instanceof Error && errorRecord(error).code === code
 }
 
 async function assertInvalidMutation(mutate, options = {}) {
@@ -325,8 +338,10 @@ async function run() {
     adapter.lstatSync = (input, options) => {
       const stat = originalLstat(input, options)
       if (String(input).endsWith(`/${TOKEN_FILE}`) && ++tokenStats === 2) {
-        const one = typeof stat.ino === 'bigint' ? 1n : 1
-        Object.defineProperty(stat, 'ino', { value: stat.ino + one })
+        const nextIno = typeof stat.ino === 'bigint'
+          ? stat.ino + 1n
+          : Number(stat.ino) + 1
+        Object.defineProperty(stat, 'ino', { value: nextIno })
       }
       return stat
     }
@@ -339,8 +354,10 @@ async function run() {
     adapter.lstatSync = (input, options) => {
       const stat = originalLstat(input, options)
       if (input === bundlePath && ++directoryStats === 2) {
-        const one = typeof stat.ino === 'bigint' ? 1n : 1
-        Object.defineProperty(stat, 'ino', { value: stat.ino + one })
+        const nextIno = typeof stat.ino === 'bigint'
+          ? stat.ino + 1n
+          : Number(stat.ino) + 1
+        Object.defineProperty(stat, 'ino', { value: nextIno })
       }
       return stat
     }

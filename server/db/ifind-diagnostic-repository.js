@@ -275,7 +275,9 @@ class IfindDiagnosticRepository {
       this.database.exec('COMMIT')
       return result
     } catch (error) {
-      try { this.database.exec('ROLLBACK') } catch {}
+      try { this.database.exec('ROLLBACK') } catch {
+        // Best-effort defensive cleanup must not replace the stable result.
+      }
       throw error
     }
   }

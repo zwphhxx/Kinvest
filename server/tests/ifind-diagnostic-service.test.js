@@ -6,6 +6,11 @@ const VERSION_ID = 'v20260826-001'
 const ROUTE = '/api/v1/get_trade_dates'
 const SCOPE = 'market-trade-dates:212001:D:-10'
 
+/** @returns {any} */
+function dynamicEmitter() {
+  return new EventEmitter()
+}
+
 function createRepository() {
   const { IfindDiagnosticRepository } = require('../db/ifind-diagnostic-repository')
   const database = new DatabaseSync(':memory:')
@@ -67,7 +72,9 @@ function createEnabledService(overrides = {}) {
 }
 
 function clientFailure(errorClass, overrides = {}) {
-  const error = new Error('raw provider marker must not escape')
+  const error = /** @type {Error & Record<string, any>} */ (
+    new Error('raw provider marker must not escape')
+  )
   error.class = errorClass
   error.code = 'RAW_PROVIDER_CODE'
   error.headers = { authorization: 'secret' }
@@ -81,12 +88,12 @@ function createRequestStub(responseBodies) {
   const calls = []
   function request(url, options, callback) {
     calls.push(String(url))
-    const outgoing = new EventEmitter()
+    const outgoing = dynamicEmitter()
     outgoing.write = () => {}
     outgoing.end = () => {
       const body = pending.shift()
       queueMicrotask(() => {
-        const incoming = new EventEmitter()
+        const incoming = dynamicEmitter()
         incoming.statusCode = 200
         incoming.destroy = () => {}
         callback(incoming)
@@ -95,6 +102,40 @@ function createRequestStub(responseBodies) {
       })
     }
     outgoing.destroy = () => {}
+    return outgoing
+  }
+  return { calls, request }
+}
+
+function createStageFailureTransport(scenarios) {
+  const pending = [...scenarios]
+  const calls = []
+  function request(url, _options, callback) {
+    const scenario = pending.shift()
+    calls.push(String(url))
+    const outgoing = dynamicEmitter()
+    outgoing.write = () => {}
+    outgoing.destroy = () => {}
+    outgoing.setTimeout = (milliseconds, handler) => {
+      if (scenario && scenario.timeout && milliseconds > 0) {
+        queueMicrotask(handler)
+      }
+    }
+    outgoing.end = () => {
+      if (scenario && scenario.timeout) return
+      queueMicrotask(() => {
+        if (scenario && scenario.networkError) {
+          outgoing.emit('error', new Error('raw network marker'))
+          return
+        }
+        const incoming = dynamicEmitter()
+        incoming.statusCode = 200
+        incoming.destroy = () => {}
+        callback(incoming)
+        incoming.emit('data', Buffer.from(JSON.stringify(scenario.body)))
+        incoming.emit('end')
+      })
+    }
     return outgoing
   }
   return { calls, request }
@@ -167,7 +208,7 @@ async function run() {
   assert.equal(successful.repository.status(Date.parse('2026-08-26T02:00:00.010Z')).localAttemptCount, 1)
   assert.equal(successful.repository.latest().requestCount, 4)
   assert.equal(Buffer.isBuffer(receivedToken), true)
-  assert.equal(receivedToken.every((byte) => byte === 0), true)
+  assert.equal((/** @type {Buffer} */ (receivedToken)).every((byte) => byte === 0), true)
   assert.equal(successful.tokenBuffers.every((buffer) => buffer.every((byte) => byte === 0)), true)
   assert.deepEqual(Object.keys(success.diagnostic).sort(), [
     'authStatus',
@@ -212,7 +253,9 @@ async function run() {
   invalidSecret.database.close()
 
   let throwingSecretClientCalls = 0
-  const throwingSecretError = new Error('throwing secret provider raw marker')
+  const throwingSecretError = /** @type {Error & Record<string, any>} */ (
+    new Error('throwing secret provider raw marker')
+  )
   throwingSecretError.class = 'CONFIG'
   throwingSecretError.requestCount = 4
   const throwingSecret = createEnabledService({
@@ -322,6 +365,59 @@ async function run() {
   )
   assert.equal(exhaustedTransport.calls.length, 4)
   integrated.database.close()
+
+  for (const scenario of [
+    {
+      name: 'authentication network failure',
+      transport: [{ networkError: true }],
+      expected: {
+        authStatus: 'failed', probeStatus: 'not_run',
+        safeErrorClass: 'NETWORK', requestCount: 1
+      }
+    },
+    {
+      name: 'authentication timeout',
+      transport: [{ timeout: true }],
+      expected: {
+        authStatus: 'failed', probeStatus: 'not_run',
+        safeErrorClass: 'NETWORK', requestCount: 1
+      }
+    },
+    {
+      name: 'authentication format failure',
+      transport: [{ body: {} }],
+      expected: {
+        authStatus: 'failed', probeStatus: 'not_run',
+        safeErrorClass: 'API', requestCount: 1
+      }
+    },
+    {
+      name: 'probe network failure',
+      transport: [
+        { body: { errorcode: 0, data: { access_token: 'synthetic-access-token' } } },
+        { networkError: true }
+      ],
+      expected: {
+        authStatus: 'success', probeStatus: 'failed',
+        safeErrorClass: 'NETWORK', requestCount: 2
+      }
+    }
+  ]) {
+    const transport = createStageFailureTransport(scenario.transport)
+    const client = createIfindHttpClient({
+      request: transport.request,
+      now: () => new Date('2026-08-26T02:00:00.000Z')
+    })
+    const state = createEnabledService({ client })
+    const outcome = await state.service.run()
+    assert.equal(outcome.status, 'failed', scenario.name)
+    for (const [key, value] of Object.entries(scenario.expected)) {
+      assert.equal(outcome.diagnostic[key], value, `${scenario.name}: ${key}`)
+      assert.equal(state.repository.latest()[key], value, `${scenario.name}: persisted ${key}`)
+    }
+    assert.equal(transport.calls.length, scenario.expected.requestCount)
+    state.database.close()
+  }
 
   const malformedCount = createEnabledService()
   malformedCount.client.diagnose = async () => successResult({
@@ -488,7 +584,7 @@ async function run() {
   })
   assert.throws(
     () => hostileStatus.service.status(),
-    (error) => error instanceof IfindDiagnosticServiceError &&
+    (/**  {any} */ error) => error instanceof IfindDiagnosticServiceError &&
       !`${error.message}:${error.code}`.includes('raw')
   )
   hostileStatus.database.close()
@@ -504,7 +600,7 @@ async function run() {
   clearState.service.clear()
   clearState.service.clear()
   assert.equal(clearCalls, 1)
-  finishClient(successResult())
+  ;(/** @type {(value: any) => void} */ (finishClient))(successResult())
   const clearedOutcome = await pending
   assert.equal(clearedOutcome.status, 'failed')
   assert.equal(clearedOutcome.diagnostic.safeErrorClass, 'CONFIG')

@@ -483,12 +483,18 @@ async function testShutdownCleanupOrder() {
 }
 
 async function run() {
-  await testDisabledRuntimeTouchesNothing()
-  await testEnabledRuntimeRequiresDeviceApprovalAndSharesDatabase()
-  await testFailureCleanupAndSanitization()
-  await testPreparationPassesFrozenRuntimeAndKeepsHealthUnchanged()
-  await testStartupFailuresPreventListenAndCleanEveryPhase()
-  await testShutdownCleanupOrder()
+  const initialUmask = process.umask()
+  try {
+    await testDisabledRuntimeTouchesNothing()
+    await testEnabledRuntimeRequiresDeviceApprovalAndSharesDatabase()
+    await testFailureCleanupAndSanitization()
+    await testPreparationPassesFrozenRuntimeAndKeepsHealthUnchanged()
+    await testStartupFailuresPreventListenAndCleanEveryPhase()
+    await testShutdownCleanupOrder()
+  } finally {
+    process.umask(initialUmask)
+  }
+  assert.equal(process.umask(), initialUmask)
 }
 
 module.exports = { run }

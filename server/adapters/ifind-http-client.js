@@ -7,6 +7,16 @@ const PERMISSION_ERROR_CODES = new Set([-403])
 const QUOTA_ERROR_CODES = new Set([-429])
 const SAFE_ERRORS = new WeakSet()
 
+/**
+ * @typedef {Error & {
+ *   code: string,
+ *   class: string,
+ *   dataVol?: number,
+ *   requestCount?: number,
+ *   stage?: 'auth' | 'probe'
+ * }} IfindClientError
+ */
+
 function isRecord(value) {
   return typeof value === 'object' && value !== null && !Array.isArray(value)
 }
@@ -18,8 +28,9 @@ function isHeaderSafeToken(value) {
     /^[\x21-\x7e]+$/.test(value)
 }
 
+/** @returns {IfindClientError} */
 function safeError(code, errorClass, message, dataVol) {
-  const error = new Error(message)
+  const error = /** @type {IfindClientError} */ (new Error(message))
   error.code = code
   error.class = errorClass
   if (Number.isSafeInteger(dataVol) && dataVol >= 0) error.dataVol = dataVol
@@ -36,6 +47,23 @@ function withRequestCount(error, requestCount) {
     : safeError('IFIND_CLIENT_FAILED', 'API', 'iFinD diagnostic failed')
   Object.defineProperty(sanitized, 'requestCount', {
     value: safeCount,
+    enumerable: true,
+    configurable: false,
+    writable: false
+  })
+  return sanitized
+}
+
+function withStage(error, stage) {
+  const sanitized = SAFE_ERRORS.has(error)
+    ? error
+    : safeError('IFIND_CLIENT_FAILED', 'API', 'iFinD diagnostic failed')
+  const existing = Object.getOwnPropertyDescriptor(sanitized, 'stage')
+  if (existing && (existing.value === 'auth' || existing.value === 'probe')) {
+    return sanitized
+  }
+  Object.defineProperty(sanitized, 'stage', {
+    value: stage,
     enumerable: true,
     configurable: false,
     writable: false
@@ -69,12 +97,16 @@ function requestJson(request, path, headers, body, setTimer, clearTimer) {
         if (emitter && typeof emitter.removeListener === 'function' && handler) {
           emitter.removeListener(event, handler)
         }
-      } catch {}
+      } catch {
+        // Best-effort defensive cleanup must not replace the stable result.
+      }
     }
     const destroy = (stream) => {
       try {
         if (stream && typeof stream.destroy === 'function') stream.destroy()
-      } catch {}
+      } catch {
+        // Best-effort defensive cleanup must not replace the stable result.
+      }
     }
     let onRequestError
     let onRequestTimeout
@@ -90,7 +122,9 @@ function requestJson(request, path, headers, body, setTimer, clearTimer) {
       if (timer === undefined) return
       try {
         clearTimer(timer)
-      } catch {}
+      } catch {
+        // Best-effort defensive cleanup must not replace the stable result.
+      }
     }
 
     function clearConnectionLifecycle() {
@@ -105,7 +139,9 @@ function requestJson(request, path, headers, body, setTimer, clearTimer) {
       removeListener(outgoing, 'timeout', onRequestTimeout)
       try {
         if (outgoing && typeof outgoing.setTimeout === 'function') outgoing.setTimeout(0)
-      } catch {}
+      } catch {
+        // Best-effort defensive cleanup must not replace the stable result.
+      }
     }
 
     function connectionEstablished() {
@@ -347,23 +383,28 @@ function classifyProbeFailure(response) {
   return 'API'
 }
 
+/**
+ * @param {{
+ *   request?: (url: string, options: any, callback: (response: any) => void) => any,
+ *   now?: () => Date,
+ *   setTimer?: (handler: () => void, milliseconds: number) => any,
+ *   clearTimer?: (timer: any) => void,
+ *   logger?: any
+ * }} [options]
+ */
 function createIfindHttpClient({
   request = https.request,
   now = () => new Date(),
   setTimer = setTimeout,
   clearTimer = clearTimeout
 } = {}) {
-  let accessToken = null
   let generation = 0
-
-  function discardAccessToken() {
-    if (Buffer.isBuffer(accessToken)) accessToken.fill(0)
-    accessToken = null
-  }
+  const activeAccessTokens = new Set()
 
   function clear() {
     generation += 1
-    discardAccessToken()
+    for (const token of activeAccessTokens) token.fill(0)
+    activeAccessTokens.clear()
   }
 
   function requireCurrentGeneration(expectedGeneration) {
@@ -385,6 +426,14 @@ function createIfindHttpClient({
 
   async function diagnose(input) {
     let requestCount = 0
+    let accessToken = null
+    function discardAccessToken() {
+      if (Buffer.isBuffer(accessToken)) {
+        activeAccessTokens.delete(accessToken)
+        accessToken.fill(0)
+      }
+      accessToken = null
+    }
     try {
     let refreshToken
     try {
@@ -407,104 +456,117 @@ function createIfindHttpClient({
     const startedAt = readNow()
 
     async function authenticate() {
-      requireCurrentGeneration(operationGeneration)
-      requestCount += 1
-      const tokenResponse = await requestJson(
-        request,
-        '/api/v1/get_access_token',
-        { refresh_token: refreshToken },
-        undefined,
-        setTimer,
-        clearTimer
-      )
-      requireCurrentGeneration(operationGeneration)
-      if (!isRecord(tokenResponse) || typeof tokenResponse.errorcode !== 'number') {
-        throw safeError('IFIND_RESPONSE_SHAPE', 'API', 'iFinD response shape was invalid')
+      try {
+        requireCurrentGeneration(operationGeneration)
+        requestCount += 1
+        const tokenResponse = await requestJson(
+          request,
+          '/api/v1/get_access_token',
+          { refresh_token: refreshToken },
+          undefined,
+          setTimer,
+          clearTimer
+        )
+        requireCurrentGeneration(operationGeneration)
+        if (!isRecord(tokenResponse) || typeof tokenResponse.errorcode !== 'number') {
+          throw safeError('IFIND_RESPONSE_SHAPE', 'API', 'iFinD response shape was invalid')
+        }
+        if (tokenResponse.errorcode !== 0) {
+          throw safeError('IFIND_AUTH_REJECTED', 'AUTH', 'iFinD access-token request failed')
+        }
+        if (!isRecord(tokenResponse.data) ||
+            !isHeaderSafeToken(tokenResponse.data.access_token)) {
+          throw safeError('IFIND_RESPONSE_SHAPE', 'API', 'iFinD response shape was invalid')
+        }
+        discardAccessToken()
+        accessToken = Buffer.from(tokenResponse.data.access_token, 'utf8')
+        activeAccessTokens.add(accessToken)
+        requireCurrentGeneration(operationGeneration)
+      } catch (error) {
+        throw withStage(error, 'auth')
       }
-      if (tokenResponse.errorcode !== 0) {
-        throw safeError('IFIND_AUTH_REJECTED', 'AUTH', 'iFinD access-token request failed')
-      }
-      if (!isRecord(tokenResponse.data) ||
-          !isHeaderSafeToken(tokenResponse.data.access_token)) {
-        throw safeError('IFIND_RESPONSE_SHAPE', 'API', 'iFinD response shape was invalid')
-      }
-      discardAccessToken()
-      accessToken = Buffer.from(tokenResponse.data.access_token, 'utf8')
-      requireCurrentGeneration(operationGeneration)
     }
 
-    if (accessToken === null) await authenticate()
+    await authenticate()
 
     let probeResponse
-    for (let attempt = 0; attempt < 2; attempt += 1) {
-      requireCurrentGeneration(operationGeneration)
-      requestCount += 1
-      probeResponse = await requestJson(
-        request,
-        '/api/v1/get_trade_dates',
-        {
-          access_token: accessToken.toString('utf8'),
-          ifindlang: 'cn'
-        },
-        {
-          marketcode: '212001',
-          functionpara: {
-            dateType: '0',
-            period: 'D',
-            offset: '-10',
-            dateFormat: '0',
-            output: 'sequencedate'
+    try {
+      for (let attempt = 0; attempt < 2; attempt += 1) {
+        requireCurrentGeneration(operationGeneration)
+        const tokenForProbe = accessToken
+        if (!Buffer.isBuffer(tokenForProbe)) {
+          throw safeError('IFIND_CONFIG_INVALID', 'CONFIG', 'iFinD client configuration was invalid')
+        }
+        requestCount += 1
+        probeResponse = await requestJson(
+          request,
+          '/api/v1/get_trade_dates',
+          {
+            access_token: tokenForProbe.toString('utf8'),
+            ifindlang: 'cn'
           },
-          startdate: shanghaiDate(startedAt)
-        },
-        setTimer,
-        clearTimer
-      )
-      requireCurrentGeneration(operationGeneration)
-      if (!isRecord(probeResponse) || typeof probeResponse.errorcode !== 'number') {
+          {
+            marketcode: '212001',
+            functionpara: {
+              dateType: '0',
+              period: 'D',
+              offset: '-10',
+              dateFormat: '0',
+              output: 'sequencedate'
+            },
+            startdate: shanghaiDate(startedAt)
+          },
+          setTimer,
+          clearTimer
+        )
+        requireCurrentGeneration(operationGeneration)
+        if (!isRecord(probeResponse) || typeof probeResponse.errorcode !== 'number') {
+          throw safeError('IFIND_RESPONSE_SHAPE', 'API', 'iFinD response shape was invalid')
+        }
+        if (probeResponse.errorcode === 0) break
+        const failureClass = classifyProbeFailure(probeResponse)
+        if (failureClass === 'AUTH' && attempt === 1) {
+          discardAccessToken()
+          throw safeError('IFIND_AUTH_REJECTED', 'AUTH', 'iFinD authentication failed')
+        }
+        if (failureClass === 'PERMISSION') {
+          throw safeError(
+            'IFIND_PERMISSION_REJECTED',
+            'PERMISSION',
+            'iFinD permission denied',
+            probeResponse.dataVol
+          )
+        }
+        if (failureClass === 'QUOTA') {
+          throw safeError(
+            'IFIND_QUOTA_REJECTED',
+            'QUOTA',
+            'iFinD quota unavailable',
+            probeResponse.dataVol
+          )
+        }
+        if (failureClass !== 'AUTH') {
+          throw safeError(
+            'IFIND_PROBE_REJECTED',
+            'API',
+            'iFinD trade-date probe failed',
+            probeResponse.dataVol
+          )
+        }
+        discardAccessToken()
+        await authenticate()
+      }
+
+      if (!isRecord(probeResponse.tables) ||
+          !Array.isArray(probeResponse.tables.time) ||
+          !isRecord(probeResponse.tables.table) ||
+          !Array.isArray(probeResponse.tables.table.sequencedate) ||
+          (Object.hasOwn(probeResponse, 'dataVol') &&
+            (!Number.isFinite(probeResponse.dataVol) || probeResponse.dataVol < 0))) {
         throw safeError('IFIND_RESPONSE_SHAPE', 'API', 'iFinD response shape was invalid')
       }
-      if (probeResponse.errorcode === 0) break
-      const failureClass = classifyProbeFailure(probeResponse)
-      if (failureClass === 'AUTH' && attempt === 1) {
-        discardAccessToken()
-        throw safeError('IFIND_AUTH_REJECTED', 'AUTH', 'iFinD authentication failed')
-      }
-      if (failureClass === 'PERMISSION') {
-        throw safeError(
-          'IFIND_PERMISSION_REJECTED',
-          'PERMISSION',
-          'iFinD permission denied',
-          probeResponse.dataVol
-        )
-      }
-      if (failureClass === 'QUOTA') {
-        throw safeError(
-          'IFIND_QUOTA_REJECTED',
-          'QUOTA',
-          'iFinD quota unavailable',
-          probeResponse.dataVol
-        )
-      }
-      if (failureClass !== 'AUTH') {
-        throw safeError(
-          'IFIND_PROBE_REJECTED',
-          'API',
-          'iFinD trade-date probe failed',
-          probeResponse.dataVol
-        )
-      }
-      discardAccessToken()
-      await authenticate()
-    }
-
-    if (!isRecord(probeResponse.tables) ||
-        !Array.isArray(probeResponse.tables.time) ||
-        !isRecord(probeResponse.tables.table) ||
-        !Array.isArray(probeResponse.tables.table.sequencedate) ||
-        (Object.hasOwn(probeResponse, 'dataVol') &&
-          (!Number.isFinite(probeResponse.dataVol) || probeResponse.dataVol < 0))) {
-      throw safeError('IFIND_RESPONSE_SHAPE', 'API', 'iFinD response shape was invalid')
+    } catch (error) {
+      throw withStage(error, 'probe')
     }
 
     const retrievedAt = readNow()
@@ -523,6 +585,8 @@ function createIfindHttpClient({
     }
     } catch (error) {
       throw withRequestCount(error, requestCount)
+    } finally {
+      discardAccessToken()
     }
   }
 

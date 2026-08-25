@@ -1,9 +1,16 @@
 const assert = require('node:assert/strict')
 const { EventEmitter } = require('node:events')
+const fs = require('node:fs')
+const path = require('node:path')
 
-const accessTokenSuccess = require('./fixtures/ifind/access-token-success.json')
-const tradeDatesSuccess = require('./fixtures/ifind/trade-dates-success.json')
-const providerErrors = require('./fixtures/ifind/provider-errors.json')
+/** @returns {any} */
+function readFixture(name) {
+  return JSON.parse(fs.readFileSync(path.join(__dirname, 'fixtures', 'ifind', name), 'utf8'))
+}
+
+const accessTokenSuccess = readFixture('access-token-success.json')
+const tradeDatesSuccess = readFixture('trade-dates-success.json')
+const providerErrors = readFixture('provider-errors.json')
 
 const REFRESH_TOKEN = 'fake-refresh-token-for-contract-tests'
 const ACCESS_TOKEN = accessTokenSuccess.data.access_token
@@ -11,6 +18,18 @@ const SYNTHETIC_REQUEST_ID = 'synthetic-request-id-for-contract-tests'
 const ORIGIN = 'https://quantapi.51ifind.com'
 const AUTH_PROVIDER_MARKER = 'Synthetic authentication rejection'
 const PROBE_PROVIDER_MARKER = 'Synthetic probe rejection'
+
+/** @returns {any} */
+function dynamicEmitter() {
+  return new EventEmitter()
+}
+
+/** @returns {Record<string, any>} */
+function errorRecord(error) {
+  return error !== null && typeof error === 'object'
+    ? /** @type {Record<string, any>} */ (error)
+    : Object.create(null)
+}
 
 function normalizeHeaders(headers) {
   return Object.fromEntries(Object.entries(headers).map(([name, value]) => [
@@ -110,7 +129,8 @@ function containsSentinel(root, sentinel) {
     }
     for (const key of Reflect.ownKeys(descriptors)) {
       pending.push(key)
-      const descriptor = descriptors[key]
+      const descriptor = Reflect.getOwnPropertyDescriptor(value, key)
+      if (!descriptor) continue
       if (Object.hasOwn(descriptor, 'value')) pending.push(descriptor.value)
     }
   }
@@ -131,7 +151,7 @@ function createRequestStub(responseBodies) {
     }
     calls.push(call)
 
-    const outgoing = new EventEmitter()
+    const outgoing = dynamicEmitter()
     outgoing.write = (chunk) => {
       rawBody += String(chunk)
     }
@@ -140,7 +160,7 @@ function createRequestStub(responseBodies) {
       call.body = rawBody ? JSON.parse(rawBody) : null
       const body = pending.shift()
       queueMicrotask(() => {
-        const incoming = new EventEmitter()
+        const incoming = dynamicEmitter()
         incoming.statusCode = 200
         incoming.destroy = () => {}
         callback(incoming)
@@ -171,7 +191,7 @@ function createRawRequestStub(scenarios) {
       incoming: null
     }
     calls.push(call)
-    const outgoing = new EventEmitter()
+    const outgoing = dynamicEmitter()
     outgoing.write = () => {}
     outgoing.setTimeout = (milliseconds, handler) => {
       if (milliseconds > 0) call.connectionTimeoutMs = milliseconds
@@ -212,7 +232,7 @@ function createRawRequestStub(scenarios) {
           outgoing.emit('error', new Error(scenario.networkError))
           return
         }
-        const incoming = new EventEmitter()
+        const incoming = dynamicEmitter()
         call.incoming = incoming
         incoming.statusCode = scenario.statusCode === undefined ? 200 : scenario.statusCode
         incoming.destroy = () => { call.responseDestroyCount += 1 }
@@ -255,7 +275,7 @@ function createManualRequestTransport({ synchronousConnectedOnListener = false }
       endCount: 0,
       destroyCount: 0
     }
-    const outgoing = new EventEmitter()
+    const outgoing = dynamicEmitter()
     const addListener = outgoing.on
     outgoing.on = function on(event, listener) {
       const result = addListener.call(this, event, listener)
@@ -268,7 +288,7 @@ function createManualRequestTransport({ synchronousConnectedOnListener = false }
     outgoing.destroy = () => { call.destroyCount += 1 }
     outgoing.setTimeout = () => {}
     call.respond = ({ statusCode = 200, chunks = [], event = 'end' }) => {
-      const incoming = new EventEmitter()
+      const incoming = dynamicEmitter()
       incoming.statusCode = statusCode
       incoming.destroyCount = 0
       incoming.destroy = () => { incoming.destroyCount += 1 }
@@ -337,6 +357,7 @@ async function run() {
   const successTransport = createRequestStub([
     accessTokenSuccess,
     tradeDatesSuccess,
+    accessTokenSuccess,
     tradeDatesSuccess
   ])
   const successLogger = createCapturingLogger()
@@ -402,10 +423,13 @@ async function run() {
     globalOutputEntries: successExecution.entries
   })
 
-  const cachedResult = await client.diagnose({ refreshToken: REFRESH_TOKEN })
-  assert.equal(successTransport.calls.length, 3)
-  assert.equal(successTransport.calls[2].url, `${ORIGIN}/api/v1/get_trade_dates`)
-  assert.equal(cachedResult.requestCount, 1)
+  const secondResult = await client.diagnose({ refreshToken: REFRESH_TOKEN })
+  assert.equal(successTransport.calls.length, 4)
+  assert.deepEqual(
+    successTransport.calls.slice(2).map((call) => new URL(call.url).pathname),
+    ['/api/v1/get_access_token', '/api/v1/get_trade_dates']
+  )
+  assert.equal(secondResult.requestCount, 2)
 
   const authFailureTransport = createRequestStub([providerErrors.accessToken])
   const authFailureLogger = createCapturingLogger()
@@ -421,6 +445,7 @@ async function run() {
   const authError = authFailureExecution.reason
   assert.equal(authError.code, 'IFIND_AUTH_REJECTED')
   assert.equal(authError.class, 'AUTH')
+  assert.equal(authError.stage, 'auth')
   assert.equal(authError.message, 'iFinD access-token request failed')
   assert.equal(authError.requestCount, 1)
   assert.equal('cause' in authError, false)
@@ -450,6 +475,7 @@ async function run() {
   const probeError = probeFailureExecution.reason
   assert.equal(probeError.code, 'IFIND_PROBE_REJECTED')
   assert.equal(probeError.class, 'API')
+  assert.equal(probeError.stage, 'probe')
   assert.equal(probeError.message, 'iFinD trade-date probe failed')
   assert.equal(probeError.dataVol, 3)
   assert.equal(probeError.requestCount, 2)
@@ -488,6 +514,35 @@ async function run() {
     ]
   )
 
+  const isolatedDiagnosesTransport = createRequestStub([
+    accessTokenSuccess,
+    tradeDatesSuccess,
+    {
+      errorcode: 0,
+      data: { access_token: 'synthetic-second-diagnosis-access-token' }
+    },
+    tradeDatesSuccess
+  ])
+  const isolatedDiagnosesClient = createIfindHttpClient({
+    request: isolatedDiagnosesTransport.request,
+    now: () => new Date('2026-08-25T16:30:00.000Z')
+  })
+  assert.equal((await isolatedDiagnosesClient.diagnose({
+    refreshToken: REFRESH_TOKEN
+  })).requestCount, 2)
+  assert.equal((await isolatedDiagnosesClient.diagnose({
+    refreshToken: REFRESH_TOKEN
+  })).requestCount, 2)
+  assert.deepEqual(
+    isolatedDiagnosesTransport.calls.map((call) => new URL(call.url).pathname),
+    [
+      '/api/v1/get_access_token',
+      '/api/v1/get_trade_dates',
+      '/api/v1/get_access_token',
+      '/api/v1/get_trade_dates'
+    ]
+  )
+
   const exhaustedRetryTransport = createRequestStub([
     accessTokenSuccess,
     { errorcode: -401, errmsg: `Invalid token ${SYNTHETIC_REQUEST_ID}` },
@@ -500,12 +555,13 @@ async function run() {
   })
   await assert.rejects(
     () => exhaustedRetryClient.diagnose({ refreshToken: REFRESH_TOKEN }),
-    (error) => {
-      assert.equal(error.code, 'IFIND_AUTH_REJECTED')
-      assert.equal(error.class, 'AUTH')
-      assert.equal(error.message, 'iFinD authentication failed')
-      assert.equal(error.requestCount, 4)
-      assert.deepEqual(Object.keys(error).sort(), ['class', 'code', 'requestCount'])
+    (/**  {any} */ error) => {
+      assert.equal(errorRecord(error).code, 'IFIND_AUTH_REJECTED')
+      assert.equal(errorRecord(error).class, 'AUTH')
+      assert.equal(errorRecord(error).stage, 'probe')
+      assert.equal(errorRecord(error).message, 'iFinD authentication failed')
+      assert.equal(errorRecord(error).requestCount, 4)
+      assert.deepEqual(Object.keys(error).sort(), ['class', 'code', 'requestCount', 'stage'])
       return true
     }
   )
@@ -548,7 +604,7 @@ async function run() {
   })
   await assert.rejects(
     () => quotaClient.diagnose({ refreshToken: REFRESH_TOKEN }),
-    (error) => error.code === 'IFIND_QUOTA_REJECTED' && error.class === 'QUOTA'
+    (/**  {any} */ error) => errorRecord(error).code === 'IFIND_QUOTA_REJECTED' && errorRecord(error).class === 'QUOTA'
   )
   assert.equal(quotaTransport.calls.length, 2)
 
@@ -560,9 +616,9 @@ async function run() {
   const nonSuccessClient = createIfindHttpClient({ request: nonSuccessTransport.request })
   await assert.rejects(
     () => nonSuccessClient.diagnose({ refreshToken: REFRESH_TOKEN }),
-    (error) => {
-      assert.equal(error.code, 'IFIND_HTTP_STATUS')
-      assert.equal(error.class, 'API')
+    (/**  {any} */ error) => {
+      assert.equal(errorRecord(error).code, 'IFIND_HTTP_STATUS')
+      assert.equal(errorRecord(error).class, 'API')
       assert.equal(containsSentinel(error, nonSuccessMarker), false)
       assert.equal(containsSentinel(error, ORIGIN), false)
       return true
@@ -574,7 +630,8 @@ async function run() {
   const timeoutClient = createIfindHttpClient({ request: timeoutTransport.request })
   await assert.rejects(
     () => timeoutClient.diagnose({ refreshToken: REFRESH_TOKEN }),
-    (error) => error.code === 'IFIND_TIMEOUT' && error.class === 'NETWORK'
+    (/**  {any} */ error) => errorRecord(error).code === 'IFIND_TIMEOUT' && errorRecord(error).class === 'NETWORK' &&
+      errorRecord(error).stage === 'auth' && errorRecord(error).requestCount === 1
   )
   assert.ok(timeoutTransport.calls[0].connectionTimeoutMs > 0)
   assert.ok(timeoutTransport.calls[0].connectionTimeoutMs <= 5000)
@@ -601,10 +658,10 @@ async function run() {
   })
   await assert.rejects(
     () => totalTimeoutClient.diagnose({ refreshToken: REFRESH_TOKEN }),
-    (error) => error.code === 'IFIND_TIMEOUT' && error.class === 'NETWORK'
+    (/**  {any} */ error) => errorRecord(error).code === 'IFIND_TIMEOUT' && errorRecord(error).class === 'NETWORK'
   )
-  assert.ok(totalTimeoutMs > timeoutTransport.calls[0].connectionTimeoutMs)
-  assert.ok(totalTimeoutMs <= 10000)
+  assert.ok(Number(totalTimeoutMs) > timeoutTransport.calls[0].connectionTimeoutMs)
+  assert.ok(Number(totalTimeoutMs) <= 10000)
   assert.equal(clearedTotalTimer, true)
 
   const oversizedTransport = createRawRequestStub([{
@@ -613,7 +670,7 @@ async function run() {
   const oversizedClient = createIfindHttpClient({ request: oversizedTransport.request })
   await assert.rejects(
     () => oversizedClient.diagnose({ refreshToken: REFRESH_TOKEN }),
-    (error) => error.code === 'IFIND_RESPONSE_TOO_LARGE' && error.class === 'API'
+    (/**  {any} */ error) => errorRecord(error).code === 'IFIND_RESPONSE_TOO_LARGE' && errorRecord(error).class === 'API'
   )
   assert.equal(oversizedTransport.calls.length, 1)
 
@@ -623,14 +680,14 @@ async function run() {
   const invalidUtf8Client = createIfindHttpClient({ request: invalidUtf8Transport.request })
   await assert.rejects(
     () => invalidUtf8Client.diagnose({ refreshToken: REFRESH_TOKEN }),
-    (error) => error.code === 'IFIND_RESPONSE_ENCODING' && error.class === 'API'
+    (/**  {any} */ error) => errorRecord(error).code === 'IFIND_RESPONSE_ENCODING' && errorRecord(error).class === 'API'
   )
 
   const invalidJsonTransport = createRawRequestStub([{ chunks: ['{"errorcode":'] }])
   const invalidJsonClient = createIfindHttpClient({ request: invalidJsonTransport.request })
   await assert.rejects(
     () => invalidJsonClient.diagnose({ refreshToken: REFRESH_TOKEN }),
-    (error) => error.code === 'IFIND_RESPONSE_JSON' && error.class === 'API'
+    (/**  {any} */ error) => errorRecord(error).code === 'IFIND_RESPONSE_JSON' && errorRecord(error).class === 'API'
   )
 
   const malformedTokenTransport = createRequestStub([{
@@ -641,7 +698,7 @@ async function run() {
   const malformedTokenClient = createIfindHttpClient({ request: malformedTokenTransport.request })
   await assert.rejects(
     () => malformedTokenClient.diagnose({ refreshToken: REFRESH_TOKEN }),
-    (error) => error.code === 'IFIND_RESPONSE_SHAPE' && error.class === 'API'
+    (/**  {any} */ error) => errorRecord(error).code === 'IFIND_RESPONSE_SHAPE' && errorRecord(error).class === 'API'
   )
   assert.equal(malformedTokenTransport.calls.length, 1)
 
@@ -652,7 +709,7 @@ async function run() {
   const unsupportedShapeClient = createIfindHttpClient({ request: unsupportedShapeTransport.request })
   await assert.rejects(
     () => unsupportedShapeClient.diagnose({ refreshToken: REFRESH_TOKEN }),
-    (error) => error.code === 'IFIND_RESPONSE_SHAPE' && error.class === 'API'
+    (/**  {any} */ error) => errorRecord(error).code === 'IFIND_RESPONSE_SHAPE' && errorRecord(error).class === 'API'
   )
   assert.equal(unsupportedShapeTransport.calls.length, 2)
 
@@ -677,7 +734,7 @@ async function run() {
       refreshToken: REFRESH_TOKEN,
       marketcode: 'browser-controlled-market'
     }),
-    (error) => error.code === 'IFIND_CONFIG_INVALID' && error.class === 'CONFIG'
+    (/**  {any} */ error) => errorRecord(error).code === 'IFIND_CONFIG_INVALID' && errorRecord(error).class === 'CONFIG'
   )
   assert.equal(parameterTransport.calls.length, 0)
 
@@ -688,7 +745,7 @@ async function run() {
   const networkClient = createIfindHttpClient({ request: networkTransport.request })
   await assert.rejects(
     () => networkClient.diagnose({ refreshToken: REFRESH_TOKEN }),
-    (error) => error.code === 'IFIND_NETWORK_FAILED' && error.class === 'NETWORK'
+    (/**  {any} */ error) => errorRecord(error).code === 'IFIND_NETWORK_FAILED' && errorRecord(error).class === 'NETWORK'
   )
   assert.equal(networkTransport.calls.length, 2)
 
@@ -733,7 +790,6 @@ async function run() {
     request: clearTransport.request,
     now: () => new Date('2026-08-25T16:30:00.000Z')
   })
-  await clearClient.diagnose({ refreshToken: REFRESH_TOKEN })
   const originalBufferFill = Buffer.prototype.fill
   let clearedTokenBuffer = null
   Buffer.prototype.fill = function captureTokenClear(value, ...args) {
@@ -741,13 +797,14 @@ async function run() {
     return originalBufferFill.call(this, value, ...args)
   }
   try {
+    await clearClient.diagnose({ refreshToken: REFRESH_TOKEN })
     clearClient.clear()
     clearClient.clear()
   } finally {
     Buffer.prototype.fill = originalBufferFill
   }
   assert.ok(Buffer.isBuffer(clearedTokenBuffer))
-  assert.equal(clearedTokenBuffer.every((byte) => byte === 0), true)
+  assert.equal((/** @type {Buffer} */ (clearedTokenBuffer)).every((byte) => byte === 0), true)
   assert.deepEqual(Object.keys(clearClient), ['diagnose'])
   assert.equal(Object.getOwnPropertyDescriptor(clearClient, 'clear').enumerable, false)
   await clearClient.diagnose({ refreshToken: REFRESH_TOKEN })
@@ -849,7 +906,7 @@ async function run() {
   })
   let responseErrorRejections = 0
   const responseErrorExecution = await captureGlobalOutput(
-    () => responseErrorClient.diagnose({ refreshToken: REFRESH_TOKEN }).catch((error) => {
+    () => responseErrorClient.diagnose({ refreshToken: REFRESH_TOKEN }).catch((/**  {any} */ error) => {
       responseErrorRejections += 1
       throw error
     })
@@ -898,7 +955,7 @@ async function run() {
   })
   let abortedRejections = 0
   const abortedExecution = await captureGlobalOutput(
-    () => abortedClient.diagnose({ refreshToken: REFRESH_TOKEN }).catch((error) => {
+    () => abortedClient.diagnose({ refreshToken: REFRESH_TOKEN }).catch((/**  {any} */ error) => {
       abortedRejections += 1
       throw error
     })
@@ -940,7 +997,7 @@ async function run() {
   })
   await assert.rejects(
     () => oversizedStatusClient.diagnose({ refreshToken: REFRESH_TOKEN }),
-    (error) => error.code === 'IFIND_RESPONSE_TOO_LARGE' && error.class === 'API'
+    (/**  {any} */ error) => errorRecord(error).code === 'IFIND_RESPONSE_TOO_LARGE' && errorRecord(error).class === 'API'
   )
   assert.equal(statusTimerActiveDuringBody, true)
   assert.equal(oversizedStatusTransport.calls[0].requestDestroyCount, 1)
@@ -1000,7 +1057,7 @@ async function run() {
   lateResponseTimers.find((timer) => timer.milliseconds === 2000).handler()
   await assert.rejects(
     () => lateDiagnosis,
-    (error) => error.code === 'IFIND_CONNECTION_TIMEOUT' && error.class === 'NETWORK'
+    (/**  {any} */ error) => errorRecord(error).code === 'IFIND_CONNECTION_TIMEOUT' && errorRecord(error).class === 'NETWORK'
   )
   const lateIncoming = lateResponseTransport.calls[0].respond({
     chunks: [JSON.stringify(accessTokenSuccess)]
@@ -1051,7 +1108,7 @@ async function run() {
   })
   await assert.rejects(
     () => synchronousTimerClient.diagnose({ refreshToken: REFRESH_TOKEN }),
-    (error) => error.code === 'IFIND_CONNECTION_TIMEOUT' && error.class === 'NETWORK'
+    (/**  {any} */ error) => errorRecord(error).code === 'IFIND_CONNECTION_TIMEOUT' && errorRecord(error).class === 'NETWORK'
   )
   assert.equal(synchronousTimerTransport.calls[0].writeCount, 0)
   assert.equal(synchronousTimerTransport.calls[0].endCount, 0)
@@ -1090,7 +1147,7 @@ async function run() {
   })
   await assert.rejects(
     () => connectedSlowClient.diagnose({ refreshToken: REFRESH_TOKEN }),
-    (error) => error.code === 'IFIND_TIMEOUT' && error.class === 'NETWORK'
+    (/**  {any} */ error) => errorRecord(error).code === 'IFIND_TIMEOUT' && errorRecord(error).class === 'NETWORK'
   )
   assert.equal(inactivityDisabledAtConnection, true)
   assert.equal(connectedSlowTimers.every((timer) => timer.cleared), true)
@@ -1117,26 +1174,28 @@ async function run() {
     const pendingClearDiagnosis = pendingClearClient.diagnose({ refreshToken: REFRESH_TOKEN })
     const pendingClearRejection = assert.rejects(
       () => pendingClearDiagnosis,
-      (error) => error.code === 'IFIND_CLIENT_CLEARED' && error.class === 'CONFIG'
+      (/**  {any} */ error) => errorRecord(error).code === 'IFIND_CLIENT_CLEARED' && errorRecord(error).class === 'CONFIG'
     )
-    pendingClearTransport.calls[2].respond({
+    pendingClearTransport.calls[2].respond({ chunks: [JSON.stringify(accessTokenSuccess)] })
+    await new Promise((resolve) => setImmediate(resolve))
+    pendingClearTransport.calls[3].respond({
       chunks: [JSON.stringify({ errorcode: -401, errmsg: 'documented auth rejection' })]
     })
     await new Promise((resolve) => setImmediate(resolve))
-    assert.equal(pendingClearTransport.calls.length, 4)
+    assert.equal(pendingClearTransport.calls.length, 5)
     pendingClearClient.clear()
-    pendingClearTransport.calls[3].respond({ chunks: [JSON.stringify(accessTokenSuccess)] })
+    pendingClearTransport.calls[4].respond({ chunks: [JSON.stringify(accessTokenSuccess)] })
     await new Promise((resolve) => setImmediate(resolve))
-    if (pendingClearTransport.calls[4]) {
-      pendingClearTransport.calls[4].respond({ chunks: [JSON.stringify(tradeDatesSuccess)] })
+    if (pendingClearTransport.calls[5]) {
+      pendingClearTransport.calls[5].respond({ chunks: [JSON.stringify(tradeDatesSuccess)] })
     }
     await pendingClearRejection
   } finally {
     Buffer.prototype.fill = originalPendingClearFill
   }
   assert.ok(Buffer.isBuffer(zeroedPendingClearToken))
-  assert.equal(zeroedPendingClearToken.every((byte) => byte === 0), true)
-  assert.equal(pendingClearTransport.calls.length, 4)
+  assert.equal((/** @type {Buffer} */ (zeroedPendingClearToken)).every((byte) => byte === 0), true)
+  assert.equal(pendingClearTransport.calls.length, 5)
 
   const conflictingPermissionTransport = createRequestStub([
     accessTokenSuccess,
@@ -1147,7 +1206,7 @@ async function run() {
   })
   await assert.rejects(
     () => conflictingPermissionClient.diagnose({ refreshToken: REFRESH_TOKEN }),
-    (error) => error.class === 'PERMISSION' && error.code === 'IFIND_PERMISSION_REJECTED'
+    (/**  {any} */ error) => errorRecord(error).class === 'PERMISSION' && errorRecord(error).code === 'IFIND_PERMISSION_REJECTED'
   )
   assert.equal(conflictingPermissionTransport.calls.length, 2)
 
@@ -1158,7 +1217,7 @@ async function run() {
   const conflictingQuotaClient = createIfindHttpClient({ request: conflictingQuotaTransport.request })
   await assert.rejects(
     () => conflictingQuotaClient.diagnose({ refreshToken: REFRESH_TOKEN }),
-    (error) => error.class === 'QUOTA' && error.code === 'IFIND_QUOTA_REJECTED'
+    (/**  {any} */ error) => errorRecord(error).class === 'QUOTA' && errorRecord(error).code === 'IFIND_QUOTA_REJECTED'
   )
   assert.equal(conflictingQuotaTransport.calls.length, 2)
 
@@ -1179,7 +1238,7 @@ async function run() {
   const unknownCodeClient = createIfindHttpClient({ request: unknownCodeTransport.request })
   await assert.rejects(
     () => unknownCodeClient.diagnose({ refreshToken: REFRESH_TOKEN }),
-    (error) => error.class === 'API' && error.code === 'IFIND_PROBE_REJECTED'
+    (/**  {any} */ error) => errorRecord(error).class === 'API' && errorRecord(error).code === 'IFIND_PROBE_REJECTED'
   )
   assert.equal(unknownCodeTransport.calls.length, 2)
 
@@ -1195,7 +1254,7 @@ async function run() {
     const invalidRefreshClient = createIfindHttpClient({ request: invalidRefreshTransport.request })
     await assert.rejects(
       () => invalidRefreshClient.diagnose({ refreshToken: invalidRefreshToken }),
-      (error) => error.code === 'IFIND_CONFIG_INVALID' && error.class === 'CONFIG'
+      (/**  {any} */ error) => errorRecord(error).code === 'IFIND_CONFIG_INVALID' && errorRecord(error).class === 'CONFIG'
     )
     assert.equal(invalidRefreshTransport.calls.length, 0)
   }
@@ -1215,7 +1274,7 @@ async function run() {
     const invalidAccessClient = createIfindHttpClient({ request: invalidAccessTransport.request })
     await assert.rejects(
       () => invalidAccessClient.diagnose({ refreshToken: REFRESH_TOKEN }),
-      (error) => error.code === 'IFIND_RESPONSE_SHAPE' && error.class === 'API'
+      (/**  {any} */ error) => errorRecord(error).code === 'IFIND_RESPONSE_SHAPE' && errorRecord(error).class === 'API'
     )
   assert.equal(invalidAccessTransport.calls.length, 1)
     assert.equal(
@@ -1244,7 +1303,7 @@ async function run() {
   if (!overlappingTotalTimer.cleared) overlappingTotalTimer.handler()
   await assert.rejects(
     () => overlappingDiagnosis,
-    (error) => error.code === 'IFIND_DUPLICATE_RESPONSE' && error.class === 'NETWORK'
+    (/**  {any} */ error) => errorRecord(error).code === 'IFIND_DUPLICATE_RESPONSE' && errorRecord(error).class === 'NETWORK'
   )
   assert.equal(overlappingTransport.calls[0].destroyCount, 1)
   assert.equal(firstOverlappingResponse.destroyCount, 1)
@@ -1308,7 +1367,7 @@ async function run() {
   assert.equal(duringTimerHandles.every((timer) => timer.cleared), true)
 
   const hostileResponseMarker = `hostile response metadata ${ACCESS_TOKEN} ${SYNTHETIC_REQUEST_ID}`
-  const hostileResponseEmitter = new EventEmitter()
+  const hostileResponseEmitter = dynamicEmitter()
   hostileResponseEmitter.destroy = () => {}
   const hostileResponseValues = [
     null,
@@ -1367,14 +1426,14 @@ async function run() {
   const synchronousResponseCalls = []
   function synchronousResponseRequest(url, options, callback) {
     const call = { url: String(url), options, destroyCount: 0 }
-    const outgoing = new EventEmitter()
+    const outgoing = dynamicEmitter()
     outgoing.write = () => {}
     outgoing.end = () => {}
     outgoing.destroy = () => { call.destroyCount += 1 }
     outgoing.setTimeout = () => {}
     call.outgoing = outgoing
     synchronousResponseCalls.push(call)
-    const incoming = new EventEmitter()
+    const incoming = dynamicEmitter()
     incoming.statusCode = 200
     incoming.destroy = () => {}
     incoming.on('error', () => {})

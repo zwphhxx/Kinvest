@@ -7,6 +7,13 @@ const { DatabaseSync } = require('node:sqlite')
 const VERSION_ID = 'v20260826-001'
 const ROUTE = '/api/v1/get_trade_dates'
 
+/** @returns {Record<string, any>} */
+function errorRecord(error) {
+  return error !== null && typeof error === 'object'
+    ? /** @type {Record<string, any>} */ (error)
+    : Object.create(null)
+}
+
 function diagnosticId(number) {
   return `diag_${String(number).padStart(24, '0')}`
 }
@@ -109,7 +116,7 @@ async function run() {
   wrongIdentity.exec('PRAGMA application_id = 1234')
   assert.throws(
     () => new IfindDiagnosticRepository(wrongIdentity).initialize(),
-    (error) => error.code === 'DEVICE_AUTH_DATABASE_IDENTITY_INVALID'
+    (/**  {any} */ error) => errorRecord(error).code === 'DEVICE_AUTH_DATABASE_IDENTITY_INVALID'
   )
   assert.equal(
     wrongIdentity.prepare("SELECT COUNT(*) AS count FROM sqlite_master WHERE name LIKE 'ifind_diagnostic_%'").get().count,
@@ -231,7 +238,7 @@ async function run() {
         startedAt: startedAt + 120_000,
         tokenVersionId: VERSION_ID
       }),
-      (error) => error.code === 'ERR_SQLITE_ERROR' && /locked|busy/i.test(error.message)
+      (/**  {any} */ error) => errorRecord(error).code === 'ERR_SQLITE_ERROR' && /locked|busy/i.test(errorRecord(error).message)
     )
     assert.equal(Date.now() - lockStartedAt < 1000, true)
     firstDatabase.exec('ROLLBACK')

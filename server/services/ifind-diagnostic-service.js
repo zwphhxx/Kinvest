@@ -134,10 +134,10 @@ function safeClientResultRequestCount(value) {
 }
 
 function invalidClientResult(requestCount) {
-  const error = new Error('invalid client result')
-  error.class = 'API'
-  error.requestCount = requestCount
-  return error
+  return Object.assign(new Error('invalid client result'), {
+    class: 'API',
+    requestCount
+  })
 }
 
 function validateClientResult(value) {
@@ -433,7 +433,9 @@ function createIfindDiagnosticService(options) {
       try {
         const result = decodeSettlement(config.repository[method](input))
         if (result.status === 'completed') return result
-      } catch {}
+      } catch {
+        // Best-effort defensive cleanup must not replace the stable result.
+      }
     }
     return null
   }
@@ -475,10 +477,10 @@ function createIfindDiagnosticService(options) {
     try {
       refreshToken = config.secretProvider.readRefreshToken()
       if (!Buffer.isBuffer(refreshToken) || refreshToken.length < 1 || refreshToken.length > 4096) {
-        const error = new Error('invalid secret provider')
-        error.class = 'CONFIG'
-        error.requestCount = 0
-        throw error
+        throw Object.assign(new Error('invalid secret provider'), {
+          class: 'CONFIG',
+          requestCount: 0
+        })
       }
       activeTokens.add(refreshToken)
       clientInvoked = true
@@ -486,10 +488,10 @@ function createIfindDiagnosticService(options) {
         await config.client.diagnose({ refreshToken })
       )
       if (invalidated || operationGeneration !== generation) {
-        const error = new Error('service cleared')
-        error.class = 'CONFIG'
-        error.requestCount = clientResult.requestCount
-        throw error
+        throw Object.assign(new Error('service cleared'), {
+          class: 'CONFIG',
+          requestCount: clientResult.requestCount
+        })
       }
       terminal = {
         completedAt: readTimestamp(config.clock),
@@ -510,7 +512,9 @@ function createIfindDiagnosticService(options) {
         : { ...observedFields, requestCount: 0 }
       const statuses = mapFailureStatuses(fields.errorClass, fields.stage)
       let completedAt = startedAt
-      try { completedAt = readTimestamp(config.clock) } catch {}
+      try { completedAt = readTimestamp(config.clock) } catch {
+        // Best-effort defensive cleanup must not replace the stable result.
+      }
       terminal = {
         completedAt: Math.max(startedAt, completedAt),
         authStatus: statuses.authStatus,

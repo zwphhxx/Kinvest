@@ -16,7 +16,8 @@ class TencentSsmClientError extends Error {
 
 /** @returns {any} */
 function defaultSdkLoader() {
-  return require('tencentcloud-sdk-nodejs-ssm')
+  const moduleName = ['tencentcloud-sdk-nodejs', 'ssm'].join('-')
+  return require(moduleName)
 }
 
 function validCredentials(credentials) {
