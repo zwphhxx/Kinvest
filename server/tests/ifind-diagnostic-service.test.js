@@ -187,6 +187,30 @@ async function run() {
   ])
   successful.database.close()
 
+  let invalidSecretClientCalls = 0
+  const invalidSecret = createEnabledService({
+    secretProvider: { readRefreshToken: () => null },
+    client: {
+      diagnose: async () => {
+        invalidSecretClientCalls += 1
+        return successResult()
+      },
+      clear() {}
+    }
+  })
+  const invalidSecretOutcome = await invalidSecret.service.run()
+  assert.equal(invalidSecretOutcome.status, 'failed')
+  assert.equal(invalidSecretOutcome.diagnostic.safeErrorClass, 'CONFIG')
+  assert.equal(invalidSecretOutcome.diagnostic.requestCount, 0)
+  assert.equal(invalidSecretOutcome.localAttemptCount, 1)
+  assert.equal(invalidSecretClientCalls, 0)
+  assert.equal(invalidSecret.repository.latest().requestCount, 0)
+  assert.equal(
+    invalidSecret.repository.status(Date.parse('2026-08-26T02:00:00.000Z')).localAttemptCount,
+    1
+  )
+  invalidSecret.database.close()
+
   const busyState = createEnabledService()
   const occupied = busyState.repository.reserve({
     diagnosticId: 'diag_999999999999999999999999',
@@ -208,6 +232,10 @@ async function run() {
     {
       error: clientFailure('AUTH', { requestCount: 1 }),
       expected: { authStatus: 'failed', probeStatus: 'not_run', safeErrorClass: 'AUTH', requestCount: 1 }
+    },
+    {
+      error: clientFailure('CONFIG', { requestCount: 0 }),
+      expected: { authStatus: 'failed', probeStatus: 'not_run', safeErrorClass: 'CONFIG', requestCount: 0 }
     },
     {
       error: clientFailure('PERMISSION', { requestCount: 2, dataVol: 7 }),

@@ -80,10 +80,10 @@ function readTimestamp(clock) {
   }
 }
 
-function readErrorFields(error) {
+function readErrorFields(error, fallbackRequestCount = 1) {
   const fallback = {
     errorClass: 'API',
-    requestCount: 1,
+    requestCount: fallbackRequestCount === 0 ? 0 : 1,
     dataVol: null,
     stage: null
   }
@@ -100,7 +100,7 @@ function readErrorFields(error) {
     const candidateStage = readData('stage')
     return {
       errorClass: SAFE_ERROR_CLASSES.has(candidateClass) ? candidateClass : 'API',
-      requestCount: isCount(candidateCount, 1, MAX_DIAGNOSTIC_REQUEST_COUNT)
+      requestCount: isCount(candidateCount, 0, MAX_DIAGNOSTIC_REQUEST_COUNT)
         ? candidateCount
         : 1,
       dataVol: Number.isSafeInteger(candidateDataVol) && candidateDataVol >= 0
@@ -125,7 +125,7 @@ function safeClientResultRequestCount(value) {
     if (!descriptor || !descriptor.enumerable || !Object.hasOwn(descriptor, 'value')) {
       return 1
     }
-    return isCount(descriptor.value, 1, MAX_DIAGNOSTIC_REQUEST_COUNT)
+    return isCount(descriptor.value, 0, MAX_DIAGNOSTIC_REQUEST_COUNT)
       ? descriptor.value
       : 1
   } catch {
@@ -154,7 +154,7 @@ function validateClientResult(value) {
       typeof result.retrievedAt !== 'string' ||
       !Number.isFinite(Date.parse(result.retrievedAt)) ||
       !Number.isSafeInteger(result.elapsedMs) || result.elapsedMs < 0 ||
-      !isCount(result.requestCount, 1, MAX_DIAGNOSTIC_REQUEST_COUNT) ||
+      !isCount(result.requestCount, 0, MAX_DIAGNOSTIC_REQUEST_COUNT) ||
       !dataVolValid ||
       (result.completeness !== 'complete' && result.completeness !== 'partial') ||
       (result.dataVol === 'unavailable' && result.completeness !== 'partial') ||
@@ -471,16 +471,20 @@ function createIfindDiagnosticService(options) {
     let refreshToken = null
     let terminal
     let outcomeStatus = 'failed'
+    let clientInvoked = false
     try {
       refreshToken = config.secretProvider.readRefreshToken()
       if (!Buffer.isBuffer(refreshToken) || refreshToken.length < 1 || refreshToken.length > 4096) {
         const error = new Error('invalid secret provider')
         error.class = 'CONFIG'
-        error.requestCount = 1
+        error.requestCount = 0
         throw error
       }
       activeTokens.add(refreshToken)
-      const clientResult = validateClientResult(await config.client.diagnose({ refreshToken }))
+      clientInvoked = true
+      const clientResult = validateClientResult(
+        await config.client.diagnose({ refreshToken })
+      )
       if (invalidated || operationGeneration !== generation) {
         const error = new Error('service cleared')
         error.class = 'CONFIG'
@@ -500,7 +504,7 @@ function createIfindDiagnosticService(options) {
       }
       outcomeStatus = 'completed'
     } catch (error) {
-      const fields = readErrorFields(error)
+      const fields = readErrorFields(error, clientInvoked ? 1 : 0)
       const statuses = mapFailureStatuses(fields.errorClass, fields.stage)
       let completedAt = startedAt
       try { completedAt = readTimestamp(config.clock) } catch {}

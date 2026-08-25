@@ -177,7 +177,7 @@ function validateTerminalResult(value) {
       !PROBE_STATUSES.has(result.probeStatus) ||
       (result.safeErrorClass !== null && !SAFE_ERROR_CLASSES.has(result.safeErrorClass)) ||
       result.route !== IFIND_DIAGNOSTIC_ROUTE ||
-      !Number.isSafeInteger(result.requestCount) || result.requestCount < 1 ||
+      !Number.isSafeInteger(result.requestCount) || result.requestCount < 0 ||
       result.requestCount > 4 ||
       (result.dataVol !== null && !isNonNegativeInteger(result.dataVol)) ||
       !isNonNegativeInteger(result.elapsedMs) ||
