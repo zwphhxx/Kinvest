@@ -37,7 +37,8 @@ async function run() {
   const {
     IFIND_DIAGNOSTIC_LEASE_MS,
     IfindDiagnosticRepository,
-    IfindDiagnosticRepositoryError
+    IfindDiagnosticRepositoryError,
+    IfindDiagnosticRepositorySchemaError
   } = require('../db/ifind-diagnostic-repository')
   const {
     KINVEST_SQLITE_APPLICATION_ID
@@ -87,6 +88,19 @@ async function run() {
       'in_flight_token_version_id'
     ]
   )
+  const runColumns = identityDatabase.prepare(
+    'PRAGMA table_info(ifind_diagnostic_runs)'
+  ).all()
+  assert.equal(runColumns.find((row) => row.name === 'started_at').notnull, 1)
+  assert.equal(runColumns.find((row) => row.name === 'completed_at').notnull, 0)
+  assert.deepEqual(
+    identityDatabase.prepare('PRAGMA index_list(ifind_diagnostic_runs)').all().map((row) => ({
+      unique: row.unique,
+      origin: row.origin,
+      partial: row.partial
+    })),
+    [{ unique: 1, origin: 'pk', partial: 0 }]
+  )
   identityRepository.initialize()
   assert.equal(identityDatabase.prepare('SELECT COUNT(*) AS count FROM ifind_diagnostic_control').get().count, 1)
   identityDatabase.close()
@@ -127,6 +141,27 @@ async function run() {
       localDayKey: '2026-08-26',
       localAttemptCount: 1
     })
+    assert.deepEqual(second.reserve({
+      diagnosticId: diagnosticId(1),
+      startedAt: startedAt + 1,
+      tokenVersionId: VERSION_ID
+    }), {
+      status: 'duplicate',
+      localDayKey: '2026-08-26',
+      localAttemptCount: 1
+    })
+    assert.deepEqual(first.status(startedAt + 1), {
+      localDayKey: '2026-08-26',
+      localAttemptCount: 1,
+      cooldownUntil: null,
+      inFlight: true,
+      inFlightExpiresAt: startedAt + IFIND_DIAGNOSTIC_LEASE_MS
+    })
+    assert.equal(firstDatabase.prepare(`
+      SELECT COUNT(*) AS count
+      FROM ifind_diagnostic_runs
+      WHERE diagnostic_id = ? AND completed_at IS NULL
+    `).get(diagnosticId(1)).count, 1)
     const busy = second.reserve({
       diagnosticId: diagnosticId(2),
       startedAt: startedAt + 1,
@@ -147,10 +182,14 @@ async function run() {
       status: 'completed',
       cooldownUntil: startedAt + 10 + 60_000
     })
+    assert.deepEqual(second.complete({
+      reservation: firstReservation.reservation,
+      result: terminalResult({ completedAt: startedAt + 10 })
+    }), completed)
     assert.deepEqual(first.complete({
       reservation: firstReservation.reservation,
       result: terminalResult({ completedAt: startedAt + 11 })
-    }), { status: 'not-found' })
+    }), { status: 'conflict' })
     assert.deepEqual(first.reserve({
       diagnosticId: diagnosticId(3),
       startedAt: startedAt + 60_009,
@@ -182,6 +221,30 @@ async function run() {
     assert.equal(Object.getPrototypeOf(first.latest()), Object.prototype)
     assert.equal(Object.getPrototypeOf(first.list()[0]), Object.prototype)
     assert.equal(firstDatabase.prepare('SELECT 1 AS value').get().value, 1)
+
+    firstDatabase.exec('BEGIN IMMEDIATE')
+    secondDatabase.exec('PRAGMA busy_timeout = 25')
+    const lockStartedAt = Date.now()
+    assert.throws(
+      () => second.reserve({
+        diagnosticId: diagnosticId(90),
+        startedAt: startedAt + 120_000,
+        tokenVersionId: VERSION_ID
+      }),
+      (error) => error.code === 'ERR_SQLITE_ERROR' && /locked|busy/i.test(error.message)
+    )
+    assert.equal(Date.now() - lockStartedAt < 1000, true)
+    firstDatabase.exec('ROLLBACK')
+    const afterLock = second.reserve({
+      diagnosticId: diagnosticId(90),
+      startedAt: startedAt + 120_000,
+      tokenVersionId: VERSION_ID
+    })
+    assert.equal(afterLock.status, 'reserved')
+    assert.equal(firstDatabase.prepare(`
+      SELECT COUNT(*) AS count FROM ifind_diagnostic_runs
+      WHERE diagnostic_id = ?
+    `).get(diagnosticId(90)).count, 1)
 
     for (const unsafe of [
       { diagnosticId: diagnosticId(4), startedAt, tokenVersionId: VERSION_ID, token: 'secret' },
@@ -262,6 +325,16 @@ async function run() {
     tokenVersionId: VERSION_ID
   })
   assert.equal(recovered.status, 'cooldown')
+  const repeatedRecovery = staleRepository.reserve({
+    diagnosticId: diagnosticId(303),
+    startedAt: staleStartedAt + IFIND_DIAGNOSTIC_LEASE_MS + 1,
+    tokenVersionId: VERSION_ID
+  })
+  assert.equal(repeatedRecovery.status, 'cooldown')
+  assert.equal(staleDatabase.prepare(`
+    SELECT COUNT(*) AS count FROM ifind_diagnostic_runs
+    WHERE diagnostic_id = ? AND completed_at IS NOT NULL
+  `).get(diagnosticId(300)).count, 1)
   const staleRun = staleRepository.latest()
   assert.deepEqual(staleRun, {
     diagnosticId: diagnosticId(300),
@@ -293,6 +366,103 @@ async function run() {
     inFlightExpiresAt: afterRecoveryCooldown + IFIND_DIAGNOSTIC_LEASE_MS
   })
   staleDatabase.close()
+
+  const rollbackDatabase = new DatabaseSync(':memory:')
+  const rollbackRepository = createRepository(rollbackDatabase)
+  const newerDay = Date.parse('2026-08-26T16:00:00.000Z')
+  const newerReservation = rollbackRepository.reserve({
+    diagnosticId: diagnosticId(400),
+    startedAt: newerDay,
+    tokenVersionId: VERSION_ID
+  })
+  rollbackRepository.fail({
+    reservation: newerReservation.reservation,
+    result: terminalResult({
+      completedAt: newerDay + 1,
+      authStatus: 'failed',
+      probeStatus: 'not_run',
+      safeErrorClass: 'AUTH',
+      requestCount: 1,
+      dataVol: null,
+      elapsedMs: 1,
+      completeness: 'unavailable'
+    })
+  })
+  const beforeRollback = rollbackRepository.status(newerDay + 1)
+  assert.deepEqual(rollbackRepository.reserve({
+    diagnosticId: diagnosticId(401),
+    startedAt: newerDay - 1,
+    tokenVersionId: VERSION_ID
+  }), {
+    status: 'clock-rollback',
+    localDayKey: '2026-08-27',
+    localAttemptCount: 1
+  })
+  assert.deepEqual(rollbackRepository.status(newerDay + 1), beforeRollback)
+  assert.deepEqual(rollbackRepository.status(newerDay - 1), {
+    localDayKey: '2026-08-27',
+    localAttemptCount: 1,
+    cooldownUntil: newerDay + 60_001,
+    inFlight: false,
+    inFlightExpiresAt: null
+  })
+  assert.equal(rollbackDatabase.prepare(`
+    SELECT COUNT(*) AS count FROM ifind_diagnostic_runs
+    WHERE diagnostic_id = ?
+  `).get(diagnosticId(401)).count, 0)
+  rollbackDatabase.close()
+
+  const injectionDatabase = new DatabaseSync(':memory:')
+  const injectionRepository = createRepository(injectionDatabase)
+  injectionDatabase.exec(`
+    CREATE TRIGGER reject_diagnostic_control_update
+    BEFORE UPDATE ON ifind_diagnostic_control
+    BEGIN
+      SELECT RAISE(ABORT, 'injected transaction failure');
+    END
+  `)
+  assert.throws(() => injectionRepository.reserve({
+    diagnosticId: diagnosticId(500),
+    startedAt: Date.parse('2026-08-26T02:00:00.000Z'),
+    tokenVersionId: VERSION_ID
+  }), /injected transaction failure/)
+  assert.equal(injectionDatabase.prepare(`
+    SELECT COUNT(*) AS count FROM ifind_diagnostic_runs
+    WHERE diagnostic_id = ?
+  `).get(diagnosticId(500)).count, 0)
+  const injectionControl = injectionDatabase.prepare(`
+    SELECT day_key, daily_attempt_count, in_flight_id
+    FROM ifind_diagnostic_control WHERE singleton_id = 1
+  `).get()
+  assert.equal(injectionControl.day_key, '')
+  assert.equal(injectionControl.daily_attempt_count, 0)
+  assert.equal(injectionControl.in_flight_id, null)
+  injectionDatabase.close()
+
+  const malformedDatabase = new DatabaseSync(':memory:')
+  malformedDatabase.exec(`
+    CREATE TABLE ifind_diagnostic_runs (
+      diagnostic_id TEXT PRIMARY KEY,
+      raw_response_json TEXT
+    )
+  `)
+  assert.throws(
+    () => new IfindDiagnosticRepository(malformedDatabase).initialize(),
+    IfindDiagnosticRepositorySchemaError
+  )
+  assert.equal(
+    Number(malformedDatabase.prepare('PRAGMA application_id').get().application_id),
+    0
+  )
+  assert.equal(malformedDatabase.prepare(`
+    SELECT COUNT(*) AS count FROM sqlite_master
+    WHERE type = 'table' AND name = 'ifind_diagnostic_control'
+  `).get().count, 0)
+  assert.deepEqual(
+    malformedDatabase.prepare('PRAGMA table_info(ifind_diagnostic_runs)').all().map((row) => row.name),
+    ['diagnostic_id', 'raw_response_json']
+  )
+  malformedDatabase.close()
 }
 
 module.exports = { run }

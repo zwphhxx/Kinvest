@@ -100,6 +100,17 @@ function createRequestStub(responseBodies) {
   return { calls, request }
 }
 
+function wrapRepository(repository, overrides = {}) {
+  return {
+    reserve: repository.reserve.bind(repository),
+    complete: repository.complete.bind(repository),
+    fail: repository.fail.bind(repository),
+    latest: repository.latest.bind(repository),
+    status: repository.status.bind(repository),
+    ...overrides
+  }
+}
+
 async function run() {
   const {
     IfindDiagnosticServiceError,
@@ -259,6 +270,18 @@ async function run() {
   assert.equal(exhaustedTransport.calls.length, 4)
   integrated.database.close()
 
+  const malformedCount = createEnabledService()
+  malformedCount.client.diagnose = async () => successResult({
+    route: '/malformed-route',
+    requestCount: 4
+  })
+  const malformedCountOutcome = await malformedCount.service.run()
+  assert.equal(malformedCountOutcome.status, 'failed')
+  assert.equal(malformedCountOutcome.diagnostic.safeErrorClass, 'API')
+  assert.equal(malformedCountOutcome.diagnostic.requestCount, 4)
+  assert.equal(malformedCount.repository.latest().requestCount, 4)
+  malformedCount.database.close()
+
   const invalidResponse = createEnabledService()
   invalidResponse.client.diagnose = async () => ({
     ...successResult(),
@@ -289,8 +312,125 @@ async function run() {
     status: 'internal-error',
     safeErrorClass: 'API'
   })
-  assert.equal(completionCalls, 1)
+  assert.equal(completionCalls, 2)
   completionFailure.database.close()
+
+  const responseLostState = createRepository()
+  let responseLostCalls = 0
+  const responseLostRepository = wrapRepository(responseLostState.repository, {
+    complete(input) {
+      responseLostCalls += 1
+      const result = responseLostState.repository.complete(input)
+      if (responseLostCalls === 1) throw new Error('committed response lost marker')
+      return result
+    }
+  })
+  const responseLost = createEnabledService({ repository: responseLostRepository })
+  const recoveredSettlement = await responseLost.service.run()
+  assert.equal(recoveredSettlement.status, 'completed')
+  assert.equal(responseLostCalls, 2)
+  assert.equal(responseLostState.repository.list().length, 1)
+  responseLost.database.close()
+  responseLostState.database.close()
+
+  const ambiguousState = createRepository()
+  let ambiguousCalls = 0
+  const ambiguousRepository = wrapRepository(ambiguousState.repository, {
+    complete(input) {
+      ambiguousCalls += 1
+      if (ambiguousCalls === 1) return { status: 'ambiguous' }
+      return ambiguousState.repository.complete(input)
+    }
+  })
+  const ambiguous = createEnabledService({ repository: ambiguousRepository })
+  assert.equal((await ambiguous.service.run()).status, 'completed')
+  assert.equal(ambiguousCalls, 2)
+  ambiguous.database.close()
+  ambiguousState.database.close()
+
+  const persistentState = createRepository()
+  let persistentCalls = 0
+  const persistentRepository = wrapRepository(persistentState.repository, {
+    complete() {
+      persistentCalls += 1
+      throw new Error('persistent settlement marker')
+    }
+  })
+  const persistent = createEnabledService({ repository: persistentRepository })
+  assert.deepEqual(await persistent.service.run(), {
+    status: 'internal-error',
+    safeErrorClass: 'API'
+  })
+  assert.equal(persistentCalls, 2)
+  const pendingRow = persistentState.database.prepare(`
+    SELECT completed_at FROM ifind_diagnostic_runs
+    WHERE diagnostic_id = ?
+  `).get('diag_000000000000000000000001')
+  assert.equal(pendingRow.completed_at, null)
+  assert.equal(
+    persistentState.repository.status(Date.parse('2026-08-26T02:00:00.000Z')).inFlight,
+    true
+  )
+  persistent.database.close()
+  persistentState.database.close()
+
+  let hostileReads = 0
+  const hiddenExtraDto = {
+    status: 'busy',
+    retryAt: 1,
+    localDayKey: '2026-08-26',
+    localAttemptCount: 1
+  }
+  Object.defineProperty(hiddenExtraDto, 'rawResponse', { value: true })
+  const hostileDtos = [
+    new Proxy({}, { get() { hostileReads += 1; throw new Error('proxy marker') } }),
+    Object.defineProperty({}, 'status', {
+      enumerable: true,
+      get() { hostileReads += 1; throw new Error('getter marker') }
+    }),
+    hiddenExtraDto,
+    { status: 'busy', retryAt: 'tomorrow', localDayKey: '2026-08-26', localAttemptCount: 1 },
+    { status: 'reserved', reservation: null, localDayKey: '2026-08-26', localAttemptCount: 1 }
+  ]
+  for (const dto of hostileDtos) {
+    const state = createRepository()
+    let clientCalls = 0
+    const repository = wrapRepository(state.repository, { reserve: () => dto })
+    const hostile = createEnabledService({
+      repository,
+      client: { diagnose: async () => { clientCalls += 1 }, clear() {} }
+    })
+    assert.deepEqual(await hostile.service.run(), {
+      status: 'internal-error',
+      safeErrorClass: 'API'
+    })
+    assert.equal(clientCalls, 0)
+    hostile.database.close()
+    state.database.close()
+  }
+  assert.equal(hostileReads, 0)
+
+  const hostileStatusState = createRepository()
+  const symbolStatus = {
+    localDayKey: '2026-08-26',
+    localAttemptCount: 0,
+    cooldownUntil: null,
+    inFlight: false,
+    inFlightExpiresAt: null
+  }
+  symbolStatus[Symbol('raw')] = true
+  const hostileStatus = createEnabledService({
+    repository: wrapRepository(hostileStatusState.repository, {
+      status: () => symbolStatus
+    })
+  })
+  assert.throws(
+    () => hostileStatus.service.status(),
+    (error) => error instanceof IfindDiagnosticServiceError &&
+      !`${error.message}:${error.code}`.includes('raw')
+  )
+  hostileStatus.database.close()
+  hostileStatusState.database.close()
 
   const clearState = createEnabledService()
   let clearCalls = 0

@@ -7,17 +7,15 @@ const ROUTE = '/api/v1/get_trade_dates'
 const SCOPE = 'market-trade-dates:212001:D:-10'
 const VERSION_ID_PATTERN = /^v[0-9]{8}-[0-9]{3}$/
 const DIAGNOSTIC_ID_PATTERN = /^diag_[a-f0-9]{24,64}$/
+const DAY_KEY_PATTERN = /^[0-9]{4}-[0-9]{2}-[0-9]{2}$/
 const MAX_DIAGNOSTIC_REQUEST_COUNT = 4
 const SAFE_ERROR_CLASSES = new Set([
-  'AUTH',
-  'PERMISSION',
-  'QUOTA',
-  'NETWORK',
-  'API',
-  'CONFIG',
-  'BUSY',
+  'AUTH', 'PERMISSION', 'QUOTA', 'NETWORK', 'API', 'CONFIG', 'BUSY',
   'RATE_LIMITED'
 ])
+const AUTH_STATUSES = new Set(['success', 'failed', 'unknown'])
+const PROBE_STATUSES = new Set(['success', 'failed', 'not_run'])
+const COMPLETENESS_VALUES = new Set(['complete', 'partial', 'unavailable'])
 
 class IfindDiagnosticServiceError extends Error {
   constructor() {
@@ -54,14 +52,27 @@ function snapshotExactDataObject(value, expectedKeys) {
   }
 }
 
+function isTimestamp(value) {
+  return Number.isSafeInteger(value) && value >= 0 && value <= 8_640_000_000_000_000
+}
+
+function isCount(value, minimum = 0, maximum = 20) {
+  return Number.isSafeInteger(value) && value >= minimum && value <= maximum
+}
+
+function isDayKey(value) {
+  if (typeof value !== 'string' || !DAY_KEY_PATTERN.test(value)) return false
+  const parsed = new Date(`${value}T00:00:00.000Z`)
+  return Number.isFinite(parsed.getTime()) && parsed.toISOString().slice(0, 10) === value
+}
+
 function readTimestamp(clock) {
   try {
     const value = clock()
     const timestamp = value instanceof Date
       ? Date.prototype.getTime.call(value)
       : value
-    if (!Number.isSafeInteger(timestamp) || timestamp < 0 ||
-        timestamp > 8_640_000_000_000_000) failConfig()
+    if (!isTimestamp(timestamp)) failConfig()
     return timestamp
   } catch (error) {
     if (error instanceof IfindDiagnosticServiceError) throw error
@@ -89,8 +100,7 @@ function readErrorFields(error) {
     const candidateStage = readData('stage')
     return {
       errorClass: SAFE_ERROR_CLASSES.has(candidateClass) ? candidateClass : 'API',
-      requestCount: Number.isSafeInteger(candidateCount) && candidateCount >= 0 &&
-        candidateCount <= MAX_DIAGNOSTIC_REQUEST_COUNT
+      requestCount: isCount(candidateCount, 1, MAX_DIAGNOSTIC_REQUEST_COUNT)
         ? candidateCount
         : 1,
       dataVol: Number.isSafeInteger(candidateDataVol) && candidateDataVol >= 0
@@ -105,17 +115,36 @@ function readErrorFields(error) {
   }
 }
 
+function safeClientResultRequestCount(value) {
+  try {
+    if (types.isProxy(value) || value === null || typeof value !== 'object' ||
+        Array.isArray(value)) return 1
+    const prototype = Reflect.getPrototypeOf(value)
+    if (prototype !== Object.prototype && prototype !== null) return 1
+    const descriptor = Reflect.getOwnPropertyDescriptor(value, 'requestCount')
+    if (!descriptor || !descriptor.enumerable || !Object.hasOwn(descriptor, 'value')) {
+      return 1
+    }
+    return isCount(descriptor.value, 1, MAX_DIAGNOSTIC_REQUEST_COUNT)
+      ? descriptor.value
+      : 1
+  } catch {
+    return 1
+  }
+}
+
+function invalidClientResult(requestCount) {
+  const error = new Error('invalid client result')
+  error.class = 'API'
+  error.requestCount = requestCount
+  return error
+}
+
 function validateClientResult(value) {
+  const requestCount = safeClientResultRequestCount(value)
   const result = snapshotExactDataObject(value, [
-    'route',
-    'scope',
-    'retrievedAt',
-    'timezone',
-    'elapsedMs',
-    'requestCount',
-    'dataVol',
-    'officialQuotaStatus',
-    'completeness'
+    'route', 'scope', 'retrievedAt', 'timezone', 'elapsedMs', 'requestCount',
+    'dataVol', 'officialQuotaStatus', 'completeness'
   ])
   const dataVolValid = result && (result.dataVol === 'unavailable' ||
     (Number.isSafeInteger(result.dataVol) && result.dataVol >= 0))
@@ -125,17 +154,147 @@ function validateClientResult(value) {
       typeof result.retrievedAt !== 'string' ||
       !Number.isFinite(Date.parse(result.retrievedAt)) ||
       !Number.isSafeInteger(result.elapsedMs) || result.elapsedMs < 0 ||
-      !Number.isSafeInteger(result.requestCount) || result.requestCount < 1 ||
+      !isCount(result.requestCount, 1, MAX_DIAGNOSTIC_REQUEST_COUNT) ||
       !dataVolValid ||
       (result.completeness !== 'complete' && result.completeness !== 'partial') ||
       (result.dataVol === 'unavailable' && result.completeness !== 'partial') ||
       (result.dataVol !== 'unavailable' && result.completeness !== 'complete')) {
-    const error = new Error('invalid client result')
-    error.class = 'API'
-    error.requestCount = 1
-    throw error
+    throw invalidClientResult(requestCount)
   }
   return result
+}
+
+function decodeReservation(value) {
+  const reservation = snapshotExactDataObject(value, [
+    'diagnosticId', 'startedAt', 'tokenVersionId', 'inFlightExpiresAt'
+  ])
+  if (!reservation || typeof reservation.diagnosticId !== 'string' ||
+      !DIAGNOSTIC_ID_PATTERN.test(reservation.diagnosticId) ||
+      !isTimestamp(reservation.startedAt) ||
+      typeof reservation.tokenVersionId !== 'string' ||
+      !VERSION_ID_PATTERN.test(reservation.tokenVersionId) ||
+      !isTimestamp(reservation.inFlightExpiresAt) ||
+      reservation.inFlightExpiresAt <= reservation.startedAt) failConfig()
+  return {
+    diagnosticId: reservation.diagnosticId,
+    startedAt: reservation.startedAt,
+    tokenVersionId: reservation.tokenVersionId,
+    inFlightExpiresAt: reservation.inFlightExpiresAt
+  }
+}
+
+function decodeReserveResult(value) {
+  let dto = snapshotExactDataObject(value, [
+    'status', 'reservation', 'localDayKey', 'localAttemptCount'
+  ])
+  if (dto && dto.status === 'reserved' && isDayKey(dto.localDayKey) &&
+      isCount(dto.localAttemptCount, 1, 20)) {
+    return {
+      status: 'reserved',
+      reservation: decodeReservation(dto.reservation),
+      localDayKey: dto.localDayKey,
+      localAttemptCount: dto.localAttemptCount
+    }
+  }
+
+  dto = snapshotExactDataObject(value, [
+    'status', 'retryAt', 'localDayKey', 'localAttemptCount'
+  ])
+  if (dto && ['busy', 'cooldown', 'daily-limit'].includes(dto.status) &&
+      isTimestamp(dto.retryAt) && isDayKey(dto.localDayKey) &&
+      isCount(dto.localAttemptCount, 0, 20)) {
+    return {
+      status: dto.status,
+      retryAt: dto.retryAt,
+      localDayKey: dto.localDayKey,
+      localAttemptCount: dto.localAttemptCount
+    }
+  }
+
+  dto = snapshotExactDataObject(value, [
+    'status', 'localDayKey', 'localAttemptCount'
+  ])
+  if (dto && (dto.status === 'duplicate' || dto.status === 'clock-rollback') &&
+      isDayKey(dto.localDayKey) && isCount(dto.localAttemptCount, 0, 20)) {
+    return {
+      status: dto.status,
+      localDayKey: dto.localDayKey,
+      localAttemptCount: dto.localAttemptCount
+    }
+  }
+  failConfig()
+}
+
+function decodeSettlement(value) {
+  let dto = snapshotExactDataObject(value, ['status', 'cooldownUntil'])
+  if (dto && dto.status === 'completed' && isTimestamp(dto.cooldownUntil)) {
+    return { status: 'completed', cooldownUntil: dto.cooldownUntil }
+  }
+  dto = snapshotExactDataObject(value, ['status'])
+  if (dto && (dto.status === 'not-found' || dto.status === 'conflict')) {
+    return { status: dto.status }
+  }
+  failConfig()
+}
+
+function decodeRepositoryStatus(value) {
+  const dto = snapshotExactDataObject(value, [
+    'localDayKey', 'localAttemptCount', 'cooldownUntil', 'inFlight',
+    'inFlightExpiresAt'
+  ])
+  if (!dto || !isDayKey(dto.localDayKey) ||
+      !isCount(dto.localAttemptCount, 0, 20) ||
+      (dto.cooldownUntil !== null && !isTimestamp(dto.cooldownUntil)) ||
+      typeof dto.inFlight !== 'boolean' ||
+      (dto.inFlight && !isTimestamp(dto.inFlightExpiresAt)) ||
+      (!dto.inFlight && dto.inFlightExpiresAt !== null)) failConfig()
+  return {
+    localDayKey: dto.localDayKey,
+    localAttemptCount: dto.localAttemptCount,
+    cooldownUntil: dto.cooldownUntil,
+    inFlight: dto.inFlight,
+    inFlightExpiresAt: dto.inFlightExpiresAt
+  }
+}
+
+function decodeRun(value) {
+  if (value === null) return null
+  const run = snapshotExactDataObject(value, [
+    'diagnosticId', 'startedAt', 'completedAt', 'authStatus', 'probeStatus',
+    'safeErrorClass', 'route', 'requestCount', 'dataVol', 'elapsedMs',
+    'completeness', 'tokenVersionId'
+  ])
+  if (!run || typeof run.diagnosticId !== 'string' ||
+      !DIAGNOSTIC_ID_PATTERN.test(run.diagnosticId) ||
+      !isTimestamp(run.startedAt) || !isTimestamp(run.completedAt) ||
+      run.completedAt < run.startedAt || !AUTH_STATUSES.has(run.authStatus) ||
+      !PROBE_STATUSES.has(run.probeStatus) ||
+      (run.safeErrorClass !== null && !SAFE_ERROR_CLASSES.has(run.safeErrorClass)) ||
+      run.route !== ROUTE || !isCount(run.requestCount, 0, 4) ||
+      (run.dataVol !== null && (!Number.isSafeInteger(run.dataVol) || run.dataVol < 0)) ||
+      !Number.isSafeInteger(run.elapsedMs) || run.elapsedMs < 0 ||
+      !COMPLETENESS_VALUES.has(run.completeness) ||
+      typeof run.tokenVersionId !== 'string' ||
+      !VERSION_ID_PATTERN.test(run.tokenVersionId)) failConfig()
+  if (run.authStatus === 'success' && run.probeStatus === 'success') {
+    if (run.safeErrorClass !== null || run.completeness === 'unavailable') failConfig()
+  } else if (run.safeErrorClass === null) {
+    failConfig()
+  }
+  return {
+    diagnosticId: run.diagnosticId,
+    startedAt: run.startedAt,
+    completedAt: run.completedAt,
+    authStatus: run.authStatus,
+    probeStatus: run.probeStatus,
+    safeErrorClass: run.safeErrorClass,
+    route: run.route,
+    requestCount: run.requestCount,
+    dataVol: run.dataVol,
+    elapsedMs: run.elapsedMs,
+    completeness: run.completeness,
+    tokenVersionId: run.tokenVersionId
+  }
 }
 
 function mapFailureStatuses(errorClass, stage) {
@@ -182,12 +341,7 @@ function disabledStatus() {
 
 function createIfindDiagnosticService(options) {
   const config = snapshotExactDataObject(options, [
-    'mode',
-    'tokenVersionId',
-    'repository',
-    'client',
-    'secretProvider',
-    'clock',
+    'mode', 'tokenVersionId', 'repository', 'client', 'secretProvider', 'clock',
     'idSource'
   ])
   if (!config || (config.mode !== MODE_ADMIN && config.mode !== MODE_DISABLED) ||
@@ -223,8 +377,8 @@ function createIfindDiagnosticService(options) {
     if (config.mode === MODE_DISABLED || invalidated) return disabledStatus()
     try {
       const now = readTimestamp(config.clock)
-      const control = config.repository.status(now)
-      const latest = config.repository.latest()
+      const control = decodeRepositoryStatus(config.repository.status(now))
+      const latest = decodeRun(config.repository.latest())
       return {
         mode: MODE_ADMIN,
         configured: true,
@@ -257,6 +411,30 @@ function createIfindDiagnosticService(options) {
         localAttemptCount: result.localAttemptCount
       }
     }
+    if (result.status === 'duplicate') {
+      return {
+        status: 'rejected',
+        safeErrorClass: 'CONFIG',
+        localAttemptCount: result.localAttemptCount
+      }
+    }
+    if (result.status === 'clock-rollback') {
+      return {
+        status: 'clock-rollback',
+        safeErrorClass: 'CONFIG',
+        localAttemptCount: result.localAttemptCount
+      }
+    }
+    return null
+  }
+
+  function settleWithRetry(method, input) {
+    for (let attempt = 0; attempt < 2; attempt += 1) {
+      try {
+        const result = decodeSettlement(config.repository[method](input))
+        if (result.status === 'completed') return result
+      } catch {}
+    }
     return null
   }
 
@@ -266,26 +444,25 @@ function createIfindDiagnosticService(options) {
     }
 
     let startedAt
-    let diagnosticId
     let reservationResult
     try {
       startedAt = readTimestamp(config.clock)
-      diagnosticId = config.idSource()
+      const diagnosticId = config.idSource()
       if (typeof diagnosticId !== 'string' || !DIAGNOSTIC_ID_PATTERN.test(diagnosticId)) {
         failConfig()
       }
-      reservationResult = config.repository.reserve({
+      reservationResult = decodeReserveResult(config.repository.reserve({
         diagnosticId,
         startedAt,
         tokenVersionId: config.tokenVersionId
-      })
+      }))
     } catch {
       return { status: 'internal-error', safeErrorClass: 'API' }
     }
 
     const blocked = reserveOutcome(reservationResult)
     if (blocked) return blocked
-    if (!reservationResult || reservationResult.status !== 'reserved') {
+    if (reservationResult.status !== 'reserved') {
       return { status: 'internal-error', safeErrorClass: 'API' }
     }
 
@@ -299,7 +476,7 @@ function createIfindDiagnosticService(options) {
       if (!Buffer.isBuffer(refreshToken) || refreshToken.length < 1 || refreshToken.length > 4096) {
         const error = new Error('invalid secret provider')
         error.class = 'CONFIG'
-        error.requestCount = 0
+        error.requestCount = 1
         throw error
       }
       activeTokens.add(refreshToken)
@@ -310,9 +487,8 @@ function createIfindDiagnosticService(options) {
         error.requestCount = clientResult.requestCount
         throw error
       }
-      const completedAt = readTimestamp(config.clock)
       terminal = {
-        completedAt,
+        completedAt: readTimestamp(config.clock),
         authStatus: 'success',
         probeStatus: 'success',
         safeErrorClass: null,
@@ -344,17 +520,11 @@ function createIfindDiagnosticService(options) {
       activeTokens.delete(refreshToken)
     }
 
-    let settlement
-    try {
-      settlement = outcomeStatus === 'completed'
-        ? config.repository.complete({ reservation, result: terminal })
-        : config.repository.fail({ reservation, result: terminal })
-    } catch {
-      return { status: 'internal-error', safeErrorClass: 'API' }
-    }
-    if (!settlement || settlement.status !== 'completed') {
-      return { status: 'internal-error', safeErrorClass: 'API' }
-    }
+    const settlement = settleWithRetry(
+      outcomeStatus === 'completed' ? 'complete' : 'fail',
+      { reservation, result: terminal }
+    )
+    if (!settlement) return { status: 'internal-error', safeErrorClass: 'API' }
 
     const persisted = {
       diagnosticId: reservation.diagnosticId,
