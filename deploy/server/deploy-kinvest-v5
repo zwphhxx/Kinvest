@@ -472,15 +472,21 @@ create_database_backup() {
   local temporary desired
   desired="$(date -u +%Y%m%dT%H%M%SZ)-$target_commit.sqlite"
   secure_temp temporary "$BACKUP_ROOT/.backup-v5.XXXXXX" || return 1
-  python3 - "$DATABASE" "$temporary" 2>/dev/null <<'PY'
+  if ! python3 - "$DATABASE" "$temporary" 2>/dev/null <<'PY'
 import sqlite3, sys
 with sqlite3.connect('file:' + sys.argv[1] + '?mode=ro', uri=True) as source, sqlite3.connect(sys.argv[2]) as target:
     source.backup(target)
     if target.execute('PRAGMA quick_check').fetchone()[0] != 'ok': raise SystemExit(1)
 PY
+  then
+    rm -f -- "$temporary" 2>/dev/null
+    return 1
+  fi
   chmod 0600 "$temporary" 2>/dev/null || { rm -f -- "$temporary" 2>/dev/null; return 1; }
   chown "$ROOT_UID:$ROOT_GID" "$temporary" 2>/dev/null || { rm -f -- "$temporary" 2>/dev/null; return 1; }
-  backup_path="$("$RUNTIME_HELPER" commit-backup "$BACKUP_ROOT" "$temporary" "$desired" "$ROOT_UID" "$ROOT_GID" "$candidate_registry" "$RUN_ROOT" 2>/dev/null)" || { rm -f -- "$temporary" 2>/dev/null; return 1; }
+  # Ownership transfers here: before helper invocation the shell owns temporary;
+  # after invocation only helper/registry recovery may remove it.
+  backup_path="$("$RUNTIME_HELPER" commit-backup "$BACKUP_ROOT" "$temporary" "$desired" "$ROOT_UID" "$ROOT_GID" "$candidate_registry" "$RUN_ROOT" 2>/dev/null)" || return 1
   backup_checksum="$(sha256sum "$backup_path" 2>/dev/null | awk '{print $1}')" || return 1
   [[ "$backup_checksum" =~ ^[0-9a-f]{64}$ ]] || return 1
   verify_backup_file "$backup_path" "$backup_checksum"

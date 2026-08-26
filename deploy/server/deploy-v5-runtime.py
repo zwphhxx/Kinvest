@@ -496,6 +496,8 @@ def commit_backup_no_replace(root: str, temporary: str, desired_name: str,
         raise RuntimeErrorCode('DEPLOY_V5_BACKUP_INVALID')
     root_fd = open_backup_root(root, uid, gid)
     source_fd = -1
+    registry_recorded = False
+    source_name = ''
     try:
         source_fd, source_name = validate_backup_temp(root_fd, root, temporary, uid, gid)
         os.fsync(source_fd)
@@ -511,7 +513,18 @@ def commit_backup_no_replace(root: str, temporary: str, desired_name: str,
                     'backupTemp': source_name, 'backupFinal': candidate,
                     'backupChecksum': checksum,
                 })
-                write_registry(registry_path, run_root, registry, uid, gid)
+                try:
+                    write_registry(registry_path, run_root, registry, uid, gid)
+                    registry_recorded = True
+                except BaseException:
+                    if not registry_recorded:
+                        try:
+                            persisted = read_registry(registry_path, run_root, uid, gid)
+                            registry_recorded = persisted['backupTemp'] == source_name and \
+                                persisted['backupChecksum'] == checksum
+                        except Exception:
+                            registry_recorded = False
+                    raise
             fault_barrier('backup-before-link')
             try:
                 os.link(source_name, candidate, src_dir_fd=root_fd,
@@ -525,6 +538,17 @@ def commit_backup_no_replace(root: str, temporary: str, desired_name: str,
             except FileExistsError:
                 continue
         raise RuntimeErrorCode('DEPLOY_V5_BACKUP_INVALID')
+    except BaseException:
+        if not registry_recorded and source_fd >= 0 and source_name:
+            try:
+                opened = os.fstat(source_fd)
+                current = os.stat(source_name, dir_fd=root_fd, follow_symlinks=False)
+                if (opened.st_dev, opened.st_ino) == (current.st_dev, current.st_ino):
+                    os.unlink(source_name, dir_fd=root_fd)
+                    os.fsync(root_fd)
+            except OSError:
+                pass
+        raise
     finally:
         if source_fd >= 0:
             os.close(source_fd)

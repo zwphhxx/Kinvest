@@ -264,6 +264,26 @@ with tempfile.TemporaryDirectory() as temporary:
                             str(backup_root), str(state_root), uid, gid)
     assert not same_temp.exists() and same_final.read_bytes() == b'same' and not same_registry.exists()
 
+    owned_registry = pathlib.Path(module.reserve_registry(str(run_root), uid, gid))
+    owned_temp = backup_root / '.backup-v5.registered'; owned_temp.write_bytes(b'registered'); owned_temp.chmod(0o600)
+    owned_hash = hashlib.sha256(b'registered').hexdigest()
+    owned_value = dict(value, backupTemp=owned_temp.name, backupFinal='registered-old.sqlite',
+                       backupChecksum=owned_hash)
+    module.write_registry(str(owned_registry), str(run_root), owned_value, uid, gid)
+    original_registry_write = module.write_registry
+    def fail_registry_write(*_args): raise OSError('injected registry update failure')
+    module.write_registry = fail_registry_write
+    try:
+        try: module.commit_backup_no_replace(str(backup_root), str(owned_temp), 'registered-new.sqlite',
+                                             uid, gid, str(owned_registry), str(run_root))
+        except OSError: pass
+        else: raise AssertionError('registry update failure accepted')
+    finally: module.write_registry = original_registry_write
+    assert owned_temp.exists(), 'registered pending backup lost helper ownership'
+    module.recover_registry(str(owned_registry), str(run_root), str(access_root), str(ifind_root),
+                            str(backup_root), str(state_root), uid, gid)
+    assert not owned_temp.exists() and not owned_registry.exists()
+
     empty = run_root / 'kinvest-v5.candidates.Empty123'
     fd = os.open(empty, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW, 0o600)
     os.fchmod(fd, 0o600); os.fchown(fd, uid, gid); os.close(fd)
@@ -1017,6 +1037,73 @@ module.materialize(sys.argv[2], sys.argv[3], sys.argv[4], sys.argv[5],
     assert.equal(fs.existsSync(badBackup.operations) &&
       fs.readFileSync(badBackup.operations, 'utf8').includes(' compose '), false)
   } finally { cleanupHarness(badBackup) }
+
+  const collision = makeHarness({
+    runtimeTransform: source => source.replace(
+      "write_all(fd, b'reached\\n')",
+      "write_all(fd, (str(os.getpid()) + '\\n').encode('ascii'))"
+    )
+  })
+  let collisionChild
+  try {
+    const barrierRoot = path.join(collision.runRoot, 'backup-barriers')
+    fs.mkdirSync(barrierRoot, { mode: 0o700 })
+    fs.chmodSync(barrierRoot, 0o700)
+    const marker = path.join(barrierRoot, 'backup-before-link.reached')
+    const output = { stdout: '', stderr: '' }
+    collisionChild = spawn(collision.executor, [], {
+      detached: true,
+      env: {
+        ...process.env,
+        PATH: `${collision.bin}:${process.env.PATH}`,
+        KINVEST_V5_TEST_BARRIER_ROOT: barrierRoot,
+        KINVEST_V5_TEST_BARRIER: 'backup-before-link'
+      },
+      stdio: ['pipe', 'pipe', 'pipe']
+    })
+    collisionChild.stdout.on('data', chunk => { output.stdout += chunk })
+    collisionChild.stderr.on('data', chunk => { output.stderr += chunk })
+    collisionChild.stdin.end(diagnosticPayload())
+    await waitForFile(marker, collisionChild, output, 15000)
+
+    const registries = fs.readdirSync(collision.runRoot)
+      .filter(name => /^kinvest-v5\.candidates\.[A-Za-z0-9]+$/.test(name))
+    assert.equal(registries.length, 1)
+    const registryPath = path.join(collision.runRoot, registries[0])
+    const registry = JSON.parse(fs.readFileSync(registryPath, 'utf8'))
+    const temporary = path.join(collision.root, 'backups', registry.backupTemp)
+    const preexistingFinal = path.join(collision.root, 'backups', registry.backupFinal)
+    assert.equal(fs.existsSync(temporary), true)
+    fs.copyFileSync(temporary, preexistingFinal, fs.constants.COPYFILE_EXCL)
+    fs.chmodSync(preexistingFinal, 0o600)
+    assert.notEqual(fs.statSync(temporary).ino, fs.statSync(preexistingFinal).ino)
+    const expected = fs.readFileSync(preexistingFinal)
+
+    const helperPid = Number.parseInt(fs.readFileSync(marker, 'utf8').trim(), 10)
+    assert.equal(Number.isSafeInteger(helperPid) && helperPid > 1, true)
+    process.kill(helperPid, 'SIGTERM')
+    const interrupted = await new Promise((resolve, reject) => {
+      const timer = setTimeout(() => {
+        process.kill(-collisionChild.pid, 'SIGKILL')
+        reject(new Error('full executor backup collision did not terminate'))
+      }, 10000)
+      collisionChild.once('close', code => { clearTimeout(timer); resolve({ code, ...output }) })
+    })
+    assert.notEqual(interrupted.code, 0)
+    assert.equal(fs.readFileSync(preexistingFinal).equals(expected), true,
+      'preexisting same-content final must survive registry recovery')
+    assert.equal(fs.existsSync(temporary), false)
+    assert.equal(fs.existsSync(registryPath), false)
+
+    const recovered = spawnSync(collision.executor, [], {
+      encoding: 'utf8', input: diagnosticPayload(), timeout: 30000,
+      env: { ...process.env, PATH: `${collision.bin}:${process.env.PATH}` }
+    })
+    assert.equal(recovered.status, 0, recovered.stderr)
+  } finally {
+    if (collisionChild && collisionChild.exitCode === null) process.kill(-collisionChild.pid, 'SIGKILL')
+    cleanupHarness(collision)
+  }
 
   for (const window of [
     'TRANSACTION_WINDOW_BEFORE_COMPOSE',
