@@ -60,7 +60,7 @@ function latest(overrides = {}) {
     probeStatus: 'success',
     safeErrorClass: null,
     route: '/api/v1/get_trade_dates',
-    scope: 'fixed_trade_dates_probe',
+    scope: 'market-trade-dates:212001:D:-10',
     requestCount: 2,
     dataVol: 7,
     elapsedMs: 50,
@@ -146,6 +146,37 @@ async function request(baseUrl, pathname, options = {}) {
   }
 }
 
+async function abortPartialRequest(baseUrl) {
+  const observed = []
+  const onUnhandled = (error) => observed.push(error)
+  process.on('unhandledRejection', onUnhandled)
+  process.on('uncaughtExceptionMonitor', onUnhandled)
+  try {
+    await new Promise((resolve) => {
+      const req = http.request(`${baseUrl}/api/admin/ifind/diagnostics/run`, {
+        method: 'POST',
+        headers: {
+          ...postHeaders(),
+          'content-length': '2'
+        }
+      })
+      req.once('response', (response) => {
+        response.resume()
+        response.once('end', resolve)
+      })
+      req.once('error', () => resolve())
+      req.write('{')
+      req.flushHeaders()
+      setTimeout(() => req.destroy(), 20)
+    })
+    await new Promise((resolve) => setTimeout(resolve, 25))
+  } finally {
+    process.removeListener('unhandledRejection', onUnhandled)
+    process.removeListener('uncaughtExceptionMonitor', onUnhandled)
+  }
+  assert.deepEqual(observed, [])
+}
+
 function adminCookie(token = ADMIN_TOKEN) {
   return `__Host-kinvest-admin=${token}`
 }
@@ -225,6 +256,7 @@ async function testStrictEmptyJsonBody() {
   try {
     /** @type {Array<[Record<string, string>, string, number, string]>} */
     const cases = [
+      [postHeaders(), '', 400, 'JSON_INVALID'],
       [{ ...postHeaders(), 'content-type': 'text/plain' }, '{}', 415, 'JSON_REQUIRED'],
       [postHeaders(), '{"extra":true}', 400, 'JSON_INVALID'],
       [postHeaders(), '{', 400, 'JSON_INVALID'],
@@ -236,6 +268,9 @@ async function testStrictEmptyJsonBody() {
       })
       assert.deepEqual(response, { status, body: { error } })
     }
+    assert.deepEqual(runtime.calls, [])
+
+    await abortPartialRequest(running.baseUrl)
     assert.deepEqual(runtime.calls, [])
 
     const accepted = await request(running.baseUrl, '/api/admin/ifind/diagnostics/run', {
@@ -257,47 +292,110 @@ async function testSafeStatusAndOutcomeMappings() {
     })
     assert.equal(response.status, 200)
     assert.deepEqual(Object.keys(response.body.data).sort(), [
-      'configured', 'cooldownUntil', 'inFlight', 'latest', 'localAttemptCount',
+      'configured', 'cooldownUntil', 'latest', 'localAttemptCount',
       'mode', 'officialQuotaStatus', 'tokenVersionId'
     ])
     assert.deepEqual(Object.keys(response.body.data.latest).sort(), [
-      'authStatus', 'completedAt', 'completeness', 'dataVol', 'diagnosticId',
+      'authStatus', 'completedAt', 'completeness', 'dataVol',
       'elapsedMs', 'officialQuotaStatus', 'probeStatus', 'requestCount', 'route',
       'safeErrorClass', 'scope', 'startedAt', 'tokenVersionId'
     ])
+    const expectedLatest = latest()
+    delete expectedLatest.diagnosticId
+    assert.deepEqual(response.body, {
+      data: {
+        mode: 'admin-diagnostic',
+        configured: true,
+        tokenVersionId: VERSION_ID,
+        officialQuotaStatus: 'unavailable',
+        cooldownUntil: null,
+        localAttemptCount: 1,
+        latest: expectedLatest
+      }
+    })
     assert.equal(JSON.stringify(response.body).includes('refresh_token'), false)
     assert.deepEqual(runtime.calls, ['status'])
   } finally {
     await running.close()
   }
 
-  const scenarios = [
-    [{ status: 'disabled', safeErrorClass: 'CONFIG', raw: 'provider secret' }, 503, 'IFIND_DIAGNOSTIC_DISABLED'],
-    [{ status: 'busy', safeErrorClass: 'BUSY', retryAt: NOW + 1000, localAttemptCount: 1 }, 409, 'IFIND_DIAGNOSTIC_BUSY'],
-    [{ status: 'cooldown', safeErrorClass: 'RATE_LIMITED', retryAt: NOW + 1000, localAttemptCount: 2 }, 429, 'IFIND_DIAGNOSTIC_COOLDOWN'],
-    [{ status: 'daily-limit', safeErrorClass: 'RATE_LIMITED', retryAt: NOW + 1000, localAttemptCount: 20 }, 429, 'IFIND_DIAGNOSTIC_DAILY_LIMIT'],
-    [{ status: 'failed', safeErrorClass: 'AUTH', diagnostic: latest({ authStatus: 'failed', probeStatus: 'not_run', safeErrorClass: 'AUTH', dataVol: null, completeness: 'unavailable' }), cooldownUntil: NOW + 1000, localAttemptCount: 3, RequestId: 'raw-request-id' }, 200, null],
-    [{ status: 'failed', safeErrorClass: 'PERMISSION', diagnostic: latest({ probeStatus: 'failed', safeErrorClass: 'PERMISSION', dataVol: null, completeness: 'unavailable' }), cooldownUntil: NOW + 1000, localAttemptCount: 4, token: 'raw-token' }, 200, null],
-    [{ status: 'completed', safeErrorClass: null, diagnostic: latest(), cooldownUntil: NOW + 1000, localAttemptCount: 5 }, 200, null]
+  const outcomeCases = [
+    {
+      outcome: { status: 'disabled', safeErrorClass: 'CONFIG' },
+      expected: { status: 503, body: { error: 'IFIND_DIAGNOSTIC_DISABLED' } }
+    },
+    {
+      outcome: { status: 'busy', safeErrorClass: 'BUSY', retryAt: NOW + 1000, localAttemptCount: 1 },
+      expected: { status: 409, body: { error: 'IFIND_DIAGNOSTIC_BUSY', retryAt: NOW + 1000, localAttemptCount: 1 } }
+    },
+    {
+      outcome: { status: 'cooldown', safeErrorClass: 'RATE_LIMITED', retryAt: NOW + 2000, localAttemptCount: 2 },
+      expected: { status: 429, body: { error: 'IFIND_DIAGNOSTIC_COOLDOWN', retryAt: NOW + 2000, localAttemptCount: 2 } }
+    },
+    {
+      outcome: { status: 'daily-limit', safeErrorClass: 'RATE_LIMITED', retryAt: NOW + 3000, localAttemptCount: 20 },
+      expected: { status: 429, body: { error: 'IFIND_DIAGNOSTIC_DAILY_LIMIT', retryAt: NOW + 3000, localAttemptCount: 20 } }
+    },
+    {
+      outcome: { status: 'failed', safeErrorClass: 'AUTH', diagnostic: latest({ authStatus: 'failed', probeStatus: 'not_run', safeErrorClass: 'AUTH', dataVol: null, completeness: 'unavailable' }), cooldownUntil: NOW + 4000, localAttemptCount: 3 },
+      expected: { status: 200, body: { data: { status: 'failed', safeErrorClass: 'AUTH', diagnostic: null, cooldownUntil: NOW + 4000, localAttemptCount: 3 } } }
+    },
+    {
+      outcome: { status: 'failed', safeErrorClass: 'PERMISSION', diagnostic: latest({ authStatus: 'success', probeStatus: 'failed', safeErrorClass: 'PERMISSION', dataVol: null, completeness: 'unavailable' }), cooldownUntil: NOW + 5000, localAttemptCount: 4 },
+      expected: { status: 200, body: { data: { status: 'failed', safeErrorClass: 'PERMISSION', diagnostic: null, cooldownUntil: NOW + 5000, localAttemptCount: 4 } } }
+    },
+    {
+      outcome: { status: 'completed', safeErrorClass: null, diagnostic: latest(), cooldownUntil: NOW + 6000, localAttemptCount: 5 },
+      expected: { status: 200, body: { data: { status: 'completed', safeErrorClass: null, diagnostic: null, cooldownUntil: NOW + 6000, localAttemptCount: 5 } } }
+    }
   ]
-  for (const [outcome, expectedStatus, expectedError] of scenarios) {
-    const scenarioRuntime = createDiagnosticRuntime({ outcome })
+  for (const scenario of outcomeCases) {
+    const expectedDiagnostic = scenario.outcome.diagnostic
+      ? { ...scenario.outcome.diagnostic }
+      : null
+    if (expectedDiagnostic) delete expectedDiagnostic.diagnosticId
+    if (scenario.expected.body.data) {
+      scenario.expected.body.data.diagnostic = expectedDiagnostic
+    }
+    const scenarioRuntime = createDiagnosticRuntime({ outcome: scenario.outcome })
     const scenarioServer = await start(scenarioRuntime)
     try {
       const response = await request(scenarioServer.baseUrl, '/api/admin/ifind/diagnostics/run', {
         method: 'POST', headers: postHeaders(), body: '{}'
       })
-      assert.equal(response.status, expectedStatus)
-      if (expectedError) assert.equal(response.body.error, expectedError)
-      else assert.deepEqual(Object.keys(response.body.data).sort(), [
-        'cooldownUntil', 'diagnostic', 'localAttemptCount', 'safeErrorClass', 'status'
-      ])
+      assert.deepEqual(response, scenario.expected)
       const serialized = JSON.stringify(response.body)
       for (const marker of ['provider secret', 'raw-request-id', 'raw-token', 'RequestId']) {
         assert.equal(serialized.includes(marker), false)
       }
     } finally {
       await scenarioServer.close()
+    }
+  }
+
+  const hostileValues = [
+    { status: { mode: 'admin-diagnostic', configured: true, tokenVersionId: 'current', officialQuotaStatus: 'unavailable', cooldownUntil: null, localAttemptCount: 1, inFlight: false, latest: null } },
+    { status: { mode: 'admin-diagnostic', configured: true, tokenVersionId: VERSION_ID, officialQuotaStatus: 'unavailable', cooldownUntil: null, localAttemptCount: 1, inFlight: false, latest: latest({ route: 'raw-provider-route' }) } },
+    { outcome: { status: 'failed', safeErrorClass: 'AUTH', diagnostic: latest({ authStatus: 'success', probeStatus: 'failed', safeErrorClass: 'AUTH', completeness: 'unavailable', dataVol: null }), cooldownUntil: NOW, localAttemptCount: 1 } },
+    { outcome: { status: 'completed', safeErrorClass: null, diagnostic: latest({ requestCount: 99 }), cooldownUntil: NOW, localAttemptCount: 1 } },
+    { outcome: { status: 'busy', safeErrorClass: 'raw-provider-error', retryAt: NOW, localAttemptCount: 1 } }
+  ]
+  for (const hostile of hostileValues) {
+    const hostileRuntime = createDiagnosticRuntime(hostile)
+    const hostileServer = await start(hostileRuntime)
+    try {
+      const isStatus = Boolean(hostile.status)
+      const response = await request(
+        hostileServer.baseUrl,
+        isStatus ? '/api/admin/ifind/diagnostics' : '/api/admin/ifind/diagnostics/run',
+        isStatus
+          ? { headers: { cookie: adminCookie() } }
+          : { method: 'POST', headers: postHeaders(), body: '{}' }
+      )
+      assert.deepEqual(response, { status: 500, body: { error: 'INTERNAL_ERROR' } })
+      assert.equal(JSON.stringify(response.body).includes('raw-provider'), false)
+    } finally {
+      await hostileServer.close()
     }
   }
 }

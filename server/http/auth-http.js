@@ -1,5 +1,5 @@
 const crypto = require('node:crypto')
-const { TextDecoder } = require('node:util')
+const { TextDecoder, types } = require('node:util')
 
 const { resolveClientIdentity } = require('./trusted-client')
 
@@ -17,6 +17,16 @@ const TERMINAL_REQUEST_ERRORS = new Set([
   'REQUEST_ALREADY_USED',
   'REQUEST_NOT_FOUND'
 ])
+const IFIND_ROUTE = '/api/v1/get_trade_dates'
+const IFIND_SCOPE = 'market-trade-dates:212001:D:-10'
+const IFIND_VERSION_PATTERN = /^v[0-9]{8}-[0-9]{3}$/
+const IFIND_AUTH_STATUSES = new Set(['success', 'failed', 'unknown'])
+const IFIND_PROBE_STATUSES = new Set(['success', 'failed', 'not_run'])
+const IFIND_ERROR_CLASSES = new Set([
+  'AUTH', 'PERMISSION', 'QUOTA', 'NETWORK', 'API', 'CONFIG', 'BUSY',
+  'RATE_LIMITED'
+])
+const IFIND_COMPLETENESS = new Set(['complete', 'partial', 'unavailable'])
 
 class HttpBoundaryError extends Error {
   constructor(code, status) {
@@ -164,7 +174,7 @@ function assertNoDuplicateTopLevelKeys(source) {
   }
 }
 
-function parseStrictJsonBody(req) {
+function parseStrictJsonBody(req, { allowEmpty = true } = {}) {
   const type = req.headers['content-type']
   if (typeof type !== 'string' ||
     !/^application\/json(?:\s*;\s*charset=utf-8)?$/i.test(type)) {
@@ -202,6 +212,7 @@ function parseStrictJsonBody(req) {
         const raw = new TextDecoder('utf-8', { fatal: true })
           .decode(Buffer.concat(chunks))
         assertNoDuplicateTopLevelKeys(raw)
+        if (raw.length === 0 && !allowEmpty) boundaryError('JSON_INVALID', 400)
         const parsed = raw.length === 0 ? {} : JSON.parse(raw)
         if (parsed === null || typeof parsed !== 'object' || Array.isArray(parsed)) {
           boundaryError('JSON_INVALID', 400)
@@ -265,25 +276,99 @@ function createAuthHttpController({
   const device = accessRuntime.deviceApproval
   const admin = accessRuntime.adminAuth
 
+  function exactData(value, keys) {
+    try {
+      if (types.isProxy(value) || !value || typeof value !== 'object' ||
+        Array.isArray(value)) boundaryError('INTERNAL_ERROR', 500)
+      const prototype = Reflect.getPrototypeOf(value)
+      if (prototype !== Object.prototype && prototype !== null) {
+        boundaryError('INTERNAL_ERROR', 500)
+      }
+      const ownKeys = Reflect.ownKeys(value)
+      if (ownKeys.length !== keys.length ||
+        ownKeys.some((key) => typeof key !== 'string' || !keys.includes(key))) {
+        boundaryError('INTERNAL_ERROR', 500)
+      }
+      const result = Object.create(null)
+      for (const key of keys) {
+        const descriptor = Reflect.getOwnPropertyDescriptor(value, key)
+        if (!descriptor || !descriptor.enumerable ||
+          !Object.hasOwn(descriptor, 'value')) boundaryError('INTERNAL_ERROR', 500)
+        result[key] = descriptor.value
+      }
+      return result
+    } catch (error) {
+      if (error instanceof HttpBoundaryError) throw error
+      boundaryError('INTERNAL_ERROR', 500)
+    }
+  }
+
+  function isTimestamp(value) {
+    return Number.isSafeInteger(value) && value >= 0 &&
+      value <= 8_640_000_000_000_000
+  }
+
+  function isCount(value, maximum) {
+    return Number.isSafeInteger(value) && value >= 0 && value <= maximum
+  }
+
   function copyDiagnostic(value) {
-    if (!value || typeof value !== 'object' || Array.isArray(value)) {
+    const dto = exactData(value, [
+      'diagnosticId', 'startedAt', 'completedAt', 'authStatus', 'probeStatus',
+      'safeErrorClass', 'route', 'scope', 'requestCount', 'dataVol', 'elapsedMs',
+      'completeness', 'tokenVersionId', 'officialQuotaStatus'
+    ])
+    const successful = dto.authStatus === 'success' && dto.probeStatus === 'success'
+    const authFailed = dto.authStatus === 'failed' && dto.probeStatus === 'not_run'
+    const probeFailed = dto.authStatus === 'success' && dto.probeStatus === 'failed'
+    const authUnknown = dto.authStatus === 'unknown' && dto.probeStatus === 'failed'
+    if (typeof dto.diagnosticId !== 'string' ||
+      !/^diag_[a-f0-9]{24,64}$/.test(dto.diagnosticId) ||
+      !isTimestamp(dto.startedAt) || !isTimestamp(dto.completedAt) ||
+      dto.completedAt < dto.startedAt ||
+      !IFIND_AUTH_STATUSES.has(dto.authStatus) ||
+      !IFIND_PROBE_STATUSES.has(dto.probeStatus) ||
+      (dto.safeErrorClass !== null && !IFIND_ERROR_CLASSES.has(dto.safeErrorClass)) ||
+      dto.route !== IFIND_ROUTE || dto.scope !== IFIND_SCOPE ||
+      !isCount(dto.requestCount, 4) ||
+      (dto.dataVol !== null && !isCount(dto.dataVol, Number.MAX_SAFE_INTEGER)) ||
+      !isCount(dto.elapsedMs, Number.MAX_SAFE_INTEGER) ||
+      !IFIND_COMPLETENESS.has(dto.completeness) ||
+      typeof dto.tokenVersionId !== 'string' ||
+      !IFIND_VERSION_PATTERN.test(dto.tokenVersionId) ||
+      dto.officialQuotaStatus !== 'unavailable' ||
+      (!successful && !authFailed && !probeFailed && !authUnknown) ||
+      (successful && (dto.safeErrorClass !== null ||
+        dto.completeness === 'unavailable' ||
+        (dto.completeness === 'complete' && dto.dataVol === null) ||
+        (dto.completeness === 'partial' && dto.dataVol !== null))) ||
+      (authFailed && (dto.safeErrorClass === null ||
+        dto.completeness !== 'unavailable' || dto.dataVol !== null)) ||
+      (probeFailed && (dto.safeErrorClass === null ||
+        dto.completeness !== 'unavailable')) ||
+      (authUnknown &&
+        (dto.safeErrorClass !== 'NETWORK' && dto.safeErrorClass !== 'API')) ||
+      ((dto.safeErrorClass === 'AUTH' || dto.safeErrorClass === 'CONFIG') &&
+        !authFailed) ||
+      ((dto.safeErrorClass === 'PERMISSION' || dto.safeErrorClass === 'QUOTA') &&
+        !probeFailed) ||
+      dto.safeErrorClass === 'BUSY' || dto.safeErrorClass === 'RATE_LIMITED') {
       boundaryError('INTERNAL_ERROR', 500)
     }
     return {
-      diagnosticId: value.diagnosticId,
-      startedAt: value.startedAt,
-      completedAt: value.completedAt,
-      authStatus: value.authStatus,
-      probeStatus: value.probeStatus,
-      safeErrorClass: value.safeErrorClass,
-      route: value.route,
-      scope: value.scope,
-      requestCount: value.requestCount,
-      dataVol: value.dataVol,
-      elapsedMs: value.elapsedMs,
-      completeness: value.completeness,
-      tokenVersionId: value.tokenVersionId,
-      officialQuotaStatus: value.officialQuotaStatus
+      startedAt: dto.startedAt,
+      completedAt: dto.completedAt,
+      authStatus: dto.authStatus,
+      probeStatus: dto.probeStatus,
+      safeErrorClass: dto.safeErrorClass,
+      route: IFIND_ROUTE,
+      scope: IFIND_SCOPE,
+      requestCount: dto.requestCount,
+      dataVol: dto.dataVol,
+      elapsedMs: dto.elapsedMs,
+      completeness: dto.completeness,
+      tokenVersionId: dto.tokenVersionId,
+      officialQuotaStatus: 'unavailable'
     }
   }
 
@@ -295,7 +380,6 @@ function createAuthHttpController({
       officialQuotaStatus: 'unavailable',
       cooldownUntil: null,
       localAttemptCount: 0,
-      inFlight: false,
       latest: null
     }
   }
@@ -307,50 +391,91 @@ function createAuthHttpController({
   }
 
   function copyDiagnosticStatus(value) {
-    if (!value || typeof value !== 'object' || Array.isArray(value)) {
+    const dto = exactData(value, [
+      'mode', 'configured', 'tokenVersionId', 'officialQuotaStatus',
+      'cooldownUntil', 'localAttemptCount', 'inFlight', 'latest'
+    ])
+    if (dto.mode !== 'admin-diagnostic' || dto.configured !== true ||
+      typeof dto.tokenVersionId !== 'string' ||
+      !IFIND_VERSION_PATTERN.test(dto.tokenVersionId) ||
+      dto.officialQuotaStatus !== 'unavailable' ||
+      (dto.cooldownUntil !== null && !isTimestamp(dto.cooldownUntil)) ||
+      !isCount(dto.localAttemptCount, 20) || typeof dto.inFlight !== 'boolean' ||
+      (dto.latest !== null && typeof dto.latest !== 'object')) {
+      boundaryError('INTERNAL_ERROR', 500)
+    }
+    const latest = dto.latest === null ? null : copyDiagnostic(dto.latest)
+    if (latest && latest.tokenVersionId !== dto.tokenVersionId) {
       boundaryError('INTERNAL_ERROR', 500)
     }
     return {
-      mode: value.mode,
-      configured: value.configured,
-      tokenVersionId: value.tokenVersionId,
-      officialQuotaStatus: value.officialQuotaStatus,
-      cooldownUntil: value.cooldownUntil,
-      localAttemptCount: value.localAttemptCount,
-      inFlight: value.inFlight,
-      latest: value.latest === null ? null : copyDiagnostic(value.latest)
+      mode: 'admin-diagnostic',
+      configured: true,
+      tokenVersionId: dto.tokenVersionId,
+      officialQuotaStatus: 'unavailable',
+      cooldownUntil: dto.cooldownUntil,
+      localAttemptCount: dto.localAttemptCount,
+      latest
     }
   }
 
   function sendDiagnosticOutcome(res, outcome) {
-    if (!outcome || typeof outcome !== 'object' || Array.isArray(outcome)) {
-      boundaryError('INTERNAL_ERROR', 500)
-    }
-    const blocked = {
-      disabled: [503, 'IFIND_DIAGNOSTIC_DISABLED'],
-      busy: [409, 'IFIND_DIAGNOSTIC_BUSY'],
-      cooldown: [429, 'IFIND_DIAGNOSTIC_COOLDOWN'],
-      'daily-limit': [429, 'IFIND_DIAGNOSTIC_DAILY_LIMIT']
-    }[outcome.status]
-    if (blocked) {
-      const body = { error: blocked[1] }
-      if (outcome.status !== 'disabled') {
-        body.retryAt = outcome.retryAt
-        body.localAttemptCount = outcome.localAttemptCount
-      }
-      sendJson(res, body, blocked[0])
+    const statusDescriptor = !types.isProxy(outcome) && outcome &&
+      typeof outcome === 'object'
+      ? Reflect.getOwnPropertyDescriptor(outcome, 'status')
+      : null
+    const status = statusDescriptor && Object.hasOwn(statusDescriptor, 'value')
+      ? statusDescriptor.value
+      : null
+    if (status === 'disabled') {
+      const dto = exactData(outcome, ['status', 'safeErrorClass'])
+      if (dto.safeErrorClass !== 'CONFIG') boundaryError('INTERNAL_ERROR', 500)
+      sendJson(res, { error: 'IFIND_DIAGNOSTIC_DISABLED' }, 503)
       return
     }
-    if (outcome.status !== 'completed' && outcome.status !== 'failed') {
+    if (status === 'busy' || status === 'cooldown' || status === 'daily-limit') {
+      const dto = exactData(outcome, [
+        'status', 'safeErrorClass', 'retryAt', 'localAttemptCount'
+      ])
+      const expectedClass = status === 'busy' ? 'BUSY' : 'RATE_LIMITED'
+      if (dto.safeErrorClass !== expectedClass || !isTimestamp(dto.retryAt) ||
+        !isCount(dto.localAttemptCount, 20)) boundaryError('INTERNAL_ERROR', 500)
+      const mapping = {
+        busy: [409, 'IFIND_DIAGNOSTIC_BUSY'],
+        cooldown: [429, 'IFIND_DIAGNOSTIC_COOLDOWN'],
+        'daily-limit': [429, 'IFIND_DIAGNOSTIC_DAILY_LIMIT']
+      }
+      const mapped = mapping[status]
+      sendJson(res, {
+        error: mapped[1],
+        retryAt: dto.retryAt,
+        localAttemptCount: dto.localAttemptCount
+      }, mapped[0])
+      return
+    }
+    if (status !== 'completed' && status !== 'failed') {
+      boundaryError('INTERNAL_ERROR', 500)
+    }
+    const dto = exactData(outcome, [
+      'status', 'safeErrorClass', 'diagnostic', 'cooldownUntil',
+      'localAttemptCount'
+    ])
+    const diagnostic = copyDiagnostic(dto.diagnostic)
+    if (!isTimestamp(dto.cooldownUntil) || !isCount(dto.localAttemptCount, 20) ||
+      (status === 'completed' && (dto.safeErrorClass !== null ||
+        diagnostic.authStatus !== 'success' || diagnostic.probeStatus !== 'success')) ||
+      (status === 'failed' && (!IFIND_ERROR_CLASSES.has(dto.safeErrorClass) ||
+        dto.safeErrorClass !== diagnostic.safeErrorClass ||
+        (diagnostic.authStatus === 'success' && diagnostic.probeStatus === 'success')))) {
       boundaryError('INTERNAL_ERROR', 500)
     }
     sendJson(res, {
       data: {
-        status: outcome.status,
-        safeErrorClass: outcome.safeErrorClass,
-        diagnostic: copyDiagnostic(outcome.diagnostic),
-        cooldownUntil: outcome.cooldownUntil,
-        localAttemptCount: outcome.localAttemptCount
+        status,
+        safeErrorClass: dto.safeErrorClass,
+        diagnostic,
+        cooldownUntil: dto.cooldownUntil,
+        localAttemptCount: dto.localAttemptCount
       }
     })
   }
@@ -617,7 +742,7 @@ function createAuthHttpController({
       requireEnabled()
       requireOrigin(req, publicOrigin)
       authenticateMutation(req, res)
-      exactObject(await parseStrictJsonBody(req), [], [])
+      exactObject(await parseStrictJsonBody(req, { allowEmpty: false }), [], [])
       const service = diagnosticService()
       if (!service) {
         sendDiagnosticOutcome(res, { status: 'disabled' })
