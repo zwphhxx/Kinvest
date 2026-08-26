@@ -3,6 +3,10 @@ set -euo pipefail
 umask 077
 
 KINVEST_DEPLOY_PROTOCOL='5'
+BUNDLE_UID='0'
+BUNDLE_GID='10001'
+ROOT_UID='0'
+ROOT_GID='0'
 ROOT='/root/docker/kinvest'
 RUN_ROOT='/run'
 STATE_ROOT="$ROOT/state"
@@ -13,9 +17,11 @@ CURRENT_STATE="$STATE_ROOT/current.state"
 PREVIOUS_STATE="$STATE_ROOT/previous.state"
 ATTEMPT_STATE="$STATE_ROOT/attempt.state"
 JOURNAL="$STATE_ROOT/deploy-v5.journal"
+BEFORE_STATE="$STATE_ROOT/deploy-v5-current.before"
 DATABASE="$ROOT/data/kinvest.sqlite"
 COMPOSE="$ROOT/docker-compose-v5.yml"
 CONTRACT='/usr/local/libexec/kinvest-deploy-v5-contract'
+RUNTIME_HELPER='/usr/local/libexec/kinvest-deploy-v5-runtime'
 OFFLINE_ATTESTATION='/usr/local/libexec/kinvest-offline-image-attestation'
 NETWORK_CONFIG='/etc/kinvest/metadata-network.conf'
 PUBLIC_HEALTH_URL='https://dearmina.cn/api/health'
@@ -23,7 +29,7 @@ PUBLIC_HEALTH_URL='https://dearmina.cn/api/health'
 fail() { printf '%s\n' "$1" >&2; exit "${2:-1}"; }
 [[ "$#" -eq 0 ]] || fail DEPLOY_V5_ARGUMENTS_FORBIDDEN 2
 [[ "$(id -u)" -eq 0 ]] || fail DEPLOY_V5_ROOT_REQUIRED
-[[ -x "$CONTRACT" && -x "$OFFLINE_ATTESTATION" && -f "$COMPOSE" && ! -L "$COMPOSE" ]] || fail DEPLOY_V5_ASSETS_MISSING
+[[ -x "$CONTRACT" && -x "$RUNTIME_HELPER" && -x "$OFFLINE_ATTESTATION" && -f "$COMPOSE" && ! -L "$COMPOSE" ]] || fail DEPLOY_V5_ASSETS_MISSING
 [[ "$(findmnt -n -o FSTYPE --target "$RUN_ROOT" 2>/dev/null)" == tmpfs ]] || fail DEPLOY_V5_RUN_NOT_TMPFS
 install -d -o root -g root -m 0700 -- "$STATE_ROOT" "$BACKUP_ROOT" "$ACCESS_BUNDLE_ROOT" "$IFIND_BUNDLE_ROOT"
 exec 9>"$STATE_ROOT/deploy.lock"
@@ -45,8 +51,36 @@ transaction_started='false'
 current_image=''
 current_access_path=''
 current_ifind_path=''
+stable_output=''
+stable_error=''
 
 safe_runtime_file() { [[ -n "${1:-}" && "$1" == "$RUN_ROOT"/kinvest-v5.* ]]; }
+
+json_field() {
+  python3 - "$1" "$2" 2>/dev/null <<'PY'
+import json, sys
+try:
+    with open(sys.argv[1], encoding='ascii') as stream:
+        value = json.load(stream)[sys.argv[2]]
+    print(json.dumps(value, separators=(',', ':'), sort_keys=True) if isinstance(value, (dict, list)) else value)
+except Exception:
+    raise SystemExit(1)
+PY
+}
+
+run_docker() { timeout --signal=TERM --kill-after=10s 120s docker "$@"; }
+
+run_stable_command() {
+  local code="$1" status=0
+  shift
+  stable_output="$(mktemp "$RUN_ROOT/kinvest-v5.command-out.XXXXXX")"
+  stable_error="$(mktemp "$RUN_ROOT/kinvest-v5.command-err.XXXXXX")"
+  chmod 0600 "$stable_output" "$stable_error"
+  "$@" >"$stable_output" 2>"$stable_error" || status=$?
+  rm -f -- "$stable_output" "$stable_error"
+  stable_output=''; stable_error=''
+  [[ "$status" -eq 0 ]] || fail "$code"
+}
 
 remove_tree_safe() {
   local root="$1" id="$2" path entry
@@ -61,24 +95,151 @@ remove_tree_safe() {
   rmdir -- "$path"
 }
 
-prune_ifind_bundles() {
-  local keep="$1" entry id
-  [[ -d "$IFIND_BUNDLE_ROOT" && ! -L "$IFIND_BUNDLE_ROOT" ]] || return 1
+prune_bundle_root() {
+  local root="$1" keep="$2" entry id
+  [[ -d "$root" && ! -L "$root" ]] || return 1
   while IFS= read -r -d '' entry; do
     id="${entry##*/}"
+    [[ "$id" == disabled ]] && continue
     [[ "$id" =~ ^[0-9a-f]{32}$ ]] || return 1
-    [[ "$id" == "$keep" ]] || remove_tree_safe "$IFIND_BUNDLE_ROOT" "$id"
-  done < <(find "$IFIND_BUNDLE_ROOT" -mindepth 1 -maxdepth 1 -print0)
+    [[ " $keep " == *" $id "* ]] || remove_tree_safe "$root" "$id"
+  done < <(find "$root" -mindepth 1 -maxdepth 1 -print0)
+}
+
+collect_referenced_bundle_ids() {
+  local field="$1" file parsed id values=''
+  for file in "$CURRENT_STATE" "$PREVIOUS_STATE"; do
+    [[ -f "$file" && ! -L "$file" ]] || continue
+    parsed="$(mktemp "$RUN_ROOT/kinvest-v5.reference.XXXXXX")"
+    if "$CONTRACT" parse-state <"$file" >"$parsed" 2>/dev/null; then
+      id="$(json_field "$parsed" "$field")" || { rm -f -- "$parsed"; return 1; }
+      [[ "$id" == none ]] || values+=" $id"
+    else
+      rm -f -- "$parsed"
+      return 1
+    fi
+    rm -f -- "$parsed"
+  done
+  printf '%s\n' "$values"
+}
+
+prune_access_bundles() { prune_bundle_root "$ACCESS_BUNDLE_ROOT" "$(collect_referenced_bundle_ids secretBundleId)"; }
+prune_ifind_bundles() { prune_bundle_root "$IFIND_BUNDLE_ROOT" "$(collect_referenced_bundle_ids ifindSecretBundleId)"; }
+
+atomic_state_from_json() {
+  local source="$1" target="$2" prefix="$3" temporary
+  temporary="$(mktemp "$STATE_ROOT/.${prefix}-v5.XXXXXX")"
+  chmod 0600 "$temporary"
+  if ! "$CONTRACT" canonical-state <"$source" >"$temporary" 2>/dev/null; then
+    rm -f -- "$temporary"; return 1
+  fi
+  mv -f -- "$temporary" "$target"
+}
+
+atomic_state_from_text() {
+  local source="$1" target="$2" prefix="$3" temporary
+  temporary="$(mktemp "$STATE_ROOT/.${prefix}-v5.XXXXXX")"
+  chmod 0600 "$temporary"
+  cat -- "$source" >"$temporary" 2>/dev/null || { rm -f -- "$temporary"; return 1; }
+  mv -f -- "$temporary" "$target"
+}
+
+write_journal() {
+  local phase="$1" temporary
+  temporary="$(mktemp "$STATE_ROOT/.deploy-v5-journal.XXXXXX")"
+  python3 - "$temporary" "$phase" "$intent" "$candidate_access_id" "$candidate_ifind_id" 2>/dev/null <<'PY' || { rm -f -- "$temporary"; return 1; }
+import json, os, sys
+path, phase, intent, access_id, ifind_id = sys.argv[1:]
+value = {'version': 1, 'phase': phase, 'intent': intent, 'candidateAccessId': access_id, 'candidateIfindId': ifind_id}
+fd = os.open(path, os.O_WRONLY | os.O_TRUNC | os.O_NOFOLLOW)
+try:
+    os.fchmod(fd, 0o600)
+    os.write(fd, (json.dumps(value, separators=(',', ':'), sort_keys=True) + '\n').encode('ascii'))
+    os.fsync(fd)
+finally: os.close(fd)
+PY
+  mv -f -- "$temporary" "$JOURNAL"
+}
+
+compose_state_file() {
+  local state_file="$1" parsed image provider_value versions_value access_id access_path access_value proxies_value ifind_value ifind_version_value ifind_id ifind_path profile service
+  parsed="$(mktemp "$RUN_ROOT/kinvest-v5.compose-state.XXXXXX")"
+  chmod 0600 "$parsed"
+  "$CONTRACT" parse-state <"$state_file" >"$parsed" 2>/dev/null || { rm -f -- "$parsed"; return 1; }
+  image="$(json_field "$parsed" runtimeImageId)" || { rm -f -- "$parsed"; return 1; }
+  provider_value="$(json_field "$parsed" secretProviderMode)" || { rm -f -- "$parsed"; return 1; }
+  versions_value="$(json_field "$parsed" secretVersionIds)" || { rm -f -- "$parsed"; return 1; }
+  access_id="$(json_field "$parsed" secretBundleId)" || { rm -f -- "$parsed"; return 1; }
+  access_value="$(json_field "$parsed" accessControlMode)" || { rm -f -- "$parsed"; return 1; }
+  proxies_value="$(json_field "$parsed" trustedProxyAddresses)" || { rm -f -- "$parsed"; return 1; }
+  ifind_value="$(json_field "$parsed" ifindDiagnosticMode)" || { rm -f -- "$parsed"; return 1; }
+  ifind_version_value="$(json_field "$parsed" ifindRefreshTokenVersionId)" || { rm -f -- "$parsed"; return 1; }
+  ifind_id="$(json_field "$parsed" ifindSecretBundleId)" || { rm -f -- "$parsed"; return 1; }
+  rm -f -- "$parsed"
+  [[ "$access_id" == none ]] && access_path="$ACCESS_BUNDLE_ROOT/disabled" || access_path="$ACCESS_BUNDLE_ROOT/$access_id"
+  if [[ "$ifind_value" == diagnostic ]]; then
+    profile=ifind-diagnostic; service=kinvest-diagnostic; ifind_path="$IFIND_BUNDLE_ROOT/$ifind_id"
+  else
+    profile=ifind-disabled; service=kinvest-disabled; ifind_path=''
+  fi
+  (
+    export COMPOSE_PROFILES="$profile" KINVEST_IMAGE="$image"
+    export KINVEST_SECRET_PROVIDER_MODE="$provider_value" KINVEST_SECRET_VERSION_IDS="$versions_value"
+    export KINVEST_SECRET_BUNDLE_HOST_PATH="$access_path" KINVEST_ACCESS_CONTROL_MODE="$access_value"
+    export KINVEST_TRUSTED_PROXY_ADDRESSES="$proxies_value"
+    export KINVEST_IFIND_REFRESH_TOKEN_VERSION_ID="$ifind_version_value" KINVEST_IFIND_SECRET_BUNDLE_HOST_PATH="$ifind_path"
+    run_docker compose -f "$COMPOSE" --env-file "$NETWORK_CONFIG" up -d --remove-orphans "$service" >/dev/null 2>&1
+  )
+}
+
+restore_previous_runtime() {
+  [[ -f "$BEFORE_STATE" && ! -L "$BEFORE_STATE" ]] || return 1
+  compose_state_file "$BEFORE_STATE" || return 1
+  atomic_state_from_text "$BEFORE_STATE" "$CURRENT_STATE" current || return 1
+}
+
+reconcile_transaction_journal() {
+  [[ -e "$JOURNAL" ]] || return 0
+  [[ -f "$JOURNAL" && ! -L "$JOURNAL" && -f "$BEFORE_STATE" && ! -L "$BEFORE_STATE" ]] || return 1
+  local phase journal_intent access_id ifind_id
+  phase="$(json_field "$JOURNAL" phase)" || return 1
+  journal_intent="$(json_field "$JOURNAL" intent)" || return 1
+  access_id="$(json_field "$JOURNAL" candidateAccessId)" || return 1
+  ifind_id="$(json_field "$JOURNAL" candidateIfindId)" || return 1
+  case "$phase" in
+    prepared)
+      remove_tree_safe "$ACCESS_BUNDLE_ROOT" "$access_id" || return 1
+      remove_tree_safe "$IFIND_BUNDLE_ROOT" "$ifind_id" || return 1
+      ;;
+    compose-active)
+      restore_previous_runtime || return 1
+      remove_tree_safe "$ACCESS_BUNDLE_ROOT" "$access_id" || return 1
+      remove_tree_safe "$IFIND_BUNDLE_ROOT" "$ifind_id" || return 1
+      ;;
+    state-committed)
+      compose_state_file "$CURRENT_STATE" || return 1
+      if [[ "$journal_intent" != RESTORE ]]; then atomic_state_from_text "$BEFORE_STATE" "$PREVIOUS_STATE" previous || return 1; fi
+      ;;
+    *) return 1 ;;
+  esac
+  rm -f -- "$ATTEMPT_STATE" "$JOURNAL" "$BEFORE_STATE"
+  prune_access_bundles && prune_ifind_bundles
 }
 
 cleanup() {
   local status=$?
   trap - EXIT
-  if [[ "$candidate_keep" != true ]]; then
-    remove_tree_safe "$ACCESS_BUNDLE_ROOT" "$candidate_access_id"
-    remove_tree_safe "$IFIND_BUNDLE_ROOT" "$candidate_ifind_id"
+  if [[ -e "$JOURNAL" ]]; then
+    if ! reconcile_transaction_journal >/dev/null 2>&1; then
+      printf '%s\n' DEPLOY_V5_RECOVERY_FAILED >&2
+      status=70
+      candidate_keep='true'
+    fi
+  elif [[ "$candidate_keep" != true ]]; then
+    remove_tree_safe "$ACCESS_BUNDLE_ROOT" "$candidate_access_id" >/dev/null 2>&1 || true
+    remove_tree_safe "$IFIND_BUNDLE_ROOT" "$candidate_ifind_id" >/dev/null 2>&1 || true
   fi
-  for file in "$payload_file" "$prepared_file" "$current_json" "$previous_json" "$plan_file" "$target_file" "$candidate_state"; do
+  for file in "$payload_file" "$prepared_file" "$current_json" "$previous_json" "$plan_file" "$target_file" "$candidate_state" "$stable_output" "$stable_error"; do
     safe_runtime_file "$file" && shred -u -z -- "$file" 2>/dev/null || true
   done
   exit "$status"
@@ -88,6 +249,8 @@ trap 'exit 129' HUP
 trap 'exit 130' INT
 trap 'exit 143' TERM
 
+reconcile_transaction_journal >/dev/null 2>&1 || fail DEPLOY_V5_RECOVERY_FAILED 70
+
 payload_file="$(mktemp "$RUN_ROOT/kinvest-v5.payload.XXXXXX")"
 chmod 0600 "$payload_file"
 dd bs=4096 count=5 of="$payload_file" status=none
@@ -96,121 +259,37 @@ grep -Fqx 'KINVEST_DEPLOY_V5' <(head -n 1 "$payload_file") || fail DEPLOY_V5_PAY
 
 prepared_file="$(mktemp "$RUN_ROOT/kinvest-v5.prepared.XXXXXX")"
 chmod 0600 "$prepared_file"
-"$CONTRACT" validate-payload <"$payload_file" >"$prepared_file" || fail DEPLOY_V5_PAYLOAD_REJECTED 2
+"$CONTRACT" validate-payload <"$payload_file" >"$prepared_file" 2>/dev/null || fail DEPLOY_V5_PAYLOAD_REJECTED 2
 
-json_field() {
-  python3 - "$1" "$2" <<'PY'
-import json, sys
-with open(sys.argv[1], encoding='ascii') as stream:
-    value = json.load(stream)[sys.argv[2]]
-print(json.dumps(value, separators=(',', ':'), sort_keys=True) if isinstance(value, (dict, list)) else value)
-PY
-}
-
-materialize_bundles() {
-  python3 - "$payload_file" "$ACCESS_BUNDLE_ROOT" "$IFIND_BUNDLE_ROOT" <<'PY'
-import base64, hashlib, json, os, secrets, stat, sys
-
-payload_path, access_root, ifind_root = sys.argv[1:]
-flags = os.O_RDONLY | os.O_NOFOLLOW
-fd = os.open(payload_path, flags)
-try:
-    raw = os.read(fd, 16385)
-finally:
-    os.close(fd)
-lines = raw[:-1].split(b'\n')
-if len(lines) != 16:
-    raise SystemExit(2)
-provider = lines[6].decode('ascii')
-admin_version = lines[7].decode('ascii')
-hmac_version = lines[8].decode('ascii')
-ifind_mode = lines[12].decode('ascii')
-ifind_version = lines[13].decode('ascii')
-
-def atomic_file(directory, name, value):
-    path = os.path.join(directory, name)
-    file_fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW, 0o440)
-    try:
-        os.write(file_fd, value)
-        os.fsync(file_fd)
-    finally:
-        os.close(file_fd)
-    os.chown(path, 0, 10001, follow_symlinks=False)
-
-result = {'accessId': 'none', 'accessPath': os.path.join(access_root, 'disabled'), 'ifindId': 'none', 'ifindPath': ''}
-if provider == 'github-tmpfs-v1':
-    admin = bytearray(base64.urlsafe_b64decode(lines[9] + b'=' * ((4 - len(lines[9]) % 4) % 4)))
-    hmac = bytearray(lines[10])
-    bundle_id = secrets.token_hex(16)
-    bundle = os.path.join(access_root, bundle_id)
-    os.mkdir(bundle, 0o750)
-    os.chown(bundle, 0, 10001)
-    try:
-        manifest = json.dumps({
-            'format': 'kinvest-github-tmpfs-v1',
-            'adminPasswordVerifier': {'file': 'admin-password-verifier', 'versionId': admin_version, 'sha256': hashlib.sha256(admin).hexdigest()},
-            'deviceTokenHmac': {'file': 'device-token-hmac-key', 'versionId': hmac_version, 'sha256': hashlib.sha256(hmac).hexdigest()},
-        }, separators=(',', ':')).encode('ascii')
-        atomic_file(bundle, 'manifest.json', manifest)
-        atomic_file(bundle, 'admin-password-verifier', admin)
-        atomic_file(bundle, 'device-token-hmac-key', hmac)
-        os.chmod(bundle, 0o550)
-        result.update(accessId=bundle_id, accessPath=bundle)
-    finally:
-        admin[:] = b'\0' * len(admin)
-        hmac[:] = b'\0' * len(hmac)
-elif provider != 'disabled':
-    raise SystemExit(2)
-
-if ifind_mode == 'diagnostic':
-    token = bytearray(lines[14])
-    bundle_id = secrets.token_hex(16)
-    bundle = os.path.join(ifind_root, bundle_id)
-    os.mkdir(bundle, 0o750)
-    os.chown(bundle, 0, 10001)
-    try:
-        manifest = json.dumps({
-            'format': 'kinvest-ifind-tmpfs-v1',
-            'refreshToken': {'file': 'refresh-token', 'versionId': ifind_version, 'sha256': hashlib.sha256(token).hexdigest()},
-        }, separators=(',', ':')).encode('ascii')
-        atomic_file(bundle, 'manifest.json', manifest)
-        atomic_file(bundle, 'refresh-token', token)
-        os.chmod(bundle, 0o550)
-        result.update(ifindId=bundle_id, ifindPath=bundle)
-    finally:
-        token[:] = b'\0' * len(token)
-elif ifind_mode != 'disabled':
-    raise SystemExit(2)
-print(json.dumps(result, separators=(',', ':'), sort_keys=True))
-PY
-}
-
-bundle_result="$(materialize_bundles)" || fail DEPLOY_V5_BUNDLE_CREATE_FAILED
-candidate_access_id="$(python3 -c 'import json,sys; print(json.load(sys.stdin)["accessId"])' <<<"$bundle_result")"
-candidate_access_path="$(python3 -c 'import json,sys; print(json.load(sys.stdin)["accessPath"])' <<<"$bundle_result")"
-candidate_ifind_id="$(python3 -c 'import json,sys; print(json.load(sys.stdin)["ifindId"])' <<<"$bundle_result")"
-candidate_ifind_path="$(python3 -c 'import json,sys; print(json.load(sys.stdin)["ifindPath"])' <<<"$bundle_result")"
+bundle_result="$("$RUNTIME_HELPER" materialize "$payload_file" "$RUN_ROOT" "$ACCESS_BUNDLE_ROOT" "$IFIND_BUNDLE_ROOT" \
+  "$BUNDLE_UID" "$BUNDLE_GID" "$ROOT_UID" "$ROOT_GID" 2>/dev/null)" || fail DEPLOY_V5_BUNDLE_CREATE_FAILED
+candidate_access_id="$(python3 -c 'import json,sys; print(json.load(sys.stdin)["accessId"])' 2>/dev/null <<<"$bundle_result")" || fail DEPLOY_V5_BUNDLE_CREATE_FAILED
+candidate_access_path="$ACCESS_BUNDLE_ROOT/$candidate_access_id"
+candidate_ifind_id="$(python3 -c 'import json,sys; print(json.load(sys.stdin)["ifindId"])' 2>/dev/null <<<"$bundle_result")" || fail DEPLOY_V5_BUNDLE_CREATE_FAILED
+candidate_ifind_path="$IFIND_BUNDLE_ROOT/$candidate_ifind_id"
 unset bundle_result
 
 if [[ "$candidate_access_id" == none ]]; then
+  candidate_access_path="$ACCESS_BUNDLE_ROOT/disabled"
   install -d -o root -g 10001 -m 0550 -- "$candidate_access_path"
 fi
+if [[ "$candidate_ifind_id" == none ]]; then candidate_ifind_path=''; fi
 
 current_json="$(mktemp "$RUN_ROOT/kinvest-v5.current.XXXXXX")"
 previous_json="$(mktemp "$RUN_ROOT/kinvest-v5.previous.XXXXXX")"
 chmod 0600 "$current_json" "$previous_json"
 [[ -f "$CURRENT_STATE" && ! -L "$CURRENT_STATE" ]] || fail DEPLOY_V5_CURRENT_STATE_MISSING
-"$CONTRACT" parse-state <"$CURRENT_STATE" >"$current_json" || fail DEPLOY_V5_CURRENT_STATE_INVALID
+"$CONTRACT" parse-state <"$CURRENT_STATE" >"$current_json" 2>/dev/null || fail DEPLOY_V5_CURRENT_STATE_INVALID
 if [[ -e "$PREVIOUS_STATE" ]]; then
   [[ -f "$PREVIOUS_STATE" && ! -L "$PREVIOUS_STATE" ]] || fail DEPLOY_V5_PREVIOUS_STATE_INVALID
-  "$CONTRACT" parse-state <"$PREVIOUS_STATE" >"$previous_json" || fail DEPLOY_V5_PREVIOUS_STATE_INVALID
+  "$CONTRACT" parse-state <"$PREVIOUS_STATE" >"$previous_json" 2>/dev/null || fail DEPLOY_V5_PREVIOUS_STATE_INVALID
 else
   printf 'null\n' >"$previous_json"
 fi
 
 plan_file="$(mktemp "$RUN_ROOT/kinvest-v5.plan.XXXXXX")"
 chmod 0600 "$plan_file"
-python3 - "$prepared_file" "$current_json" "$previous_json" <<'PY' | "$CONTRACT" resolve-intent >"$plan_file"
+python3 - "$prepared_file" "$current_json" "$previous_json" 2>/dev/null <<'PY' | "$CONTRACT" resolve-intent >"$plan_file" 2>/dev/null
 import json, sys
 with open(sys.argv[1]) as stream: request = json.load(stream)
 with open(sys.argv[2]) as stream: current = json.load(stream)
@@ -228,16 +307,18 @@ intent="$(json_field "$prepared_file" intent)"
 if [[ "$intent" == FORWARD ]]; then
   target_digest="$(json_field "$prepared_file" imageDigest)"
   target_commit="$(json_field "$prepared_file" commit)"
+  target_verification_run_id="$(json_field "$prepared_file" verificationRunId)"
   target_file="$prepared_file"
 else
   target_file="$(mktemp "$RUN_ROOT/kinvest-v5.target.XXXXXX")"
   chmod 0600 "$target_file"
-  python3 - "$plan_file" >"$target_file" <<'PY'
+  python3 - "$plan_file" >"$target_file" 2>/dev/null <<'PY'
 import json, sys
 with open(sys.argv[1]) as stream: print(json.dumps(json.load(stream)['target'], separators=(',', ':'), sort_keys=True))
 PY
   target_digest="$(json_field "$target_file" imageDigest)"
   target_commit="$(json_field "$target_file" commit)"
+  target_verification_run_id="$(json_field "$target_file" verificationRunId)"
 fi
 ifind_mode="$(json_field "$prepared_file" ifindDiagnosticMode)"
 ifind_version="$(json_field "$prepared_file" ifindRefreshTokenVersionId)"
@@ -245,31 +326,27 @@ access_mode="$(json_field "$prepared_file" accessControlMode)"
 provider="$(json_field "$prepared_file" secretProviderMode)"
 versions="$(json_field "$prepared_file" secretVersionIds)"
 
-run_docker() { timeout --signal=TERM --kill-after=10s 120s docker "$@"; }
 inspect_id() { run_docker image inspect "$1" --format '{{.Id}}' 2>/dev/null; }
 read_label() { run_docker image inspect "$1" --format "{{index .Config.Labels \"$2\"}}" 2>/dev/null; }
 verify_repo_digest() { run_docker image inspect "$1" --format '{{json .RepoDigests}}' 2>/dev/null | grep -Fq -- "\"$2\""; }
 
 resolve_offline_image() {
   local id
-  id="$(timeout 15s "$OFFLINE_ATTESTATION" resolve "$target_digest" "$target_commit" "$(json_field "$prepared_file" verificationRunId)" 2>/dev/null)" || return 1
+  id="$(timeout 15s "$OFFLINE_ATTESTATION" resolve "$target_digest" "$target_commit" "$target_verification_run_id" 2>/dev/null)" || return 1
   [[ "$id" =~ ^sha256:[0-9a-f]{64}$ && "$(inspect_id "$id")" == "$id" ]] || return 1
   verify_repo_digest "$id" "$target_digest" || return 1
   printf '%s\n' "$id"
 }
 
+attested_image_id="$(resolve_offline_image)" || fail DEPLOY_V5_IMAGE_PROVENANCE_INVALID
 if [[ "$intent" == FORWARD ]]; then
-  runtime_image_id="$(inspect_id "$target_digest" 2>/dev/null || true)"
-  if [[ ! "$runtime_image_id" =~ ^sha256:[0-9a-f]{64}$ ]] || ! verify_repo_digest "$runtime_image_id" "$target_digest"; then
-    runtime_image_id="$(resolve_offline_image)" || fail DEPLOY_V5_IMAGE_RESOLUTION_FAILED
-  fi
+  runtime_image_id="$attested_image_id"
 else
   runtime_image_id="$(json_field "$target_file" runtimeImageId)"
-  [[ "$(inspect_id "$runtime_image_id")" == "$runtime_image_id" ]] || fail DEPLOY_V5_STATE_IMAGE_MISMATCH
-  verify_repo_digest "$runtime_image_id" "$target_digest" || [[ "$(resolve_offline_image)" == "$runtime_image_id" ]] || fail DEPLOY_V5_STATE_IMAGE_UNATTESTED
+  [[ "$runtime_image_id" == "$attested_image_id" ]] || fail DEPLOY_V5_IMAGE_PROVENANCE_INVALID
 fi
 
-schema_before="$(python3 - "$DATABASE" <<'PY'
+schema_before="$(python3 - "$DATABASE" 2>/dev/null <<'PY'
 import sqlite3, sys
 with sqlite3.connect('file:' + sys.argv[1] + '?mode=ro', uri=True) as db: print(db.execute('PRAGMA user_version').fetchone()[0])
 PY
@@ -287,7 +364,7 @@ run_access_preflight() {
     --volume "$candidate_access_path:/run/secrets/kinvest:ro" \
     --env "KINVEST_SECRET_PROVIDER_MODE=$provider" --env "KINVEST_SECRET_VERSION_IDS=$versions" \
     --env KINVEST_SECRET_BUNDLE_PATH=/run/secrets/kinvest \
-    --entrypoint node "$runtime_image_id" server/secret-preflight.js >/dev/null
+    --entrypoint node "$runtime_image_id" server/secret-preflight.js
 }
 
 run_ifind_preflight() {
@@ -297,27 +374,48 @@ run_ifind_preflight() {
     --env KINVEST_IFIND_DIAGNOSTIC_MODE=admin-diagnostic \
     --env "KINVEST_IFIND_REFRESH_TOKEN_VERSION_ID=$ifind_version" \
     --env KINVEST_IFIND_SECRET_BUNDLE_PATH=/run/secrets/kinvest-ifind \
-    --entrypoint node "$runtime_image_id" server/ifind-secret-preflight.js >/dev/null
+    --entrypoint node "$runtime_image_id" server/ifind-secret-preflight.js
 }
 
-run_access_preflight || fail DEPLOY_V5_ACCESS_PREFLIGHT_FAILED
-run_ifind_preflight || fail DEPLOY_V5_IFIND_PREFLIGHT_FAILED
+run_stable_command DEPLOY_V5_ACCESS_PREFLIGHT_FAILED run_access_preflight
+run_stable_command DEPLOY_V5_IFIND_PREFLIGHT_FAILED run_ifind_preflight
 
 verify_backup_file() {
-  python3 - "$1" "$2" "$BACKUP_ROOT" <<'PY'
+  python3 - "$1" "$2" "$BACKUP_ROOT" 2>/dev/null <<'PY'
 import hashlib, os, stat, sys
 path, expected, root = sys.argv[1:]
-if os.path.realpath(os.path.dirname(path)) != os.path.realpath(root) or os.path.basename(path) in ('', '.', '..'):
+if os.path.abspath(path) != path or os.path.islink(root) or os.path.realpath(os.path.dirname(path)) != os.path.realpath(root) or os.path.basename(path) in ('', '.', '..'):
     raise SystemExit(1)
-fd = os.open(path, os.O_RDONLY | os.O_NOFOLLOW)
+root_fd = os.open(root, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW)
+fd = os.open(os.path.basename(path), os.O_RDONLY | os.O_NOFOLLOW, dir_fd=root_fd)
 try:
     info = os.fstat(fd)
     if not stat.S_ISREG(info.st_mode) or info.st_nlink != 1: raise SystemExit(1)
     digest = hashlib.file_digest(os.fdopen(os.dup(fd), 'rb'), 'sha256').hexdigest()
     if digest != expected: raise SystemExit(1)
-finally: os.close(fd)
+finally:
+    os.close(fd)
+    os.close(root_fd)
 PY
 }
+
+verify_state_backup_references() {
+  local state_file="$1" path checksum
+  [[ -f "$state_file" && ! -L "$state_file" ]] || return 1
+  path="$(json_field "$state_file" databaseBackupPath)" || return 1
+  checksum="$(json_field "$state_file" databaseBackupChecksum)" || return 1
+  if [[ "$path" == none && "$checksum" == none ]]; then return 0; fi
+  [[ "$path" != none && "$checksum" =~ ^[0-9a-f]{64}$ ]] || return 1
+  verify_backup_file "$path" "$checksum"
+}
+
+verify_state_backup_references "$current_json" || fail DEPLOY_V5_EXISTING_BACKUP_INVALID
+if ! grep -Fqx null "$previous_json"; then
+  verify_state_backup_references "$previous_json" || fail DEPLOY_V5_EXISTING_BACKUP_INVALID
+fi
+if [[ "$intent" != FORWARD ]]; then
+  verify_state_backup_references "$target_file" || fail DEPLOY_V5_EXISTING_BACKUP_INVALID
+fi
 
 backup_path='none'
 backup_checksum='none'
@@ -325,7 +423,7 @@ create_database_backup() {
   local temporary
   backup_path="$BACKUP_ROOT/$(date -u +%Y%m%dT%H%M%SZ)-$target_commit.sqlite"
   temporary="$(mktemp "$BACKUP_ROOT/.backup-v5.XXXXXX")"
-  python3 - "$DATABASE" "$temporary" <<'PY'
+  python3 - "$DATABASE" "$temporary" 2>/dev/null <<'PY'
 import sqlite3, sys
 with sqlite3.connect('file:' + sys.argv[1] + '?mode=ro', uri=True) as source, sqlite3.connect(sys.argv[2]) as target:
     source.backup(target)
@@ -353,38 +451,22 @@ compose_up() {
   )
 }
 
-atomic_state_from_json() {
-  local source="$1" target="$2" prefix="$3" temporary
-  temporary="$(mktemp "$STATE_ROOT/.${prefix}-v5.XXXXXX")"
-  chmod 0600 "$temporary"
-  if ! "$CONTRACT" canonical-state <"$source" >"$temporary"; then
-    rm -f -- "$temporary"
-    return 1
-  fi
-  mv -f -- "$temporary" "$target"
-}
-
-atomic_state_from_text() {
-  local source="$1" target="$2" prefix="$3" temporary
-  temporary="$(mktemp "$STATE_ROOT/.${prefix}-v5.XXXXXX")"
-  chmod 0600 "$temporary"
-  cat -- "$source" >"$temporary" || { rm -f -- "$temporary"; return 1; }
-  mv -f -- "$temporary" "$target"
-}
-
 candidate_state="$(mktemp "$RUN_ROOT/kinvest-v5.state.XXXXXX")"
 chmod 0600 "$candidate_state"
-python3 - "$target_file" "$prepared_file" "$current_json" "$runtime_image_id" "$schema_before" "$schema_min" "$schema_max" "$candidate_access_id" "$candidate_ifind_id" "$backup_path" "$backup_checksum" >"$candidate_state" <<'PY'
+python3 - "$target_file" "$prepared_file" "$current_json" "$runtime_image_id" "$schema_before" "$schema_min" "$schema_max" "$candidate_access_id" "$candidate_ifind_id" "$backup_path" "$backup_checksum" >"$candidate_state" 2>/dev/null <<'PY'
 import datetime, json, sys
 target_path, request_path, current_path, image_id, schema, minimum, maximum, access_id, ifind_id, backup, checksum = sys.argv[1:]
 with open(target_path) as stream: target = json.load(stream)
 with open(request_path) as stream: request = json.load(stream)
 with open(current_path) as stream: current = json.load(stream)
 state = dict(target) if 'protocolVersion' in target else {}
+identity = state if state else request
 proxy_source = state if state else current
+backup_value = state['databaseBackupPath'] if request['intent'] == 'RESTORE' else backup
+checksum_value = state['databaseBackupChecksum'] if request['intent'] == 'RESTORE' else checksum
 state.update({
-  'protocolVersion': 6, 'imageDigest': request['imageDigest'] if not state else state['imageDigest'],
-  'runtimeImageId': image_id, 'commit': request['commit'] if not state else state['commit'],
+  'protocolVersion': 6, 'imageDigest': identity['imageDigest'],
+  'runtimeImageId': image_id, 'commit': identity['commit'],
   'schemaVersion': int(schema), 'imageSchemaMin': int(minimum), 'imageSchemaMax': int(maximum),
   'secretProviderMode': request['secretProviderMode'], 'secretVersionIds': request['secretVersionIds'],
   'secretBundleId': access_id, 'secretMaterialFingerprints': request['secretMaterialFingerprints'],
@@ -395,38 +477,45 @@ state.update({
   'ifindRefreshTokenVersionId': request['ifindRefreshTokenVersionId'],
   'ifindSecretBundleId': ifind_id,
   'ifindSecretMaterialFingerprint': request['ifindSecretMaterialFingerprint'],
-  'releaseRecordSchemaVersion': request['releaseRecordSchemaVersion'],
-  'verificationRunId': request['verificationRunId'], 'artifactSource': request['artifactSource'],
-  'databaseBackupPath': backup, 'databaseBackupChecksum': checksum,
+  'releaseRecordSchemaVersion': identity['releaseRecordSchemaVersion'],
+  'verificationRunId': identity['verificationRunId'], 'artifactSource': identity['artifactSource'],
+  'databaseBackupPath': backup_value, 'databaseBackupChecksum': checksum_value,
   'deployedAt': datetime.datetime.now(datetime.timezone.utc).strftime('%Y-%m-%dT%H:%M:%SZ')
 })
 print(json.dumps(state, separators=(',', ':'), sort_keys=True))
 PY
-"$CONTRACT" canonical-state <"$candidate_state" >"$candidate_state.text"
+"$CONTRACT" canonical-state <"$candidate_state" >"$candidate_state.text" 2>/dev/null || fail DEPLOY_V5_STATE_WRITE_FAILED
 mv -- "$candidate_state.text" "$candidate_state"
 
-printf 'phase=prepared\n' >"$JOURNAL"
-chmod 0600 "$JOURNAL"
+atomic_state_from_json "$current_json" "$BEFORE_STATE" before || fail DEPLOY_V5_STATE_WRITE_FAILED
+write_journal prepared || fail DEPLOY_V5_STATE_WRITE_FAILED
 atomic_state_from_text "$candidate_state" "$ATTEMPT_STATE" attempt || fail DEPLOY_V5_STATE_WRITE_FAILED
 transaction_started='true'
-if [[ "$intent" != RESTORE ]]; then
-  atomic_state_from_json "$current_json" "$PREVIOUS_STATE" previous || fail DEPLOY_V5_STATE_WRITE_FAILED
-fi
-compose_up || fail DEPLOY_V5_COMPOSE_FAILED
+# TRANSACTION_WINDOW_BEFORE_COMPOSE
+write_journal compose-active || fail DEPLOY_V5_STATE_WRITE_FAILED
+run_stable_command DEPLOY_V5_COMPOSE_FAILED compose_up
+# TRANSACTION_WINDOW_AFTER_COMPOSE_BEFORE_CURRENT
 
 for _ in $(seq 1 60); do
   [[ "$(run_docker inspect --format '{{.State.Health.Status}}' kinvest 2>/dev/null || true)" == healthy ]] && break
   sleep 2
 done
 [[ "$(run_docker inspect --format '{{.State.Health.Status}}' kinvest 2>/dev/null || true)" == healthy ]] || fail DEPLOY_V5_HEALTH_FAILED
-[[ "$(run_docker inspect --format '{{.Image}}' kinvest)" == "$runtime_image_id" ]] || fail DEPLOY_V5_RUNTIME_IMAGE_MISMATCH
-curl -fsS --max-time 15 "$PUBLIC_HEALTH_URL" >/dev/null || fail DEPLOY_V5_PUBLIC_HEALTH_FAILED
+[[ "$(run_docker inspect --format '{{.Image}}' kinvest 2>/dev/null)" == "$runtime_image_id" ]] || fail DEPLOY_V5_RUNTIME_IMAGE_MISMATCH
+curl -fsS --max-time 15 "$PUBLIC_HEALTH_URL" >/dev/null 2>&1 || fail DEPLOY_V5_PUBLIC_HEALTH_FAILED
 
 current_temporary="$(mktemp "$STATE_ROOT/.current-v5.XXXXXX")"
 chmod 0600 "$current_temporary"
 cat -- "$candidate_state" >"$current_temporary" || fail DEPLOY_V5_STATE_WRITE_FAILED
 mv -f -- "$current_temporary" "$CURRENT_STATE" || fail DEPLOY_V5_STATE_WRITE_FAILED
-rm -f -- "$ATTEMPT_STATE" "$JOURNAL"
+write_journal state-committed || fail DEPLOY_V5_STATE_WRITE_FAILED
+# TRANSACTION_WINDOW_AFTER_CURRENT_BEFORE_KEEP
+if [[ "$intent" != RESTORE ]]; then
+  atomic_state_from_text "$BEFORE_STATE" "$PREVIOUS_STATE" previous || fail DEPLOY_V5_STATE_WRITE_FAILED
+fi
+rm -f -- "$ATTEMPT_STATE"
+prune_access_bundles || fail DEPLOY_V5_CLEANUP_PENDING 71
+prune_ifind_bundles || fail DEPLOY_V5_CLEANUP_PENDING 71
 candidate_keep='true'
-prune_ifind_bundles "$candidate_ifind_id" || fail DEPLOY_V5_CLEANUP_PENDING 71
+rm -f -- "$JOURNAL" "$BEFORE_STATE"
 printf 'KINVEST_DEPLOY_V5_OK intent=%s commit=%s ifind=%s\n' "$intent" "$target_commit" "$ifind_mode"
