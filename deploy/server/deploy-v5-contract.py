@@ -9,6 +9,7 @@ import ipaddress
 import json
 import re
 import sys
+from datetime import datetime
 from typing import Any
 
 
@@ -385,11 +386,21 @@ def validate_state(value: Any) -> dict[str, Any]:
         fail("DEPLOY_V5_STATE_INVALID")
     if value["artifactSource"] != "ghcr-public":
         fail("DEPLOY_V5_STATE_INVALID")
-    if not all(isinstance(value[field], str) and "\n" not in value[field] and "\r" not in value[field] for field in (
-        "databaseBackupPath", "databaseBackupChecksum"
-    )):
+    backup_path = value["databaseBackupPath"]
+    backup_checksum = value["databaseBackupChecksum"]
+    if (backup_path, backup_checksum) != ("none", "none") and (
+        not isinstance(backup_path, str)
+        or not backup_path.startswith("/root/docker/kinvest/backups/")
+        or not isinstance(backup_checksum, str)
+        or FINGERPRINT_PATTERN.fullmatch(backup_checksum) is None
+    ):
         fail("DEPLOY_V5_STATE_INVALID")
-    if TIMESTAMP_PATTERN.fullmatch(value["deployedAt"]) is None:
+    deployed_at = value["deployedAt"]
+    if not isinstance(deployed_at, str) or TIMESTAMP_PATTERN.fullmatch(deployed_at) is None:
+        fail("DEPLOY_V5_STATE_INVALID")
+    try:
+        datetime.strptime(deployed_at, "%Y-%m-%dT%H:%M:%SZ")
+    except ValueError:
         fail("DEPLOY_V5_STATE_INVALID")
     return {
         **value,

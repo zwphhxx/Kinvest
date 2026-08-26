@@ -120,7 +120,21 @@ async function run() {
       ifindRefreshTokenVersionId: 'v20260826-003',
       ifindSecretBundleId: 'none',
       ifindSecretMaterialFingerprint: ''
-    })
+    }),
+    state({
+      databaseBackupPath: '/tmp/kinvest.sqlite.backup',
+      databaseBackupChecksum: '4'.repeat(64)
+    }),
+    state({
+      databaseBackupPath: '/root/docker/kinvest/backups/kinvest.sqlite.backup',
+      databaseBackupChecksum: 'not-a-sha256'
+    }),
+    state({ databaseBackupPath: 'none', databaseBackupChecksum: '4'.repeat(64) }),
+    state({
+      databaseBackupPath: '/root/docker/kinvest/backups/kinvest.sqlite.backup',
+      databaseBackupChecksum: 'none'
+    }),
+    state({ deployedAt: '2026-02-30T00:00:00Z' })
   ]) assertFailure(runContract('canonical-state', invalid), 'DEPLOY_V5_STATE_INVALID')
 
   const forward = runContract('resolve-intent', {
