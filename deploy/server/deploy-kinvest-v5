@@ -469,9 +469,10 @@ fi
 backup_path='none'
 backup_checksum='none'
 create_database_backup() {
-  local temporary desired identity
+  local temporary desired sealed_checksum
   desired="$(date -u +%Y%m%dT%H%M%SZ)-$target_commit.sqlite"
-  secure_temp temporary "$BACKUP_ROOT/.backup-v5.XXXXXX" || return 1
+  temporary="$("$RUNTIME_HELPER" reserve-backup-temp "$BACKUP_ROOT" "$candidate_registry" "$RUN_ROOT" "$ROOT_UID" "$ROOT_GID" 2>/dev/null)" || return 1
+  [[ "$temporary" == "$BACKUP_ROOT"/.backup-v5.* ]] || return 1
   if ! python3 - "$DATABASE" "$temporary" 2>/dev/null <<'PY'
 import sqlite3, sys
 with sqlite3.connect('file:' + sys.argv[1] + '?mode=ro', uri=True) as source, sqlite3.connect(sys.argv[2]) as target:
@@ -479,18 +480,11 @@ with sqlite3.connect('file:' + sys.argv[1] + '?mode=ro', uri=True) as source, sq
     if target.execute('PRAGMA quick_check').fetchone()[0] != 'ok': raise SystemExit(1)
 PY
   then
-    rm -f -- "$temporary" 2>/dev/null
     return 1
   fi
-  chmod 0600 "$temporary" 2>/dev/null || { rm -f -- "$temporary" 2>/dev/null; return 1; }
-  chown "$ROOT_UID:$ROOT_GID" "$temporary" 2>/dev/null || { rm -f -- "$temporary" 2>/dev/null; return 1; }
-  identity="$("$RUNTIME_HELPER" backup-identity "$BACKUP_ROOT" "$temporary" "$ROOT_UID" "$ROOT_GID" 2>/dev/null)" || { rm -f -- "$temporary" 2>/dev/null; return 1; }
-  [[ "$identity" =~ ^[0-9]+:[0-9]+:[0-9a-f]{64}$ ]] || { rm -f -- "$temporary" 2>/dev/null; return 1; }
-  # The shell owns temporary until commit-backup persists registry ownership.
-  if ! backup_path="$("$RUNTIME_HELPER" commit-backup "$BACKUP_ROOT" "$temporary" "$desired" "$ROOT_UID" "$ROOT_GID" "$candidate_registry" "$RUN_ROOT" 2>/dev/null)"; then
-    "$RUNTIME_HELPER" resolve-backup-handoff "$BACKUP_ROOT" "$temporary" "$identity" "$candidate_registry" "$RUN_ROOT" "$ROOT_UID" "$ROOT_GID" >/dev/null 2>&1 || return 1
-    return 1
-  fi
+  sealed_checksum="$("$RUNTIME_HELPER" seal-backup-temp "$BACKUP_ROOT" "$temporary" "$candidate_registry" "$RUN_ROOT" "$ROOT_UID" "$ROOT_GID" 2>/dev/null)" || return 1
+  [[ "$sealed_checksum" =~ ^[0-9a-f]{64}$ ]] || return 1
+  backup_path="$("$RUNTIME_HELPER" commit-backup "$BACKUP_ROOT" "$temporary" "$desired" "$ROOT_UID" "$ROOT_GID" "$candidate_registry" "$RUN_ROOT" 2>/dev/null)" || return 1
   backup_checksum="$(sha256sum "$backup_path" 2>/dev/null | awk '{print $1}')" || return 1
   [[ "$backup_checksum" =~ ^[0-9a-f]{64}$ ]] || return 1
   verify_backup_file "$backup_path" "$backup_checksum"

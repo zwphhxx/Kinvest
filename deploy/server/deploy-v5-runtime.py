@@ -26,6 +26,7 @@ RUNTIME_SOURCE_PATTERN = __import__('re').compile(
 )
 REGISTRY_FIELDS = {
     'accessId', 'ifindId', 'backupTemp', 'backupFinal', 'backupChecksum',
+    'backupPhase', 'backupDevice', 'backupInode',
 }
 STATE_NAMES = {
     'current.state', 'previous.state', 'attempt.state',
@@ -82,6 +83,7 @@ def empty_registry() -> dict[str, str]:
     return {
         'accessId': 'none', 'ifindId': 'none', 'backupTemp': 'none',
         'backupFinal': 'none', 'backupChecksum': 'none',
+        'backupPhase': 'none', 'backupDevice': 'none', 'backupInode': 'none',
     }
 
 
@@ -93,12 +95,26 @@ def validate_registry_value(value: object) -> dict[str, str]:
         if item != 'none' and (not isinstance(item, str) or BUNDLE_ID_PATTERN.fullmatch(item) is None):
             raise RuntimeErrorCode('DEPLOY_V5_CANDIDATE_REGISTRY_INVALID')
     temporary, final, checksum = value['backupTemp'], value['backupFinal'], value['backupChecksum']
-    if temporary == final == checksum == 'none':
+    phase, device, inode = value['backupPhase'], value['backupDevice'], value['backupInode']
+    if phase == 'none' and temporary == final == checksum == device == inode == 'none':
         return value
-    if not isinstance(temporary, str) or BACKUP_TEMP_PATTERN.fullmatch(temporary) is None or \
-            not isinstance(final, str) or BACKUP_NAME_PATTERN.fullmatch(final) is None or \
-            not isinstance(checksum, str) or len(checksum) != 64 or \
+    if phase not in ('reserved', 'allocated', 'temporary', 'pending') or \
+            not isinstance(temporary, str) or BACKUP_TEMP_PATTERN.fullmatch(temporary) is None:
+        raise RuntimeErrorCode('DEPLOY_V5_CANDIDATE_REGISTRY_INVALID')
+    if phase == 'reserved' and final == checksum == device == inode == 'none':
+        return value
+    if not isinstance(device, str) or not device.isdigit() or \
+            not isinstance(inode, str) or not inode.isdigit():
+        raise RuntimeErrorCode('DEPLOY_V5_CANDIDATE_REGISTRY_INVALID')
+    if phase == 'allocated' and final == checksum == 'none':
+        return value
+    if not isinstance(checksum, str) or len(checksum) != 64 or \
             any(item not in '0123456789abcdef' for item in checksum):
+        raise RuntimeErrorCode('DEPLOY_V5_CANDIDATE_REGISTRY_INVALID')
+    if phase == 'temporary' and final == 'none':
+        return value
+    if phase != 'pending' or not isinstance(final, str) or \
+            BACKUP_NAME_PATTERN.fullmatch(final) is None:
         raise RuntimeErrorCode('DEPLOY_V5_CANDIDATE_REGISTRY_INVALID')
     return value
 
@@ -548,6 +564,66 @@ def resolve_backup_handoff(root: str, temporary: str, identity: str,
         os.close(root_fd)
 
 
+def reserve_backup_temporary(root: str, registry_path: str, run_root: str,
+                             uid: int, gid: int) -> str:
+    root_fd = open_backup_root(root, uid, gid)
+    file_fd = -1
+    try:
+        registry = read_registry(registry_path, run_root, uid, gid)
+        if registry['backupPhase'] != 'none':
+            raise RuntimeErrorCode('DEPLOY_V5_BACKUP_RESERVE_INVALID')
+        name = f'.backup-v5.{secrets.token_hex(16)}'
+        registry.update({'backupPhase': 'reserved', 'backupTemp': name})
+        write_registry(registry_path, run_root, registry, uid, gid)
+        file_fd = os.open(name, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW,
+                          0o600, dir_fd=root_fd)
+        os.fchmod(file_fd, 0o600)
+        os.fchown(file_fd, uid, gid)
+        os.fsync(file_fd)
+        info = os.fstat(file_fd)
+        if not stat.S_ISREG(info.st_mode) or info.st_nlink != 1 or \
+                info.st_uid != uid or info.st_gid != gid or stat.S_IMODE(info.st_mode) != 0o600:
+            raise RuntimeErrorCode('DEPLOY_V5_BACKUP_RESERVE_INVALID')
+        registry.update({
+            'backupPhase': 'allocated', 'backupDevice': str(info.st_dev),
+            'backupInode': str(info.st_ino),
+        })
+        write_registry(registry_path, run_root, registry, uid, gid)
+        os.fsync(root_fd)
+        return os.path.join(root, name)
+    except OSError as error:
+        raise RuntimeErrorCode('DEPLOY_V5_BACKUP_RESERVE_INVALID') from error
+    finally:
+        if file_fd >= 0:
+            os.close(file_fd)
+        os.close(root_fd)
+
+
+def seal_backup_temporary(root: str, temporary: str, registry_path: str,
+                          run_root: str, uid: int, gid: int) -> str:
+    root_fd = open_backup_root(root, uid, gid)
+    source_fd = -1
+    try:
+        source_fd, source_name = validate_backup_temp(root_fd, root, temporary, uid, gid)
+        info = os.fstat(source_fd)
+        registry = read_registry(registry_path, run_root, uid, gid)
+        if registry['backupPhase'] != 'allocated' or registry['backupTemp'] != source_name or \
+                registry['backupDevice'] != str(info.st_dev) or \
+                registry['backupInode'] != str(info.st_ino):
+            raise RuntimeErrorCode('DEPLOY_V5_BACKUP_SEAL_INVALID')
+        os.fsync(source_fd)
+        checksum = hashlib.file_digest(os.fdopen(os.dup(source_fd), 'rb'), 'sha256').hexdigest()
+        fault_barrier('backup-before-temporary-only-registry')
+        registry.update({'backupPhase': 'temporary', 'backupChecksum': checksum})
+        write_registry(registry_path, run_root, registry, uid, gid)
+        fault_barrier('backup-after-temporary-only-registry')
+        return checksum
+    finally:
+        if source_fd >= 0:
+            os.close(source_fd)
+        os.close(root_fd)
+
+
 def commit_backup_no_replace(root: str, temporary: str, desired_name: str,
                              uid: int, gid: int, registry_path: str | None = None,
                              run_root: str | None = None) -> str:
@@ -563,8 +639,17 @@ def commit_backup_no_replace(root: str, temporary: str, desired_name: str,
         source_fd, source_name = validate_backup_temp(root_fd, root, temporary, uid, gid)
         os.fsync(source_fd)
         checksum = hashlib.file_digest(os.fdopen(os.dup(source_fd), 'rb'), 'sha256').hexdigest()
+        source_info = os.fstat(source_fd)
         if os.environ.get('FAKE_FAILURE') == 'backup-mv':
             raise RuntimeErrorCode('DEPLOY_V5_BACKUP_INVALID')
+        if registry_path is not None and run_root is not None:
+            registered = read_registry(registry_path, run_root, uid, gid)
+            if registered['backupPhase'] != 'temporary' or \
+                    registered['backupTemp'] != source_name or \
+                    registered['backupChecksum'] != checksum or \
+                    registered['backupDevice'] != str(source_info.st_dev) or \
+                    registered['backupInode'] != str(source_info.st_ino):
+                raise RuntimeErrorCode('DEPLOY_V5_BACKUP_INVALID')
         for attempt in range(128):
             candidate = desired_name if attempt == 0 else \
                 f'{desired_name[:-7]}.{secrets.token_hex(8)}.sqlite'
@@ -572,6 +657,7 @@ def commit_backup_no_replace(root: str, temporary: str, desired_name: str,
             if registry_path is not None and run_root is not None:
                 registry = read_registry(registry_path, run_root, uid, gid)
                 registry.update({
+                    'backupPhase': 'pending',
                     'backupTemp': source_name, 'backupFinal': candidate,
                     'backupChecksum': checksum,
                 })
@@ -715,11 +801,35 @@ def unlink_backup_entry(root_fd: int, name: str) -> None:
 def recover_registered_backup(value: dict[str, str], backup_root: str,
                               state_root: str, uid: int, gid: int) -> None:
     temporary, final, checksum = value['backupTemp'], value['backupFinal'], value['backupChecksum']
-    if temporary == final == checksum == 'none':
+    phase = value['backupPhase']
+    if phase == 'none':
         return
-    references = collect_backup_references(state_root, backup_root, uid, gid)
     root_fd = open_backup_root(backup_root, uid, gid)
     try:
+        if phase in ('reserved', 'allocated', 'temporary'):
+            try:
+                fd = os.open(temporary, os.O_RDONLY | os.O_NOFOLLOW, dir_fd=root_fd)
+            except FileNotFoundError:
+                return
+            try:
+                info = os.fstat(fd)
+                if not stat.S_ISREG(info.st_mode) or info.st_uid != uid or info.st_gid != gid or \
+                        stat.S_IMODE(info.st_mode) != 0o600 or info.st_nlink != 1:
+                    raise RuntimeErrorCode('DEPLOY_V5_BACKUP_INVALID')
+                if phase != 'reserved' and (str(info.st_dev) != value['backupDevice'] or
+                                             str(info.st_ino) != value['backupInode']):
+                    raise RuntimeErrorCode('DEPLOY_V5_BACKUP_INVALID')
+                if phase == 'temporary':
+                    digest = hashlib.file_digest(os.fdopen(os.dup(fd), 'rb'), 'sha256').hexdigest()
+                    if digest != checksum:
+                        raise RuntimeErrorCode('DEPLOY_V5_BACKUP_INVALID')
+            finally:
+                os.close(fd)
+            unlink_backup_entry(root_fd, temporary)
+            return
+        if phase != 'pending':
+            raise RuntimeErrorCode('DEPLOY_V5_BACKUP_INVALID')
+        references = collect_backup_references(state_root, backup_root, uid, gid)
         entries: dict[str, tuple[int, os.stat_result]] = {}
         for name, pattern in ((temporary, BACKUP_TEMP_PATTERN), (final, BACKUP_NAME_PATTERN)):
             if pattern.fullmatch(name) is None:
@@ -740,6 +850,11 @@ def recover_registered_backup(value: dict[str, str], backup_root: str,
                     continue
                 raise RuntimeErrorCode('DEPLOY_V5_BACKUP_INVALID')
             entries[name] = (fd, info)
+        if temporary in entries:
+            temp_info = entries[temporary][1]
+            if str(temp_info.st_dev) != value['backupDevice'] or \
+                    str(temp_info.st_ino) != value['backupInode']:
+                raise RuntimeErrorCode('DEPLOY_V5_BACKUP_INVALID')
         preexisting_same_content_final = False
         if temporary in entries and final in entries:
             left, right = entries[temporary][1], entries[final][1]
@@ -965,6 +1080,8 @@ def release_registry(registry_path: str, run_root: str, state_root: str,
                      backup_root: str, root_uid: int, root_gid: int) -> None:
     value = read_registry(registry_path, run_root, root_uid, root_gid)
     if value['backupFinal'] != 'none':
+        if value['backupPhase'] != 'pending':
+            raise RuntimeErrorCode('DEPLOY_V5_CANDIDATE_REGISTRY_INVALID')
         references = collect_backup_references(state_root, backup_root, root_uid, root_gid)
         final_path = os.path.join(backup_root, value['backupFinal'])
         if references.get(final_path) != value['backupChecksum']:
@@ -1018,6 +1135,15 @@ def main() -> int:
         print(commit_backup_no_replace(sys.argv[2], sys.argv[3], sys.argv[4],
                                        int(sys.argv[5]), int(sys.argv[6]),
                                        sys.argv[7], sys.argv[8]))
+    elif len(sys.argv) == 7 and sys.argv[1] == 'reserve-backup-temp':
+        print(reserve_backup_temporary(
+            sys.argv[2], sys.argv[3], sys.argv[4], int(sys.argv[5]), int(sys.argv[6]),
+        ))
+    elif len(sys.argv) == 8 and sys.argv[1] == 'seal-backup-temp':
+        print(seal_backup_temporary(
+            sys.argv[2], sys.argv[3], sys.argv[4], sys.argv[5],
+            int(sys.argv[6]), int(sys.argv[7]),
+        ))
     elif len(sys.argv) == 6 and sys.argv[1] == 'backup-identity':
         print(backup_identity(sys.argv[2], sys.argv[3], int(sys.argv[4]), int(sys.argv[5])))
     elif len(sys.argv) == 9 and sys.argv[1] == 'resolve-backup-handoff':

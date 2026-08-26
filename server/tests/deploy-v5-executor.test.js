@@ -86,8 +86,9 @@ with tempfile.TemporaryDirectory() as temporary:
     run_root = pathlib.Path(temporary) / 'run'; run_root.mkdir(mode=0o755)
     legal = run_root / 'kinvest-v5.candidates.Abc123'
     value = {'accessId': 'none', 'ifindId': 'none', 'backupTemp': 'none',
-             'backupFinal': 'none', 'backupChecksum': 'none'}
-    legal.write_text('{"accessId":"none","backupChecksum":"none","backupFinal":"none","backupTemp":"none","ifindId":"none"}\n'); legal.chmod(0o600)
+             'backupFinal': 'none', 'backupChecksum': 'none', 'backupPhase': 'none',
+             'backupDevice': 'none', 'backupInode': 'none'}
+    legal.write_text(json.dumps(value, separators=(',', ':'), sort_keys=True) + '\n'); legal.chmod(0o600)
     module.write_registry(str(legal), str(run_root), value, uid, gid)
     assert module.read_registry(str(legal), str(run_root), uid, gid) == value
     reserved = pathlib.Path(module.reserve_registry(str(run_root), uid, gid))
@@ -235,8 +236,10 @@ with tempfile.TemporaryDirectory() as temporary:
     txn_temp = backup_root / '.backup-v5.crash'; txn_temp.write_bytes(b'crash'); txn_temp.chmod(0o600)
     txn_final = backup_root / 'crash.sqlite'; os.link(txn_temp, txn_final)
     txn_hash = hashlib.sha256(b'crash').hexdigest()
+    txn_info = os.stat(txn_temp)
     registry_value = dict(value, backupTemp=txn_temp.name, backupFinal=txn_final.name,
-                          backupChecksum=txn_hash)
+                          backupChecksum=txn_hash, backupPhase='pending',
+                          backupDevice=str(txn_info.st_dev), backupInode=str(txn_info.st_ino))
     module.write_registry(str(reserved), str(run_root), registry_value, uid, gid)
     module.recover_registry(str(reserved), str(run_root), str(access_root), str(ifind_root),
                             str(backup_root), str(state_root), uid, gid)
@@ -245,8 +248,10 @@ with tempfile.TemporaryDirectory() as temporary:
     collision_registry = pathlib.Path(module.reserve_registry(str(run_root), uid, gid))
     collision_temp = backup_root / '.backup-v5.collision'; collision_temp.write_bytes(b'new'); collision_temp.chmod(0o600)
     collision_final = backup_root / 'collision.sqlite'; collision_final.write_bytes(b'existing'); collision_final.chmod(0o600)
+    collision_info = os.stat(collision_temp)
     collision_value = dict(value, backupTemp=collision_temp.name, backupFinal=collision_final.name,
-                           backupChecksum=hashlib.sha256(b'new').hexdigest())
+                           backupChecksum=hashlib.sha256(b'new').hexdigest(), backupPhase='pending',
+                           backupDevice=str(collision_info.st_dev), backupInode=str(collision_info.st_ino))
     module.write_registry(str(collision_registry), str(run_root), collision_value, uid, gid)
     module.recover_registry(str(collision_registry), str(run_root), str(access_root), str(ifind_root),
                             str(backup_root), str(state_root), uid, gid)
@@ -257,8 +262,10 @@ with tempfile.TemporaryDirectory() as temporary:
     same_temp = backup_root / '.backup-v5.samecollision'; same_temp.write_bytes(b'same'); same_temp.chmod(0o600)
     same_final = backup_root / 'same-collision.sqlite'; same_final.write_bytes(b'same'); same_final.chmod(0o600)
     assert os.stat(same_temp).st_ino != os.stat(same_final).st_ino
+    same_info = os.stat(same_temp)
     same_value = dict(value, backupTemp=same_temp.name, backupFinal=same_final.name,
-                      backupChecksum=hashlib.sha256(b'same').hexdigest())
+                      backupChecksum=hashlib.sha256(b'same').hexdigest(), backupPhase='pending',
+                      backupDevice=str(same_info.st_dev), backupInode=str(same_info.st_ino))
     module.write_registry(str(same_registry), str(run_root), same_value, uid, gid)
     module.recover_registry(str(same_registry), str(run_root), str(access_root), str(ifind_root),
                             str(backup_root), str(state_root), uid, gid)
@@ -267,8 +274,10 @@ with tempfile.TemporaryDirectory() as temporary:
     owned_registry = pathlib.Path(module.reserve_registry(str(run_root), uid, gid))
     owned_temp = backup_root / '.backup-v5.registered'; owned_temp.write_bytes(b'registered'); owned_temp.chmod(0o600)
     owned_hash = hashlib.sha256(b'registered').hexdigest()
-    owned_value = dict(value, backupTemp=owned_temp.name, backupFinal='registered-old.sqlite',
-                       backupChecksum=owned_hash)
+    owned_info = os.stat(owned_temp)
+    owned_value = dict(value, backupTemp=owned_temp.name, backupFinal='none',
+                       backupChecksum=owned_hash, backupPhase='temporary',
+                       backupDevice=str(owned_info.st_dev), backupInode=str(owned_info.st_ino))
     module.write_registry(str(owned_registry), str(run_root), owned_value, uid, gid)
     original_registry_write = module.write_registry
     def fail_registry_write(*_args): raise OSError('injected registry update failure')
@@ -667,8 +676,9 @@ async function run() {
   assert.match(source, /DEPLOY_V5_IFIND_PREFLIGHT_FAILED/)
   assert.match(source, /resolve_offline_image/)
   assert.match(source, /verify_repo_digest/)
-  assert.match(source, /backup-identity/)
-  assert.match(source, /resolve-backup-handoff/)
+  assert.match(source, /reserve-backup-temp/)
+  assert.match(source, /seal-backup-temp/)
+  assert.match(runtimeSource, /backupPhase/)
   assert.doesNotMatch(source, /commit-backup[^\n]*\|\|\s*\{[^\n]*rm -f -- "\$temporary"/)
 
   const preflightAt = source.indexOf('run_ifind_preflight')
@@ -1109,23 +1119,19 @@ module.materialize(sys.argv[2], sys.argv[3], sys.argv[4], sys.argv[5],
   }
 
   for (const point of [
-    'backup-helper-startup',
-    'backup-before-open-root',
-    'backup-after-open-root-before-validate',
-    'backup-after-validate-before-registry'
+    'backup-before-temporary-only-registry',
+    'backup-after-temporary-only-registry'
   ]) {
     for (const signal of ['SIGTERM', 'SIGKILL']) {
-      const gap = makeHarness({
-        runtimeTransform: source => source.replace(
-          "write_all(fd, b'reached\\n')",
-          "write_all(fd, (str(os.getpid()) + '\\n').encode('ascii'))"
-        )
-      })
+      const gap = makeHarness()
       let gapChild
       try {
-        const protectedFinal = path.join(gap.root, 'backups', `manual-${point}-${signal}.sqlite`)
-        fs.writeFileSync(protectedFinal, 'preexisting-manual-backup', { mode: 0o600 })
+        const protectedFinal = path.join(gap.root, 'backups', `preexisting-final-${signal}.sqlite`)
+        const manualBackup = path.join(gap.root, 'backups', `manual-${signal}.sqlite`)
+        fs.writeFileSync(protectedFinal, 'preexisting-final-backup', { mode: 0o600 })
+        fs.writeFileSync(manualBackup, 'manual-backup', { mode: 0o600 })
         fs.chmodSync(protectedFinal, 0o600)
+        fs.chmodSync(manualBackup, 0o600)
         const barrierRoot = path.join(gap.runRoot, 'backup-gap-barriers')
         fs.mkdirSync(barrierRoot, { mode: 0o700 })
         fs.chmodSync(barrierRoot, 0o700)
@@ -1145,9 +1151,7 @@ module.materialize(sys.argv[2], sys.argv[3], sys.argv[4], sys.argv[5],
         gapChild.stderr.on('data', chunk => { output.stderr += chunk })
         gapChild.stdin.end(diagnosticPayload())
         await waitForFile(marker, gapChild, output, 15000)
-        const helperPid = Number.parseInt(fs.readFileSync(marker, 'utf8').trim(), 10)
-        assert.equal(Number.isSafeInteger(helperPid) && helperPid > 1, true)
-        process.kill(helperPid, signal)
+        process.kill(-gapChild.pid, signal)
         const interrupted = await new Promise((resolve, reject) => {
           const timer = setTimeout(() => {
             process.kill(-gapChild.pid, 'SIGKILL')
@@ -1156,19 +1160,24 @@ module.materialize(sys.argv[2], sys.argv[3], sys.argv[4], sys.argv[5],
           gapChild.once('close', code => { clearTimeout(timer); resolve({ code, ...output }) })
         })
         assert.notEqual(interrupted.code, 0, `${point}/${signal}`)
-        assert.equal(fs.readFileSync(protectedFinal, 'utf8'), 'preexisting-manual-backup')
-        assert.deepEqual(fs.readdirSync(path.join(gap.root, 'backups'))
-          .filter(name => name.startsWith('.backup-v5.')), [], `${point}/${signal}: temporary leaked`)
-        assert.deepEqual(fs.readdirSync(gap.runRoot)
-          .filter(name => name.startsWith('kinvest-v5.candidates.')), [], `${point}/${signal}: registry leaked`)
 
         const recovered = spawnSync(gap.executor, [], {
           encoding: 'utf8', input: diagnosticPayload(), timeout: 30000,
           env: { ...process.env, PATH: `${gap.bin}:${process.env.PATH}` }
         })
         assert.equal(recovered.status, 0, `${point}/${signal}: ${recovered.stderr}`)
+        assert.equal(fs.readFileSync(protectedFinal, 'utf8'), 'preexisting-final-backup')
+        assert.equal(fs.readFileSync(manualBackup, 'utf8'), 'manual-backup')
+        assert.deepEqual(fs.readdirSync(path.join(gap.root, 'backups'))
+          .filter(name => name.startsWith('.backup-v5.')), [], `${point}/${signal}: temporary leaked`)
+        assert.deepEqual(fs.readdirSync(gap.runRoot)
+          .filter(name => name.startsWith('kinvest-v5.candidates.')), [], `${point}/${signal}: registry leaked`)
       } finally {
-        if (gapChild && gapChild.exitCode === null) process.kill(-gapChild.pid, 'SIGKILL')
+        if (gapChild && gapChild.exitCode === null) {
+          try { process.kill(-gapChild.pid, 'SIGKILL') } catch (error) {
+            if (error.code !== 'ESRCH') throw error
+          }
+        }
         cleanupHarness(gap)
       }
     }

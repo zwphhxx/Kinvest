@@ -127,9 +127,14 @@ async function run() {
       const reservedBackup = runHelper(['reserve-registry', runRoot, uid, gid])
       assert.equal(reservedBackup.status, 0, reservedBackup.stderr)
       const backupRegistry = reservedBackup.stdout.trim()
-      const sourceBackup = path.join(backupRoot, `.backup-v5.${point.replaceAll('-', '')}`)
+      const reservedTemp = runHelper(['reserve-backup-temp', backupRoot, backupRegistry,
+        runRoot, uid, gid])
+      assert.equal(reservedTemp.status, 0, reservedTemp.stderr)
+      const sourceBackup = reservedTemp.stdout.trim()
       fs.writeFileSync(sourceBackup, point, { mode: 0o600 })
       fs.chmodSync(sourceBackup, 0o600)
+      assert.equal(runHelper(['seal-backup-temp', backupRoot, sourceBackup, backupRegistry,
+        runRoot, uid, gid]).status, 0)
       await killAtBarrier(['commit-backup', backupRoot, sourceBackup,
         `${point}.sqlite`, uid, gid, backupRegistry, runRoot],
       barrierRoot, point, signal)
@@ -143,12 +148,17 @@ async function run() {
       const reservedBackup = runHelper(['reserve-registry', runRoot, uid, gid])
       assert.equal(reservedBackup.status, 0, reservedBackup.stderr)
       const backupRegistry = reservedBackup.stdout.trim()
-      const sourceBackup = path.join(backupRoot, `.backup-v5.samecollision${suffix}`)
+      const reservedTemp = runHelper(['reserve-backup-temp', backupRoot, backupRegistry,
+        runRoot, uid, gid])
+      assert.equal(reservedTemp.status, 0, reservedTemp.stderr)
+      const sourceBackup = reservedTemp.stdout.trim()
       const finalBackup = path.join(backupRoot, `same-collision-${suffix}.sqlite`)
       fs.writeFileSync(sourceBackup, 'same-content', { mode: 0o600 })
       fs.writeFileSync(finalBackup, 'same-content', { mode: 0o600 })
       fs.chmodSync(sourceBackup, 0o600)
       fs.chmodSync(finalBackup, 0o600)
+      assert.equal(runHelper(['seal-backup-temp', backupRoot, sourceBackup, backupRegistry,
+        runRoot, uid, gid]).status, 0)
       assert.notEqual(fs.statSync(sourceBackup).ino, fs.statSync(finalBackup).ino)
       await killAtBarrier(['commit-backup', backupRoot, sourceBackup,
         path.basename(finalBackup), uid, gid, backupRegistry, runRoot],
