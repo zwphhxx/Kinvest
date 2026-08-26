@@ -263,17 +263,20 @@ def read_payload() -> dict[str, Any]:
         fail("DEPLOY_V5_COMMIT_INVALID")
     provenance = parse_canonical_json(
         provenance_raw,
-        {"artifactSource", "releaseRecordSchemaVersion", "verificationRunId"},
+        {"artifactSource", "provenanceMode", "releaseRecordSchemaVersion", "verificationRunId"},
         "DEPLOY_V5_PROVENANCE_INVALID",
     )
     if (
         provenance["artifactSource"] != "ghcr-public"
+        or provenance["provenanceMode"] not in {"artifact-v2", "state-reproof"}
         or type(provenance["releaseRecordSchemaVersion"]) is not int
         or provenance["releaseRecordSchemaVersion"] != 2
         or not isinstance(provenance["verificationRunId"], str)
         or re.fullmatch(r"[0-9]{1,20}", provenance["verificationRunId"]) is None
     ):
         fail("DEPLOY_V5_PROVENANCE_INVALID")
+    if intent == "FORWARD" and provenance["provenanceMode"] == "state-reproof":
+        fail("DEPLOY_V5_STATE_REPROOF_FORWARD_FORBIDDEN")
     registry = parse_canonical_json(
         registry_raw, {"host", "mode", "repository"}, "DEPLOY_V5_REGISTRY_INVALID"
     )
@@ -342,6 +345,7 @@ def read_payload() -> dict[str, Any]:
             "ifindSecretMaterialFingerprint": ifind_fingerprint,
             "imageDigest": image_digest,
             "intent": intent,
+            "provenanceMode": provenance["provenanceMode"],
             "registryHost": registry["host"],
             "registryMode": registry["mode"],
             "releaseRecordSchemaVersion": provenance["releaseRecordSchemaVersion"],
@@ -532,7 +536,9 @@ def parse_state_text(raw: str) -> dict[str, Any]:
 
 def validate_request(value: Any) -> dict[str, Any]:
     value = require_exact_keys(value, {
-        "imageDigest", "commit", "secretProviderMode", "secretVersionIds",
+        "imageDigest", "commit", "artifactSource", "provenanceMode",
+        "releaseRecordSchemaVersion", "verificationRunId",
+        "secretProviderMode", "secretVersionIds",
         "secretMaterialFingerprints", "accessControlMode", "ifindDiagnosticMode",
         "ifindRefreshTokenVersionId", "ifindSecretMaterialFingerprint",
     }, "DEPLOY_V5_INTENT_STATE_INVALID")
@@ -541,6 +547,15 @@ def validate_request(value: Any) -> dict[str, Any]:
         or DIGEST_PATTERN.fullmatch(value["imageDigest"]) is None
         or not isinstance(value["commit"], str)
         or COMMIT_PATTERN.fullmatch(value["commit"]) is None
+    ):
+        fail("DEPLOY_V5_INTENT_STATE_INVALID")
+    if (
+        value["artifactSource"] != "ghcr-public"
+        or value["provenanceMode"] not in {"artifact-v2", "state-reproof"}
+        or type(value["releaseRecordSchemaVersion"]) is not int
+        or value["releaseRecordSchemaVersion"] != 2
+        or not isinstance(value["verificationRunId"], str)
+        or re.fullmatch(r"[0-9]{1,20}", value["verificationRunId"]) is None
     ):
         fail("DEPLOY_V5_INTENT_STATE_INVALID")
     provider = value["secretProviderMode"]
@@ -594,6 +609,13 @@ def security_matches(current: dict[str, Any], request: dict[str, Any]) -> bool:
     ))
 
 
+def provenance_matches(target: dict[str, Any], request: dict[str, Any]) -> bool:
+    return all(request[field] == target[field] for field in (
+        "imageDigest", "commit", "artifactSource", "releaseRecordSchemaVersion",
+        "verificationRunId",
+    ))
+
+
 def resolve_intent(value: Any) -> dict[str, Any]:
     value = require_exact_keys(value, {"intent", "request", "current", "previous"}, "DEPLOY_V5_INTENT_STATE_INVALID")
     intent = value["intent"]
@@ -606,6 +628,8 @@ def resolve_intent(value: Any) -> dict[str, Any]:
     if previous is not None:
         check_version_reuse(previous, request)
     if intent == "FORWARD":
+        if request["provenanceMode"] != "artifact-v2":
+            fail("DEPLOY_V5_STATE_REPROOF_FORWARD_FORBIDDEN")
         if current["accessControlMode"] == "device-approval" and request["accessControlMode"] == "disabled":
             fail("ACCESS_CONTROL_DOWNGRADE_FORBIDDEN")
         if current["secretProviderMode"] == "github-tmpfs-v1" and request["secretProviderMode"] == "disabled":
@@ -626,6 +650,8 @@ def resolve_intent(value: Any) -> dict[str, Any]:
         if not security_matches(current, request):
             fail("ROLLBACK_SECURITY_STATE_MISMATCH")
         if request["imageDigest"] != previous["imageDigest"] or request["commit"] != previous["commit"]:
+            fail("ROLLBACK_STATE_MISMATCH")
+        if request["provenanceMode"] == "state-reproof" and not provenance_matches(previous, request):
             fail("ROLLBACK_STATE_MISMATCH")
         if not previous["imageSchemaMin"] <= current["schemaVersion"] <= previous["imageSchemaMax"]:
             fail("ROLLBACK_REQUIRES_DB_RESTORE")
@@ -654,6 +680,8 @@ def resolve_intent(value: Any) -> dict[str, Any]:
         or request["commit"] != current["commit"]
         or not security_matches(current, request)
     ):
+        fail("RESTORE_STATE_MISMATCH")
+    if request["provenanceMode"] == "state-reproof" and not provenance_matches(current, request):
         fail("RESTORE_STATE_MISMATCH")
     return {
         "intent": intent,

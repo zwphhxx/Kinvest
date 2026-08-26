@@ -75,6 +75,9 @@ current_ifind_path=''
 stable_output=''
 stable_error=''
 candidate_state_text=''
+reboot_restore_phase=''
+journal_intent=''
+journal_handling_started='false'
 
 safe_runtime_file() { [[ -n "${1:-}" && "$1" == "$RUN_ROOT"/kinvest-v5.* ]]; }
 
@@ -263,13 +266,51 @@ reconcile_transaction_journal() {
   prune_access_bundles && prune_ifind_bundles
 }
 
+state_bundles_present() {
+  local state_file="$1" parsed provider_value access_id ifind_value ifind_id
+  secure_temp parsed "$RUN_ROOT/kinvest-v5.bundle-state.XXXXXX" || return 1
+  "$CONTRACT" parse-state <"$state_file" >"$parsed" 2>/dev/null || { rm -f -- "$parsed"; return 1; }
+  provider_value="$(json_field "$parsed" secretProviderMode)" || { rm -f -- "$parsed"; return 1; }
+  access_id="$(json_field "$parsed" secretBundleId)" || { rm -f -- "$parsed"; return 1; }
+  ifind_value="$(json_field "$parsed" ifindDiagnosticMode)" || { rm -f -- "$parsed"; return 1; }
+  ifind_id="$(json_field "$parsed" ifindSecretBundleId)" || { rm -f -- "$parsed"; return 1; }
+  rm -f -- "$parsed"
+  if [[ "$provider_value" == github-tmpfs-v1 ]]; then
+    [[ -d "$ACCESS_BUNDLE_ROOT/$access_id" && ! -L "$ACCESS_BUNDLE_ROOT/$access_id" ]] || return 1
+  fi
+  if [[ "$ifind_value" == diagnostic ]]; then
+    [[ -d "$IFIND_BUNDLE_ROOT/$ifind_id" && ! -L "$IFIND_BUNDLE_ROOT/$ifind_id" ]] || return 1
+  fi
+}
+
+prepare_journal_recovery() {
+  [[ -e "$JOURNAL" ]] || return 0
+  [[ -f "$JOURNAL" && ! -L "$JOURNAL" && -f "$BEFORE_STATE" && ! -L "$BEFORE_STATE" ]] || return 1
+  local phase authority request_intent
+  phase="$(json_field "$JOURNAL" phase)" || return 1
+  journal_intent="$(json_field "$JOURNAL" intent)" || return 1
+  request_intent="$(json_field "$prepared_file" intent)" || return 1
+  case "$phase" in
+    prepared) reconcile_transaction_journal || return 1; return 0 ;;
+    compose-active) authority="$BEFORE_STATE" ;;
+    state-committed) authority="$CURRENT_STATE" ;;
+    *) return 1 ;;
+  esac
+  if state_bundles_present "$authority"; then
+    reconcile_transaction_journal
+    return $?
+  fi
+  reboot_restore_phase="$phase"
+  [[ "$request_intent" == RESTORE ]] || fail DEPLOY_V5_RESTORE_REQUIRED 72
+}
+
 cleanup() {
   local status=$?
   trap - EXIT
   if [[ -n "$candidate_registry" && -f "$candidate_registry" && ! -L "$candidate_registry" ]]; then
     "$RUNTIME_HELPER" recover "$candidate_registry" "$RUN_ROOT" "$ACCESS_BUNDLE_ROOT" "$IFIND_BUNDLE_ROOT" "$BACKUP_ROOT" "$STATE_ROOT" "$ROOT_UID" "$ROOT_GID" >/dev/null 2>&1 || true
   fi
-  if [[ -e "$JOURNAL" ]]; then
+  if [[ -e "$JOURNAL" && "$journal_handling_started" == true && -z "$reboot_restore_phase" ]]; then
     if ! reconcile_transaction_journal >/dev/null 2>&1; then
       printf '%s\n' DEPLOY_V5_RECOVERY_FAILED >&3
       status=70
@@ -293,8 +334,6 @@ trap 'exit 129' HUP
 trap 'exit 130' INT
 trap 'exit 143' TERM
 
-reconcile_transaction_journal >/dev/null 2>&1 || fail DEPLOY_V5_RECOVERY_FAILED 70
-
 recover_stale_candidate_registries() {
   local registry
   shopt -s nullglob
@@ -304,10 +343,6 @@ recover_stale_candidate_registries() {
   done
   shopt -u nullglob
 }
-recover_stale_candidate_registries || fail DEPLOY_V5_CANDIDATE_RECOVERY_FAILED 70
-"$RUNTIME_HELPER" cleanup-stale-sources "$RUN_ROOT" "$ROOT_UID" "$ROOT_GID" >/dev/null 2>&1 || fail DEPLOY_V5_RUNTIME_SOURCE_RECOVERY_FAILED 70
-"$RUNTIME_HELPER" recover-orphan-backups "$BACKUP_ROOT" "$STATE_ROOT" "$ROOT_UID" "$ROOT_GID" >/dev/null 2>&1 || fail DEPLOY_V5_BACKUP_RECOVERY_FAILED 70
-
 secure_temp payload_file "$RUN_ROOT/kinvest-v5.payload.XXXXXX" || fail DEPLOY_V5_PAYLOAD_FILE_FAILED
 run_stable_command DEPLOY_V5_PAYLOAD_READ_FAILED dd bs=4096 count=5 of="$payload_file" status=none
 [[ "$(wc -c <"$payload_file" | tr -d '[:space:]')" -le 16384 ]] || fail DEPLOY_V5_PAYLOAD_TOO_LARGE 2
@@ -315,6 +350,12 @@ grep -Fqx 'KINVEST_DEPLOY_V5' <(head -n 1 "$payload_file") || fail DEPLOY_V5_PAY
 
 secure_temp prepared_file "$RUN_ROOT/kinvest-v5.prepared.XXXXXX" || fail DEPLOY_V5_PAYLOAD_FILE_FAILED
 "$CONTRACT" validate-payload <"$payload_file" >"$prepared_file" 2>/dev/null || fail DEPLOY_V5_PAYLOAD_REJECTED 2
+journal_handling_started='true'
+prepare_journal_recovery || fail DEPLOY_V5_RECOVERY_FAILED 70
+
+recover_stale_candidate_registries || fail DEPLOY_V5_CANDIDATE_RECOVERY_FAILED 70
+"$RUNTIME_HELPER" cleanup-stale-sources "$RUN_ROOT" "$ROOT_UID" "$ROOT_GID" >/dev/null 2>&1 || fail DEPLOY_V5_RUNTIME_SOURCE_RECOVERY_FAILED 70
+"$RUNTIME_HELPER" recover-orphan-backups "$BACKUP_ROOT" "$STATE_ROOT" "$ROOT_UID" "$ROOT_GID" >/dev/null 2>&1 || fail DEPLOY_V5_BACKUP_RECOVERY_FAILED 70
 
 candidate_registry="$("$RUNTIME_HELPER" reserve-registry "$RUN_ROOT" "$ROOT_UID" "$ROOT_GID" 2>/dev/null)" || fail DEPLOY_V5_CANDIDATE_REGISTRY_FAILED
 [[ "$candidate_registry" == "$RUN_ROOT"/kinvest-v5.candidates.* ]] || fail DEPLOY_V5_CANDIDATE_REGISTRY_FAILED
@@ -352,7 +393,9 @@ with open(sys.argv[1]) as stream: request = json.load(stream)
 with open(sys.argv[2]) as stream: current = json.load(stream)
 with open(sys.argv[3]) as stream: previous = json.load(stream)
 request_fields = (
-    'imageDigest', 'commit', 'secretProviderMode', 'secretVersionIds',
+    'imageDigest', 'commit', 'artifactSource', 'provenanceMode',
+    'releaseRecordSchemaVersion', 'verificationRunId',
+    'secretProviderMode', 'secretVersionIds',
     'secretMaterialFingerprints', 'accessControlMode', 'ifindDiagnosticMode',
     'ifindRefreshTokenVersionId', 'ifindSecretMaterialFingerprint',
 )
@@ -365,6 +408,7 @@ fi
 [[ -s "$plan_file" ]] || fail DEPLOY_V5_INTENT_RESOLUTION_FAILED
 
 intent="$(json_field "$prepared_file" intent)"
+provenance_mode="$(json_field "$prepared_file" provenanceMode)"
 if [[ "$intent" == FORWARD ]]; then
   target_digest="$(json_field "$prepared_file" imageDigest)"
   target_commit="$(json_field "$prepared_file" commit)"
@@ -402,12 +446,19 @@ resolve_offline_image() {
   printf '%s\n' "$id"
 }
 
-attested_image_id="$(resolve_offline_image)" || fail DEPLOY_V5_IMAGE_PROVENANCE_INVALID
-if [[ "$intent" == FORWARD ]]; then
-  runtime_image_id="$attested_image_id"
-else
+if [[ "$provenance_mode" == state-reproof ]]; then
+  [[ "$intent" != FORWARD ]] || fail DEPLOY_V5_STATE_REPROOF_FORWARD_FORBIDDEN
   runtime_image_id="$(json_field "$target_file" runtimeImageId)"
-  [[ "$runtime_image_id" == "$attested_image_id" ]] || fail DEPLOY_V5_IMAGE_PROVENANCE_INVALID
+  [[ "$runtime_image_id" =~ ^sha256:[0-9a-f]{64}$ && "$(inspect_id "$runtime_image_id")" == "$runtime_image_id" ]] || fail DEPLOY_V5_IMAGE_PROVENANCE_INVALID
+  verify_repo_digest "$runtime_image_id" "$target_digest" || fail DEPLOY_V5_IMAGE_PROVENANCE_INVALID
+else
+  attested_image_id="$(resolve_offline_image)" || fail DEPLOY_V5_IMAGE_PROVENANCE_INVALID
+  if [[ "$intent" == FORWARD ]]; then
+    runtime_image_id="$attested_image_id"
+  else
+    runtime_image_id="$(json_field "$target_file" runtimeImageId)"
+    [[ "$runtime_image_id" == "$attested_image_id" ]] || fail DEPLOY_V5_IMAGE_PROVENANCE_INVALID
+  fi
 fi
 
 schema_before="$(python3 - "$DATABASE" 2>/dev/null <<'PY'
@@ -545,6 +596,27 @@ secure_temp candidate_state_text "$RUN_ROOT/kinvest-v5.state-text.XXXXXX" || fai
 "$CONTRACT" canonical-state <"$candidate_state" >"$candidate_state_text" 2>/dev/null || fail DEPLOY_V5_STATE_WRITE_FAILED
 mv -- "$candidate_state_text" "$candidate_state" 2>/dev/null || fail DEPLOY_V5_STATE_WRITE_FAILED
 candidate_state_text=''
+
+if [[ -n "$reboot_restore_phase" ]]; then
+  run_stable_command DEPLOY_V5_COMPOSE_FAILED compose_up
+  for _ in $(seq 1 60); do
+    [[ "$(run_docker inspect --format '{{.State.Health.Status}}' kinvest 2>/dev/null || true)" == healthy ]] && break
+    sleep 2
+  done
+  [[ "$(run_docker inspect --format '{{.State.Health.Status}}' kinvest 2>/dev/null || true)" == healthy ]] || fail DEPLOY_V5_HEALTH_FAILED
+  [[ "$(run_docker inspect --format '{{.Image}}' kinvest 2>/dev/null)" == "$runtime_image_id" ]] || fail DEPLOY_V5_RUNTIME_IMAGE_MISMATCH
+  curl -fsS --max-time 15 "$PUBLIC_HEALTH_URL" >/dev/null 2>&1 || fail DEPLOY_V5_PUBLIC_HEALTH_FAILED
+  atomic_state_from_text "$candidate_state" "$CURRENT_STATE" current || fail DEPLOY_V5_STATE_WRITE_FAILED
+  if [[ "$reboot_restore_phase" == state-committed && "$journal_intent" != RESTORE ]]; then
+    atomic_state_from_text "$BEFORE_STATE" "$PREVIOUS_STATE" previous || fail DEPLOY_V5_STATE_WRITE_FAILED
+  fi
+  candidate_keep='true'
+  durable_state_delete "${ATTEMPT_STATE##*/}" "${JOURNAL##*/}" "${BEFORE_STATE##*/}" || fail DEPLOY_V5_JOURNAL_CLEANUP_FAILED
+  prune_access_bundles || fail DEPLOY_V5_CLEANUP_PENDING 71
+  prune_ifind_bundles || fail DEPLOY_V5_CLEANUP_PENDING 71
+  printf 'KINVEST_DEPLOY_V5_OK intent=RESTORE commit=%s ifind=%s\n' "$target_commit" "$ifind_mode"
+  exit 0
+fi
 
 atomic_state_from_json "$current_json" "$BEFORE_STATE" before || fail DEPLOY_V5_STATE_WRITE_FAILED
 # REGISTRY_WINDOW_BEFORE_PREPARED_JOURNAL

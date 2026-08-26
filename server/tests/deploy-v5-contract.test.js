@@ -29,7 +29,7 @@ function payload(overrides = {}) {
     intent: 'FORWARD',
     digest: `ghcr.io/zwphhxx/kinvest@sha256:${'a'.repeat(64)}`,
     commit: 'b'.repeat(40),
-    provenance: '{"artifactSource":"ghcr-public","releaseRecordSchemaVersion":2,"verificationRunId":"123"}',
+    provenance: '{"artifactSource":"ghcr-public","provenanceMode":"artifact-v2","releaseRecordSchemaVersion":2,"verificationRunId":"123"}',
     registry: '{"host":"ghcr.io","mode":"ghcr-public","repository":"ghcr.io/zwphhxx/kinvest"}',
     provider: 'github-tmpfs-v1',
     adminVersion: 'v20260826-001',
@@ -78,6 +78,7 @@ async function run() {
   assert.equal(valid.status, 0, valid.stderr)
   const parsed = JSON.parse(valid.stdout)
   assert.equal(parsed.ifindDiagnosticMode, 'diagnostic')
+  assert.equal(parsed.provenanceMode, 'artifact-v2')
   assert.equal(parsed.ifindRefreshTokenVersionId, 'v20260826-003')
   assert.equal(
     parsed.ifindSecretMaterialFingerprint,
@@ -133,10 +134,20 @@ async function run() {
     payload({ ifindVersion: 'v2026826-001' }),
     payload({ ifindMaterial: 'contains space' }),
     payload({ ifindMaterial: 'x'.repeat(4097) }),
-    payload({ provenance: '{"verificationRunId":"123","releaseRecordSchemaVersion":2,"artifactSource":"ghcr-public"}' }),
+    payload({ provenance: '{"artifactSource":"ghcr-public","provenanceMode":"state-reproof","releaseRecordSchemaVersion":2,"verificationRunId":"123"}' }),
+    payload({ intent: 'FORWARD', provenance: '{"artifactSource":"ghcr-public","provenanceMode":"state-reproof","releaseRecordSchemaVersion":2,"verificationRunId":"123"}' }),
+    payload({ provenance: '{"artifactSource":"ghcr-public","releaseRecordSchemaVersion":2,"verificationRunId":"123"}' }),
+    payload({ provenance: '{"verificationRunId":"123","releaseRecordSchemaVersion":2,"provenanceMode":"artifact-v2","artifactSource":"ghcr-public"}' }),
     payload({ registry: '{"mode":"ghcr-public","host":"ghcr.io","repository":"ghcr.io/zwphhxx/kinvest"}' }),
     payload({ policy: '{"schemaVersion":1,"accessControlMode":"device-approval"}' })
   ]) assertSecretSafeFailure(runContract(invalid))
+
+  const reproof = runContract(payload({
+    intent: 'RESTORE',
+    provenance: '{"artifactSource":"ghcr-public","provenanceMode":"state-reproof","releaseRecordSchemaVersion":2,"verificationRunId":"123"}'
+  }))
+  assert.equal(reproof.status, 0, reproof.stderr)
+  assert.equal(JSON.parse(reproof.stdout).provenanceMode, 'state-reproof')
 
   const nonAscii = Buffer.from(payload().replace(refreshToken, '令牌'), 'utf8')
   assertSecretSafeFailure(runContract(nonAscii), '令牌')

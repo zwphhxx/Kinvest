@@ -57,6 +57,10 @@ function request(overrides = {}) {
   return {
     imageDigest: current.imageDigest,
     commit: current.commit,
+    artifactSource: current.artifactSource,
+    provenanceMode: 'artifact-v2',
+    releaseRecordSchemaVersion: current.releaseRecordSchemaVersion,
+    verificationRunId: current.verificationRunId,
     secretProviderMode: current.secretProviderMode,
     secretVersionIds: current.secretVersionIds,
     secretMaterialFingerprints: current.secretMaterialFingerprints,
@@ -363,6 +367,43 @@ async function run() {
     previous: null
   })
   assertFailure(restoreMismatch, 'RESTORE_STATE_MISMATCH')
+
+  for (const [field, bad] of [
+    ['imageDigest', `ghcr.io/zwphhxx/kinvest@sha256:${'9'.repeat(64)}`],
+    ['commit', '9'.repeat(40)],
+    ['verificationRunId', '999']
+  ]) {
+    const mismatch = runContract('resolve-intent', {
+      intent: 'RESTORE',
+      request: request({ provenanceMode: 'state-reproof', [field]: bad }),
+      current: state(),
+      previous: null
+    })
+    assertFailure(mismatch, 'RESTORE_STATE_MISMATCH')
+  }
+  for (const [field, bad] of [['artifactSource', 'tcr-private'], ['releaseRecordSchemaVersion', 1]]) {
+    const invalidReproof = runContract('resolve-intent', {
+      intent: 'RESTORE', request: request({ provenanceMode: 'state-reproof', [field]: bad }),
+      current: state(), previous: null
+    })
+    assertFailure(invalidReproof, 'DEPLOY_V5_INTENT_STATE_INVALID')
+  }
+
+  const reproofRestore = runContract('resolve-intent', {
+    intent: 'RESTORE',
+    request: request({ provenanceMode: 'state-reproof' }),
+    current: state(),
+    previous: null
+  })
+  assert.equal(reproofRestore.status, 0, reproofRestore.stderr)
+
+  const reproofForward = runContract('resolve-intent', {
+    intent: 'FORWARD',
+    request: request({ provenanceMode: 'state-reproof' }),
+    current: state(),
+    previous: null
+  })
+  assertFailure(reproofForward, 'DEPLOY_V5_STATE_REPROOF_FORWARD_FORBIDDEN')
 }
 
 module.exports = { run }

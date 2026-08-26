@@ -346,7 +346,7 @@ function currentState(overrides = {}) {
 function diagnosticPayload() {
   return [
     'KINVEST_DEPLOY_V5', 'FORWARD', DIGEST, COMMIT,
-    '{"artifactSource":"ghcr-public","releaseRecordSchemaVersion":2,"verificationRunId":"123"}',
+    '{"artifactSource":"ghcr-public","provenanceMode":"artifact-v2","releaseRecordSchemaVersion":2,"verificationRunId":"123"}',
     '{"host":"ghcr.io","mode":"ghcr-public","repository":"ghcr.io/zwphhxx/kinvest"}',
     'github-tmpfs-v1', ADMIN_VERSION, HMAC_VERSION, ADMIN_MATERIAL, HMAC_MATERIAL,
     '{"accessControlMode":"device-approval","schemaVersion":1}',
@@ -357,7 +357,7 @@ function diagnosticPayload() {
 function disabledPayload() {
   return [
     'KINVEST_DEPLOY_V5', 'FORWARD', DIGEST, COMMIT,
-    '{"artifactSource":"ghcr-public","releaseRecordSchemaVersion":2,"verificationRunId":"123"}',
+    '{"artifactSource":"ghcr-public","provenanceMode":"artifact-v2","releaseRecordSchemaVersion":2,"verificationRunId":"123"}',
     '{"host":"ghcr.io","mode":"ghcr-public","repository":"ghcr.io/zwphhxx/kinvest"}',
     'github-tmpfs-v1', ADMIN_VERSION, HMAC_VERSION, ADMIN_MATERIAL, HMAC_MATERIAL,
     '{"accessControlMode":"device-approval","schemaVersion":1}',
@@ -365,10 +365,10 @@ function disabledPayload() {
   ].join('\n') + '\n'
 }
 
-function intentPayload(intent, digest, commit, verificationRunId = '999', ifindMode = 'diagnostic') {
+function intentPayload(intent, digest, commit, verificationRunId = '999', ifindMode = 'diagnostic', provenanceMode = 'artifact-v2') {
   return [
     'KINVEST_DEPLOY_V5', intent, digest, commit,
-    `{"artifactSource":"ghcr-public","releaseRecordSchemaVersion":2,"verificationRunId":"${verificationRunId}"}`,
+    `{"artifactSource":"ghcr-public","provenanceMode":"${provenanceMode}","releaseRecordSchemaVersion":2,"verificationRunId":"${verificationRunId}"}`,
     '{"host":"ghcr.io","mode":"ghcr-public","repository":"ghcr.io/zwphhxx/kinvest"}',
     'github-tmpfs-v1', ADMIN_VERSION, HMAC_VERSION, ADMIN_MATERIAL, HMAC_MATERIAL,
     '{"accessControlMode":"device-approval","schemaVersion":1}',
@@ -1276,6 +1276,72 @@ module.materialize(sys.argv[2], sys.argv[3], sys.argv[4], sys.argv[5],
     assert.match(restoredState, /databaseBackupPath=.*current\.sqlite/)
     assert.match(restoredState, /databaseBackupChecksum=[0-9a-f]{64}/)
   } finally { cleanupHarness(restore) }
+
+  for (const scenario of [
+    {
+      window: 'TRANSACTION_WINDOW_AFTER_COMPOSE_BEFORE_CURRENT',
+      payload: intentPayload('RESTORE', CURRENT_DIGEST, CURRENT_COMMIT, '1', 'disabled', 'state-reproof')
+    },
+    {
+      window: 'TRANSACTION_WINDOW_AFTER_CURRENT_BEFORE_KEEP',
+      payload: intentPayload('RESTORE', DIGEST, COMMIT, '123', 'diagnostic', 'state-reproof')
+    }
+  ]) {
+    const rebooted = makeHarness({ signalWindow: scenario.window, signalType: 'KILL' })
+    try {
+      const interrupted = spawnSync(rebooted.executor, [], {
+        encoding: 'utf8', input: diagnosticPayload(),
+        env: { ...process.env, PATH: `${rebooted.bin}:${process.env.PATH}` }
+      })
+      assert.notEqual(interrupted.status, 0)
+      assert.equal(fs.existsSync(path.join(rebooted.root, 'state/deploy-v5.journal')), true)
+      fs.writeFileSync(rebooted.executor,
+        fs.readFileSync(rebooted.executor, 'utf8').replace(`kill -TERM $$  # ${scenario.window}`, `:  # ${scenario.window}`),
+        { mode: 0o755 })
+      for (const rootName of ['kinvest-secrets', 'kinvest-ifind-secrets']) {
+        const bundleRoot = path.join(rebooted.runRoot, rootName)
+        for (const name of fs.readdirSync(bundleRoot)) {
+          const candidate = path.join(bundleRoot, name)
+          if (fs.statSync(candidate).isDirectory()) fs.chmodSync(candidate, 0o700)
+        }
+        fs.rmSync(bundleRoot, { recursive: true, force: true })
+        fs.mkdirSync(bundleRoot, { mode: 0o700 })
+      }
+      const persistentBefore = new Map(
+        fs.readdirSync(path.join(rebooted.root, 'state')).map((name) => [
+          name, fs.readFileSync(path.join(rebooted.root, 'state', name), 'utf8')
+        ])
+      )
+      const refused = spawnSync(rebooted.executor, [], {
+        encoding: 'utf8', input: scenario.payload
+          .replace('\nRESTORE\n', '\nFORWARD\n')
+          .replace('"provenanceMode":"state-reproof"', '"provenanceMode":"artifact-v2"'),
+        env: { ...process.env, PATH: `${rebooted.bin}:${process.env.PATH}` }
+      })
+      assert.notEqual(refused.status, 0)
+      assert.equal(refused.stderr, 'DEPLOY_V5_RESTORE_REQUIRED\n')
+      for (const [name, value] of persistentBefore) {
+        assert.equal(fs.readFileSync(path.join(rebooted.root, 'state', name), 'utf8'), value)
+      }
+      const wrongMaterial = spawnSync(rebooted.executor, [], {
+        encoding: 'utf8', input: scenario.payload.replace(ADMIN_MATERIAL, Buffer.alloc(32, 8).toString('base64url')),
+        env: { ...process.env, PATH: `${rebooted.bin}:${process.env.PATH}` }
+      })
+      assert.notEqual(wrongMaterial.status, 0)
+      for (const [name, value] of persistentBefore) {
+        assert.equal(fs.readFileSync(path.join(rebooted.root, 'state', name), 'utf8'), value)
+      }
+      const recovered = spawnSync(rebooted.executor, [], {
+        encoding: 'utf8', input: scenario.payload,
+        env: { ...process.env, PATH: `${rebooted.bin}:${process.env.PATH}` }
+      })
+      assert.equal(recovered.status, 0, `${scenario.window}: ${recovered.stderr}`)
+      assert.equal(fs.existsSync(path.join(rebooted.root, 'state/deploy-v5.journal')), false)
+      assert.equal(fs.existsSync(path.join(rebooted.root, 'state/deploy-v5-current.before')), false)
+      const operations = fs.readFileSync(rebooted.operations, 'utf8')
+      assert.doesNotMatch(operations, /attestation resolve.*state-reproof/)
+    } finally { cleanupHarness(rebooted) }
+  }
 
   const incompatible = makeHarness({ currentStateOverrides: deployedState, previousState: currentState() })
   try {

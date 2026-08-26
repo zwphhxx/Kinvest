@@ -4,8 +4,28 @@ on:
   workflow_dispatch:
     inputs:
       release_run_id:
-        description: 'Successful main Deploy Kinvest run ID containing release-record v2'
+        description: 'Artifact-v2 release run ID; leave empty for state-reproof'
+        required: false
+        type: string
+      provenance_mode:
+        description: 'Use release artifact or exact root-owned deployment state'
         required: true
+        default: artifact-v2
+        type: choice
+        options:
+          - artifact-v2
+          - state-reproof
+      target_digest:
+        description: 'State-reproof target sha256 digest; empty for artifact-v2'
+        required: false
+        type: string
+      target_commit:
+        description: 'State-reproof target main ancestor commit; empty for artifact-v2'
+        required: false
+        type: string
+      target_verification_run_id:
+        description: 'State-reproof target verification run ID; empty for artifact-v2'
+        required: false
         type: string
       intent:
         description: 'FORWARD deploys a release, ROLLBACK selects previous state, RESTORE rebuilds lost tmpfs for current state'
@@ -23,7 +43,7 @@ on:
           - disabled
           - diagnostic
       confirm:
-        description: 'Type DEPLOY_V5, ROLLBACK_V4, or RESTORE_V4 to match intent'
+        description: 'Type DEPLOY_V5, ROLLBACK_V4, RESTORE_V4, ROLLBACK_STATE_REPROOF, or RESTORE_STATE_REPROOF'
         required: true
         type: string
 
@@ -43,11 +63,12 @@ jobs:
       contents: read
       actions: read
     outputs:
-      artifact_source: ${{ steps.record.outputs.artifact_source }}
-      commit_sha: ${{ steps.record.outputs.commit_sha }}
-      image_digest: ${{ steps.record.outputs.image_digest }}
-      release_record_schema_version: ${{ steps.record.outputs.release_record_schema_version }}
-      verification_run_id: ${{ steps.record.outputs.verification_run_id }}
+      artifact_source: ${{ steps.record.outputs.artifact_source || steps.reproof.outputs.artifact_source }}
+      commit_sha: ${{ steps.record.outputs.commit_sha || steps.reproof.outputs.commit_sha }}
+      image_digest: ${{ steps.record.outputs.image_digest || steps.reproof.outputs.image_digest }}
+      provenance_mode: ${{ inputs.provenance_mode }}
+      release_record_schema_version: ${{ steps.record.outputs.release_record_schema_version || steps.reproof.outputs.release_record_schema_version }}
+      verification_run_id: ${{ steps.record.outputs.verification_run_id || steps.reproof.outputs.verification_run_id }}
     steps:
       - name: Check out main history
         uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683
@@ -58,6 +79,10 @@ jobs:
         shell: bash
         env:
           RELEASE_RUN_ID: ${{ inputs.release_run_id }}
+          PROVENANCE_MODE: ${{ inputs.provenance_mode }}
+          TARGET_DIGEST: ${{ inputs.target_digest }}
+          TARGET_COMMIT: ${{ inputs.target_commit }}
+          TARGET_VERIFICATION_RUN_ID: ${{ inputs.target_verification_run_id }}
           CONFIRM: ${{ inputs.confirm }}
           INTENT: ${{ inputs.intent }}
           IFIND_MODE: ${{ inputs.ifind_mode }}
@@ -65,13 +90,31 @@ jobs:
         run: |
           set -euo pipefail
           [[ "$WORKFLOW_REF" == 'refs/heads/main' ]]
-          [[ "$RELEASE_RUN_ID" =~ ^[0-9]+$ ]]
           [[ "$IFIND_MODE" =~ ^(disabled|diagnostic)$ ]]
-          case "$INTENT:$CONFIRM" in
-            FORWARD:DEPLOY_V5|ROLLBACK:ROLLBACK_V4|RESTORE:RESTORE_V4) ;;
+          case "$PROVENANCE_MODE" in
+            artifact-v2)
+              [[ "$RELEASE_RUN_ID" =~ ^[0-9]+$ ]]
+              [[ -z "$TARGET_DIGEST$TARGET_COMMIT$TARGET_VERIFICATION_RUN_ID" ]]
+              case "$INTENT:$CONFIRM" in
+                FORWARD:DEPLOY_V5|ROLLBACK:ROLLBACK_V4|RESTORE:RESTORE_V4) ;;
+                *) exit 1 ;;
+              esac
+              ;;
+            state-reproof)
+              [[ -z "$RELEASE_RUN_ID" ]]
+              [[ "$TARGET_DIGEST" =~ ^sha256:[0-9a-f]{64}$ ]]
+              [[ "$TARGET_COMMIT" =~ ^[0-9a-f]{40}$ ]]
+              [[ "$TARGET_VERIFICATION_RUN_ID" =~ ^[0-9]{1,20}$ ]]
+              case "$INTENT:$CONFIRM" in
+                ROLLBACK:ROLLBACK_STATE_REPROOF|RESTORE:RESTORE_STATE_REPROOF) ;;
+                FORWARD:*) printf '%s\n' DEPLOY_V5_STATE_REPROOF_FORWARD_FORBIDDEN >&2; exit 2 ;;
+                *) exit 1 ;;
+              esac
+              ;;
             *) exit 1 ;;
           esac
       - name: Verify release run provenance
+        if: ${{ inputs.provenance_mode == 'artifact-v2' }}
         id: provenance
         shell: bash
         env:
@@ -95,6 +138,7 @@ jobs:
           printf 'run_attempt=%s\n' "$run_attempt" >> "$GITHUB_OUTPUT"
           printf 'head_sha=%s\n' "$head_sha" >> "$GITHUB_OUTPUT"
       - name: Download and validate offline release attestation
+        if: ${{ inputs.provenance_mode == 'artifact-v2' }}
         id: record
         shell: bash
         env:
@@ -135,6 +179,28 @@ jobs:
           printf 'image_digest=%s\n' "$source_digest" >> "$GITHUB_OUTPUT"
           printf 'release_record_schema_version=2\n' >> "$GITHUB_OUTPUT"
           printf 'verification_run_id=%s\n' "$RELEASE_RUN_ID" >> "$GITHUB_OUTPUT"
+      - name: Validate state reproof target
+        id: reproof
+        if: ${{ inputs.provenance_mode == 'state-reproof' }}
+        shell: bash
+        env:
+          INTENT: ${{ inputs.intent }}
+          TARGET_DIGEST: ${{ inputs.target_digest }}
+          TARGET_COMMIT: ${{ inputs.target_commit }}
+          TARGET_VERIFICATION_RUN_ID: ${{ inputs.target_verification_run_id }}
+        run: |
+          set -euo pipefail
+          [[ "$INTENT" =~ ^(ROLLBACK|RESTORE)$ ]] || { printf '%s\n' DEPLOY_V5_STATE_REPROOF_FORWARD_FORBIDDEN >&2; exit 2; }
+          [[ "$TARGET_DIGEST" =~ ^sha256:[0-9a-f]{64}$ ]]
+          [[ "$TARGET_COMMIT" =~ ^[0-9a-f]{40}$ ]]
+          [[ "$TARGET_VERIFICATION_RUN_ID" =~ ^[0-9]{1,20}$ ]]
+          git cat-file -e "${TARGET_COMMIT}^{commit}"
+          git merge-base --is-ancestor "$TARGET_COMMIT" origin/main
+          printf 'artifact_source=ghcr-public\n' >> "$GITHUB_OUTPUT"
+          printf 'commit_sha=%s\n' "$TARGET_COMMIT" >> "$GITHUB_OUTPUT"
+          printf 'image_digest=%s\n' "$TARGET_DIGEST" >> "$GITHUB_OUTPUT"
+          printf 'release_record_schema_version=2\n' >> "$GITHUB_OUTPUT"
+          printf 'verification_run_id=%s\n' "$TARGET_VERIFICATION_RUN_ID" >> "$GITHUB_OUTPUT"
 
   deploy-disabled:
     name: deploy-v5-disabled
@@ -182,6 +248,10 @@ jobs:
           GH_TOKEN: ${{ github.token }}
           RELEASE_RUN_ID: ${{ inputs.release_run_id }}
           INTENT: ${{ inputs.intent }}
+          PROVENANCE_MODE: ${{ inputs.provenance_mode }}
+          TARGET_DIGEST: ${{ inputs.target_digest }}
+          TARGET_COMMIT: ${{ inputs.target_commit }}
+          TARGET_VERIFICATION_RUN_ID: ${{ inputs.target_verification_run_id }}
           WORKFLOW_SHA: ${{ github.sha }}
           VALIDATED_COMMIT: ${{ needs.validate.outputs.commit_sha }}
           VALIDATED_DIGEST: ${{ needs.validate.outputs.image_digest }}
@@ -192,6 +262,16 @@ jobs:
           set +x
           main_sha="$(gh api "repos/${GITHUB_REPOSITORY}/git/ref/heads/main" --jq '.object.sha')"
           [[ "$main_sha" =~ ^[0-9a-f]{40}$ && "$WORKFLOW_SHA" == "$main_sha" ]] || exit 1
+          if [[ "$PROVENANCE_MODE" == state-reproof ]]; then
+            [[ "$INTENT" =~ ^(ROLLBACK|RESTORE)$ ]] || exit 1
+            [[ "$TARGET_DIGEST" == "$VALIDATED_DIGEST" && "$TARGET_DIGEST" =~ ^sha256:[0-9a-f]{64}$ ]] || exit 1
+            [[ "$TARGET_COMMIT" == "$VALIDATED_COMMIT" && "$TARGET_COMMIT" =~ ^[0-9a-f]{40}$ ]] || exit 1
+            [[ "$TARGET_VERIFICATION_RUN_ID" == "$VALIDATED_RUN_ID" && "$TARGET_VERIFICATION_RUN_ID" =~ ^[0-9]{1,20}$ ]] || exit 1
+            [[ "$VALIDATED_SCHEMA" == 2 ]]
+            git cat-file -e "${TARGET_COMMIT}^{commit}"
+            git merge-base --is-ancestor "$TARGET_COMMIT" origin/main || exit 1
+          else
+          [[ "$PROVENANCE_MODE" == artifact-v2 ]] || exit 1
           [[ "$RELEASE_RUN_ID" == "$VALIDATED_RUN_ID" && "$RELEASE_RUN_ID" =~ ^[0-9]+$ ]] || exit 1
           run_json="$(gh api "repos/${GITHUB_REPOSITORY}/actions/runs/${RELEASE_RUN_ID}")"
           [[ "$(jq -r '.path' <<<"$run_json")" == '.github/workflows/deploy.yml' ]] || exit 1
@@ -228,6 +308,7 @@ jobs:
           [[ "$VALIDATED_SCHEMA" == "2" ]] || exit 1
           git merge-base --is-ancestor "$commit_sha" origin/main || exit 1
           if [[ "$INTENT" == "FORWARD" ]]; then [[ "$commit_sha" == "$main_sha" ]] || exit 1; fi
+          fi
       - name: Configure strict SSH trust
         shell: bash
         env:
@@ -261,6 +342,7 @@ jobs:
           IMAGE_DIGEST: ${{ needs.validate.outputs.image_digest }}
           RELEASE_SCHEMA: ${{ needs.validate.outputs.release_record_schema_version }}
           VERIFICATION_RUN_ID: ${{ needs.validate.outputs.verification_run_id }}
+          PROVENANCE_MODE: ${{ needs.validate.outputs.provenance_mode }}
           INTENT: ${{ inputs.intent }}
           TMPFS_BOOTSTRAP_ENABLED: ${{ vars.TMPFS_BOOTSTRAP_ENABLED }}
           TMPFS_ADMIN_PASSWORD_VERIFIER_VERSION_ID: ${{ vars.TMPFS_ADMIN_PASSWORD_VERIFIER_VERSION_ID }}
@@ -328,7 +410,8 @@ jobs:
           esac
 
           image_ref="ghcr.io/zwphhxx/kinvest@${IMAGE_DIGEST}"
-          provenance="{\"artifactSource\":\"ghcr-public\",\"releaseRecordSchemaVersion\":2,\"verificationRunId\":\"${VERIFICATION_RUN_ID}\"}"
+          [[ "$PROVENANCE_MODE" =~ ^(artifact-v2|state-reproof)$ ]]
+          provenance="{\"artifactSource\":\"ghcr-public\",\"provenanceMode\":\"${PROVENANCE_MODE}\",\"releaseRecordSchemaVersion\":2,\"verificationRunId\":\"${VERIFICATION_RUN_ID}\"}"
           registry='{"host":"ghcr.io","mode":"ghcr-public","repository":"ghcr.io/zwphhxx/kinvest"}'
           policy="{\"accessControlMode\":\"${KINVEST_ACCESS_CONTROL_MODE}\",\"schemaVersion\":1}"
           [[ "$policy" == '{"accessControlMode":"disabled","schemaVersion":1}' || \
@@ -425,6 +508,10 @@ jobs:
           GH_TOKEN: ${{ github.token }}
           RELEASE_RUN_ID: ${{ inputs.release_run_id }}
           INTENT: ${{ inputs.intent }}
+          PROVENANCE_MODE: ${{ inputs.provenance_mode }}
+          TARGET_DIGEST: ${{ inputs.target_digest }}
+          TARGET_COMMIT: ${{ inputs.target_commit }}
+          TARGET_VERIFICATION_RUN_ID: ${{ inputs.target_verification_run_id }}
           WORKFLOW_SHA: ${{ github.sha }}
           VALIDATED_COMMIT: ${{ needs.validate.outputs.commit_sha }}
           VALIDATED_DIGEST: ${{ needs.validate.outputs.image_digest }}
@@ -435,6 +522,16 @@ jobs:
           set +x
           main_sha="$(gh api "repos/${GITHUB_REPOSITORY}/git/ref/heads/main" --jq '.object.sha')"
           [[ "$main_sha" =~ ^[0-9a-f]{40}$ && "$WORKFLOW_SHA" == "$main_sha" ]] || exit 1
+          if [[ "$PROVENANCE_MODE" == state-reproof ]]; then
+            [[ "$INTENT" =~ ^(ROLLBACK|RESTORE)$ ]] || exit 1
+            [[ "$TARGET_DIGEST" == "$VALIDATED_DIGEST" && "$TARGET_DIGEST" =~ ^sha256:[0-9a-f]{64}$ ]] || exit 1
+            [[ "$TARGET_COMMIT" == "$VALIDATED_COMMIT" && "$TARGET_COMMIT" =~ ^[0-9a-f]{40}$ ]] || exit 1
+            [[ "$TARGET_VERIFICATION_RUN_ID" == "$VALIDATED_RUN_ID" && "$TARGET_VERIFICATION_RUN_ID" =~ ^[0-9]{1,20}$ ]] || exit 1
+            [[ "$VALIDATED_SCHEMA" == 2 ]]
+            git cat-file -e "${TARGET_COMMIT}^{commit}"
+            git merge-base --is-ancestor "$TARGET_COMMIT" origin/main || exit 1
+          else
+          [[ "$PROVENANCE_MODE" == artifact-v2 ]] || exit 1
           [[ "$RELEASE_RUN_ID" == "$VALIDATED_RUN_ID" && "$RELEASE_RUN_ID" =~ ^[0-9]+$ ]] || exit 1
           run_json="$(gh api "repos/${GITHUB_REPOSITORY}/actions/runs/${RELEASE_RUN_ID}")"
           [[ "$(jq -r '.path' <<<"$run_json")" == '.github/workflows/deploy.yml' ]] || exit 1
@@ -471,6 +568,7 @@ jobs:
           [[ "$VALIDATED_SCHEMA" == "2" ]] || exit 1
           git merge-base --is-ancestor "$commit_sha" origin/main || exit 1
           if [[ "$INTENT" == "FORWARD" ]]; then [[ "$commit_sha" == "$main_sha" ]] || exit 1; fi
+          fi
       - name: Configure strict SSH trust
         shell: bash
         env:
@@ -504,6 +602,7 @@ jobs:
           IMAGE_DIGEST: ${{ needs.validate.outputs.image_digest }}
           RELEASE_SCHEMA: ${{ needs.validate.outputs.release_record_schema_version }}
           VERIFICATION_RUN_ID: ${{ needs.validate.outputs.verification_run_id }}
+          PROVENANCE_MODE: ${{ needs.validate.outputs.provenance_mode }}
           INTENT: ${{ inputs.intent }}
           TMPFS_BOOTSTRAP_ENABLED: ${{ vars.TMPFS_BOOTSTRAP_ENABLED }}
           TMPFS_ADMIN_PASSWORD_VERIFIER_VERSION_ID: ${{ vars.TMPFS_ADMIN_PASSWORD_VERIFIER_VERSION_ID }}
@@ -572,7 +671,8 @@ jobs:
           esac
 
           image_ref="ghcr.io/zwphhxx/kinvest@${IMAGE_DIGEST}"
-          provenance="{\"artifactSource\":\"ghcr-public\",\"releaseRecordSchemaVersion\":2,\"verificationRunId\":\"${VERIFICATION_RUN_ID}\"}"
+          [[ "$PROVENANCE_MODE" =~ ^(artifact-v2|state-reproof)$ ]]
+          provenance="{\"artifactSource\":\"ghcr-public\",\"provenanceMode\":\"${PROVENANCE_MODE}\",\"releaseRecordSchemaVersion\":2,\"verificationRunId\":\"${VERIFICATION_RUN_ID}\"}"
           registry='{"host":"ghcr.io","mode":"ghcr-public","repository":"ghcr.io/zwphhxx/kinvest"}'
           policy="{\"accessControlMode\":\"${KINVEST_ACCESS_CONTROL_MODE}\",\"schemaVersion\":1}"
           [[ "$policy" == '{"accessControlMode":"disabled","schemaVersion":1}' || \

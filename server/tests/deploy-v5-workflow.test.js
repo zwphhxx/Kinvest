@@ -5,7 +5,7 @@ const path = require('node:path')
 const { spawnSync } = require('node:child_process')
 
 const rootDir = path.resolve(__dirname, '../..')
-const workflow = fs.readFileSync(path.join(rootDir, '.github/workflows/deploy-production-v5-manual.yml'), 'utf8')
+  const workflow = fs.readFileSync(path.join(rootDir, '.github/workflows/deploy-production-v5-manual.yml'), 'utf8')
 
 function stepScript(name) {
   const lines = workflow.split('\n')
@@ -137,6 +137,7 @@ if (args[0] === 'api' && args[1].includes('/git/ref/heads/main')) {
         MOCK_RECORD: JSON.stringify(state.record),
         MOCK_RUN: JSON.stringify(state.run),
         PATH: `${bin}:${process.env.PATH}`,
+        PROVENANCE_MODE: 'artifact-v2',
         RELEASE_RUN_ID: state.releaseRunId,
         SECRET_SSH_SENTINEL: sentinel,
         VALIDATED_COMMIT: state.validatedCommit,
@@ -153,6 +154,18 @@ if (args[0] === 'api' && args[1].includes('/git/ref/heads/main')) {
 }
 
 async function run() {
+  assert.match(workflow, /provenance_mode:/)
+  assert.match(workflow, /artifact-v2/)
+  assert.match(workflow, /state-reproof/)
+  for (const input of ['target_digest', 'target_commit', 'target_verification_run_id']) {
+    assert.match(workflow, new RegExp(`${input}:`))
+  }
+  assert.match(workflow, /ROLLBACK_STATE_REPROOF/)
+  assert.match(workflow, /RESTORE_STATE_REPROOF/)
+  assert.match(workflow, /DEPLOY_V5_STATE_REPROOF_FORWARD_FORBIDDEN/)
+  assert.match(workflow, /git merge-base --is-ancestor "\$TARGET_COMMIT" origin\/main/)
+  const reproofSection = stepSection('Validate state reproof target')
+  assert.doesNotMatch(reproofSection, /gh run download|\/artifacts|release-record\.json/)
   const disabledJob = jobSection('deploy-disabled')
   const diagnosticJob = jobSection('deploy-diagnostic')
   assert.match(disabledJob, /environment: Production/)
@@ -181,6 +194,7 @@ async function run() {
   /** @type {Array<[string, (state: ReturnType<typeof provenanceState>) => void]>} */
   const mismatchCases = [
     ['run id', (state) => { state.validatedRunId = '124' }],
+    ['expired artifact', (state) => { state.artifacts.artifacts[0].expired = true }],
     ['run attempt', (state) => { state.run.run_attempt = 3 }],
     ['attempt', (state) => { state.record.verification_run_attempt = 3 }],
     ['conclusion', (state) => { state.run.conclusion = 'failure' }],
@@ -240,6 +254,7 @@ async function run() {
         DEPLOY_HOST: 'example.invalid', DEPLOY_PORT: '4334',
         DEPLOY_SHA: 'b'.repeat(40), IMAGE_DIGEST: `sha256:${'a'.repeat(64)}`,
         RELEASE_SCHEMA: '2', VERIFICATION_RUN_ID: '123', INTENT: 'FORWARD',
+        PROVENANCE_MODE: 'artifact-v2',
         TMPFS_BOOTSTRAP_ENABLED: 'true',
         TMPFS_ADMIN_PASSWORD_VERIFIER_VERSION_ID: 'v20260813-001',
         TMPFS_DEVICE_TOKEN_HMAC_VERSION_ID: 'v20260813-002',
@@ -261,7 +276,7 @@ async function run() {
     assert.equal(lines[1], 'FORWARD')
     assert.equal(lines[2], `ghcr.io/zwphhxx/kinvest@sha256:${'a'.repeat(64)}`)
     assert.equal(lines[3], 'b'.repeat(40))
-    assert.equal(lines[4], '{"artifactSource":"ghcr-public","releaseRecordSchemaVersion":2,"verificationRunId":"123"}')
+    assert.equal(lines[4], '{"artifactSource":"ghcr-public","provenanceMode":"artifact-v2","releaseRecordSchemaVersion":2,"verificationRunId":"123"}')
     assert.equal(lines[5], '{"host":"ghcr.io","mode":"ghcr-public","repository":"ghcr.io/zwphhxx/kinvest"}')
     assert.equal(lines[6], 'github-tmpfs-v1')
     assert.equal(lines[7], 'v20260813-001')
@@ -295,6 +310,7 @@ async function run() {
         DEPLOY_HOST: 'example.invalid', DEPLOY_PORT: '4334',
         DEPLOY_SHA: 'b'.repeat(40), IMAGE_DIGEST: `sha256:${'a'.repeat(64)}`,
         RELEASE_SCHEMA: '2', VERIFICATION_RUN_ID: '123', INTENT: 'FORWARD',
+        PROVENANCE_MODE: 'artifact-v2',
         TMPFS_BOOTSTRAP_ENABLED: 'true',
         TMPFS_ADMIN_PASSWORD_VERIFIER_VERSION_ID: 'v20260813-001',
         TMPFS_DEVICE_TOKEN_HMAC_VERSION_ID: 'v20260813-002',
