@@ -2,6 +2,7 @@
 set -euo pipefail
 umask 077
 exec 3>&2
+exec 2>/dev/null
 
 KINVEST_DEPLOY_PROTOCOL='5'
 BUNDLE_UID='0'
@@ -104,7 +105,9 @@ run_stable_command() {
   secure_temp stable_output "$RUN_ROOT/kinvest-v5.command-out.XXXXXX" || fail DEPLOY_V5_CAPTURE_FAILED
   secure_temp stable_error "$RUN_ROOT/kinvest-v5.command-err.XXXXXX" || { rm -f -- "$stable_output" 2>/dev/null; stable_output=''; fail DEPLOY_V5_CAPTURE_FAILED; }
   "$@" >"$stable_output" 2>"$stable_error" || status=$?
-  rm -f -- "$stable_output" "$stable_error"
+  if ! rm -f -- "$stable_output" "$stable_error" 2>/dev/null; then
+    fail DEPLOY_V5_CAPTURE_CLEANUP_FAILED
+  fi
   stable_output=''; stable_error=''
   [[ "$status" -eq 0 ]] || fail "$code"
 }
@@ -258,7 +261,7 @@ cleanup() {
   fi
   if [[ -e "$JOURNAL" ]]; then
     if ! reconcile_transaction_journal >/dev/null 2>&1; then
-      printf '%s\n' DEPLOY_V5_RECOVERY_FAILED >&2
+      printf '%s\n' DEPLOY_V5_RECOVERY_FAILED >&3
       status=70
       candidate_keep='true'
     fi
@@ -267,7 +270,10 @@ cleanup() {
     remove_tree_safe "$IFIND_BUNDLE_ROOT" "$candidate_ifind_id" >/dev/null 2>&1 || true
   fi
   for file in "$payload_file" "$prepared_file" "$current_json" "$previous_json" "$plan_file" "$target_file" "$candidate_state" "$candidate_state_text" "$stable_output" "$stable_error" "$candidate_registry"; do
-    safe_runtime_file "$file" && shred -u -z -- "$file" 2>/dev/null || true
+    if safe_runtime_file "$file"; then
+      shred -u -z -- "$file" 2>/dev/null || true
+      rm -f -- "$file" 2>/dev/null || true
+    fi
   done
   exit "$status"
 }
@@ -306,8 +312,7 @@ candidate_access_id="$(python3 -c 'import json,sys; print(json.load(sys.stdin)["
 candidate_access_path="$ACCESS_BUNDLE_ROOT/$candidate_access_id"
 candidate_ifind_id="$(python3 -c 'import json,sys; print(json.load(sys.stdin)["ifindId"])' 2>/dev/null <<<"$bundle_result")" || fail DEPLOY_V5_BUNDLE_CREATE_FAILED
 candidate_ifind_path="$IFIND_BUNDLE_ROOT/$candidate_ifind_id"
-rm -f -- "$candidate_registry" 2>/dev/null || fail DEPLOY_V5_CANDIDATE_REGISTRY_FAILED
-candidate_registry=''
+# REGISTRY_WINDOW_AFTER_ID_RECORD
 unset bundle_result
 
 if [[ "$candidate_access_id" == none ]]; then
@@ -539,7 +544,11 @@ mv -- "$candidate_state_text" "$candidate_state" 2>/dev/null || fail DEPLOY_V5_S
 candidate_state_text=''
 
 atomic_state_from_json "$current_json" "$BEFORE_STATE" before || fail DEPLOY_V5_STATE_WRITE_FAILED
+# REGISTRY_WINDOW_BEFORE_PREPARED_JOURNAL
 write_journal prepared || fail DEPLOY_V5_STATE_WRITE_FAILED
+# REGISTRY_WINDOW_AFTER_PREPARED_BEFORE_DELETE
+rm -f -- "$candidate_registry" 2>/dev/null || fail DEPLOY_V5_CANDIDATE_REGISTRY_FAILED
+candidate_registry=''
 atomic_state_from_text "$candidate_state" "$ATTEMPT_STATE" attempt || fail DEPLOY_V5_STATE_WRITE_FAILED
 transaction_started='true'
 # TRANSACTION_WINDOW_BEFORE_COMPOSE
@@ -563,9 +572,9 @@ write_journal state-committed || fail DEPLOY_V5_STATE_WRITE_FAILED
 if [[ "$intent" != RESTORE ]]; then
   atomic_state_from_text "$BEFORE_STATE" "$PREVIOUS_STATE" previous || fail DEPLOY_V5_STATE_WRITE_FAILED
 fi
-rm -f -- "$ATTEMPT_STATE"
+rm -f -- "$ATTEMPT_STATE" 2>/dev/null || fail DEPLOY_V5_JOURNAL_CLEANUP_FAILED
 prune_access_bundles || fail DEPLOY_V5_CLEANUP_PENDING 71
 prune_ifind_bundles || fail DEPLOY_V5_CLEANUP_PENDING 71
 candidate_keep='true'
-rm -f -- "$JOURNAL" "$BEFORE_STATE"
+rm -f -- "$JOURNAL" "$BEFORE_STATE" 2>/dev/null || fail DEPLOY_V5_JOURNAL_CLEANUP_FAILED
 printf 'KINVEST_DEPLOY_V5_OK intent=%s commit=%s ifind=%s\n' "$intent" "$target_commit" "$ifind_mode"

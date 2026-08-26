@@ -266,6 +266,18 @@ case "\${FAKE_FAILURE:-}:$target" in
 esac
 exec /bin/mv "$@"
 `)
+  writeExecutable(path.join(bin, 'rm'), `#!/usr/bin/env bash
+marker='${path.join(temp, 'rm-failure-consumed')}'
+all="$*"
+if [[ ! -e "$marker" ]]; then
+  case "\${FAKE_RM_FAILURE:-}:$all" in
+    capture-rm:*kinvest-v5.command-*) : >"$marker"; printf '%s\n' '${TOKEN}' 'rm: /private/capture/path' >&2; exit 96 ;;
+    cleanup-rm:*kinvest-v5.payload.*) : >"$marker"; printf '%s\n' '${TOKEN}' 'rm: /private/payload/path' >&2; exit 97 ;;
+    journal-rm:*deploy-v5.journal*) : >"$marker"; printf '%s\n' '${TOKEN}' 'rm: /private/journal/path' >&2; exit 98 ;;
+  esac
+fi
+exec /bin/rm "$@"
+`)
   writeExecutable(path.join(bin, 'curl'), '#!/bin/sh\nexit 0\n')
   writeExecutable(path.join(bin, 'timeout'), `#!/usr/bin/env bash
 while [[ "$#" -gt 0 ]]; do
@@ -434,6 +446,10 @@ async function run() {
   assert.match(source, /collect_referenced_bundle_ids/)
   assert.match(source, /verify_state_backup_references/)
   assert.match(source, /run_stable_command/)
+  assert.match(source, /exec 3>&2/)
+  assert.match(source, /exec 2>\/dev\/null/)
+  assert.ok(source.indexOf('write_journal prepared') < source.indexOf('rm -f -- "$candidate_registry"'),
+    'candidate registry must survive until prepared journal is durable')
   assert.match(source, /RESTORE/)
   assert.match(source, /ROLLBACK/)
   assert.match(source, /FORWARD/)
@@ -590,6 +606,33 @@ async function run() {
     } finally { cleanupHarness(interrupted) }
   }
 
+  for (const window of [
+    'HELPER_WINDOW_AFTER_SUCCESS_BEFORE_ID_RECORD',
+    'REGISTRY_WINDOW_AFTER_ID_RECORD',
+    'REGISTRY_WINDOW_BEFORE_PREPARED_JOURNAL',
+    'REGISTRY_WINDOW_AFTER_PREPARED_BEFORE_DELETE'
+  ]) {
+    const interrupted = makeHarness({ signalWindow: window, signalType: 'KILL' })
+    try {
+      const first = spawnSync(interrupted.executor, [], {
+        encoding: 'utf8', input: diagnosticPayload(),
+        env: { ...process.env, PATH: `${interrupted.bin}:${process.env.PATH}` }
+      })
+      assert.notEqual(first.status, 0, window)
+      fs.writeFileSync(interrupted.executor,
+        fs.readFileSync(interrupted.executor, 'utf8').replace(
+          new RegExp(`kill -KILL \\$\\$  # ${window}`), `:  # ${window}`
+        ), { mode: 0o755 })
+      const recovered = spawnSync(interrupted.executor, [], {
+        encoding: 'utf8', input: disabledPayload(),
+        env: { ...process.env, PATH: `${interrupted.bin}:${process.env.PATH}` }
+      })
+      assert.equal(recovered.status, 0, `${window}: ${recovered.stderr}`)
+      assert.deepEqual(fs.readdirSync(path.join(interrupted.runRoot, 'kinvest-ifind-secrets')), [])
+      assert.equal(fs.readdirSync(interrupted.runRoot).some(name => name.startsWith('kinvest-v5.candidates.')), false)
+    } finally { cleanupHarness(interrupted) }
+  }
+
   for (const [failure, expected] of [
     ['init-install', 'DEPLOY_V5_INITIALIZE_FAILED\n'],
     ['file-mktemp', 'DEPLOY_V5_PAYLOAD_FILE_FAILED\n'],
@@ -609,6 +652,31 @@ async function run() {
       assert.equal(result.stdout.includes(TOKEN) || result.stderr.includes(TOKEN), false, failure)
       assert.equal(result.stderr.includes('Traceback') || result.stderr.includes('/private/'), false, failure)
     } finally { cleanupHarness(operationFailure) }
+  }
+
+  for (const [failure, expected] of [
+    ['capture-rm', 'DEPLOY_V5_CAPTURE_CLEANUP_FAILED\n'],
+    ['cleanup-rm', 'DEPLOY_V5_IFIND_PREFLIGHT_FAILED\n'],
+    ['journal-rm', 'DEPLOY_V5_JOURNAL_CLEANUP_FAILED\n']
+  ]) {
+    const removalFailure = makeHarness()
+    try {
+      const env = {
+        ...process.env, PATH: `${removalFailure.bin}:${process.env.PATH}`,
+        FAKE_RM_FAILURE: failure,
+        ...(failure === 'cleanup-rm' ? { FAKE_FAILURE: 'ifind-preflight' } : {})
+      }
+      const result = spawnSync(removalFailure.executor, [], {
+        encoding: 'utf8', input: diagnosticPayload(), env
+      })
+      assert.notEqual(result.status, 0, failure)
+      assert.equal(result.stderr, expected, failure)
+      assert.equal(result.stdout.includes(TOKEN) || result.stderr.includes(TOKEN), false, failure)
+      assert.equal(result.stderr.includes('/private/') || result.stderr.includes('rm:'), false, failure)
+      const leftovers = fs.readdirSync(removalFailure.runRoot).filter(name =>
+        /^kinvest-v5\.(command-|payload\.|candidates\.)/.test(name))
+      assert.deepEqual(leftovers, [], `${failure}: ${leftovers.join(',')}`)
+    } finally { cleanupHarness(removalFailure) }
   }
 
   const observable = makeHarness()
