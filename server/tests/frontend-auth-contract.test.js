@@ -183,13 +183,14 @@ function assertAdminDeskContract() {
     'ifind-run'
   ]) assert.match(html, new RegExp(`id="${id}"`))
   assert.match(html, /官方剩余额度不可用/)
-  assert.match(script, /\/api\/admin\/ifind\/diagnostics/)
-  assert.match(script, /\/api\/admin\/ifind\/diagnostics\/run/)
-  assert.match(script, /renderIfindDiagnostic/)
+  const diagnosticSources = `${script}\n${adminContract}`
+  assert.match(diagnosticSources, /\/api\/admin\/ifind\/diagnostics/)
+  assert.match(diagnosticSources, /\/api\/admin\/ifind\/diagnostics\/run/)
+  assert.match(script, /createIfindDiagnosticController/)
   assert.match(script, /runAdminWrite\(/)
   assert.match(script, /sessionLifecycle\.beginRequest\(\)/)
-  assert.doesNotMatch(script, /setInterval|setTimeout\([^)]*ifind/i)
-  assert.doesNotMatch(script, /RequestId|refresh_token|access_token|providerMessage/)
+  assert.doesNotMatch(diagnosticSources, /setInterval|setTimeout\([^)]*ifind/i)
+  assert.doesNotMatch(diagnosticSources, /RequestId|refresh_token|access_token|providerMessage/)
   assert.match(adminContract, /createIfindDiagnosticView/)
   assert.match(adminContract, /ifindDiagnosticErrorMessage/)
 }

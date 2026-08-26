@@ -5,8 +5,6 @@
   const sessionLifecycle = adminContracts.createAdminSessionLifecycle()
   const bootstrapGate = adminContracts.createAdminBootstrapGate()
   const busy = new Set()
-  let ifindDiagnosticStatus = null
-  let ifindDiagnosticRunning = false
   const byId = (id) => document.getElementById(id)
 
   function setLive(message, tone = '') {
@@ -106,9 +104,7 @@
     byId('pending-requests').replaceChildren()
     byId('approved-devices').replaceChildren()
     byId('auth-audit').replaceChildren()
-    ifindDiagnosticStatus = null
-    ifindDiagnosticRunning = false
-    renderIfindDiagnostic(null)
+    ifindController.reset()
   }
 
   function showLogin(message = '') {
@@ -278,70 +274,19 @@
     }
   }
 
-  function renderIfindDiagnostic(status) {
-    const view = adminContracts.createIfindDiagnosticView(status, {
-      running: ifindDiagnosticRunning,
-      now: Date.now()
-    })
-    byId('ifind-enabled').textContent = view.enabledLabel
-    byId('ifind-version-id').textContent = view.versionId
-    byId('ifind-last-run').textContent = view.lastRunAt === null ? '尚未执行' : dateText(view.lastRunAt)
-    byId('ifind-request-count').textContent = view.requestCount
-    byId('ifind-elapsed').textContent = view.elapsed
-    byId('ifind-data-vol').textContent = view.dataVol
-    byId('ifind-completeness').textContent = view.completeness
-    byId('ifind-local-attempt').textContent = view.localAttempt
-    byId('ifind-cooldown').textContent = view.cooldownUntil && view.cooldownUntil > Date.now()
-      ? `至 ${dateText(view.cooldownUntil)}`
-      : '未冷却'
-    byId('ifind-official-quota').textContent = view.officialQuota
-    byId('ifind-diagnostic-note').textContent = view.errorMessage ||
-      '只执行固定的认证与交易日探针，不查询证券或财务数据。'
-
-    for (const [id, stage] of [
-      ['ifind-auth-stage', view.authStage],
-      ['ifind-probe-stage', view.probeStage]
-    ]) {
-      const node = byId(id)
-      node.textContent = stage.label
-      node.parentElement.dataset.tone = stage.tone
-    }
-
-    const button = /** @type {HTMLButtonElement} */ (byId('ifind-run'))
-    button.textContent = view.run.label
-    button.disabled = view.run.disabled
-    button.dataset.tone = view.run.tone
-    button.setAttribute('aria-busy', String(ifindDiagnosticRunning))
-  }
-
-  async function loadIfindDiagnostic(signal) {
-    try {
-      const payload = await api('/api/admin/ifind/diagnostics', { signal })
-      return payload.data
-    } catch (error) {
-      if (error.code === 'IFIND_DIAGNOSTIC_DISABLED') return null
-      if (error.code === 'ADMIN_AUTH_REQUIRED' || error.name === 'AbortError' ||
-        error.message === 'ADMIN_EPOCH_STALE') throw error
-      return Object.freeze({ mode: 'unavailable' })
-    }
-  }
-
   async function refreshLists() {
     const ticket = sessionLifecycle.beginRequest()
     try {
       const requestOptions = { signal: ticket.signal }
-      const [pending, devices, audit, ifindDiagnostic] = await Promise.all([
+      const [pending, devices, audit] = await Promise.all([
         api('/api/admin/device-requests', requestOptions),
         api('/api/admin/devices', requestOptions),
-        api('/api/admin/audit', requestOptions),
-        loadIfindDiagnostic(ticket.signal)
+        api('/api/admin/audit', requestOptions)
       ])
       sessionLifecycle.commit(ticket, () => {
         renderPending(pending.data)
         renderDevices(devices.data)
         renderAudit(audit.data || {})
-        ifindDiagnosticStatus = ifindDiagnostic
-        renderIfindDiagnostic(ifindDiagnosticStatus)
       })
     } catch (error) {
       if (error.name === 'AbortError' || error.message === 'ADMIN_EPOCH_STALE') return
@@ -349,50 +294,19 @@
     } finally {
       sessionLifecycle.finishRequest(ticket)
     }
+    await ifindController.refresh()
   }
 
-  byId('ifind-run').addEventListener('click', async () => {
-    const button = /** @type {HTMLButtonElement} */ (byId('ifind-run'))
-    if (ifindDiagnosticRunning || button.disabled) return
-    ifindDiagnosticRunning = true
-    renderIfindDiagnostic(ifindDiagnosticStatus)
-    try {
-      await runAdminWrite(
-        (signal) => api('/api/admin/ifind/diagnostics/run', {
-          method: 'POST', body: {}, csrf: true, signal
-        }),
-        async (result) => {
-          const message = result.data && result.data.status === 'completed'
-            ? 'iFinD 双级诊断已完成。'
-            : adminContracts.ifindDiagnosticErrorMessage(result.data && result.data.safeErrorClass)
-          setLive(message, result.data && result.data.status === 'completed' ? 'success' : 'error')
-          await refreshLists()
-        }
-      )
-    } catch (error) {
-      if (String(error.code).startsWith('IFIND_DIAGNOSTIC_')) {
-        setLive(adminContracts.ifindDiagnosticErrorMessage(error.code), 'error')
-        try {
-          const ticket = sessionLifecycle.beginRequest()
-          try {
-            const status = await loadIfindDiagnostic(ticket.signal)
-            sessionLifecycle.commit(ticket, () => { ifindDiagnosticStatus = status })
-          } finally {
-            sessionLifecycle.finishRequest(ticket)
-          }
-        } catch (refreshError) {
-          if (refreshError.name !== 'AbortError' && refreshError.message !== 'ADMIN_EPOCH_STALE') {
-            await handleError(refreshError)
-          }
-        }
-      } else {
-        await handleError(error)
-      }
-    } finally {
-      ifindDiagnosticRunning = false
-      renderIfindDiagnostic(ifindDiagnosticStatus)
-    }
+  const ifindController = adminContracts.createIfindDiagnosticController({
+    document,
+    sessionLifecycle,
+    request: api,
+    dateText,
+    now: () => Date.now(),
+    setLive,
+    onError: handleError
   })
+  ifindController.bind()
 
   byId('admin-login-form').addEventListener('submit', async (event) => {
     event.preventDefault()
