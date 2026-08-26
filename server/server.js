@@ -415,11 +415,11 @@ function createRequestHandler({
   }
   const authHttp = createAuthHttpController({
     accessRuntime,
+    ifindDiagnosticRuntime,
     now,
     publicOrigin,
     trustedProxyAddresses
   })
-  void ifindDiagnosticRuntime
   return async (req, res) => {
     try {
       const urlObj = new URL(req.url, `http://localhost:${PORT}`)

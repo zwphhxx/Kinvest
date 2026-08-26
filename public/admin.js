@@ -54,7 +54,9 @@
     })
     const payload = await response.json().catch(() => ({}))
     if (!response.ok) {
-      const failure = contracts.classifyApiFailure(response.status, payload)
+      const failure = path.startsWith('/api/admin/ifind/diagnostics')
+        ? adminContracts.ifindDiagnosticApiFailure(response.status, payload)
+        : contracts.classifyApiFailure(response.status, payload)
       throw Object.assign(new Error('ADMIN_REQUEST_FAILED'), {
         ...failure,
         status: response.status
@@ -102,6 +104,7 @@
     byId('pending-requests').replaceChildren()
     byId('approved-devices').replaceChildren()
     byId('auth-audit').replaceChildren()
+    ifindController.reset()
   }
 
   function showLogin(message = '') {
@@ -291,7 +294,19 @@
     } finally {
       sessionLifecycle.finishRequest(ticket)
     }
+    await ifindController.refresh()
   }
+
+  const ifindController = adminContracts.createIfindDiagnosticController({
+    document,
+    sessionLifecycle,
+    request: api,
+    dateText,
+    now: () => Date.now(),
+    setLive,
+    onError: handleError
+  })
+  ifindController.bind()
 
   byId('admin-login-form').addEventListener('submit', async (event) => {
     event.preventDefault()

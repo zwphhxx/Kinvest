@@ -34,6 +34,49 @@
 
     <section id="admin-desk" class="hidden" aria-label="家庭设备审批管理">
       <div class="admin-grid">
+        <section id="ifind-diagnostic" class="admin-panel admin-panel-wide ifind-diagnostic" aria-labelledby="ifind-diagnostic-title">
+          <div class="ifind-diagnostic-head">
+            <div>
+              <p class="ticket-label">iFinD / Admin only</p>
+              <h2 id="ifind-diagnostic-title">管理员诊断</h2>
+              <p id="ifind-mock-boundary" class="ifind-boundary">家庭看板仍为 Mock；此处结果不会进入家人的投资页面。</p>
+            </div>
+            <p class="ifind-enabled-badge">诊断能力 <strong id="ifind-enabled">未启用</strong></p>
+          </div>
+
+          <div id="ifind-diagnostic-stages" class="ifind-stage-line" aria-label="iFinD 双级诊断状态">
+            <div class="ifind-stage-node" data-tone="idle">
+              <span class="ifind-stage-index" aria-hidden="true">01</span>
+              <span>访问令牌认证</span>
+              <strong id="ifind-auth-stage">认证尚未运行</strong>
+            </div>
+            <div class="ifind-stage-node" data-tone="idle">
+              <span class="ifind-stage-index" aria-hidden="true">02</span>
+              <span>交易日探针</span>
+              <strong id="ifind-probe-stage">交易日探针尚未运行</strong>
+            </div>
+          </div>
+
+          <dl class="ifind-metrics">
+            <div><dt>当前 VersionId</dt><dd id="ifind-version-id">未配置</dd></div>
+            <div><dt>最近执行</dt><dd id="ifind-last-run">尚未执行</dd></div>
+            <div><dt>请求次数</dt><dd id="ifind-request-count">—</dd></div>
+            <div><dt>总耗时</dt><dd id="ifind-elapsed">—</dd></div>
+            <div><dt>数据量</dt><dd id="ifind-data-vol">—</dd></div>
+            <div><dt>完整度</dt><dd id="ifind-completeness">尚无结果</dd></div>
+            <div><dt>本地尝试</dt><dd id="ifind-local-attempt">0 / 20</dd></div>
+            <div><dt>冷却状态</dt><dd id="ifind-cooldown">未冷却</dd></div>
+          </dl>
+
+          <div class="ifind-diagnostic-actions">
+            <div>
+              <p id="ifind-official-quota" class="ifind-quota-note">官方剩余额度不可用</p>
+              <p id="ifind-diagnostic-note" class="admin-meta">只执行固定的认证与交易日探针，不查询证券或财务数据。</p>
+            </div>
+            <button id="ifind-run" class="auth-primary" type="button" disabled>诊断未启用</button>
+          </div>
+        </section>
+
         <section class="admin-panel">
           <p class="ticket-label">Pending</p>
           <h2>待审批申请</h2>

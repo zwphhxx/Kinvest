@@ -23,6 +23,11 @@ async function run() {
     createAdminBootstrapGate,
     createAdminSessionLifecycle,
     createAdminSecurityState,
+    createIfindDiagnosticController,
+    createIfindDiagnosticView,
+    ifindDiagnosticApiFailure,
+    ifindDiagnosticErrorMessage,
+    ifindDiagnosticSafeErrorClasses,
     logoutFailureDecision,
     mutationFailureDecision
   } = require('../../public/admin-contract')
@@ -285,6 +290,323 @@ async function run() {
     refresh: false,
     replay: false
   })
+
+  const now = Date.UTC(2026, 7, 26, 4, 0, 0)
+  const latest = {
+    startedAt: now - 220,
+    completedAt: now - 100,
+    authStatus: 'success',
+    probeStatus: 'success',
+    safeErrorClass: null,
+    route: '/api/v1/get_trade_dates',
+    scope: 'market-trade-dates:212001:D:-10',
+    requestCount: 2,
+    dataVol: 7,
+    elapsedMs: 120,
+    completeness: 'complete',
+    tokenVersionId: 'v20260826-001',
+    officialQuotaStatus: 'unavailable'
+  }
+  const readyDiagnostic = createIfindDiagnosticView({
+    mode: 'admin-diagnostic',
+    configured: true,
+    tokenVersionId: 'v20260826-001',
+    officialQuotaStatus: 'unavailable',
+    cooldownUntil: null,
+    localAttemptCount: 3,
+    latest
+  }, { running: false, now })
+  assert.deepEqual(readyDiagnostic.authStage, { label: '认证通过', tone: 'success' })
+  assert.deepEqual(readyDiagnostic.probeStage, { label: '交易日探针通过', tone: 'success' })
+  assert.equal(readyDiagnostic.enabledLabel, '已启用')
+  assert.equal(readyDiagnostic.versionId, 'v20260826-001')
+  assert.equal(readyDiagnostic.requestCount, '2 次')
+  assert.equal(readyDiagnostic.elapsed, '120 ms')
+  assert.equal(readyDiagnostic.dataVol, '7 条')
+  assert.equal(readyDiagnostic.completeness, '完整')
+  assert.equal(readyDiagnostic.localAttempt, '3 / 20')
+  assert.equal(readyDiagnostic.officialQuota, '官方剩余额度不可用')
+  assert.deepEqual(readyDiagnostic.run, {
+    disabled: false,
+    label: '运行双级诊断',
+    tone: 'ready'
+  })
+
+  assert.deepEqual(createIfindDiagnosticView(null, { running: false, now }).run, {
+    disabled: true,
+    label: '诊断未启用',
+    tone: 'disabled'
+  })
+  assert.deepEqual(createIfindDiagnosticView({
+    mode: 'admin-diagnostic', configured: true, tokenVersionId: 'v20260826-001',
+    officialQuotaStatus: 'unavailable', cooldownUntil: null, localAttemptCount: 1, latest: null
+  }, { running: true, now }).run, {
+    disabled: true,
+    label: '正在运行双级诊断…',
+    tone: 'running'
+  })
+  assert.deepEqual(createIfindDiagnosticView({
+    mode: 'admin-diagnostic', configured: true, tokenVersionId: 'v20260826-001',
+    officialQuotaStatus: 'unavailable', cooldownUntil: now + 60_000, localAttemptCount: 4, latest
+  }, { running: false, now }).run, {
+    disabled: true,
+    label: '冷却中，稍后再试',
+    tone: 'cooldown'
+  })
+  assert.deepEqual(createIfindDiagnosticView({
+    mode: 'admin-diagnostic', configured: true, tokenVersionId: 'v20260826-001',
+    officialQuotaStatus: 'unavailable', cooldownUntil: null, localAttemptCount: 20, latest
+  }, { running: false, now }).run, {
+    disabled: true,
+    label: '今日本地诊断已达上限',
+    tone: 'daily-limit'
+  })
+
+  const failedDiagnostic = createIfindDiagnosticView({
+    mode: 'admin-diagnostic', configured: true, tokenVersionId: 'v20260826-002',
+    officialQuotaStatus: 'unavailable', cooldownUntil: now + 60_000, localAttemptCount: 5,
+    latest: {
+      ...latest,
+      authStatus: 'failed', probeStatus: 'not_run', safeErrorClass: 'AUTH',
+      requestCount: 1, dataVol: null, completeness: 'unavailable'
+    }
+  }, { running: false, now })
+  assert.deepEqual(failedDiagnostic.authStage, { label: '认证未通过', tone: 'failed' })
+  assert.deepEqual(failedDiagnostic.probeStage, { label: '交易日探针未运行', tone: 'idle' })
+  assert.equal(failedDiagnostic.errorMessage, '认证阶段未通过，请核对管理员维护的凭据配置。')
+  assert.equal(ifindDiagnosticErrorMessage('PERMISSION'), '交易日探针未获授权，请核对 iFinD 权限范围。')
+  assert.equal(ifindDiagnosticErrorMessage('raw provider text'), '诊断未完成，请根据阶段状态检查配置后重试。')
+  const diagnosticErrorMessages = {
+    AUTH: '认证阶段未通过，请核对管理员维护的凭据配置。',
+    PERMISSION: '交易日探针未获授权，请核对 iFinD 权限范围。',
+    QUOTA: 'iFinD 侧额度不足，官方剩余额度仍不可用。',
+    NETWORK: '无法连接 iFinD 服务，请稍后重试。',
+    API: 'iFinD 接口未返回可用结果，请稍后重试。',
+    CONFIG: '诊断配置未就绪，请检查管理员配置。',
+    BUSY: '已有一项诊断正在运行，请稍后再试。',
+    RATE_LIMITED: '诊断受到本地频率限制，请稍后重试。'
+  }
+  assert.deepEqual(
+    [...ifindDiagnosticSafeErrorClasses()].sort(),
+    Object.keys(diagnosticErrorMessages).sort()
+  )
+  for (const [code, message] of Object.entries(diagnosticErrorMessages)) {
+    assert.equal(ifindDiagnosticErrorMessage(code), message)
+  }
+  for (const impossibleCode of ['TIMEOUT', 'RESPONSE_FORMAT', 'INTERNAL']) {
+    assert.equal(
+      ifindDiagnosticErrorMessage(impossibleCode),
+      '诊断未完成，请根据阶段状态检查配置后重试。'
+    )
+  }
+  assert.equal(
+    ifindDiagnosticApiFailure(401, { error: 'ADMIN_AUTH_REQUIRED' }).code,
+    'ADMIN_AUTH_REQUIRED'
+  )
+  assert.equal(
+    ifindDiagnosticApiFailure(403, { error: 'ADMIN_CSRF_INVALID' }).code,
+    'ADMIN_CSRF_INVALID'
+  )
+  const unavailableDiagnostic = createIfindDiagnosticView(
+    { mode: 'unavailable' },
+    { running: false, now }
+  )
+  assert.equal(unavailableDiagnostic.enabledLabel, '状态不可用')
+  assert.equal(unavailableDiagnostic.errorMessage, '暂时无法读取诊断状态，设备审批功能不受影响。')
+  assert.deepEqual(unavailableDiagnostic.run, {
+    disabled: true,
+    label: '诊断状态不可用',
+    tone: 'disabled'
+  })
+
+  class FakeElement {
+    constructor(id) {
+      this.id = id
+      this._textContent = ''
+      this.disabled = false
+      this.dataset = {}
+      this.attributes = new Map()
+      this.listeners = new Map()
+      this.parentElement = { dataset: {} }
+      this.tabIndex = 0
+      this.innerHtmlWrites = 0
+    }
+
+    get textContent() { return this._textContent }
+    set textContent(value) { this._textContent = String(value) }
+    set innerHTML(_value) { this.innerHtmlWrites += 1 }
+    setAttribute(name, value) { this.attributes.set(name, String(value)) }
+    addEventListener(name, handler) { this.listeners.set(name, handler) }
+    click() {
+      const handler = this.listeners.get('click')
+      return handler ? handler({ preventDefault() {} }) : undefined
+    }
+  }
+
+  function diagnosticDom() {
+    const ids = [
+      'ifind-enabled', 'ifind-version-id', 'ifind-last-run', 'ifind-request-count',
+      'ifind-elapsed', 'ifind-data-vol', 'ifind-completeness', 'ifind-local-attempt',
+      'ifind-cooldown', 'ifind-official-quota', 'ifind-diagnostic-note',
+      'ifind-auth-stage', 'ifind-probe-stage', 'ifind-run',
+      'pending-requests', 'approved-devices', 'auth-audit'
+    ]
+    const elements = Object.fromEntries(ids.map((id) => [id, new FakeElement(id)]))
+    return {
+      elements,
+      document: { getElementById: (id) => elements[id] || null }
+    }
+  }
+
+  function abortableDeferredRequest() {
+    const pending = deferred()
+    return {
+      pending,
+      request(_path, options) {
+        return new Promise((resolve, reject) => {
+          const abort = () => reject(Object.assign(new Error('aborted'), { name: 'AbortError' }))
+          if (options.signal.aborted) return abort()
+          options.signal.addEventListener('abort', abort, { once: true })
+          pending.promise.then(resolve, reject)
+        })
+      }
+    }
+  }
+
+  const maliciousDom = diagnosticDom()
+  const maliciousLifecycle = createAdminSessionLifecycle()
+  maliciousLifecycle.activate()
+  const maliciousController = createIfindDiagnosticController({
+    document: maliciousDom.document,
+    sessionLifecycle: maliciousLifecycle,
+    request: async () => ({ data: null }),
+    dateText: (value) => String(value),
+    now: () => now,
+    setLive() {},
+    onError: async () => {}
+  })
+  maliciousController.render({
+    mode: 'admin-diagnostic', configured: true,
+    tokenVersionId: '<img src=x onerror=alert(1)>',
+    officialQuotaStatus: 'unavailable', cooldownUntil: null, localAttemptCount: 1,
+    latest: { ...latest, safeErrorClass: '<svg onload=alert(1)>' }
+  })
+  assert.equal(maliciousDom.elements['ifind-version-id'].textContent, '未配置')
+  assert.equal(maliciousDom.elements['ifind-diagnostic-note'].textContent.includes('<svg'), false)
+  assert.equal(
+    Object.values(maliciousDom.elements).every((element) => element.innerHtmlWrites === 0),
+    true
+  )
+
+  const isolatedDom = diagnosticDom()
+  isolatedDom.elements['pending-requests'].textContent = '等待审批内容'
+  isolatedDom.elements['approved-devices'].textContent = '设备内容'
+  isolatedDom.elements['auth-audit'].textContent = '审计内容'
+  const isolatedLifecycle = createAdminSessionLifecycle()
+  isolatedLifecycle.activate()
+  const isolatedController = createIfindDiagnosticController({
+    document: isolatedDom.document,
+    sessionLifecycle: isolatedLifecycle,
+    request: async () => { throw Object.assign(new Error('network'), { code: 'UNKNOWN' }) },
+    dateText: (value) => String(value),
+    now: () => now,
+    setLive() {},
+    onError: async () => {}
+  })
+  await isolatedController.refresh()
+  assert.equal(isolatedDom.elements['pending-requests'].textContent, '等待审批内容')
+  assert.equal(isolatedDom.elements['approved-devices'].textContent, '设备内容')
+  assert.equal(isolatedDom.elements['auth-audit'].textContent, '审计内容')
+  assert.equal(isolatedDom.elements['ifind-enabled'].textContent, '状态不可用')
+
+  const abortDom = diagnosticDom()
+  const abortLifecycle = createAdminSessionLifecycle()
+  abortLifecycle.activate()
+  const abortRequest = abortableDeferredRequest()
+  const abortCalls = []
+  const abortController = createIfindDiagnosticController({
+    document: abortDom.document,
+    sessionLifecycle: abortLifecycle,
+    request(path, options) {
+      abortCalls.push({ path, options })
+      return abortRequest.request(path, options)
+    },
+    dateText: (value) => String(value),
+    now: () => now,
+    setLive() {},
+    onError: async () => {}
+  })
+  abortController.render({
+    mode: 'admin-diagnostic', configured: true, tokenVersionId: 'v20260826-001',
+    officialQuotaStatus: 'unavailable', cooldownUntil: null, localAttemptCount: 1, latest
+  })
+  abortController.bind()
+  const abortedRun = abortDom.elements['ifind-run'].click()
+  assert.equal(abortCalls.length, 1)
+  assert.equal(abortCalls[0].path, '/api/admin/ifind/diagnostics/run')
+  assert.equal(abortCalls[0].options.signal.aborted, false)
+  assert.equal(abortDom.elements['ifind-run'].disabled, true)
+  assert.equal(abortDom.elements['ifind-run'].attributes.get('aria-busy'), 'true')
+  const textAtLogout = abortDom.elements['ifind-diagnostic-note'].textContent
+  abortLifecycle.invalidate()
+  abortController.reset()
+  const textAfterReset = abortDom.elements['ifind-diagnostic-note'].textContent
+  await abortedRun
+  assert.equal(abortCalls.length, 1, 'logout must prevent the follow-up status request')
+  assert.equal(abortDom.elements['ifind-diagnostic-note'].textContent, textAfterReset)
+  assert.notEqual(textAtLogout, undefined)
+
+  const csrfDom = diagnosticDom()
+  const csrfLifecycle = createAdminSessionLifecycle()
+  csrfLifecycle.activate()
+  const csrfCalls = []
+  let csrfErrors = 0
+  const csrfController = createIfindDiagnosticController({
+    document: csrfDom.document,
+    sessionLifecycle: csrfLifecycle,
+    request: async (path) => {
+      csrfCalls.push(path)
+      throw Object.assign(new Error('csrf'), { code: 'ADMIN_CSRF_INVALID' })
+    },
+    dateText: (value) => String(value),
+    now: () => now,
+    setLive() {},
+    onError: async () => { csrfErrors += 1 }
+  })
+  csrfController.render({
+    mode: 'admin-diagnostic', configured: true, tokenVersionId: 'v20260826-001',
+    officialQuotaStatus: 'unavailable', cooldownUntil: null, localAttemptCount: 1, latest
+  })
+  csrfController.bind()
+  await csrfDom.elements['ifind-run'].click()
+  assert.deepEqual(csrfCalls, ['/api/admin/ifind/diagnostics/run'])
+  assert.equal(csrfErrors, 1)
+
+  const runningDom = diagnosticDom()
+  const runningLifecycle = createAdminSessionLifecycle()
+  runningLifecycle.activate()
+  const runningRequest = abortableDeferredRequest()
+  const runningController = createIfindDiagnosticController({
+    document: runningDom.document,
+    sessionLifecycle: runningLifecycle,
+    request: runningRequest.request,
+    dateText: (value) => String(value),
+    now: () => now,
+    setLive() {},
+    onError: async () => {}
+  })
+  runningController.render({
+    mode: 'admin-diagnostic', configured: true, tokenVersionId: 'v20260826-001',
+    officialQuotaStatus: 'unavailable', cooldownUntil: null, localAttemptCount: 1, latest
+  })
+  runningController.bind()
+  assert.equal(runningDom.elements['ifind-run'].disabled, false)
+  assert.equal(runningDom.elements['ifind-run'].tabIndex, 0)
+  const runningPromise = runningDom.elements['ifind-run'].click()
+  assert.equal(runningDom.elements['ifind-run'].disabled, true)
+  assert.equal(runningDom.elements['ifind-run'].textContent, '正在运行双级诊断…')
+  runningLifecycle.invalidate()
+  await runningPromise
 }
 
 module.exports = { run }
