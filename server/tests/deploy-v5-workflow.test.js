@@ -37,7 +37,7 @@ function jobSection(name) {
   assert.notEqual(start, -1, `missing job ${name}`)
   let end = lines.length
   for (let index = start + 1; index < lines.length; index += 1) {
-    if (/^  [a-zA-Z0-9_-]+:$/.test(lines[index])) { end = index; break }
+    if (/^ {2}[a-zA-Z0-9_-]+:$/.test(lines[index])) { end = index; break }
   }
   return lines.slice(start, end).join('\n')
 }
@@ -170,7 +170,7 @@ async function run() {
       assert.match(section.slice(revalidate), new RegExp(evidence.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')), `${name} ${evidence}`)
     }
   }
-  assert.doesNotMatch(workflow, /^  deploy:$/m)
+  assert.doesNotMatch(workflow, /^ {2}deploy:$/m)
 
   const provenanceScripts = ['deploy-disabled', 'deploy-diagnostic'].map((job) =>
     jobStepScript(job, 'Revalidate full release provenance after approval'))
@@ -330,8 +330,8 @@ async function run() {
     assert.match(workflow, /TMPFS_IFIND_REFRESH_TOKEN_VERSION_ID/)
     assert.doesNotMatch(workflow, /pull_request_target|permissions:\s*write-all/)
     assert.doesNotMatch(workflow, /\$GITHUB_ENV/)
-    assert.match(workflow, /^on:\n  workflow_dispatch:/m)
-    assert.doesNotMatch(workflow, /^  (push|pull_request|schedule):/m)
+    assert.match(workflow, /^on:\n {2}workflow_dispatch:/m)
+    assert.doesNotMatch(workflow, /^ {2}(push|pull_request|schedule):/m)
     for (const use of workflow.matchAll(/uses:\s*[^@\s]+@([^\s]+)/g)) {
       assert.match(use[1], /^[0-9a-f]{40}$/)
     }
@@ -340,7 +340,7 @@ async function run() {
 
     const prWorkflow = fs.readFileSync(path.join(rootDir, '.github/workflows/deploy.yml'), 'utf8')
     const securityJob = prWorkflow.slice(prWorkflow.indexOf('  security:'), prWorkflow.indexOf('  container-build:'))
-    assert.match(securityJob, /permissions:\n      contents: read/)
+    assert.match(securityJob, /permissions:\n {6}contents: read/)
     assert.doesNotMatch(securityJob, /environment:|secrets\./)
     assert.match(securityJob, /name: Verify isolated deploy-v5 sudoers semantics/)
     assert.match(securityJob, /KINVEST_RUN_SUDOERS_INTEGRATION: ['"]1['"]/)

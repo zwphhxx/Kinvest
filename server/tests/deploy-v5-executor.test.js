@@ -620,7 +620,9 @@ function cleanupHarness(harness) {
     const fullRoot = path.join(harness.runRoot, bundleRoot)
     if (fs.existsSync(fullRoot)) {
       for (const name of fs.readdirSync(fullRoot)) {
-        try { fs.chmodSync(path.join(fullRoot, name), 0o700) } catch {}
+        try { fs.chmodSync(path.join(fullRoot, name), 0o700) } catch {
+          // Best-effort permission repair; recursive forced cleanup below remains authoritative.
+        }
       }
     }
   }
@@ -1125,6 +1127,7 @@ module.materialize(sys.argv[2], sys.argv[3], sys.argv[4], sys.argv[5],
     for (const signal of ['SIGTERM', 'SIGKILL']) {
       const gap = makeHarness()
       let gapChild
+      let cleanupError = null
       try {
         const protectedFinal = path.join(gap.root, 'backups', `preexisting-final-${signal}.sqlite`)
         const manualBackup = path.join(gap.root, 'backups', `manual-${signal}.sqlite`)
@@ -1175,11 +1178,16 @@ module.materialize(sys.argv[2], sys.argv[3], sys.argv[4], sys.argv[5],
       } finally {
         if (gapChild && gapChild.exitCode === null) {
           try { process.kill(-gapChild.pid, 'SIGKILL') } catch (error) {
-            if (error.code !== 'ESRCH') throw error
+            if (error.code !== 'ESRCH') cleanupError = error
           }
         }
-        cleanupHarness(gap)
+        try {
+          cleanupHarness(gap)
+        } catch (error) {
+          cleanupError ??= error
+        }
       }
+      if (cleanupError) throw cleanupError
     }
   }
 
