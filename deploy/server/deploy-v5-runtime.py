@@ -17,6 +17,7 @@ from pathlib import PurePosixPath
 TMPFS_MAGIC = 0x01021994
 VERSION_PATTERN = __import__('re').compile(r'^v[0-9]{8}-[0-9]{3}$')
 BUNDLE_ID_PATTERN = __import__('re').compile(r'^[0-9a-f]{32}$')
+REGISTRY_NAME_PATTERN = __import__('re').compile(r'^kinvest-v5\.candidates\.[A-Za-z0-9]+$')
 
 
 class RuntimeErrorCode(Exception):
@@ -96,21 +97,81 @@ def remove_candidate(root_fd: int, bundle_id: str) -> None:
     os.rmdir(bundle_id, dir_fd=root_fd)
 
 
-def create_candidate(root_fd: int, uid: int, gid: int) -> tuple[str, int]:
+def write_registry(path: str, run_root: str, value: dict[str, str], uid: int, gid: int) -> None:
+    if PurePosixPath(path).parent != PurePosixPath(run_root) or REGISTRY_NAME_PATTERN.fullmatch(PurePosixPath(path).name) is None:
+        raise RuntimeErrorCode('DEPLOY_V5_CANDIDATE_REGISTRY_INVALID')
+    temporary = f'{path}.tmp.{secrets.token_hex(8)}'
+    fd = -1
+    try:
+        fd = os.open(temporary, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW, 0o600)
+        os.fchmod(fd, 0o600)
+        os.fchown(fd, uid, gid)
+        payload = (json.dumps(value, separators=(',', ':'), sort_keys=True) + '\n').encode('ascii')
+        os.write(fd, payload)
+        os.fsync(fd)
+        os.close(fd)
+        fd = -1
+        os.replace(temporary, path)
+        parent_fd = os.open(run_root, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW)
+        try: os.fsync(parent_fd)
+        finally: os.close(parent_fd)
+    finally:
+        if fd >= 0: os.close(fd)
+        try: os.unlink(temporary)
+        except FileNotFoundError: pass
+
+
+def read_registry(path: str, run_root: str, uid: int, gid: int) -> dict[str, str]:
+    if PurePosixPath(path).parent != PurePosixPath(run_root) or REGISTRY_NAME_PATTERN.fullmatch(PurePosixPath(path).name) is None:
+        raise RuntimeErrorCode('DEPLOY_V5_CANDIDATE_REGISTRY_INVALID')
+    fd = os.open(path, os.O_RDONLY | os.O_NOFOLLOW)
+    try:
+        info = os.fstat(fd)
+        if not stat.S_ISREG(info.st_mode) or info.st_nlink != 1 or info.st_uid != uid or info.st_gid != gid or stat.S_IMODE(info.st_mode) != 0o600:
+            raise RuntimeErrorCode('DEPLOY_V5_CANDIDATE_REGISTRY_INVALID')
+        raw = os.read(fd, 513)
+        if len(raw) > 512: raise RuntimeErrorCode('DEPLOY_V5_CANDIDATE_REGISTRY_INVALID')
+        value = json.loads(raw)
+        if set(value) != {'accessId', 'ifindId'}: raise RuntimeErrorCode('DEPLOY_V5_CANDIDATE_REGISTRY_INVALID')
+        for item in value.values():
+            if item != 'none' and BUNDLE_ID_PATTERN.fullmatch(item) is None:
+                raise RuntimeErrorCode('DEPLOY_V5_CANDIDATE_REGISTRY_INVALID')
+        return value
+    except (OSError, ValueError, TypeError) as error:
+        raise RuntimeErrorCode('DEPLOY_V5_CANDIDATE_REGISTRY_INVALID') from error
+    finally:
+        os.close(fd)
+
+
+def create_candidate(root_fd: int, uid: int, gid: int, registry_path: str,
+                     run_root: str, registry: dict[str, str], field: str,
+                     registry_uid: int, registry_gid: int) -> tuple[str, int]:
     bundle_id = secrets.token_hex(16)
-    os.mkdir(bundle_id, 0o700, dir_fd=root_fd)
-    candidate_fd = os.open(bundle_id, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW, dir_fd=root_fd)
-    os.fchmod(candidate_fd, 0o700)
-    os.fchown(candidate_fd, uid, gid)
-    candidate = os.fstat(candidate_fd)
-    root = os.fstat(root_fd)
-    if not exact_directory(candidate, uid, gid, 0o700) or candidate.st_dev != root.st_dev:
-        os.close(candidate_fd)
-        raise RuntimeErrorCode('DEPLOY_V5_TMPFS_INVALID')
-    if statfs_fd(candidate_fd) != TMPFS_MAGIC:
-        os.close(candidate_fd)
-        raise RuntimeErrorCode('DEPLOY_V5_TMPFS_INVALID')
-    return bundle_id, candidate_fd
+    candidate_fd = -1
+    registry[field] = bundle_id
+    write_registry(registry_path, run_root, registry, registry_uid, registry_gid)
+    try:
+        os.mkdir(bundle_id, 0o700, dir_fd=root_fd)
+        # CREATE_CANDIDATE_AFTER_MKDIR
+        candidate_fd = os.open(bundle_id, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW, dir_fd=root_fd)
+        # CREATE_CANDIDATE_AFTER_OPEN
+        os.fchmod(candidate_fd, 0o700)
+        os.fchown(candidate_fd, uid, gid)
+        # CREATE_CANDIDATE_AFTER_CHOWN
+        candidate = os.fstat(candidate_fd)
+        root = os.fstat(root_fd)
+        if not exact_directory(candidate, uid, gid, 0o700) or candidate.st_dev != root.st_dev:
+            raise RuntimeErrorCode('DEPLOY_V5_TMPFS_INVALID')
+        if statfs_fd(candidate_fd) != TMPFS_MAGIC:
+            raise RuntimeErrorCode('DEPLOY_V5_TMPFS_INVALID')
+        # CREATE_CANDIDATE_AFTER_STATFS
+        return bundle_id, candidate_fd
+    except BaseException:
+        if candidate_fd >= 0: os.close(candidate_fd)
+        remove_candidate(root_fd, bundle_id)
+        registry[field] = 'none'
+        write_registry(registry_path, run_root, registry, registry_uid, registry_gid)
+        raise
 
 
 def write_material(candidate_fd: int, name: str, value: bytes, uid: int, gid: int) -> None:
@@ -130,11 +191,14 @@ def write_material(candidate_fd: int, name: str, value: bytes, uid: int, gid: in
 
 
 def materialize(payload_path: str, run_root: str, access_root: str, ifind_root: str,
-                bundle_uid: int, bundle_gid: int, root_uid: int, root_gid: int) -> dict[str, str]:
+                bundle_uid: int, bundle_gid: int, root_uid: int, root_gid: int,
+                registry_path: str) -> dict[str, str]:
     access_fd = validate_tmpfs_bundle_root(access_root, run_root, root_uid, root_gid)
     ifind_fd = validate_tmpfs_bundle_root(ifind_root, run_root, root_uid, root_gid)
     created: list[tuple[int, str]] = []
     owned: list[bytearray] = []
+    registry = {'accessId': 'none', 'ifindId': 'none'}
+    write_registry(registry_path, run_root, registry, root_uid, root_gid)
     try:
         payload_fd = os.open(payload_path, os.O_RDONLY | os.O_NOFOLLOW)
         try:
@@ -155,7 +219,10 @@ def materialize(payload_path: str, run_root: str, access_root: str, ifind_root: 
             admin = bytearray(base64.urlsafe_b64decode(lines[9] + b'=' * ((4 - len(lines[9]) % 4) % 4)))
             hmac = bytearray(lines[10])
             owned.extend((admin, hmac))
-            access_id, candidate_fd = create_candidate(access_fd, bundle_uid, bundle_gid)
+            access_id, candidate_fd = create_candidate(
+                access_fd, bundle_uid, bundle_gid, registry_path, run_root,
+                registry, 'accessId', root_uid, root_gid,
+            )
             created.append((access_fd, access_id))
             try:
                 # MATERIALIZE_STAGE_DIRECTORY
@@ -182,7 +249,10 @@ def materialize(payload_path: str, run_root: str, access_root: str, ifind_root: 
                 raise RuntimeErrorCode('DEPLOY_V5_BUNDLE_CREATE_FAILED')
             token = bytearray(lines[14])
             owned.append(token)
-            ifind_id, candidate_fd = create_candidate(ifind_fd, bundle_uid, bundle_gid)
+            ifind_id, candidate_fd = create_candidate(
+                ifind_fd, bundle_uid, bundle_gid, registry_path, run_root,
+                registry, 'ifindId', root_uid, root_gid,
+            )
             created.append((ifind_fd, ifind_id))
             try:
                 # MATERIALIZE_STAGE_DIRECTORY
@@ -204,6 +274,13 @@ def materialize(payload_path: str, run_root: str, access_root: str, ifind_root: 
         return result
     except Exception:
         rollback_materialization(created)
+        try:
+            current = read_registry(registry_path, run_root, root_uid, root_gid)
+            remove_candidate(access_fd, current['accessId'])
+            remove_candidate(ifind_fd, current['ifindId'])
+            os.unlink(registry_path)
+        except Exception:
+            pass
         raise
     finally:
         for value in owned:
@@ -220,19 +297,40 @@ def rollback_materialization(created: list[tuple[int, str]]) -> None:
             pass
 
 
+def recover_registry(registry_path: str, run_root: str, access_root: str,
+                     ifind_root: str, root_uid: int, root_gid: int) -> None:
+    access_fd = validate_tmpfs_bundle_root(access_root, run_root, root_uid, root_gid)
+    ifind_fd = validate_tmpfs_bundle_root(ifind_root, run_root, root_uid, root_gid)
+    try:
+        value = read_registry(registry_path, run_root, root_uid, root_gid)
+        remove_candidate(access_fd, value['accessId'])
+        remove_candidate(ifind_fd, value['ifindId'])
+        os.unlink(registry_path)
+    finally:
+        os.close(access_fd)
+        os.close(ifind_fd)
+
+
 def main() -> int:
-    if len(sys.argv) != 10 or sys.argv[1] != 'materialize':
-        raise RuntimeErrorCode('DEPLOY_V5_RUNTIME_USAGE')
     def interrupted(_signum: int, _frame: object) -> None:
         raise RuntimeErrorCode('DEPLOY_V5_RUNTIME_INTERRUPTED')
 
     for signum in (signal.SIGHUP, signal.SIGINT, signal.SIGTERM):
         signal.signal(signum, interrupted)
-    result = materialize(
-        sys.argv[2], sys.argv[3], sys.argv[4], sys.argv[5],
-        int(sys.argv[6]), int(sys.argv[7]), int(sys.argv[8]), int(sys.argv[9]),
-    )
-    print(json.dumps(result, separators=(',', ':'), sort_keys=True))
+    if len(sys.argv) == 11 and sys.argv[1] == 'materialize':
+        result = materialize(
+            sys.argv[2], sys.argv[3], sys.argv[4], sys.argv[5],
+            int(sys.argv[6]), int(sys.argv[7]), int(sys.argv[8]), int(sys.argv[9]),
+            sys.argv[10],
+        )
+        print(json.dumps(result, separators=(',', ':'), sort_keys=True))
+    elif len(sys.argv) == 8 and sys.argv[1] == 'recover':
+        recover_registry(
+            sys.argv[2], sys.argv[3], sys.argv[4], sys.argv[5],
+            int(sys.argv[6]), int(sys.argv[7]),
+        )
+    else:
+        raise RuntimeErrorCode('DEPLOY_V5_RUNTIME_USAGE')
     return 0
 
 

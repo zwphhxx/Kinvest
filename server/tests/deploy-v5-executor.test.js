@@ -5,7 +5,7 @@ const os = require('node:os')
 const path = require('node:path')
 const vm = require('node:vm')
 const { createRequire } = require('node:module')
-const { spawnSync } = require('node:child_process')
+const { spawn, spawnSync } = require('node:child_process')
 
 const rootDir = path.resolve(__dirname, '../..')
 const executorPath = path.join(rootDir, 'deploy/server/deploy-kinvest-v5')
@@ -204,7 +204,7 @@ function makeHarness(options = {}) {
   if (options.signalWindow) {
     transformed = transformed.replace(
       `# ${options.signalWindow}`,
-      () => `kill -TERM $$  # ${options.signalWindow}`
+      () => `kill -${options.signalType || 'TERM'} $$  # ${options.signalWindow}`
     )
   }
   const executor = path.join(temp, 'deploy-v5')
@@ -232,6 +232,7 @@ function makeHarness(options = {}) {
   writeExecutable(path.join(bin, 'sleep'), '#!/bin/sh\nexit 0\n')
   writeExecutable(path.join(bin, 'shred'), '#!/bin/sh\nfor x in "$@"; do case "$x" in -*) ;; *) rm -f -- "$x" 2>/dev/null || true;; esac; done\n')
   writeExecutable(path.join(bin, 'install'), `#!/usr/bin/env bash
+if [[ "\${FAKE_FAILURE:-}" == init-install ]]; then printf '%s\n' '${TOKEN}' 'Traceback /private/secret/path' >&2; exit 91; fi
 after=false
 mode=0700
 for value in "$@"; do
@@ -242,6 +243,28 @@ for value in "$@"; do
   [[ "$value" == -- ]] && after=true
 done
 exit 0
+`)
+  writeExecutable(path.join(bin, 'dd'), `#!/usr/bin/env bash
+if [[ "\${FAKE_FAILURE:-}" == payload-dd ]]; then printf '%s\n' '${TOKEN}' 'dd: /private/secret/path' >&2; exit 92; fi
+exec /bin/dd "$@"
+`)
+  writeExecutable(path.join(bin, 'mktemp'), `#!/usr/bin/env bash
+if [[ "\${FAKE_FAILURE:-}" == file-mktemp && "$*" == *kinvest-v5.payload.* ]]; then printf '%s\n' '${TOKEN}' 'mktemp: /private/secret/path' >&2; exit 94; fi
+exec /usr/bin/mktemp "$@"
+`)
+  writeExecutable(path.join(bin, 'chmod'), `#!/usr/bin/env bash
+if [[ "\${FAKE_FAILURE:-}" == file-chmod && "$*" == *kinvest-v5.payload.* ]]; then printf '%s\n' '${TOKEN}' 'chmod: /private/secret/path' >&2; exit 95; fi
+exec /bin/chmod "$@"
+`)
+  writeExecutable(path.join(bin, 'mv'), `#!/usr/bin/env bash
+target="\${@: -1}"
+case "\${FAKE_FAILURE:-}:$target" in
+  backup-mv:*backups/*.sqlite|state-mv:*attempt.state)
+    printf '%s\n' '${TOKEN}' 'Traceback /private/secret/path' >&2
+    exit 93
+    ;;
+esac
+exec /bin/mv "$@"
 `)
   writeExecutable(path.join(bin, 'curl'), '#!/bin/sh\nexit 0\n')
   writeExecutable(path.join(bin, 'timeout'), `#!/usr/bin/env bash
@@ -274,6 +297,10 @@ if [[ "$command" == image && "$1" == inspect ]]; then
 elif [[ "$command" == run ]]; then
   [[ " $* " == *' --network none '* && " $* " == *' --read-only '* && " $* " == *' --cap-drop ALL '* && " $* " == *' --user 10001:10001 '* ]] || exit 64
   if [[ "\${FAKE_FAILURE:-}" == ifind-preflight && "$*" == *"server/ifind-secret-preflight.js"* ]]; then exit 1; fi
+  if [[ "\${FAKE_BLOCK:-}" == preflight ]]; then
+    { printf 'argv:'; printf ' %q' "$0" "$@"; printf '\nenviron:\n'; env | LC_ALL=C sort; } >'${path.join(temp, 'process-observable')}'
+    while [[ ! -e '${path.join(temp, 'process-release')}' ]]; do /bin/sleep 0.05; done
+  fi
   exit 0
 elif [[ "$command" == compose ]]; then
   if [[ "\${FAKE_FAILURE:-}" == compose-leak && ! -e '${path.join(temp, 'compose.failed')}' ]]; then
@@ -282,6 +309,7 @@ elif [[ "$command" == compose ]]; then
     exit 91
   fi
   printf '%s\n' "$KINVEST_IMAGE" >'${path.join(temp, 'runtime-image')}'
+  env | LC_ALL=C sort >'${path.join(temp, 'container-env.inspect')}'
   exit 0
 elif [[ "$command" == inspect ]]; then
   format="$2"
@@ -290,7 +318,46 @@ else
   exit 1
 fi
 `)
-  return { temp, root, runRoot, bin, executor, operations, contract }
+  return {
+    temp, root, runRoot, bin, executor, operations, contract,
+    observable: path.join(temp, 'process-observable'),
+    release: path.join(temp, 'process-release'),
+    containerEnv: path.join(temp, 'container-env.inspect')
+  }
+}
+
+function waitForFile(file, child, output, timeoutMs = 5000) {
+  return new Promise((resolve, reject) => {
+    const deadline = Date.now() + timeoutMs
+    const timer = setInterval(() => {
+      if (fs.existsSync(file)) {
+        clearInterval(timer)
+        resolve()
+      } else if (child.exitCode !== null) {
+        clearInterval(timer)
+        reject(new Error(`controlled child exited before observation: ${output.stderr}`))
+      } else if (Date.now() >= deadline) {
+        clearInterval(timer)
+        reject(new Error(`timed out waiting for controlled fixture: ${path.basename(file)}`))
+      }
+    }, 25)
+  })
+}
+
+function readProcessSurface(pid, controlledFallback) {
+  if (process.platform === 'linux' && fs.existsSync(`/proc/${pid}`)) {
+    return Buffer.concat([
+      fs.readFileSync(`/proc/${pid}/cmdline`),
+      fs.readFileSync(`/proc/${pid}/environ`)
+    ]).toString('utf8')
+  }
+  // macOS has no /proc. ps eww is the controlled platform-equivalent view of
+  // argv plus environment available to another same-user process.
+  const result = spawnSync('ps', ['eww', '-p', String(pid), '-o', 'command='], { encoding: 'utf8' })
+  if (result.status === 0) return result.stdout
+  // Sandboxed macOS can deny process-list access. The controlled child records
+  // its own argv/environ, which is the same surface ps/env would expose.
+  return fs.readFileSync(controlledFallback, 'utf8')
 }
 
 function cleanupHarness(harness) {
@@ -417,13 +484,21 @@ async function run() {
       env: { ...process.env, PYTHONDONTWRITEBYTECODE: '1' }
     })
     assert.equal(previous.status, 0, previous.stderr)
-    assert.match(source, /mktemp "\$STATE_ROOT\/\.current-v5\./)
+    assert.match(source, /secure_temp current_temporary "\$STATE_ROOT\/\.current-v5\./)
     const bundles = fs.readdirSync(path.join(harness.runRoot, 'kinvest-ifind-secrets'))
     assert.equal(bundles.length, 1)
     assert.equal(bundles.includes('8'.repeat(32)), false)
     const accessBundles = fs.readdirSync(path.join(harness.runRoot, 'kinvest-secrets')).filter(name => name !== 'disabled')
     assert.equal(accessBundles.includes('1'.repeat(32)), true)
     assert.equal(accessBundles.includes('9'.repeat(32)), false)
+    for (const bundleId of accessBundles) {
+      const accessPath = path.join(harness.runRoot, 'kinvest-secrets', bundleId)
+      for (const name of fs.readdirSync(accessPath)) {
+        const file = path.join(accessPath, name)
+        if (fs.statSync(file).isFile()) assert.equal(fs.readFileSync(file).includes(Buffer.from(TOKEN)), false, file)
+      }
+    }
+    assert.equal(fs.readFileSync(harness.containerEnv, 'utf8').includes(TOKEN), false)
     const bundlePath = path.join(harness.runRoot, 'kinvest-ifind-secrets', bundles[0])
     const provider = await loadPrivateIfindBundleLoader()({
       versionId: 'v20260826-001', bundlePath,
@@ -472,7 +547,11 @@ async function run() {
     cleanupHarness(failed)
   }
 
-  for (const stage of ['MATERIALIZE_STAGE_DIRECTORY', 'MATERIALIZE_STAGE_MANIFEST', 'MATERIALIZE_STAGE_MATERIAL']) {
+  for (const stage of [
+    'CREATE_CANDIDATE_AFTER_MKDIR', 'CREATE_CANDIDATE_AFTER_OPEN',
+    'CREATE_CANDIDATE_AFTER_CHOWN', 'CREATE_CANDIDATE_AFTER_STATFS',
+    'MATERIALIZE_STAGE_DIRECTORY', 'MATERIALIZE_STAGE_MANIFEST', 'MATERIALIZE_STAGE_MATERIAL'
+  ]) {
     const faulted = makeHarness({ materializeFault: stage })
     try {
       const result = spawnSync(faulted.executor, [], {
@@ -484,6 +563,79 @@ async function run() {
       assert.deepEqual(fs.readdirSync(path.join(faulted.runRoot, 'kinvest-secrets')), [])
       assert.deepEqual(fs.readdirSync(path.join(faulted.runRoot, 'kinvest-ifind-secrets')), [])
     } finally { cleanupHarness(faulted) }
+  }
+
+  for (const signalType of ['TERM', 'KILL']) {
+    const interrupted = makeHarness({
+      signalWindow: 'HELPER_WINDOW_AFTER_SUCCESS_BEFORE_ID_RECORD', signalType
+    })
+    try {
+      const first = spawnSync(interrupted.executor, [], {
+        encoding: 'utf8', input: diagnosticPayload(),
+        env: { ...process.env, PATH: `${interrupted.bin}:${process.env.PATH}` }
+      })
+      assert.notEqual(first.status, 0, signalType)
+      fs.writeFileSync(interrupted.executor,
+        fs.readFileSync(interrupted.executor, 'utf8').replace(
+          new RegExp(`kill -${signalType} \\$\\$  # HELPER_WINDOW_AFTER_SUCCESS_BEFORE_ID_RECORD`),
+          ':  # HELPER_WINDOW_AFTER_SUCCESS_BEFORE_ID_RECORD'
+        ), { mode: 0o755 })
+      const recovered = spawnSync(interrupted.executor, [], {
+        encoding: 'utf8', input: disabledPayload(),
+        env: { ...process.env, PATH: `${interrupted.bin}:${process.env.PATH}` }
+      })
+      assert.equal(recovered.status, 0, recovered.stderr)
+      assert.deepEqual(fs.readdirSync(path.join(interrupted.runRoot, 'kinvest-ifind-secrets')), [])
+      assert.equal(fs.readdirSync(interrupted.runRoot).some(name => name.startsWith('kinvest-v5.candidates.')), false)
+    } finally { cleanupHarness(interrupted) }
+  }
+
+  for (const [failure, expected] of [
+    ['init-install', 'DEPLOY_V5_INITIALIZE_FAILED\n'],
+    ['file-mktemp', 'DEPLOY_V5_PAYLOAD_FILE_FAILED\n'],
+    ['file-chmod', 'DEPLOY_V5_PAYLOAD_FILE_FAILED\n'],
+    ['payload-dd', 'DEPLOY_V5_PAYLOAD_READ_FAILED\n'],
+    ['backup-mv', 'DEPLOY_V5_DATABASE_BACKUP_FAILED\n'],
+    ['state-mv', 'DEPLOY_V5_STATE_WRITE_FAILED\n']
+  ]) {
+    const operationFailure = makeHarness()
+    try {
+      const result = spawnSync(operationFailure.executor, [], {
+        encoding: 'utf8', input: diagnosticPayload(),
+        env: { ...process.env, PATH: `${operationFailure.bin}:${process.env.PATH}`, FAKE_FAILURE: failure }
+      })
+      assert.notEqual(result.status, 0, failure)
+      assert.equal(result.stderr, expected, failure)
+      assert.equal(result.stdout.includes(TOKEN) || result.stderr.includes(TOKEN), false, failure)
+      assert.equal(result.stderr.includes('Traceback') || result.stderr.includes('/private/'), false, failure)
+    } finally { cleanupHarness(operationFailure) }
+  }
+
+  const observable = makeHarness()
+  let observedChild
+  try {
+    const output = { stdout: '', stderr: '' }
+    const child = spawn(observable.executor, [], {
+      env: { ...process.env, PATH: `${observable.bin}:${process.env.PATH}`, FAKE_BLOCK: 'preflight' },
+      stdio: ['pipe', 'pipe', 'pipe']
+    })
+    observedChild = child
+    child.stdout.on('data', chunk => { output.stdout += chunk })
+    child.stderr.on('data', chunk => { output.stderr += chunk })
+    child.stdin.end(diagnosticPayload())
+    await waitForFile(observable.observable, child, output)
+    assert.equal(readProcessSurface(child.pid, observable.observable).includes(TOKEN), false)
+    fs.writeFileSync(observable.release, '')
+    const result = await new Promise((resolve, reject) => {
+      const timer = setTimeout(() => { child.kill('SIGKILL'); reject(new Error('controlled process observation timed out')) }, 10000)
+      child.on('close', code => { clearTimeout(timer); resolve({ code, ...output }) })
+    })
+    assert.equal(result.code, 0, result.stderr)
+    assert.equal(result.stdout.includes(TOKEN) || result.stderr.includes(TOKEN), false)
+    assert.equal(fs.readFileSync(observable.containerEnv, 'utf8').includes(TOKEN), false)
+  } finally {
+    if (observedChild && observedChild.exitCode === null) observedChild.kill('SIGKILL')
+    cleanupHarness(observable)
   }
 
   for (const [name, options] of [
