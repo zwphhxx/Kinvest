@@ -88,6 +88,15 @@ case "${SSH_ORIGINAL_COMMAND:-}" in
     fi
     exec sudo -n /usr/local/sbin/deploy-kinvest-v4
     ;;
+  deploy-v5)
+    if [[ ! -x /usr/local/sbin/deploy-kinvest-v5 \
+      || ! -x /usr/local/libexec/kinvest-deploy-v5-contract \
+      || ! -x /usr/local/libexec/kinvest-deploy-v5-runtime ]]; then
+      printf '%s\n' 'DEPLOY_V5_ASSETS_MISSING' >&2
+      exit 69
+    fi
+    exec sudo -n /usr/local/sbin/deploy-kinvest-v5
+    ;;
   *)
     printf '%s\n' 'KINVEST_DEPLOY_WRAPPER_COMMAND_REJECTED' >&2
     exit 2

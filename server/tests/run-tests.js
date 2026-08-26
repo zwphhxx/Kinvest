@@ -70,6 +70,8 @@ const tests = [
   require('./deploy-v5-state.test'),
   require('./deploy-v5-executor.test'),
   require('./docker-ifind-secret-bootstrap.test'),
+  require('./deploy-v5-installer.test'),
+  require('./deploy-v5-workflow.test'),
   require('./nginx-fixed-ip-gate.test'),
   require('./nginx-config-installer.test'),
   require('./data-lifecycle.test'),
