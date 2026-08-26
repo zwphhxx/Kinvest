@@ -86,13 +86,15 @@ async function run() {
   for (const value of [
     '`FORWARD` | `<release_run_id>` | `disabled` | `DEPLOY_V5`',
     '`FORWARD` | `<release_run_id>` | `diagnostic` | `DEPLOY_V5`',
-    '`ROLLBACK` | `<release_run_id>` | 目标 `previous.state` 的模式 | `ROLLBACK_V4`',
+    '`ROLLBACK` | `<release_run_id>` | 当前 `current.state` 的模式 | `ROLLBACK_V4`',
     '`RESTORE` | `<release_run_id>` | 当前 `current.state` 的模式 | `RESTORE_V4`'
   ]) {
     assert.ok(runbook.includes(value), `runbook must document workflow row: ${value}`)
   }
   assert.match(runbook, /disabled[\s\S]{0,160}confirm[\s\S]{0,160}`DEPLOY_V5`/i)
   assert.match(runbook, /ROLLBACK_V4[\s\S]{0,160}RESTORE_V4[\s\S]{0,160}兼容保留/)
+  assert.match(runbook, /`ROLLBACK`[\s\S]{0,320}旧镜像[\s\S]{0,240}当前安全状态[\s\S]{0,240}当前材料/)
+  assert.match(runbook, /旧镜像[\s\S]{0,200}不支持[\s\S]{0,120}provider[\s\S]{0,120}失败关闭/)
   assert.match(runbook, /https:\/\/dearmina\.cn\/admin\.html/)
   assert.match(runbook, /卡片[“"]管理员诊断[”"]/)
   assert.match(runbook, /按钮[“"]运行双级诊断[”"]/)

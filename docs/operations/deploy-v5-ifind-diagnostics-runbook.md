@@ -35,10 +35,10 @@ TMPFS_IFIND_REFRESH_TOKEN_VERSION_ID
 |---|---|---|---|
 | `FORWARD` | `<release_run_id>` | `disabled` | `DEPLOY_V5` |
 | `FORWARD` | `<release_run_id>` | `diagnostic` | `DEPLOY_V5` |
-| `ROLLBACK` | `<release_run_id>` | 目标 `previous.state` 的模式 | `ROLLBACK_V4` |
+| `ROLLBACK` | `<release_run_id>` | 当前 `current.state` 的模式 | `ROLLBACK_V4` |
 | `RESTORE` | `<release_run_id>` | 当前 `current.state` 的模式 | `RESTORE_V4` |
 
-`FORWARD` 的 `<release_run_id>` 必须是包含目标 release-record v2 的成功 main `Deploy Kinvest` run。`ROLLBACK` 必须填写目标 `previous.state` 所记录的 verification run；`RESTORE` 必须填写当前 `current.state` 所记录的 verification run。状态模式为 `disabled` 时 workflow 精确填写 `disabled`；状态模式为 `admin-diagnostic` 时 workflow 精确填写 `diagnostic`。disabled `FORWARD` 也必须填写 confirm，精确值是 `DEPLOY_V5`，不得留空。`ROLLBACK_V4` 与 `RESTORE_V4` 是从 v4 迁移时为调用方兼容保留的 confirm 名称，不表示请求改走 deploy-v4。
+`FORWARD` 的 `<release_run_id>` 必须是包含目标 release-record v2 的成功 main `Deploy Kinvest` run。`ROLLBACK` 的 `<release_run_id>` 必须填写目标 `previous.state` 所记录的 verification run，但 `ifind_mode` 必须填写当前 `current.state` 的模式；`RESTORE` 必须填写当前 `current.state` 所记录的 verification run 和模式。所选当前安全状态为 `disabled` 时 workflow 精确填写 `disabled`；为 `admin-diagnostic` 时 workflow 精确填写 `diagnostic`。disabled `FORWARD` 也必须填写 confirm，精确值是 `DEPLOY_V5`，不得留空。`ROLLBACK_V4` 与 `RESTORE_V4` 是从 v4 迁移时为调用方兼容保留的 confirm 名称，不表示请求改走 deploy-v4。
 
 绝不在聊天、仓库、Issue、PR、普通文件、`.env`、终端历史、命令参数、截图或日志中粘贴 refresh token。不得以长期腾讯云 `SecretId`/`SecretKey`、CAM/SSM、Docker 环境变量或持久磁盘文件作为替代路线。
 
@@ -144,7 +144,7 @@ Expected state: <VERSION_ID> and fingerprint only; no secret material
 
 ### ROLLBACK
 
-`ROLLBACK` 只选择 `previous.state` 中精确、兼容的旧镜像和 provenance，但使用当前获批的 GitHub token 材料重新预检。它不恢复已撤销 token。旧镜像不支持 iFinD tmpfs provider 或 schema 不兼容时必须停在人工恢复门，不得只切镜像后宣称回滚完成。
+`ROLLBACK` 只选择 `previous.state` 中精确、兼容的旧镜像和 provenance。旧镜像必须使用当前 `current.state` 的 `ifind_mode`、当前安全状态和当前材料重新预检，不恢复已撤销 token。若旧镜像不支持当前安全状态要求的 provider，则失败关闭；schema 不兼容时也必须停在人工恢复门，不得只切镜像后宣称回滚完成。
 
 ### RESTORE
 
