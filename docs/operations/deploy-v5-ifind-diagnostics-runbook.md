@@ -29,6 +29,17 @@ TMPFS_IFIND_REFRESH_TOKEN_VERSION_ID
 
 `KINVEST_IFIND_DIAGNOSTIC_MODE` 的部署值只允许 `disabled` 或 `diagnostic`；`diagnostic` 在容器内映射为应用的 `admin-diagnostic` 模式。VersionId 使用 `vYYYYMMDD-NNN`，它是非秘密元数据。
 
+`Deploy production v5 (manual)` 的四个输入都是必填项。精确组合如下：
+
+| intent | release run | ifind mode | confirm |
+|---|---|---|---|
+| `FORWARD` | `<release_run_id>` | `disabled` | `DEPLOY_V5` |
+| `FORWARD` | `<release_run_id>` | `diagnostic` | `DEPLOY_V5` |
+| `ROLLBACK` | `<release_run_id>` | 目标 `previous.state` 的模式 | `ROLLBACK_V4` |
+| `RESTORE` | `<release_run_id>` | 当前 `current.state` 的模式 | `RESTORE_V4` |
+
+`FORWARD` 的 `<release_run_id>` 必须是包含目标 release-record v2 的成功 main `Deploy Kinvest` run。`ROLLBACK` 必须填写目标 `previous.state` 所记录的 verification run；`RESTORE` 必须填写当前 `current.state` 所记录的 verification run。状态模式为 `disabled` 时 workflow 精确填写 `disabled`；状态模式为 `admin-diagnostic` 时 workflow 精确填写 `diagnostic`。disabled `FORWARD` 也必须填写 confirm，精确值是 `DEPLOY_V5`，不得留空。`ROLLBACK_V4` 与 `RESTORE_V4` 是从 v4 迁移时为调用方兼容保留的 confirm 名称，不表示请求改走 deploy-v4。
+
 绝不在聊天、仓库、Issue、PR、普通文件、`.env`、终端历史、命令参数、截图或日志中粘贴 refresh token。不得以长期腾讯云 `SecretId`/`SecretKey`、CAM/SSM、Docker 环境变量或持久磁盘文件作为替代路线。
 
 ## 2. 权限和暂停矩阵
@@ -60,7 +71,7 @@ deploy-v5 通过加密 SSH stdin 接收 Production 获批后的秘密材料。fo
 - `ifindDiagnosticMode`、VersionId、bundle ID；
 - secret fingerprint，也就是 token 的 SHA-256 指纹。
 
-状态只保存 fingerprint，不保存 secret。相同 VersionId 对应不同 fingerprint 时必须失败关闭。状态文件继续保持 `root:root 0600`。
+状态只保存 fingerprint，不保存 secret。实现会自动比较 `current.state` 和 `previous.state`，在这两个在线状态中发现相同 VersionId 对应不同 fingerprint 时失败关闭。更早历史没有全局 ledger，运维人员必须维护非秘密轮换台账，记录已使用 VersionId、fingerprint、时间和 deployment run，并人工禁止复用。全历史自动防复用是后续能力，当前未实现，不得声称已具备全局保证。状态文件继续保持 `root:root 0600`。
 
 `deploy-v4` 协议、现有 access-control bundle 和已上线家庭登录行为保持不变。deploy-v5 只能由新工作流和新 forced-command 分支调用；v5 未通过生产验收时回退到 v4 已验证边界，而不是向 v4 注入 iFinD 字段。
 
@@ -104,6 +115,8 @@ Secret 录入、VersionId 修改和真实调用是三个不同的暂停点。不
 
 L1 完成后仍需用户明确批准首次真实调用。管理员通过家庭登录保护的独立管理员页面运行两级诊断：先交换内存 access token，再执行固定交易日最小查询。
 
+实际入口是 [https://dearmina.cn/admin.html](https://dearmina.cn/admin.html)（站内路径 `/admin.html`）。管理员登录后进入卡片“管理员诊断”，只有状态就绪时按钮“运行双级诊断”才可点击；不要把初始禁用文案“诊断未启用”当作操作按钮名称。
+
 L2 必须确认：
 
 - 匿名、仅家庭设备、过期管理员和跨来源请求均无法触发；
@@ -135,7 +148,7 @@ Expected state: <VERSION_ID> and fingerprint only; no secret material
 
 ### RESTORE
 
-`RESTORE` 只允许重建 `current.state` 对应的 access bundle 和 iFinD bundle，并恢复当前精确 Image ID。它不拉镜像、不迁移数据库，也不改变 digest、commit、schema、release provenance 或 VersionId。
+`RESTORE` 仅用于 CVM 重启后 tmpfs 丢失的恢复：它只允许按 `current.state` 的同一 VersionId、同一材料 fingerprint 重建 access bundle 和 iFinD bundle，并恢复当前精确 Image ID。`RESTORE` 不允许更换 token、VersionId 或材料；它不拉镜像、不迁移数据库，也不改变 digest、commit、schema 或 release provenance。
 
 ### Docker 与 CVM 重启
 
@@ -145,10 +158,12 @@ Docker 重启不应删除主机 `/run` 中仍被引用的 bundle，但仍需单�
 
 ## 8. Token 轮换
 
+token/VersionId 轮换只允许 `FORWARD`。`ROLLBACK` 和 `RESTORE` 都不是轮换入口；尤其 `RESTORE` 只能用 `current.state` 的同一 VersionId 和同一材料在 CVM 重启后重建 tmpfs。
+
 1. 管理员人工登录 iFinD 官方页面取得新 refresh token。
 2. 用户在 GitHub `Production` Environment 更新 `KINVEST_IFIND_REFRESH_TOKEN`，不经过聊天、命令参数或文件。
 3. 用户选择新的 `<VERSION_ID>`；禁止用旧 VersionId 覆盖为不同材料。
-4. 用户批准 diagnostic `FORWARD` 或符合状态边界的 `RESTORE`，完成 L1。
+4. 用户批准 diagnostic `FORWARD`，完成 L1；不得选择 `RESTORE` 更换材料。
 5. 用户另行批准一次 L2 最小查询。
 6. 成功后只归档旧 VersionId、fingerprint、部署 run 和验收结果等非秘密元数据。
 7. 清空本地剪贴板并退出显示 token 的 iFinD 页面。

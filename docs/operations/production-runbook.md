@@ -583,12 +583,14 @@ docker image inspect 'ghcr.io/zwphhxx/kinvest@sha256:REVIEWED_DIGEST'
 1. 管理员人工进入 iFinD 官方登录页完成登录和必要验证。
 2. 用户直接在 GitHub `Production` Environment 更新 `KINVEST_IFIND_REFRESH_TOKEN`，不通过网页业务表单、聊天、终端命令或普通文件转发。
 3. 用户设置新的 `TMPFS_IFIND_REFRESH_TOKEN_VERSION_ID`，不得复用旧 VersionId 对应不同材料。
-4. 用户分别批准 deploy-v5 Production deployment 和首次管理员 L2 最小诊断。
+4. token/VersionId 轮换只允许 `FORWARD`；用户分别批准 deploy-v5 Production deployment 和首次管理员 L2 最小诊断。`RESTORE` 仅用于 CVM 重启后按 `current.state` 的同一 VersionId、同一材料重建 tmpfs，不得更换材料。
 5. 只记录 VersionId、secret fingerprint、部署 provenance、时间和成功/失败，不记录 token。
 6. 成功后恢复 `DEPLOY_V5_ENABLED=false`；失败时保持或恢复最近已验证状态，不创建磁盘 token 副本。
 
 token 不进入仓库、`.env`、SQLite、镜像、Docker 环境、状态、应用/Nginx/部署日志、终端历史、命令参数或聊天。CVM 重启后 tmpfs 消失，应用失败关闭，必须经过获批 `RESTORE` 重建 bundle。完整流程见
 [deploy-v5 iFinD 管理员诊断运行手册](deploy-v5-ifind-diagnostics-runbook.md)。H4 当前只完成代码能力，真实 iFinD 尚未启用。
+
+实现只会自动比较 `current.state` 和 `previous.state` 的 VersionId/fingerprint。更早历史没有全局 ledger，必须用非秘密轮换台账人工禁止复用；全历史自动防复用是后续能力，当前未实现。
 
 ## 11. 故障处置顺序
 

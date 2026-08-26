@@ -555,6 +555,8 @@ PostgreSQL 不保存：
 - 家庭登录 access bundle 与 iFinD bundle 相互独立；状态仅保存 VersionId、bundle ID 和 secret fingerprint，不保存 token。
 - 应用只在内存中交换并使用 `access_token`。refresh token 和 access token 均不得进入浏览器、PostgreSQL、SQLite、镜像、Docker 环境、日志、错误详情、命令参数或持久磁盘。
 - CVM 重启后 tmpfs 消失，应用失败关闭，必须通过获批 `RESTORE` 重建 bundle；不得回退到 `.env`、长期 SecretId/Key、SSM/CAM 或聊天传密。
+- `RESTORE` 仅用于 CVM 重启后按 `current.state` 的同一 VersionId、同一材料 fingerprint 重建 tmpfs，不允许更换 token、VersionId 或材料。token/VersionId 轮换只允许 `FORWARD`。
+- 实现自动比较 `current.state` 和 `previous.state`；更早历史没有全局 ledger，必须通过非秘密轮换台账人工禁止复用。全历史自动防复用是后续能力，当前未实现。
 - H4 仅实现代码能力，该路线尚未生产启用；真实 iFinD 结果只允许进入管理员诊断，家庭展示另设授权门，禁止 real/Mock 混合。
 
 ### 12.2 iFinD `access_token`
@@ -570,12 +572,12 @@ PostgreSQL 不保存：
 1. 管理员亲自登录 iFinD 官方账号详情页，完成可能出现的验证码，并取得新的 `refresh_token`。
 2. 用户直接在 GitHub `Production` Environment 更新 `KINVEST_IFIND_REFRESH_TOKEN`；不把令牌写入 `.env`、终端命令、脚本参数、聊天或普通文本文件。
 3. 用户设置新的 `TMPFS_IFIND_REFRESH_TOKEN_VERSION_ID`，不得让同一 VersionId 对应不同 secret fingerprint。
-4. 用户分别批准 deploy-v5 Production deployment 和首次管理员两级最小诊断；部署先执行离线 L1 bootstrap/权限/格式预检，再由管理员执行 L2 固定最小查询。
+4. 用户以 `FORWARD` 分别批准 deploy-v5 Production deployment 和首次管理员两级最小诊断；部署先执行离线 L1 bootstrap/权限/格式预检，再由管理员在 `https://dearmina.cn/admin.html` 的“管理员诊断”卡片点击“运行双级诊断”执行 L2 固定最小查询。
 5. 检查应用健康、部署 provenance、VersionId 和零匹配日志扫描，确认日志、状态和数据库中没有令牌。
 6. 若 Codex iFinD 技能也需要使用同一令牌，单独更新 macOS 钥匙串项目 `codex.ifind.quantapi`，账户名称保持 `refresh_token`。
 7. 清理剪贴板，并退出包含令牌的 iFinD 页面。
 
-产品说明书同时提供更新失败的回退步骤：若新版本验证失败，管理员保持或恢复最近已验证部署状态；`ROLLBACK` 使用当前获批材料，`RESTORE` 只重建当前精确镜像的 tmpfs bundle。产品不保存 iFinD 账号密码，不自动绕过验证码。
+产品说明书同时提供更新失败的回退步骤：若新版本验证失败，管理员保持或恢复最近已验证部署状态；`ROLLBACK` 使用当前获批材料，`RESTORE` 只按 `current.state` 的同一 VersionId、同一材料重建当前精确镜像的 tmpfs bundle，不能用于轮换。产品不保存 iFinD 账号密码，不自动绕过验证码。
 
 ### 12.4 历史决策说明
 

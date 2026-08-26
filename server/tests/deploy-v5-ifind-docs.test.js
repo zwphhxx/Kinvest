@@ -73,7 +73,29 @@ async function run() {
     assert.match(document, /当前只提供 VersionId、模式、冷却、调用次数和最近诊断状态/)
     assert.match(document, /到期日期[\s\S]{0,120}管理员[\s\S]{0,120}人工记录[\s\S]{0,120}检查/)
     assert.match(document, /自动提醒[\s\S]{0,120}T10-H[\s\S]{0,120}后续[\s\S]{0,120}未实现/)
+    assert.match(document, /token\/VersionId 轮换只允许 `FORWARD`/)
+    assert.match(document, /全历史自动防复用[\s\S]{0,120}后续能力[\s\S]{0,120}未实现/)
   }
+
+  assert.match(runbook, /token\/VersionId 轮换只允许 `FORWARD`/)
+  assert.match(runbook, /`RESTORE`[\s\S]{0,240}`current\.state`[\s\S]{0,240}同一 VersionId[\s\S]{0,240}同一材料/)
+  assert.match(runbook, /自动比较 `current\.state` 和 `previous\.state`/)
+  assert.match(runbook, /更早历史[\s\S]{0,160}全局 ledger[\s\S]{0,160}非秘密轮换台账[\s\S]{0,160}人工禁止复用/)
+  assert.match(runbook, /全历史自动防复用[\s\S]{0,120}后续能力[\s\S]{0,120}未实现/)
+
+  for (const value of [
+    '`FORWARD` | `<release_run_id>` | `disabled` | `DEPLOY_V5`',
+    '`FORWARD` | `<release_run_id>` | `diagnostic` | `DEPLOY_V5`',
+    '`ROLLBACK` | `<release_run_id>` | 目标 `previous.state` 的模式 | `ROLLBACK_V4`',
+    '`RESTORE` | `<release_run_id>` | 当前 `current.state` 的模式 | `RESTORE_V4`'
+  ]) {
+    assert.ok(runbook.includes(value), `runbook must document workflow row: ${value}`)
+  }
+  assert.match(runbook, /disabled[\s\S]{0,160}confirm[\s\S]{0,160}`DEPLOY_V5`/i)
+  assert.match(runbook, /ROLLBACK_V4[\s\S]{0,160}RESTORE_V4[\s\S]{0,160}兼容保留/)
+  assert.match(runbook, /https:\/\/dearmina\.cn\/admin\.html/)
+  assert.match(runbook, /卡片[“"]管理员诊断[”"]/)
+  assert.match(runbook, /按钮[“"]运行双级诊断[”"]/)
 
   console.log('deploy-v5-ifind-docs: PASS')
 }
