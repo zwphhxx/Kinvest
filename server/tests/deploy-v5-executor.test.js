@@ -667,6 +667,55 @@ function scanPersistentFiles(root) {
   return findings
 }
 
+function parseDeploymentState(harness, name = 'current.state') {
+  const parsed = spawnSync(process.env.PYTHON || 'python3', [harness.contract, 'parse-state'], {
+    encoding: 'utf8',
+    input: fs.readFileSync(path.join(harness.root, 'state', name), 'utf8'),
+    env: { ...process.env, PYTHONDONTWRITEBYTECODE: '1' }
+  })
+  assert.equal(parsed.status, 0, parsed.stderr)
+  return JSON.parse(parsed.stdout)
+}
+
+async function assertCommittedBundlesReadable(harness) {
+  const state = parseDeploymentState(harness)
+  const accessPath = path.join(harness.runRoot, 'kinvest-secrets', state.secretBundleId)
+  assert.deepEqual(fs.readdirSync(accessPath).sort(), [
+    'admin-password-verifier', 'device-token-hmac-key', 'manifest.json'
+  ])
+  for (const file of [
+    path.join(accessPath, 'manifest.json'),
+    path.join(accessPath, 'admin-password-verifier'),
+    path.join(accessPath, 'device-token-hmac-key')
+  ]) {
+    assert.equal(fs.statSync(file).isFile(), true, file)
+  }
+  if (state.ifindDiagnosticMode === 'diagnostic') {
+    const ifindPath = path.join(harness.runRoot, 'kinvest-ifind-secrets', state.ifindSecretBundleId)
+    assert.deepEqual(fs.readdirSync(ifindPath).sort(), ['manifest.json', 'refresh-token'])
+    for (const file of [path.join(ifindPath, 'manifest.json'), path.join(ifindPath, 'refresh-token')]) {
+      assert.equal(fs.statSync(file).isFile(), true, file)
+    }
+    const provider = await loadPrivateIfindBundleLoader()({
+      versionId: state.ifindRefreshTokenVersionId,
+      bundlePath: ifindPath,
+      expectedUid: process.getuid(), expectedGid: process.getgid(),
+      fsApi: createProviderFsAdapter(ifindPath)
+    })
+    const loaded = provider.readRefreshToken()
+    assert.equal(loaded.toString('ascii'), TOKEN)
+    loaded.fill(0)
+    provider.clear()
+  } else {
+    assert.equal(state.ifindSecretBundleId, 'none')
+  }
+  assert.deepEqual(
+    fs.readdirSync(harness.runRoot).filter((name) => name.startsWith('kinvest-v5.candidates.')),
+    []
+  )
+  assert.equal(fs.existsSync(path.join(harness.root, 'state/deploy-v5.journal')), false)
+}
+
 async function run() {
   testRuntimeDurabilityPrimitives()
   assert.equal(fs.existsSync(executorPath), true, 'deploy-v5 executor must exist')
@@ -728,7 +777,7 @@ async function run() {
   assert.match(source, /recover-orphan-backups/)
   assert.match(source, /exec 3>&2/)
   assert.match(source, /exec 2>\/dev\/null/)
-  assert.ok(source.indexOf('write_journal prepared') < source.indexOf('release-registry "$candidate_registry"'),
+  assert.ok(source.indexOf('write_journal prepared') < source.lastIndexOf('release-registry "$candidate_registry"'),
     'candidate registry must survive until prepared journal is durable')
   assert.match(source, /RESTORE/)
   assert.match(source, /ROLLBACK/)
@@ -1336,11 +1385,65 @@ module.materialize(sys.argv[2], sys.argv[3], sys.argv[4], sys.argv[5],
         env: { ...process.env, PATH: `${rebooted.bin}:${process.env.PATH}` }
       })
       assert.equal(recovered.status, 0, `${scenario.window}: ${recovered.stderr}`)
-      assert.equal(fs.existsSync(path.join(rebooted.root, 'state/deploy-v5.journal')), false)
+      await assertCommittedBundlesReadable(rebooted)
       assert.equal(fs.existsSync(path.join(rebooted.root, 'state/deploy-v5-current.before')), false)
       const operations = fs.readFileSync(rebooted.operations, 'utf8')
       assert.doesNotMatch(operations, /attestation resolve.*state-reproof/)
     } finally { cleanupHarness(rebooted) }
+  }
+
+  const rebootTransferWindows = [
+    'REBOOT_RESTORE_WINDOW_BEFORE_REGISTRY_RELEASE',
+    'REBOOT_RESTORE_WINDOW_AFTER_REGISTRY_RELEASE_BEFORE_CLEAR',
+    'REBOOT_RESTORE_WINDOW_AFTER_REGISTRY_CLEAR',
+    'REBOOT_RESTORE_WINDOW_BEFORE_JOURNAL_DELETE',
+    'REBOOT_RESTORE_WINDOW_AFTER_JOURNAL_DELETE'
+  ]
+  for (const transferWindow of rebootTransferWindows) {
+    const crash = makeHarness({
+      signalWindow: 'TRANSACTION_WINDOW_AFTER_CURRENT_BEFORE_KEEP', signalType: 'KILL'
+    })
+    try {
+      const seeded = spawnSync(crash.executor, [], {
+        encoding: 'utf8', input: diagnosticPayload(),
+        env: { ...process.env, PATH: `${crash.bin}:${process.env.PATH}` }
+      })
+      assert.notEqual(seeded.status, 0)
+      let source = fs.readFileSync(crash.executor, 'utf8')
+        .replace('kill -KILL $$  # TRANSACTION_WINDOW_AFTER_CURRENT_BEFORE_KEEP', ':  # TRANSACTION_WINDOW_AFTER_CURRENT_BEFORE_KEEP')
+      for (const marker of rebootTransferWindows) {
+        source = source.replace(`# ${marker}`, `printf '%s\\n' '${marker}' >>'${crash.operations}'\n# ${marker}`)
+      }
+      source = source.replace(`# ${transferWindow}`, () => `kill -KILL $$  # ${transferWindow}`)
+      fs.writeFileSync(crash.executor, source, { mode: 0o755 })
+      for (const rootName of ['kinvest-secrets', 'kinvest-ifind-secrets']) {
+        const bundleRoot = path.join(crash.runRoot, rootName)
+        for (const name of fs.readdirSync(bundleRoot)) {
+          const candidate = path.join(bundleRoot, name)
+          if (fs.statSync(candidate).isDirectory()) fs.chmodSync(candidate, 0o700)
+        }
+        fs.rmSync(bundleRoot, { recursive: true, force: true })
+        fs.mkdirSync(bundleRoot, { mode: 0o700 })
+      }
+      const restorePayload = intentPayload('RESTORE', DIGEST, COMMIT, '123', 'diagnostic', 'state-reproof')
+      const interrupted = spawnSync(crash.executor, [], {
+        encoding: 'utf8', input: restorePayload,
+        env: { ...process.env, PATH: `${crash.bin}:${process.env.PATH}` }
+      })
+      assert.notEqual(interrupted.status, 0, `${transferWindow} must interrupt ownership transfer`)
+      fs.writeFileSync(crash.executor,
+        fs.readFileSync(crash.executor, 'utf8').replace(`kill -KILL $$  # ${transferWindow}`, `:  # ${transferWindow}`),
+        { mode: 0o755 })
+      const converged = spawnSync(crash.executor, [], {
+        encoding: 'utf8', input: restorePayload,
+        env: { ...process.env, PATH: `${crash.bin}:${process.env.PATH}` }
+      })
+      assert.equal(converged.status, 0, `${transferWindow}: ${JSON.stringify({
+        stderr: converged.stderr, stdout: converged.stdout,
+        operations: fs.existsSync(crash.operations) ? fs.readFileSync(crash.operations, 'utf8') : ''
+      })}`)
+      await assertCommittedBundlesReadable(crash)
+    } finally { cleanupHarness(crash) }
   }
 
   const incompatible = makeHarness({ currentStateOverrides: deployedState, previousState: currentState() })

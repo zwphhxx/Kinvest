@@ -283,6 +283,18 @@ state_bundles_present() {
   fi
 }
 
+pending_candidate_registry_exists() {
+  local registry
+  shopt -s nullglob
+  for registry in "$RUN_ROOT"/kinvest-v5.candidates.*; do
+    [[ "$registry" == *.tmp.* ]] && continue
+    shopt -u nullglob
+    return 0
+  done
+  shopt -u nullglob
+  return 1
+}
+
 prepare_journal_recovery() {
   [[ -e "$JOURNAL" ]] || return 0
   [[ -f "$JOURNAL" && ! -L "$JOURNAL" && -f "$BEFORE_STATE" && ! -L "$BEFORE_STATE" ]] || return 1
@@ -296,7 +308,7 @@ prepare_journal_recovery() {
     state-committed) authority="$CURRENT_STATE" ;;
     *) return 1 ;;
   esac
-  if state_bundles_present "$authority"; then
+  if state_bundles_present "$authority" && ! pending_candidate_registry_exists; then
     reconcile_transaction_journal
     return $?
   fi
@@ -610,8 +622,15 @@ if [[ -n "$reboot_restore_phase" ]]; then
   if [[ "$reboot_restore_phase" == state-committed && "$journal_intent" != RESTORE ]]; then
     atomic_state_from_text "$BEFORE_STATE" "$PREVIOUS_STATE" previous || fail DEPLOY_V5_STATE_WRITE_FAILED
   fi
+  # REBOOT_RESTORE_WINDOW_BEFORE_REGISTRY_RELEASE
+  "$RUNTIME_HELPER" release-registry "$candidate_registry" "$RUN_ROOT" "$STATE_ROOT" "$BACKUP_ROOT" "$ROOT_UID" "$ROOT_GID" >/dev/null 2>&1 || fail DEPLOY_V5_CANDIDATE_REGISTRY_FAILED
+  # REBOOT_RESTORE_WINDOW_AFTER_REGISTRY_RELEASE_BEFORE_CLEAR
+  candidate_registry=''
+  # REBOOT_RESTORE_WINDOW_AFTER_REGISTRY_CLEAR
   candidate_keep='true'
+  # REBOOT_RESTORE_WINDOW_BEFORE_JOURNAL_DELETE
   durable_state_delete "${ATTEMPT_STATE##*/}" "${JOURNAL##*/}" "${BEFORE_STATE##*/}" || fail DEPLOY_V5_JOURNAL_CLEANUP_FAILED
+  # REBOOT_RESTORE_WINDOW_AFTER_JOURNAL_DELETE
   prune_access_bundles || fail DEPLOY_V5_CLEANUP_PENDING 71
   prune_ifind_bundles || fail DEPLOY_V5_CLEANUP_PENDING 71
   printf 'KINVEST_DEPLOY_V5_OK intent=RESTORE commit=%s ifind=%s\n' "$target_commit" "$ifind_mode"
