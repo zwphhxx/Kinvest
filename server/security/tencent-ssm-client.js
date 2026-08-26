@@ -1,3 +1,5 @@
+/// <reference path="./tencentcloud-sdk-nodejs-ssm.d.ts" />
+
 const REGION = 'ap-shanghai'
 const ENDPOINT = 'ssm.tencentcloudapi.com'
 

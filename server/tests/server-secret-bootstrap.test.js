@@ -346,6 +346,22 @@ async function run() {
   }), 1)
   assert.equal(accessStderr.join(''), 'ACCESS_CONTROL_CONFIG_INVALID\n')
 
+  const ifindStderr = []
+  const ifindMarker = 'path=/run/secrets/kinvest-ifind token=secret'
+  assert.equal(await runServerExecutable({
+    prepare: async () => {
+      throw Object.assign(new Error(ifindMarker), {
+        code: 'IFIND_TMPFS_BUNDLE_INVALID'
+      })
+    },
+    runtimeServer: new FakeServer(),
+    processRef: new EventEmitter(),
+    logger: { log() {} },
+    stderr: { write: (value) => ifindStderr.push(String(value)) }
+  }), 1)
+  assert.equal(ifindStderr.join(''), 'IFIND_TMPFS_BUNDLE_INVALID\n')
+  assert.equal(ifindStderr.join('').includes(ifindMarker), false)
+
   const upstreamCode = 'ADMIN_PASSWORD_VERIFIER_V20260812_001'
   const allowlistStderr = []
   assert.equal(await runServerExecutable({

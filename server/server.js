@@ -38,7 +38,15 @@ const SECRET_BOOTSTRAP_ERROR_CODES = new Set([
   'SSM_CLIENT_UNAVAILABLE',
   'SSM_SECRET_LOAD_FAILED',
   'TEMPORARY_CREDENTIALS_REQUIRED',
-  'HTTP_SECURITY_CONFIG_INVALID'
+  'HTTP_SECURITY_CONFIG_INVALID',
+  'IFIND_DIAGNOSTIC_ACCESS_REQUIRED',
+  'IFIND_DIAGNOSTIC_DATABASE_INVALID',
+  'IFIND_DIAGNOSTIC_PROVIDER_INVALID',
+  'IFIND_DIAGNOSTIC_RUNTIME_INVALID',
+  'IFIND_DIAGNOSTIC_SCHEMA_INCOMPATIBLE',
+  'IFIND_REFRESH_TOKEN_UNAVAILABLE',
+  'IFIND_SECRET_CONFIG_INVALID',
+  'IFIND_TMPFS_BUNDLE_INVALID'
 ])
 
 const MIME = {
@@ -385,14 +393,16 @@ function serveStatic(req, res, pathname) {
  *   accessRuntime?: any,
  *   now?: () => number,
  *   publicOrigin?: string,
- *   trustedProxyAddresses?: string[]
+ *   trustedProxyAddresses?: string[],
+ *   ifindDiagnosticRuntime?: any
  * }} [options]
  */
 function createRequestHandler({
   accessRuntime,
   now = Date.now,
   publicOrigin = 'https://dearmina.cn',
-  trustedProxyAddresses = []
+  trustedProxyAddresses = [],
+  ifindDiagnosticRuntime
 } = {}) {
   if (!accessRuntime || !accessRuntime.status ||
     (accessRuntime.status.mode !== 'disabled' &&
@@ -409,6 +419,7 @@ function createRequestHandler({
     publicOrigin,
     trustedProxyAddresses
   })
+  void ifindDiagnosticRuntime
   return async (req, res) => {
     try {
       const urlObj = new URL(req.url, `http://localhost:${PORT}`)
@@ -453,12 +464,17 @@ async function startServer({
   prepare = prepareApplication,
   bootstrap = bootstrapSecrets,
   createAccessRuntime = createAccessControlRuntime,
+  createIfindRuntime,
   openDatabase = openTrackedDb,
   closeDatabase = closeTrackedDatabase,
   closeApplicationDatabase = closeDb,
   shutdownTimeoutMs = 5000,
   initializeDatabase = initializeRefreshDatabase,
   createHttpHandler = createRequestHandler,
+  loadIfindSecrets,
+  createIfindRepository,
+  createIfindClient,
+  createIfindService,
   runtimeServer,
   port = PORT,
   processRef = process,
@@ -469,10 +485,15 @@ async function startServer({
     env,
     bootstrap,
     createAccessRuntime,
+    ...(createIfindRuntime ? { createIfindRuntime } : {}),
     openDatabase,
     closeDatabase,
     initializeDatabase,
-    createHandler: createHttpHandler
+    createHandler: createHttpHandler,
+    ...(loadIfindSecrets ? { loadIfindSecrets } : {}),
+    ...(createIfindRepository ? { createIfindRepository } : {}),
+    ...(createIfindClient ? { createIfindClient } : {}),
+    ...(createIfindService ? { createIfindService } : {})
   })
   try {
     if (!runtimeServer) runtimeServer = http.createServer(prepared.handler)

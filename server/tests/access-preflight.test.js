@@ -237,6 +237,112 @@ async function testSharedPreparationAndSuccessfulPreflight(tempDirectory) {
   assert.equal(successSecret.clearCount(), 1)
 }
 
+async function testIfindStructuralPreflight(tempDirectory) {
+  const { runAccessPreflight } = require('../access-preflight')
+  const productionPath = path.join(tempDirectory, 'ifind-production.sqlite')
+  const disabledCandidate = path.join(tempDirectory, 'ifind-disabled.sqlite')
+  const enabledCandidate = path.join(tempDirectory, 'ifind-enabled.sqlite')
+  createEmptyDatabase(disabledCandidate)
+  createEmptyDatabase(enabledCandidate)
+  let providerCalls = 0
+  let clientCalls = 0
+  let transportCalls = 0
+  const disabledOut = capture()
+  const disabledErr = capture()
+  assert.equal(await runAccessPreflight({
+    env: {
+      ...enabledEnv(productionPath),
+      KINVEST_IFIND_DIAGNOSTIC_MODE: 'disabled'
+    },
+    databasePath: disabledCandidate,
+    bootstrap: async () => createSecretRuntime().runtime,
+    loadIfindSecrets: async () => {
+      providerCalls += 1
+      throw new Error('disabled preflight touched provider')
+    },
+    createIfindClient: () => {
+      clientCalls += 1
+      throw new Error('disabled preflight created client')
+    },
+    stdout: disabledOut.stream,
+    stderr: disabledErr.stream,
+    processRef: new EventEmitter()
+  }), 0)
+  assert.equal(
+    disabledOut.value(),
+    'KINVEST_ACCESS_PREFLIGHT_OK mode=device-approval references=2 database=ready proxy=ready\n'
+  )
+  assert.equal(disabledErr.value(), '')
+  assert.equal(providerCalls, 0)
+  assert.equal(clientCalls, 0)
+
+  const enabledOut = capture()
+  const enabledErr = capture()
+  const versionId = 'v20260826-001'
+  assert.equal(await runAccessPreflight({
+    env: {
+      ...enabledEnv(productionPath),
+      KINVEST_IFIND_DIAGNOSTIC_MODE: 'admin-diagnostic',
+      KINVEST_IFIND_SECRET_BUNDLE_PATH: '/run/secrets/kinvest-ifind',
+      KINVEST_IFIND_REFRESH_TOKEN_VERSION_ID: versionId
+    },
+    databasePath: enabledCandidate,
+    bootstrap: async () => createSecretRuntime().runtime,
+    loadIfindSecrets: async () => ({
+      readRefreshToken() { return Buffer.from('offline-fixture-token') },
+      clear() {}
+    }),
+    createIfindClient: () => ({
+      async diagnose() {
+        transportCalls += 1
+        throw new Error('preflight must remain offline')
+      },
+      clear() {}
+    }),
+    stdout: enabledOut.stream,
+    stderr: enabledErr.stream,
+    processRef: new EventEmitter()
+  }), 0)
+  assert.equal(enabledOut.value(), [
+    'KINVEST_ACCESS_PREFLIGHT_OK mode=device-approval references=2 database=ready proxy=ready',
+    'KINVEST_IFIND_PREFLIGHT_OK mode=admin-diagnostic configured=true'
+  ].join('\n') + '\n')
+  assert.equal(enabledErr.value(), '')
+  assert.equal(transportCalls, 0)
+
+  for (const [name, code] of [
+    ['missing', 'IFIND_TMPFS_BUNDLE_INVALID'],
+    ['wrong-version', 'IFIND_TMPFS_BUNDLE_INVALID'],
+    ['malformed', 'IFIND_TMPFS_BUNDLE_INVALID']
+  ]) {
+    const candidatePath = path.join(tempDirectory, `ifind-${name}.sqlite`)
+    createEmptyDatabase(candidatePath)
+    const stdout = capture()
+    const stderr = capture()
+    assert.equal(await runAccessPreflight({
+      env: {
+        ...enabledEnv(productionPath),
+        KINVEST_IFIND_DIAGNOSTIC_MODE: 'admin-diagnostic',
+        KINVEST_IFIND_SECRET_BUNDLE_PATH: '/run/secrets/kinvest-ifind',
+        KINVEST_IFIND_REFRESH_TOKEN_VERSION_ID: versionId
+      },
+      databasePath: candidatePath,
+      bootstrap: async () => createSecretRuntime().runtime,
+      loadIfindSecrets: async () => {
+        throw Object.assign(new Error(
+          `path=/run/secrets/kinvest-ifind version=${versionId} token=secret-${name}`
+        ), { code })
+      },
+      stdout: stdout.stream,
+      stderr: stderr.stream,
+      processRef: new EventEmitter()
+    }), 1)
+    assert.equal(stdout.value(), '')
+    assert.equal(stderr.value(), `${code}\n`)
+    assert.equal(/run\/secrets|v20260826|token=|secret-/.test(stderr.value()), false)
+  }
+}
+
 async function testRealOpenerChecksIdentityBeforeRefreshExpand(tempDirectory) {
   const { prepareApplication } = require('../pre-listen-preparation')
   const { closeDatabase, openDbAtPath } = require('../db/refresh-db')
@@ -1114,6 +1220,7 @@ async function run() {
   ))
   try {
     await testSharedPreparationAndSuccessfulPreflight(tempDirectory)
+    await testIfindStructuralPreflight(tempDirectory)
     await testRealOpenerChecksIdentityBeforeRefreshExpand(tempDirectory)
     await testStableFailuresAndDatabaseClosure(tempDirectory)
     await testDatabasePathIsolation(tempDirectory)

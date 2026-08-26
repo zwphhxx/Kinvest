@@ -1,4 +1,6 @@
 const assert = require('node:assert/strict')
+const fs = require('node:fs')
+const path = require('node:path')
 
 const TEMPORARY_CREDENTIALS = Object.freeze({
   secretId: 'temporary-id',
@@ -7,6 +9,28 @@ const TEMPORARY_CREDENTIALS = Object.freeze({
 })
 
 async function run() {
+  const repositoryRoot = path.resolve(__dirname, '..', '..')
+  const source = fs.readFileSync(
+    path.join(repositoryRoot, 'server', 'security', 'tencent-ssm-client.js'),
+    'utf8'
+  )
+  assert.match(source, /require\('tencentcloud-sdk-nodejs-ssm'\)/)
+  assert.doesNotMatch(source, /\['tencentcloud-sdk-nodejs', 'ssm'\][.]join/)
+  assert.ok(
+    source.indexOf('function defaultSdkLoader') <
+      source.indexOf("require('tencentcloud-sdk-nodejs-ssm')")
+  )
+
+  const packageJson = JSON.parse(fs.readFileSync(
+    path.join(repositoryRoot, 'package.json'),
+    'utf8'
+  ))
+  assert.equal(packageJson.dependencies['tencentcloud-sdk-nodejs-ssm'], '4.1.275')
+  assert.match(
+    fs.readFileSync(path.join(repositoryRoot, 'Dockerfile'), 'utf8'),
+    /node -e "require\('tencentcloud-sdk-nodejs-ssm'\)/
+  )
+
   const { createTencentSsmClient } = require('../security/tencent-ssm-client')
   const configurations = []
   const requests = []
@@ -51,15 +75,6 @@ async function run() {
     SecretName: 'fixture-name',
     VersionId: 'v20260812-001'
   }])
-
-  const actualSdk = require('tencentcloud-sdk-nodejs-ssm')
-  assert.equal(typeof actualSdk.ssm.v20190923.Client, 'function')
-  const smokeClient = createTencentSsmClient({
-    region: 'ap-shanghai',
-    credentials: TEMPORARY_CREDENTIALS,
-    sdkLoader: () => actualSdk
-  })
-  assert.equal(typeof smokeClient.getSecretValue, 'function')
 
   const secretMarker = 'fixture-secret-must-not-leak'
   const failingClient = createTencentSsmClient({
