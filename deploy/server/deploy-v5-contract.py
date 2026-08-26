@@ -10,6 +10,7 @@ import json
 import re
 import sys
 from datetime import datetime
+from pathlib import PurePosixPath
 from typing import Any
 
 
@@ -28,6 +29,14 @@ TIMESTAMP_PATTERN = re.compile(
 )
 IFIND_MATERIAL_PATTERN = re.compile(r"^[!-~]+$")
 
+STATE_FIELDS_V4 = (
+    "protocolVersion", "imageDigest", "runtimeImageId", "commit",
+    "schemaVersion", "imageSchemaMin", "imageSchemaMax",
+    "secretProviderMode", "secretVersionIds", "secretBundleId",
+    "secretMaterialFingerprints", "releaseRecordSchemaVersion",
+    "verificationRunId", "artifactSource", "databaseBackupPath",
+    "databaseBackupChecksum", "deployedAt",
+)
 STATE_FIELDS_V5 = (
     "protocolVersion", "imageDigest", "runtimeImageId", "commit",
     "schemaVersion", "imageSchemaMin", "imageSchemaMax",
@@ -58,6 +67,10 @@ class ContractError(Exception):
         self.code = code
 
 
+class DuplicateJsonKeyError(ValueError):
+    pass
+
+
 def fail(code: str) -> None:
     raise ContractError(code)
 
@@ -72,11 +85,24 @@ def require_exact_keys(value: Any, expected: set[str], code: str) -> dict[str, A
     return value
 
 
-def parse_canonical_json(raw: str, expected: set[str], code: str) -> dict[str, Any]:
+def reject_duplicate_pairs(pairs: list[tuple[str, Any]]) -> dict[str, Any]:
+    value: dict[str, Any] = {}
+    for key, item in pairs:
+        if key in value:
+            raise DuplicateJsonKeyError(key)
+        value[key] = item
+    return value
+
+
+def strict_json_loads(raw: str | bytes, code: str) -> Any:
     try:
-        value = json.loads(raw)
-    except (TypeError, ValueError):
+        return json.loads(raw, object_pairs_hook=reject_duplicate_pairs)
+    except (DuplicateJsonKeyError, UnicodeDecodeError, ValueError, TypeError):
         fail(code)
+
+
+def parse_canonical_json(raw: str, expected: set[str], code: str) -> dict[str, Any]:
+    value = strict_json_loads(raw, code)
     value = require_exact_keys(value, expected, code)
     if canonical_json(value) != raw:
         fail(code)
@@ -143,7 +169,12 @@ def validate_hmac_material(raw: str) -> bytearray:
 
 
 def canonical_secret_versions(admin_version: str, hmac_version: str) -> dict[str, Any]:
-    if VERSION_PATTERN.fullmatch(admin_version) is None or VERSION_PATTERN.fullmatch(hmac_version) is None:
+    if (
+        not isinstance(admin_version, str)
+        or not isinstance(hmac_version, str)
+        or VERSION_PATTERN.fullmatch(admin_version) is None
+        or VERSION_PATTERN.fullmatch(hmac_version) is None
+    ):
         fail("DEPLOY_V5_VERSION_ID_INVALID")
     return {
         "adminPasswordVerifier": admin_version,
@@ -187,7 +218,7 @@ def validate_fingerprints(value: Any, provider: str) -> dict[str, str]:
 
 
 def validate_ifind_config(mode: Any, version: Any, fingerprint: Any, bundle_id: Any | None = None) -> tuple[str, str, str, str | None]:
-    if mode not in {"disabled", "diagnostic"}:
+    if not isinstance(mode, str) or mode not in {"disabled", "diagnostic"}:
         fail("DEPLOY_V5_IFIND_CONFIG_INVALID")
     if not all(isinstance(item, str) for item in (version, fingerprint)):
         fail("DEPLOY_V5_IFIND_CONFIG_INVALID")
@@ -330,11 +361,11 @@ def validate_state(value: Any) -> dict[str, Any]:
     value = require_exact_keys(value, set(STATE_FIELDS_V6), "DEPLOY_V5_STATE_INVALID")
     if value["protocolVersion"] != 6 or type(value["protocolVersion"]) is not int:
         fail("DEPLOY_V5_STATE_INVALID")
-    if DIGEST_PATTERN.fullmatch(value["imageDigest"]) is None:
+    if not isinstance(value["imageDigest"], str) or DIGEST_PATTERN.fullmatch(value["imageDigest"]) is None:
         fail("DEPLOY_V5_STATE_INVALID")
-    if IMAGE_ID_PATTERN.fullmatch(value["runtimeImageId"]) is None:
+    if not isinstance(value["runtimeImageId"], str) or IMAGE_ID_PATTERN.fullmatch(value["runtimeImageId"]) is None:
         fail("DEPLOY_V5_STATE_INVALID")
-    if COMMIT_PATTERN.fullmatch(value["commit"]) is None:
+    if not isinstance(value["commit"], str) or COMMIT_PATTERN.fullmatch(value["commit"]) is None:
         fail("DEPLOY_V5_STATE_INVALID")
     for field in ("schemaVersion", "imageSchemaMin", "imageSchemaMax"):
         if type(value[field]) is not int or value[field] < 0:
@@ -342,10 +373,13 @@ def validate_state(value: Any) -> dict[str, Any]:
     if not value["imageSchemaMin"] <= value["schemaVersion"] <= value["imageSchemaMax"]:
         fail("DEPLOY_V5_STATE_INVALID")
     provider = value["secretProviderMode"]
-    if provider not in {"disabled", "github-tmpfs-v1"}:
+    if not isinstance(provider, str) or provider not in {"disabled", "github-tmpfs-v1"}:
         fail("DEPLOY_V5_STATE_INVALID")
-    versions = validate_secret_versions(value["secretVersionIds"], provider)
-    fingerprints = validate_fingerprints(value["secretMaterialFingerprints"], provider)
+    try:
+        versions = validate_secret_versions(value["secretVersionIds"], provider)
+        fingerprints = validate_fingerprints(value["secretMaterialFingerprints"], provider)
+    except ContractError:
+        fail("DEPLOY_V5_STATE_INVALID")
     bundle_id = value["secretBundleId"]
     if provider == "disabled":
         if bundle_id != "none":
@@ -353,7 +387,7 @@ def validate_state(value: Any) -> dict[str, Any]:
     elif not isinstance(bundle_id, str) or BUNDLE_ID_PATTERN.fullmatch(bundle_id) is None:
         fail("DEPLOY_V5_STATE_INVALID")
     access_mode = value["accessControlMode"]
-    if access_mode not in {"disabled", "device-approval"}:
+    if not isinstance(access_mode, str) or access_mode not in {"disabled", "device-approval"}:
         fail("DEPLOY_V5_STATE_INVALID")
     if type(value["imageAccessControlContract"]) is not int or value["imageAccessControlContract"] not in {0, 1}:
         fail("DEPLOY_V5_STATE_INVALID")
@@ -388,13 +422,21 @@ def validate_state(value: Any) -> dict[str, Any]:
         fail("DEPLOY_V5_STATE_INVALID")
     backup_path = value["databaseBackupPath"]
     backup_checksum = value["databaseBackupChecksum"]
-    if (backup_path, backup_checksum) != ("none", "none") and (
-        not isinstance(backup_path, str)
-        or not backup_path.startswith("/root/docker/kinvest/backups/")
-        or not isinstance(backup_checksum, str)
-        or FINGERPRINT_PATTERN.fullmatch(backup_checksum) is None
-    ):
-        fail("DEPLOY_V5_STATE_INVALID")
+    if (backup_path, backup_checksum) != ("none", "none"):
+        if not isinstance(backup_path, str) or not isinstance(backup_checksum, str):
+            fail("DEPLOY_V5_STATE_INVALID")
+        candidate_backup = PurePosixPath(backup_path)
+        backup_root = PurePosixPath("/root/docker/kinvest/backups")
+        # Contract-only path normalization. H4-2 owns openat/O_NOFOLLOW,
+        # regular-file verification, and checksum recomputation at execution.
+        if (
+            str(candidate_backup) != backup_path
+            or candidate_backup.parent != backup_root
+            or not candidate_backup.name
+            or candidate_backup.name in {".", ".."}
+            or FINGERPRINT_PATTERN.fullmatch(backup_checksum) is None
+        ):
+            fail("DEPLOY_V5_STATE_INVALID")
     deployed_at = value["deployedAt"]
     if not isinstance(deployed_at, str) or TIMESTAMP_PATTERN.fullmatch(deployed_at) is None:
         fail("DEPLOY_V5_STATE_INVALID")
@@ -430,12 +472,18 @@ def parse_state_text(raw: str) -> dict[str, Any]:
     if "\r" in raw or not raw.endswith("\n"):
         fail("DEPLOY_V5_STATE_INVALID")
     lines = raw[:-1].split("\n")
-    if lines and lines[0] == "protocolVersion=5":
+    if lines and lines[0] == "protocolVersion=4":
+        fields = STATE_FIELDS_V4
+        migrating_access = True
+        migrating_ifind = True
+    elif lines and lines[0] == "protocolVersion=5":
         fields = STATE_FIELDS_V5
-        migrating = True
+        migrating_access = False
+        migrating_ifind = True
     elif lines and lines[0] == "protocolVersion=6":
         fields = STATE_FIELDS_V6
-        migrating = False
+        migrating_access = False
+        migrating_ifind = False
     else:
         fail("DEPLOY_V5_STATE_INVALID")
     if len(lines) != len(fields):
@@ -457,14 +505,21 @@ def parse_state_text(raw: str) -> dict[str, Any]:
             value[field] = int(item)
         elif field in json_fields:
             try:
-                value[field] = json.loads(item)
-            except ValueError:
+                value[field] = strict_json_loads(item, "DEPLOY_V5_STATE_INVALID")
+            except ContractError:
                 fail("DEPLOY_V5_STATE_INVALID")
             if canonical_json(value[field]) != item:
                 fail("DEPLOY_V5_STATE_INVALID")
         else:
             value[field] = item
-    if migrating:
+    if migrating_access:
+        value.update({
+            "accessControlMode": "disabled",
+            "imageAccessControlContract": 0,
+            "trustedProxyAddresses": [],
+            "trustedProxyConfigChecksum": "",
+        })
+    if migrating_ifind:
         value.update({
             "protocolVersion": 6,
             "ifindDiagnosticMode": "disabled",
@@ -481,15 +536,20 @@ def validate_request(value: Any) -> dict[str, Any]:
         "secretMaterialFingerprints", "accessControlMode", "ifindDiagnosticMode",
         "ifindRefreshTokenVersionId", "ifindSecretMaterialFingerprint",
     }, "DEPLOY_V5_INTENT_STATE_INVALID")
-    if DIGEST_PATTERN.fullmatch(value["imageDigest"]) is None or COMMIT_PATTERN.fullmatch(value["commit"]) is None:
+    if (
+        not isinstance(value["imageDigest"], str)
+        or DIGEST_PATTERN.fullmatch(value["imageDigest"]) is None
+        or not isinstance(value["commit"], str)
+        or COMMIT_PATTERN.fullmatch(value["commit"]) is None
+    ):
         fail("DEPLOY_V5_INTENT_STATE_INVALID")
     provider = value["secretProviderMode"]
-    if provider not in {"disabled", "github-tmpfs-v1"}:
+    if not isinstance(provider, str) or provider not in {"disabled", "github-tmpfs-v1"}:
         fail("DEPLOY_V5_INTENT_STATE_INVALID")
     versions = validate_secret_versions(value["secretVersionIds"], provider)
     fingerprints = validate_fingerprints(value["secretMaterialFingerprints"], provider)
     access = value["accessControlMode"]
-    if access not in {"disabled", "device-approval"} or (access == "device-approval" and provider != "github-tmpfs-v1"):
+    if not isinstance(access, str) or access not in {"disabled", "device-approval"} or (access == "device-approval" and provider != "github-tmpfs-v1"):
         fail("DEPLOY_V5_INTENT_STATE_INVALID")
     mode, version, fingerprint, _ = validate_ifind_config(
         value["ifindDiagnosticMode"], value["ifindRefreshTokenVersionId"],
@@ -606,10 +666,7 @@ def read_json_input() -> Any:
     raw = sys.stdin.buffer.read(MAX_JSON_INPUT_BYTES + 1)
     if len(raw) > MAX_JSON_INPUT_BYTES or b"\r" in raw:
         fail("DEPLOY_V5_INPUT_INVALID")
-    try:
-        return json.loads(raw)
-    except (UnicodeDecodeError, ValueError):
-        fail("DEPLOY_V5_INPUT_INVALID")
+    return strict_json_loads(raw, "DEPLOY_V5_INPUT_INVALID")
 
 
 def main(argv: list[str]) -> int:
