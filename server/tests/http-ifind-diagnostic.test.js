@@ -1,7 +1,9 @@
 const assert = require('node:assert/strict')
 const http = require('node:http')
+const { EventEmitter } = require('node:events')
 
 const { createRequestHandler } = require('../server')
+const { parseStrictJsonBody } = require('../http/auth-http')
 
 const ORIGIN = 'https://dearmina.cn'
 const NOW = Date.UTC(2026, 7, 26, 8, 0, 0)
@@ -108,6 +110,7 @@ function createDiagnosticRuntime({ status, outcome } = {}) {
   }
 }
 
+/** @param {any} [diagnosticRuntime] */
 async function start(diagnosticRuntime = createDiagnosticRuntime()) {
   const server = http.createServer(createRequestHandler({
     accessRuntime: createAccessRuntime(),
@@ -175,6 +178,42 @@ async function abortPartialRequest(baseUrl) {
     process.removeListener('uncaughtExceptionMonitor', onUnhandled)
   }
   assert.deepEqual(observed, [])
+}
+
+function createBodyStream() {
+  const stream = /** @type {EventEmitter & {
+   *   headers: Record<string, string>,
+   *   complete: boolean,
+   *   resumeCalls: number,
+   *   resume: () => void
+   * }} */ (new EventEmitter())
+  stream.headers = { 'content-type': 'application/json' }
+  stream.complete = false
+  stream.resumeCalls = 0
+  stream.resume = () => { stream.resumeCalls += 1 }
+  return stream
+}
+
+async function observePromptSettlement(promise, fallback) {
+  const observed = promise.then(
+    (value) => ({ type: 'resolved', value }),
+    (error) => ({ type: 'rejected', error })
+  )
+  const first = await Promise.race([
+    observed,
+    new Promise((resolve) => setTimeout(() => resolve({ type: 'timeout' }), 25))
+  ])
+  if (first.type === 'timeout') {
+    fallback()
+    await observed
+  }
+  return first
+}
+
+function assertParserListenersRemoved(stream) {
+  for (const event of ['data', 'error', 'aborted', 'end', 'close']) {
+    assert.equal(stream.listenerCount(event), 0, event)
+  }
 }
 
 function adminCookie(token = ADMIN_TOKEN) {
@@ -283,6 +322,121 @@ async function testStrictEmptyJsonBody() {
   }
 }
 
+async function testJsonStreamTerminalEvents() {
+  const closeOnly = createBodyStream()
+  const closePromise = parseStrictJsonBody(
+    /** @type {any} */ (closeOnly),
+    { allowEmpty: false }
+  )
+  closeOnly.emit('data', Buffer.from('{'))
+  closeOnly.emit('close')
+  const closed = await observePromptSettlement(closePromise, () => closeOnly.emit('aborted'))
+  assert.equal(closed.type, 'rejected')
+  assert.equal(closed.error.code, 'JSON_INVALID')
+  assertParserListenersRemoved(closeOnly)
+
+  const oversized = createBodyStream()
+  const oversizedPromise = parseStrictJsonBody(
+    /** @type {any} */ (oversized),
+    { allowEmpty: false }
+  )
+  oversized.emit('data', Buffer.alloc(4097))
+  const rejected = await observePromptSettlement(oversizedPromise, () => oversized.emit('end'))
+  assert.equal(rejected.type, 'rejected')
+  assert.equal(rejected.error.code, 'BODY_TOO_LARGE')
+  assert.equal(oversized.resumeCalls, 1)
+  assertParserListenersRemoved(oversized)
+  oversized.emit('end')
+  oversized.emit('aborted')
+  oversized.emit('close')
+
+  const completed = createBodyStream()
+  let settlements = 0
+  const completedPromise = parseStrictJsonBody(
+    /** @type {any} */ (completed),
+    { allowEmpty: false }
+  ).then(
+    (value) => { settlements += 1; return value },
+    (error) => { settlements += 1; throw error }
+  )
+  completed.emit('data', Buffer.from('{}'))
+  completed.complete = true
+  completed.emit('end')
+  assert.deepEqual(await completedPromise, {})
+  completed.emit('close')
+  completed.emit('aborted')
+  completed.emit('data', Buffer.from('raw-late-data'))
+  completed.emit('end')
+  await Promise.resolve()
+  assert.equal(settlements, 1)
+  assertParserListenersRemoved(completed)
+}
+
+async function testRuntimeAvailabilityAndServiceFailures() {
+  let disabledServiceCalls = 0
+  const disabledRuntime = Object.freeze({
+    status: Object.freeze({ mode: 'disabled', configured: false, versionId: null }),
+    service: Object.freeze({
+      status() { disabledServiceCalls += 1; return createDiagnosticRuntime().service.status() },
+      async run() { disabledServiceCalls += 1; return createDiagnosticRuntime().service.run() }
+    })
+  })
+  for (const diagnosticRuntime of [null, disabledRuntime]) {
+    const running = await start(diagnosticRuntime)
+    try {
+      const getResponse = await request(running.baseUrl, '/api/admin/ifind/diagnostics', {
+        headers: { cookie: adminCookie() }
+      })
+      assert.deepEqual(getResponse, {
+        status: 503,
+        body: { error: 'IFIND_DIAGNOSTIC_DISABLED' }
+      })
+      const postResponse = await request(running.baseUrl, '/api/admin/ifind/diagnostics/run', {
+        method: 'POST', headers: postHeaders(), body: '{}'
+      })
+      assert.deepEqual(postResponse, {
+        status: 503,
+        body: { error: 'IFIND_DIAGNOSTIC_DISABLED' }
+      })
+    } finally {
+      await running.close()
+    }
+  }
+  assert.equal(disabledServiceCalls, 0)
+
+  for (const method of ['status', 'run']) {
+    const rawMarker = `raw-${method}-provider-error`
+    const service = {
+      status() {
+        if (method === 'status') throw new Error(rawMarker)
+        return createDiagnosticRuntime().service.status()
+      },
+      async run() {
+        if (method === 'run') throw new Error(rawMarker)
+        return createDiagnosticRuntime().service.run()
+      }
+    }
+    const runtime = {
+      status: { mode: 'admin-diagnostic', configured: true, versionId: VERSION_ID },
+      service
+    }
+    const running = await start(runtime)
+    try {
+      const response = method === 'status'
+        ? await request(running.baseUrl, '/api/admin/ifind/diagnostics', {
+            headers: { cookie: adminCookie() }
+          })
+        : await request(running.baseUrl, '/api/admin/ifind/diagnostics/run', {
+            method: 'POST', headers: postHeaders(), body: '{}'
+          })
+      assert.deepEqual(response, { status: 500, body: { error: 'INTERNAL_ERROR' } })
+      assert.equal(JSON.stringify(response.body).includes(rawMarker), false)
+    } finally {
+      await running.close()
+    }
+  }
+}
+
 async function testSafeStatusAndOutcomeMappings() {
   const runtime = createDiagnosticRuntime()
   const running = await start(runtime)
@@ -317,6 +471,31 @@ async function testSafeStatusAndOutcomeMappings() {
     assert.deepEqual(runtime.calls, ['status'])
   } finally {
     await running.close()
+  }
+
+  const previousVersion = 'v20260825-001'
+  const rotatedRuntime = createDiagnosticRuntime({
+    status: {
+      mode: 'admin-diagnostic',
+      configured: true,
+      tokenVersionId: VERSION_ID,
+      officialQuotaStatus: 'unavailable',
+      cooldownUntil: null,
+      localAttemptCount: 2,
+      inFlight: false,
+      latest: latest({ tokenVersionId: previousVersion })
+    }
+  })
+  const rotatedServer = await start(rotatedRuntime)
+  try {
+    const response = await request(rotatedServer.baseUrl, '/api/admin/ifind/diagnostics', {
+      headers: { cookie: adminCookie() }
+    })
+    assert.equal(response.status, 200)
+    assert.equal(response.body.data.tokenVersionId, VERSION_ID)
+    assert.equal(response.body.data.latest.tokenVersionId, previousVersion)
+  } finally {
+    await rotatedServer.close()
   }
 
   const outcomeCases = [
@@ -374,9 +553,17 @@ async function testSafeStatusAndOutcomeMappings() {
   }
 
   const hostileValues = [
+    { outcome: { status: 'disabled', safeErrorClass: 'BUSY' } },
+    { outcome: { status: 'busy', safeErrorClass: 'BUSY', retryAt: NOW - 1, localAttemptCount: 1 } },
+    { outcome: { status: 'cooldown', safeErrorClass: 'RATE_LIMITED', retryAt: NOW + 1, localAttemptCount: 0 } },
+    { outcome: { status: 'daily-limit', safeErrorClass: 'RATE_LIMITED', retryAt: NOW + 1, localAttemptCount: 19 } },
     { status: { mode: 'admin-diagnostic', configured: true, tokenVersionId: 'current', officialQuotaStatus: 'unavailable', cooldownUntil: null, localAttemptCount: 1, inFlight: false, latest: null } },
     { status: { mode: 'admin-diagnostic', configured: true, tokenVersionId: VERSION_ID, officialQuotaStatus: 'unavailable', cooldownUntil: null, localAttemptCount: 1, inFlight: false, latest: latest({ route: 'raw-provider-route' }) } },
     { outcome: { status: 'failed', safeErrorClass: 'AUTH', diagnostic: latest({ authStatus: 'success', probeStatus: 'failed', safeErrorClass: 'AUTH', completeness: 'unavailable', dataVol: null }), cooldownUntil: NOW, localAttemptCount: 1 } },
+    { outcome: { status: 'failed', safeErrorClass: 'AUTH', diagnostic: latest({ authStatus: 'failed', probeStatus: 'not_run', safeErrorClass: 'AUTH', completeness: 'unavailable', dataVol: null }), cooldownUntil: NOW - 1, localAttemptCount: 1 } },
+    { outcome: { status: 'failed', safeErrorClass: 'PERMISSION', diagnostic: latest({ authStatus: 'success', probeStatus: 'failed', safeErrorClass: 'PERMISSION', completeness: 'complete', dataVol: 1 }), cooldownUntil: NOW, localAttemptCount: 1 } },
+    { outcome: { status: 'completed', safeErrorClass: null, diagnostic: latest({ requestCount: 1 }), cooldownUntil: NOW, localAttemptCount: 1 } },
+    { outcome: { status: 'completed', safeErrorClass: null, diagnostic: latest(), cooldownUntil: NOW, localAttemptCount: 0 } },
     { outcome: { status: 'completed', safeErrorClass: null, diagnostic: latest({ requestCount: 99 }), cooldownUntil: NOW, localAttemptCount: 1 } },
     { outcome: { status: 'busy', safeErrorClass: 'raw-provider-error', retryAt: NOW, localAttemptCount: 1 } }
   ]
@@ -415,6 +602,8 @@ async function testAdminCookieDoesNotAuthorizeInvestmentData() {
 async function run() {
   await testAdministratorBoundaryAndOrdering()
   await testStrictEmptyJsonBody()
+  await testJsonStreamTerminalEvents()
+  await testRuntimeAvailabilityAndServiceFailures()
   await testSafeStatusAndOutcomeMappings()
   await testAdminCookieDoesNotAuthorizeInvestmentData()
 }

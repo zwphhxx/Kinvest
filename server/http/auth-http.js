@@ -189,25 +189,40 @@ function parseStrictJsonBody(req, { allowEmpty = true } = {}) {
     const chunks = []
     let size = 0
     let settled = false
-    const rejectOnce = (error) => {
+    const cleanup = () => {
+      req.removeListener('data', onData)
+      req.removeListener('error', onError)
+      req.removeListener('aborted', onAborted)
+      req.removeListener('end', onEnd)
+      req.removeListener('close', onClose)
+    }
+    const rejectOnce = (error, drain = false) => {
       if (settled) return
       settled = true
+      cleanup()
+      if (drain && typeof req.resume === 'function') req.resume()
       reject(error)
     }
-    req.on('data', (chunk) => {
-      size += chunk.length
-      if (size <= JSON_BODY_LIMIT) chunks.push(chunk)
-    })
-    req.once('error', () =>
-      rejectOnce(new HttpBoundaryError('JSON_INVALID', 400)))
-    req.once('aborted', () =>
-      rejectOnce(new HttpBoundaryError('JSON_INVALID', 400)))
-    req.once('end', () => {
+    const resolveOnce = (value) => {
       if (settled) return
+      settled = true
+      cleanup()
+      resolve(value)
+    }
+    const onData = (chunk) => {
+      size += chunk.length
       if (size > JSON_BODY_LIMIT) {
-        rejectOnce(new HttpBoundaryError('BODY_TOO_LARGE', 413))
+        rejectOnce(new HttpBoundaryError('BODY_TOO_LARGE', 413), true)
         return
       }
+      chunks.push(chunk)
+    }
+    const onError = () =>
+      rejectOnce(new HttpBoundaryError('JSON_INVALID', 400))
+    const onAborted = () =>
+      rejectOnce(new HttpBoundaryError('JSON_INVALID', 400))
+    const onEnd = () => {
+      if (settled) return
       try {
         const raw = new TextDecoder('utf-8', { fatal: true })
           .decode(Buffer.concat(chunks))
@@ -217,14 +232,23 @@ function parseStrictJsonBody(req, { allowEmpty = true } = {}) {
         if (parsed === null || typeof parsed !== 'object' || Array.isArray(parsed)) {
           boundaryError('JSON_INVALID', 400)
         }
-        settled = true
-        resolve(parsed)
+        resolveOnce(parsed)
       } catch (error) {
         rejectOnce(error instanceof HttpBoundaryError
           ? error
           : new HttpBoundaryError('JSON_INVALID', 400))
       }
-    })
+    }
+    const onClose = () => {
+      if (settled) return
+      if (req.complete === true) onEnd()
+      else rejectOnce(new HttpBoundaryError('JSON_INVALID', 400))
+    }
+    req.on('data', onData)
+    req.once('error', onError)
+    req.once('aborted', onAborted)
+    req.once('end', onEnd)
+    req.once('close', onClose)
   })
 }
 
@@ -339,15 +363,17 @@ function createAuthHttpController({
       dto.officialQuotaStatus !== 'unavailable' ||
       (!successful && !authFailed && !probeFailed && !authUnknown) ||
       (successful && (dto.safeErrorClass !== null ||
+        dto.requestCount < 2 ||
         dto.completeness === 'unavailable' ||
         (dto.completeness === 'complete' && dto.dataVol === null) ||
         (dto.completeness === 'partial' && dto.dataVol !== null))) ||
       (authFailed && (dto.safeErrorClass === null ||
         dto.completeness !== 'unavailable' || dto.dataVol !== null)) ||
       (probeFailed && (dto.safeErrorClass === null ||
-        dto.completeness !== 'unavailable')) ||
+        dto.requestCount < 2 || dto.completeness !== 'unavailable')) ||
       (authUnknown &&
-        (dto.safeErrorClass !== 'NETWORK' && dto.safeErrorClass !== 'API')) ||
+        (dto.requestCount < 1 ||
+          (dto.safeErrorClass !== 'NETWORK' && dto.safeErrorClass !== 'API'))) ||
       ((dto.safeErrorClass === 'AUTH' || dto.safeErrorClass === 'CONFIG') &&
         !authFailed) ||
       ((dto.safeErrorClass === 'PERMISSION' || dto.safeErrorClass === 'QUOTA') &&
@@ -372,19 +398,9 @@ function createAuthHttpController({
     }
   }
 
-  function disabledDiagnosticStatus() {
-    return {
-      mode: 'disabled',
-      configured: false,
-      tokenVersionId: null,
-      officialQuotaStatus: 'unavailable',
-      cooldownUntil: null,
-      localAttemptCount: 0,
-      latest: null
-    }
-  }
-
   function diagnosticService() {
+    if (!ifindDiagnosticRuntime || !ifindDiagnosticRuntime.status ||
+      ifindDiagnosticRuntime.status.mode !== 'admin-diagnostic') return null
     const service = ifindDiagnosticRuntime && ifindDiagnosticRuntime.service
     return service && typeof service.status === 'function' &&
       typeof service.run === 'function' ? service : null
@@ -405,7 +421,8 @@ function createAuthHttpController({
       boundaryError('INTERNAL_ERROR', 500)
     }
     const latest = dto.latest === null ? null : copyDiagnostic(dto.latest)
-    if (latest && latest.tokenVersionId !== dto.tokenVersionId) {
+    if (latest && dto.cooldownUntil !== null &&
+      dto.cooldownUntil < latest.completedAt) {
       boundaryError('INTERNAL_ERROR', 500)
     }
     return {
@@ -439,7 +456,11 @@ function createAuthHttpController({
       ])
       const expectedClass = status === 'busy' ? 'BUSY' : 'RATE_LIMITED'
       if (dto.safeErrorClass !== expectedClass || !isTimestamp(dto.retryAt) ||
-        !isCount(dto.localAttemptCount, 20)) boundaryError('INTERNAL_ERROR', 500)
+        dto.retryAt <= now() || !isCount(dto.localAttemptCount, 20) ||
+        dto.localAttemptCount < 1 ||
+        (status === 'daily-limit' && dto.localAttemptCount !== 20)) {
+        boundaryError('INTERNAL_ERROR', 500)
+      }
       const mapping = {
         busy: [409, 'IFIND_DIAGNOSTIC_BUSY'],
         cooldown: [429, 'IFIND_DIAGNOSTIC_COOLDOWN'],
@@ -462,6 +483,7 @@ function createAuthHttpController({
     ])
     const diagnostic = copyDiagnostic(dto.diagnostic)
     if (!isTimestamp(dto.cooldownUntil) || !isCount(dto.localAttemptCount, 20) ||
+      dto.localAttemptCount < 1 || dto.cooldownUntil < diagnostic.completedAt ||
       (status === 'completed' && (dto.safeErrorClass !== null ||
         diagnostic.authStatus !== 'success' || diagnostic.probeStatus !== 'success')) ||
       (status === 'failed' && (!IFIND_ERROR_CLASSES.has(dto.safeErrorClass) ||
@@ -728,11 +750,11 @@ function createAuthHttpController({
       if (req.headers.origin !== undefined) requireOrigin(req, publicOrigin)
       authenticateAdmin(req, res)
       const service = diagnosticService()
-      sendJson(res, {
-        data: service
-          ? copyDiagnosticStatus(service.status())
-          : disabledDiagnosticStatus()
-      })
+      if (!service) {
+        sendJson(res, { error: 'IFIND_DIAGNOSTIC_DISABLED' }, 503)
+        return true
+      }
+      sendJson(res, { data: copyDiagnosticStatus(service.status()) })
       return true
     }
 
@@ -745,7 +767,7 @@ function createAuthHttpController({
       exactObject(await parseStrictJsonBody(req, { allowEmpty: false }), [], [])
       const service = diagnosticService()
       if (!service) {
-        sendDiagnosticOutcome(res, { status: 'disabled' })
+        sendJson(res, { error: 'IFIND_DIAGNOSTIC_DISABLED' }, 503)
         return true
       }
       sendDiagnosticOutcome(res, await service.run())
