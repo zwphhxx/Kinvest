@@ -108,7 +108,13 @@ exec /bin/mv -f "\${args[@]}"
 `)
 
   const gate = path.join(sbin, 'kinvest-ssh-command')
-  const oldGateContent = gateSource.replace('#!/usr/bin/env bash', '#!/usr/bin/env bash\n# old-gate-fixture')
+  const oldGateFixtureMarker = '# fixture: previous forced-command gate'
+  const oldGateContent = gateSource.replace(
+    '#!/bin/bash\n',
+    `#!/usr/bin/env bash\n${oldGateFixtureMarker}\n`
+  )
+  assert.notEqual(oldGateContent, gateSource, 'old gate fixture must differ from the new forced-command gate')
+  assert.match(oldGateContent, /^#!\/usr\/bin\/env bash\n# fixture: previous forced-command gate\n/)
   const targets = [
     path.join(sbin, 'deploy-kinvest-v5'),
     path.join(libexec, 'kinvest-deploy-v5-runtime'),
