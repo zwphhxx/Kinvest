@@ -440,8 +440,22 @@ async function run() {
 
   assert.match(wrapper, /deploy-v2\)/)
   assert.match(wrapper, /deploy-v3\)/)
-  assert.match(wrapper, /exec sudo -n \/usr\/local\/sbin\/deploy-kinvest/)
-  assert.match(wrapper, /exec sudo -n \/usr\/local\/sbin\/deploy-kinvest-v3/)
+  const hardenedEnvironment = 'exec /usr/bin/env -i PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin HOME=/nonexistent LANG=C LC_ALL=C /usr/bin/sudo -n '
+  const wrapperLines = wrapper.split('\n').map((line) => line.trim())
+  for (const deployer of [
+    '/usr/local/sbin/deploy-kinvest',
+    '/usr/local/sbin/deploy-kinvest-v3',
+    '/usr/local/sbin/deploy-kinvest-v4',
+    '/usr/local/sbin/deploy-kinvest-v5'
+  ]) {
+    assert.equal(
+      wrapperLines.filter((line) => line === `${hardenedEnvironment}${deployer}`).length,
+      1,
+      `${deployer} must execute once through the absolute env and sudo paths with only the fixed minimal environment`
+    )
+  }
+  assert.match(wrapper, /^unset BASH_ENV ENV PYTHONPATH PYTHONHOME LD_PRELOAD LD_LIBRARY_PATH SUDO_ASKPASS SUDO_COMMAND SUDO_USER SUDO_UID SUDO_GID$/m)
+  assert.doesNotMatch(wrapper, /exec sudo -n|exec \/usr\/bin\/sudo -n/)
   assert.doesNotMatch(wrapper.replace('/root/docker/kinvest/state/install-v4.journal', ''), /digest|material|docker|eval/)
 
   const valid = validate(payload())
@@ -1176,6 +1190,7 @@ async function run() {
       wrapper
         .replace("GATE_STATE_DIR='/var/lib/kinvest-deploy-gate'", `GATE_STATE_DIR='${gateState}'`)
         .replace('/usr/bin/flock', path.join(fakeBin, 'flock'))
+        .replaceAll('/usr/bin/sudo', path.join(fakeBin, 'sudo'))
         .replaceAll('directory_info.st_uid != 0', `directory_info.st_uid != ${process.getuid()}`)
         .replaceAll('marker_info.st_uid != 0', `marker_info.st_uid != ${process.getuid()}`)
         .replace('/usr/local/sbin/deploy-kinvest-v3', capture)
