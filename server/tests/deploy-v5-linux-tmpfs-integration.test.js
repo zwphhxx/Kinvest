@@ -138,6 +138,28 @@ async function run() {
       assert.equal(fs.readdirSync(backupRoot).some(name => name.includes(point)), false)
     }
 
+    for (const signal of ['SIGTERM', 'SIGKILL']) {
+      const suffix = signal.toLowerCase()
+      const reservedBackup = runHelper(['reserve-registry', runRoot, uid, gid])
+      assert.equal(reservedBackup.status, 0, reservedBackup.stderr)
+      const backupRegistry = reservedBackup.stdout.trim()
+      const sourceBackup = path.join(backupRoot, `.backup-v5.samecollision${suffix}`)
+      const finalBackup = path.join(backupRoot, `same-collision-${suffix}.sqlite`)
+      fs.writeFileSync(sourceBackup, 'same-content', { mode: 0o600 })
+      fs.writeFileSync(finalBackup, 'same-content', { mode: 0o600 })
+      fs.chmodSync(sourceBackup, 0o600)
+      fs.chmodSync(finalBackup, 0o600)
+      assert.notEqual(fs.statSync(sourceBackup).ino, fs.statSync(finalBackup).ino)
+      await killAtBarrier(['commit-backup', backupRoot, sourceBackup,
+        path.basename(finalBackup), uid, gid, backupRegistry, runRoot],
+      barrierRoot, 'backup-before-link', signal)
+      assert.equal(runHelper(['recover', backupRegistry, runRoot, accessRoot, ifindRoot,
+        backupRoot, stateRoot, uid, gid]).status, 0)
+      assert.equal(fs.existsSync(sourceBackup), false)
+      assert.equal(fs.readFileSync(finalBackup, 'utf8'), 'same-content')
+      assert.equal(fs.existsSync(backupRegistry), false)
+    }
+
     const source = path.join(root, 'state-source')
     fs.writeFileSync(source, 'durable-state\n', { mode: 0o600 })
     for (const [name, point, signal] of [

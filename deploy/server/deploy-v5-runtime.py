@@ -610,14 +610,19 @@ def collect_backup_references(state_root: str, backup_root: str,
                                              'DEPLOY_V5_BACKUP_REFERENCE_INVALID')
             if value is None:
                 continue
-            path = value.get('databaseBackupPath', 'none')
-            checksum = value.get('databaseBackupChecksum', 'none')
+            if 'databaseBackupPath' not in value or 'databaseBackupChecksum' not in value:
+                raise RuntimeErrorCode('DEPLOY_V5_BACKUP_REFERENCE_INVALID')
+            path = value['databaseBackupPath']
+            checksum = value['databaseBackupChecksum']
             if path == checksum == 'none':
                 continue
             candidate = PurePosixPath(path) if isinstance(path, str) else PurePosixPath('.')
             if candidate.parent != PurePosixPath(backup_root) or \
                     BACKUP_NAME_PATTERN.fullmatch(candidate.name) is None or \
-                    not isinstance(checksum, str) or len(checksum) != 64:
+                    not isinstance(checksum, str) or len(checksum) != 64 or \
+                    any(character not in '0123456789abcdef' for character in checksum):
+                raise RuntimeErrorCode('DEPLOY_V5_BACKUP_REFERENCE_INVALID')
+            if str(candidate) in references and references[str(candidate)] != checksum:
                 raise RuntimeErrorCode('DEPLOY_V5_BACKUP_REFERENCE_INVALID')
             references[str(candidate)] = checksum
         journal_raw = read_secure_bytes(root_fd, 'deploy-v5.journal', uid, gid,
@@ -627,9 +632,13 @@ def collect_backup_references(state_root: str, backup_root: str,
             path = validated['pendingBackupPath']
             checksum = validated['pendingBackupChecksum']
             if path != 'none':
+                if str(path) in references and references[str(path)] != str(checksum):
+                    raise RuntimeErrorCode('DEPLOY_V5_BACKUP_REFERENCE_INVALID')
                 references[str(path)] = str(checksum)
     finally:
         os.close(root_fd)
+    for path, checksum in references.items():
+        verify_backup(path, checksum, backup_root, uid, gid)
     return references
 
 
@@ -666,15 +675,18 @@ def recover_registered_backup(value: dict[str, str], backup_root: str,
                     continue
                 raise RuntimeErrorCode('DEPLOY_V5_BACKUP_INVALID')
             entries[name] = (fd, info)
+        preexisting_same_content_final = False
         if temporary in entries and final in entries:
             left, right = entries[temporary][1], entries[final][1]
-            if (left.st_dev, left.st_ino) != (right.st_dev, right.st_ino) or left.st_nlink != 2:
+            if (left.st_dev, left.st_ino) != (right.st_dev, right.st_ino):
+                preexisting_same_content_final = True
+            elif left.st_nlink != 2:
                 raise RuntimeErrorCode('DEPLOY_V5_BACKUP_INVALID')
         final_path = os.path.join(backup_root, final)
         keep_final = references.get(final_path) == checksum
         if temporary in entries:
             unlink_backup_entry(root_fd, temporary)
-        if final in entries and not keep_final:
+        if final in entries and not keep_final and not preexisting_same_content_final:
             unlink_backup_entry(root_fd, final)
         if keep_final:
             verify_backup(final_path, checksum, backup_root, uid, gid)
@@ -685,31 +697,10 @@ def recover_registered_backup(value: dict[str, str], backup_root: str,
 
 
 def recover_orphan_backups(backup_root: str, state_root: str, uid: int, gid: int) -> None:
-    references = collect_backup_references(state_root, backup_root, uid, gid)
-    root_fd = open_backup_root(backup_root, uid, gid)
-    try:
-        for name in os.listdir(root_fd):
-            if BACKUP_TEMP_PATTERN.fullmatch(name) is not None:
-                expected = None
-            elif BACKUP_NAME_PATTERN.fullmatch(name) is not None:
-                expected = references.get(os.path.join(backup_root, name))
-            else:
-                raise RuntimeErrorCode('DEPLOY_V5_BACKUP_INVALID')
-            fd = os.open(name, os.O_RDONLY | os.O_NOFOLLOW, dir_fd=root_fd)
-            try:
-                info = os.fstat(fd)
-                if not stat.S_ISREG(info.st_mode) or info.st_nlink != 1 or info.st_uid != uid or \
-                        info.st_gid != gid or stat.S_IMODE(info.st_mode) != 0o600:
-                    raise RuntimeErrorCode('DEPLOY_V5_BACKUP_INVALID')
-                digest = hashlib.file_digest(os.fdopen(os.dup(fd), 'rb'), 'sha256').hexdigest()
-                if expected is not None and digest != expected:
-                    raise RuntimeErrorCode('DEPLOY_V5_BACKUP_INVALID')
-            finally:
-                os.close(fd)
-            if expected is None:
-                unlink_backup_entry(root_fd, name)
-    finally:
-        os.close(root_fd)
+    # Unknown .sqlite files may be historical or manually managed backups. Only
+    # registry recovery owns transaction artifacts; this pass validates every
+    # durable reference as one complete plan and deliberately deletes nothing.
+    collect_backup_references(state_root, backup_root, uid, gid)
 
 
 def create_candidate(root_fd: int, uid: int, gid: int, registry_path: str,

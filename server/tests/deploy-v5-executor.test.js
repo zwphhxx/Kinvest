@@ -204,9 +204,33 @@ with tempfile.TemporaryDirectory() as temporary:
     (state_root / 'current.state').write_text(
         f'databaseBackupPath={first}\ndatabaseBackupChecksum={first_hash}\n'
     ); (state_root / 'current.state').chmod(0o600)
-    orphan = backup_root / 'orphan.sqlite'; orphan.write_bytes(b'orphan'); orphan.chmod(0o600)
+    manual = backup_root / 'manual.sqlite'; manual.write_bytes(b'manual'); manual.chmod(0o600)
+    historical = backup_root / 'historical.sqlite'; historical.write_bytes(b'historical'); historical.chmod(0o600)
     module.recover_orphan_backups(str(backup_root), str(state_root), uid, gid)
-    assert pathlib.Path(first).exists() and not orphan.exists()
+    assert pathlib.Path(first).exists() and manual.exists() and historical.exists()
+
+    protected = {item.name: item.read_bytes() for item in backup_root.iterdir()}
+    (state_root / 'previous.state').write_text('databaseBackupPath=missing-only\n')
+    (state_root / 'previous.state').chmod(0o600)
+    try: module.recover_orphan_backups(str(backup_root), str(state_root), uid, gid)
+    except module.RuntimeErrorCode: pass
+    else: raise AssertionError('state with missing backup checksum accepted')
+    assert {item.name: item.read_bytes() for item in backup_root.iterdir()} == protected
+
+    (state_root / 'previous.state').write_text('malformed-state-line\n')
+    try: module.recover_orphan_backups(str(backup_root), str(state_root), uid, gid)
+    except module.RuntimeErrorCode: pass
+    else: raise AssertionError('malformed state accepted')
+    assert {item.name: item.read_bytes() for item in backup_root.iterdir()} == protected
+
+    (state_root / 'previous.state').write_text(
+        f'databaseBackupPath={historical}\ndatabaseBackupChecksum={'0' * 64}\n'
+    )
+    try: module.recover_orphan_backups(str(backup_root), str(state_root), uid, gid)
+    except module.RuntimeErrorCode: pass
+    else: raise AssertionError('partially invalid backup reference accepted')
+    assert {item.name: item.read_bytes() for item in backup_root.iterdir()} == protected
+    (state_root / 'previous.state').unlink()
 
     txn_temp = backup_root / '.backup-v5.crash'; txn_temp.write_bytes(b'crash'); txn_temp.chmod(0o600)
     txn_final = backup_root / 'crash.sqlite'; os.link(txn_temp, txn_final)
@@ -228,6 +252,17 @@ with tempfile.TemporaryDirectory() as temporary:
                             str(backup_root), str(state_root), uid, gid)
     assert not collision_temp.exists() and collision_final.read_bytes() == b'existing'
     collision_final.unlink()
+
+    same_registry = pathlib.Path(module.reserve_registry(str(run_root), uid, gid))
+    same_temp = backup_root / '.backup-v5.samecollision'; same_temp.write_bytes(b'same'); same_temp.chmod(0o600)
+    same_final = backup_root / 'same-collision.sqlite'; same_final.write_bytes(b'same'); same_final.chmod(0o600)
+    assert os.stat(same_temp).st_ino != os.stat(same_final).st_ino
+    same_value = dict(value, backupTemp=same_temp.name, backupFinal=same_final.name,
+                      backupChecksum=hashlib.sha256(b'same').hexdigest())
+    module.write_registry(str(same_registry), str(run_root), same_value, uid, gid)
+    module.recover_registry(str(same_registry), str(run_root), str(access_root), str(ifind_root),
+                            str(backup_root), str(state_root), uid, gid)
+    assert not same_temp.exists() and same_final.read_bytes() == b'same' and not same_registry.exists()
 
     empty = run_root / 'kinvest-v5.candidates.Empty123'
     fd = os.open(empty, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW, 0o600)
