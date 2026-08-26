@@ -256,6 +256,7 @@ function safeError(error) {
 
 function createAuthHttpController({
   accessRuntime,
+  ifindDiagnosticRuntime,
   now = Date.now,
   publicOrigin = 'https://dearmina.cn',
   trustedProxyAddresses = []
@@ -263,6 +264,96 @@ function createAuthHttpController({
   const enabled = accessRuntime.status.mode === 'device-approval'
   const device = accessRuntime.deviceApproval
   const admin = accessRuntime.adminAuth
+
+  function copyDiagnostic(value) {
+    if (!value || typeof value !== 'object' || Array.isArray(value)) {
+      boundaryError('INTERNAL_ERROR', 500)
+    }
+    return {
+      diagnosticId: value.diagnosticId,
+      startedAt: value.startedAt,
+      completedAt: value.completedAt,
+      authStatus: value.authStatus,
+      probeStatus: value.probeStatus,
+      safeErrorClass: value.safeErrorClass,
+      route: value.route,
+      scope: value.scope,
+      requestCount: value.requestCount,
+      dataVol: value.dataVol,
+      elapsedMs: value.elapsedMs,
+      completeness: value.completeness,
+      tokenVersionId: value.tokenVersionId,
+      officialQuotaStatus: value.officialQuotaStatus
+    }
+  }
+
+  function disabledDiagnosticStatus() {
+    return {
+      mode: 'disabled',
+      configured: false,
+      tokenVersionId: null,
+      officialQuotaStatus: 'unavailable',
+      cooldownUntil: null,
+      localAttemptCount: 0,
+      inFlight: false,
+      latest: null
+    }
+  }
+
+  function diagnosticService() {
+    const service = ifindDiagnosticRuntime && ifindDiagnosticRuntime.service
+    return service && typeof service.status === 'function' &&
+      typeof service.run === 'function' ? service : null
+  }
+
+  function copyDiagnosticStatus(value) {
+    if (!value || typeof value !== 'object' || Array.isArray(value)) {
+      boundaryError('INTERNAL_ERROR', 500)
+    }
+    return {
+      mode: value.mode,
+      configured: value.configured,
+      tokenVersionId: value.tokenVersionId,
+      officialQuotaStatus: value.officialQuotaStatus,
+      cooldownUntil: value.cooldownUntil,
+      localAttemptCount: value.localAttemptCount,
+      inFlight: value.inFlight,
+      latest: value.latest === null ? null : copyDiagnostic(value.latest)
+    }
+  }
+
+  function sendDiagnosticOutcome(res, outcome) {
+    if (!outcome || typeof outcome !== 'object' || Array.isArray(outcome)) {
+      boundaryError('INTERNAL_ERROR', 500)
+    }
+    const blocked = {
+      disabled: [503, 'IFIND_DIAGNOSTIC_DISABLED'],
+      busy: [409, 'IFIND_DIAGNOSTIC_BUSY'],
+      cooldown: [429, 'IFIND_DIAGNOSTIC_COOLDOWN'],
+      'daily-limit': [429, 'IFIND_DIAGNOSTIC_DAILY_LIMIT']
+    }[outcome.status]
+    if (blocked) {
+      const body = { error: blocked[1] }
+      if (outcome.status !== 'disabled') {
+        body.retryAt = outcome.retryAt
+        body.localAttemptCount = outcome.localAttemptCount
+      }
+      sendJson(res, body, blocked[0])
+      return
+    }
+    if (outcome.status !== 'completed' && outcome.status !== 'failed') {
+      boundaryError('INTERNAL_ERROR', 500)
+    }
+    sendJson(res, {
+      data: {
+        status: outcome.status,
+        safeErrorClass: outcome.safeErrorClass,
+        diagnostic: copyDiagnostic(outcome.diagnostic),
+        cooldownUntil: outcome.cooldownUntil,
+        localAttemptCount: outcome.localAttemptCount
+      }
+    })
+  }
 
   function requireEnabled() {
     if (!enabled || !device || !admin) {
@@ -502,6 +593,37 @@ function createAuthHttpController({
           device: device.listAuditEvents()
         }
       })
+      return true
+    }
+
+    if (segments[1] === 'admin' && segments[2] === 'ifind' &&
+      segments[3] === 'diagnostics' && segments.length === 4 &&
+      req.method === 'GET') {
+      requireEnabled()
+      if (req.headers.origin !== undefined) requireOrigin(req, publicOrigin)
+      authenticateAdmin(req, res)
+      const service = diagnosticService()
+      sendJson(res, {
+        data: service
+          ? copyDiagnosticStatus(service.status())
+          : disabledDiagnosticStatus()
+      })
+      return true
+    }
+
+    if (segments[1] === 'admin' && segments[2] === 'ifind' &&
+      segments[3] === 'diagnostics' && segments[4] === 'run' &&
+      segments.length === 5 && req.method === 'POST') {
+      requireEnabled()
+      requireOrigin(req, publicOrigin)
+      authenticateMutation(req, res)
+      exactObject(await parseStrictJsonBody(req), [], [])
+      const service = diagnosticService()
+      if (!service) {
+        sendDiagnosticOutcome(res, { status: 'disabled' })
+        return true
+      }
+      sendDiagnosticOutcome(res, await service.run())
       return true
     }
 

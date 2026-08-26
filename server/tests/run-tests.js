@@ -15,6 +15,7 @@ const tests = [
   require('./admin-auth.test'),
   require('./trusted-client.test'),
   require('./http-auth.test'),
+  require('./http-ifind-diagnostic.test'),
   require('./http-security-regression.test'),
   require('./http-auth-real.test'),
   require('./admin-auth-atomic.test'),
