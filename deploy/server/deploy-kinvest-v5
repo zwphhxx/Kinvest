@@ -157,21 +157,29 @@ prune_access_bundles() { prune_bundle_root "$ACCESS_BUNDLE_ROOT" "$(collect_refe
 prune_ifind_bundles() { prune_bundle_root "$IFIND_BUNDLE_ROOT" "$(collect_referenced_bundle_ids ifindSecretBundleId)"; }
 
 atomic_state_from_json() {
-  local source="$1" target="$2" prefix="$3" temporary target_name
+  local source="$1" target="$2" prefix="$3" temporary target_name status=0
   secure_temp temporary "$RUN_ROOT/kinvest-v5.state-${prefix}.XXXXXX" || return 1
   if ! "$CONTRACT" canonical-state <"$source" >"$temporary" 2>/dev/null; then
-    rm -f -- "$temporary"; return 1
+    status=1
+  else
+    target_name="${target##*/}"
+    "$RUNTIME_HELPER" state-write "$STATE_ROOT" "$target_name" "$temporary" "$ROOT_UID" "$ROOT_GID" >/dev/null 2>&1 || status=1
   fi
-  target_name="${target##*/}"
-  "$RUNTIME_HELPER" state-write "$STATE_ROOT" "$target_name" "$temporary" "$ROOT_UID" "$ROOT_GID" >/dev/null 2>&1
+  "$RUNTIME_HELPER" remove-runtime-source "$temporary" "$RUN_ROOT" "$ROOT_UID" "$ROOT_GID" >/dev/null 2>&1 || return 1
+  return "$status"
 }
 
 atomic_state_from_text() {
-  local source="$1" target="$2" prefix="$3" temporary target_name
+  local source="$1" target="$2" prefix="$3" temporary target_name status=0
   secure_temp temporary "$RUN_ROOT/kinvest-v5.state-${prefix}.XXXXXX" || return 1
-  cat -- "$source" >"$temporary" 2>/dev/null || { rm -f -- "$temporary"; return 1; }
-  target_name="${target##*/}"
-  "$RUNTIME_HELPER" state-write "$STATE_ROOT" "$target_name" "$temporary" "$ROOT_UID" "$ROOT_GID" >/dev/null 2>&1
+  if ! cat -- "$source" >"$temporary" 2>/dev/null; then
+    status=1
+  else
+    target_name="${target##*/}"
+    "$RUNTIME_HELPER" state-write "$STATE_ROOT" "$target_name" "$temporary" "$ROOT_UID" "$ROOT_GID" >/dev/null 2>&1 || status=1
+  fi
+  "$RUNTIME_HELPER" remove-runtime-source "$temporary" "$RUN_ROOT" "$ROOT_UID" "$ROOT_GID" >/dev/null 2>&1 || return 1
+  return "$status"
 }
 
 durable_state_delete() {
@@ -179,20 +187,16 @@ durable_state_delete() {
 }
 
 write_journal() {
-  local phase="$1" temporary
+  local phase="$1" temporary status=0
   secure_temp temporary "$RUN_ROOT/kinvest-v5.journal.XXXXXX" || return 1
-  python3 - "$temporary" "$phase" "$intent" "$candidate_access_id" "$candidate_ifind_id" 2>/dev/null <<'PY' || { rm -f -- "$temporary"; return 1; }
-import json, os, sys
-path, phase, intent, access_id, ifind_id = sys.argv[1:]
-value = {'version': 1, 'phase': phase, 'intent': intent, 'candidateAccessId': access_id, 'candidateIfindId': ifind_id}
-fd = os.open(path, os.O_WRONLY | os.O_TRUNC | os.O_NOFOLLOW)
-try:
-    os.fchmod(fd, 0o600)
-    os.write(fd, (json.dumps(value, separators=(',', ':'), sort_keys=True) + '\n').encode('ascii'))
-    os.fsync(fd)
-finally: os.close(fd)
-PY
-  "$RUNTIME_HELPER" state-write "$STATE_ROOT" "${JOURNAL##*/}" "$temporary" "$ROOT_UID" "$ROOT_GID" >/dev/null 2>&1
+  "$RUNTIME_HELPER" build-journal-source "$temporary" "$RUN_ROOT" "$STATE_ROOT" "$phase" "$intent" \
+    "$candidate_access_id" "$candidate_ifind_id" "$backup_path" "$backup_checksum" \
+    "$ROOT_UID" "$ROOT_GID" >/dev/null 2>&1 || status=1
+  if [[ "$status" -eq 0 ]]; then
+    "$RUNTIME_HELPER" state-write "$STATE_ROOT" "${JOURNAL##*/}" "$temporary" "$ROOT_UID" "$ROOT_GID" >/dev/null 2>&1 || status=1
+  fi
+  "$RUNTIME_HELPER" remove-runtime-source "$temporary" "$RUN_ROOT" "$ROOT_UID" "$ROOT_GID" >/dev/null 2>&1 || return 1
+  return "$status"
 }
 
 compose_state_file() {
@@ -263,7 +267,7 @@ cleanup() {
   local status=$?
   trap - EXIT
   if [[ -n "$candidate_registry" && -f "$candidate_registry" && ! -L "$candidate_registry" ]]; then
-    "$RUNTIME_HELPER" recover "$candidate_registry" "$RUN_ROOT" "$ACCESS_BUNDLE_ROOT" "$IFIND_BUNDLE_ROOT" "$ROOT_UID" "$ROOT_GID" >/dev/null 2>&1 || true
+    "$RUNTIME_HELPER" recover "$candidate_registry" "$RUN_ROOT" "$ACCESS_BUNDLE_ROOT" "$IFIND_BUNDLE_ROOT" "$BACKUP_ROOT" "$STATE_ROOT" "$ROOT_UID" "$ROOT_GID" >/dev/null 2>&1 || true
   fi
   if [[ -e "$JOURNAL" ]]; then
     if ! reconcile_transaction_journal >/dev/null 2>&1; then
@@ -296,11 +300,13 @@ recover_stale_candidate_registries() {
   shopt -s nullglob
   for registry in "$RUN_ROOT"/kinvest-v5.candidates.*; do
     [[ "$registry" == *.tmp.* ]] && continue
-    "$RUNTIME_HELPER" recover "$registry" "$RUN_ROOT" "$ACCESS_BUNDLE_ROOT" "$IFIND_BUNDLE_ROOT" "$ROOT_UID" "$ROOT_GID" >/dev/null 2>&1 || return 1
+    "$RUNTIME_HELPER" recover "$registry" "$RUN_ROOT" "$ACCESS_BUNDLE_ROOT" "$IFIND_BUNDLE_ROOT" "$BACKUP_ROOT" "$STATE_ROOT" "$ROOT_UID" "$ROOT_GID" >/dev/null 2>&1 || return 1
   done
   shopt -u nullglob
 }
 recover_stale_candidate_registries || fail DEPLOY_V5_CANDIDATE_RECOVERY_FAILED 70
+"$RUNTIME_HELPER" cleanup-stale-sources "$RUN_ROOT" "$ROOT_UID" "$ROOT_GID" >/dev/null 2>&1 || fail DEPLOY_V5_RUNTIME_SOURCE_RECOVERY_FAILED 70
+"$RUNTIME_HELPER" recover-orphan-backups "$BACKUP_ROOT" "$STATE_ROOT" "$ROOT_UID" "$ROOT_GID" >/dev/null 2>&1 || fail DEPLOY_V5_BACKUP_RECOVERY_FAILED 70
 
 secure_temp payload_file "$RUN_ROOT/kinvest-v5.payload.XXXXXX" || fail DEPLOY_V5_PAYLOAD_FILE_FAILED
 run_stable_command DEPLOY_V5_PAYLOAD_READ_FAILED dd bs=4096 count=5 of="$payload_file" status=none
@@ -474,7 +480,7 @@ with sqlite3.connect('file:' + sys.argv[1] + '?mode=ro', uri=True) as source, sq
 PY
   chmod 0600 "$temporary" 2>/dev/null || { rm -f -- "$temporary" 2>/dev/null; return 1; }
   chown "$ROOT_UID:$ROOT_GID" "$temporary" 2>/dev/null || { rm -f -- "$temporary" 2>/dev/null; return 1; }
-  backup_path="$("$RUNTIME_HELPER" commit-backup "$BACKUP_ROOT" "$temporary" "$desired" "$ROOT_UID" "$ROOT_GID" 2>/dev/null)" || { rm -f -- "$temporary" 2>/dev/null; return 1; }
+  backup_path="$("$RUNTIME_HELPER" commit-backup "$BACKUP_ROOT" "$temporary" "$desired" "$ROOT_UID" "$ROOT_GID" "$candidate_registry" "$RUN_ROOT" 2>/dev/null)" || { rm -f -- "$temporary" 2>/dev/null; return 1; }
   backup_checksum="$(sha256sum "$backup_path" 2>/dev/null | awk '{print $1}')" || return 1
   [[ "$backup_checksum" =~ ^[0-9a-f]{64}$ ]] || return 1
   verify_backup_file "$backup_path" "$backup_checksum"
@@ -540,7 +546,7 @@ atomic_state_from_json "$current_json" "$BEFORE_STATE" before || fail DEPLOY_V5_
 # REGISTRY_WINDOW_BEFORE_PREPARED_JOURNAL
 write_journal prepared || fail DEPLOY_V5_STATE_WRITE_FAILED
 # REGISTRY_WINDOW_AFTER_PREPARED_BEFORE_DELETE
-"$RUNTIME_HELPER" release-registry "$candidate_registry" "$RUN_ROOT" "$ROOT_UID" "$ROOT_GID" >/dev/null 2>&1 || fail DEPLOY_V5_CANDIDATE_REGISTRY_FAILED
+"$RUNTIME_HELPER" release-registry "$candidate_registry" "$RUN_ROOT" "$STATE_ROOT" "$BACKUP_ROOT" "$ROOT_UID" "$ROOT_GID" >/dev/null 2>&1 || fail DEPLOY_V5_CANDIDATE_REGISTRY_FAILED
 candidate_registry=''
 atomic_state_from_text "$candidate_state" "$ATTEMPT_STATE" attempt || fail DEPLOY_V5_STATE_WRITE_FAILED
 transaction_started='true'

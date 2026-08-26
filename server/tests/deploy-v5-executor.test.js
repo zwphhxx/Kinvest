@@ -77,7 +77,7 @@ function writeExecutable(file, source) {
 
 function testRuntimeDurabilityPrimitives() {
   const script = String.raw`
-import hashlib, importlib.util, os, pathlib, stat, sys, tempfile
+import hashlib, importlib.util, json, os, pathlib, stat, sys, tempfile
 spec = importlib.util.spec_from_file_location('deploy_v5_runtime', sys.argv[1])
 module = importlib.util.module_from_spec(spec); spec.loader.exec_module(module)
 uid, gid = os.getuid(), os.getgid()
@@ -85,8 +85,9 @@ with tempfile.TemporaryDirectory() as temporary:
     os.environ['KINVEST_V5_TEST_ALLOW_NON_TMPFS'] = '1'
     run_root = pathlib.Path(temporary) / 'run'; run_root.mkdir(mode=0o755)
     legal = run_root / 'kinvest-v5.candidates.Abc123'
-    value = {'accessId': 'none', 'ifindId': 'none'}
-    legal.write_text('{"accessId":"none","ifindId":"none"}\n'); legal.chmod(0o600)
+    value = {'accessId': 'none', 'ifindId': 'none', 'backupTemp': 'none',
+             'backupFinal': 'none', 'backupChecksum': 'none'}
+    legal.write_text('{"accessId":"none","backupChecksum":"none","backupFinal":"none","backupTemp":"none","ifindId":"none"}\n'); legal.chmod(0o600)
     module.write_registry(str(legal), str(run_root), value, uid, gid)
     assert module.read_registry(str(legal), str(run_root), uid, gid) == value
     reserved = pathlib.Path(module.reserve_registry(str(run_root), uid, gid))
@@ -105,11 +106,15 @@ with tempfile.TemporaryDirectory() as temporary:
     else: raise AssertionError('symlink registry accepted')
     access_root = run_root / 'kinvest-secrets'; access_root.mkdir(mode=0o700)
     ifind_root = run_root / 'kinvest-ifind-secrets'; ifind_root.mkdir(mode=0o700)
-    empty = run_root / 'kinvest-v5.candidates.Empty123'
-    fd = os.open(empty, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW, 0o600)
-    os.fchmod(fd, 0o600); os.fchown(fd, uid, gid); os.close(fd)
-    module.recover_registry(str(empty), str(run_root), str(access_root), str(ifind_root), uid, gid)
-    assert not empty.exists()
+    stale = run_root / 'kinvest-v5.state-before.Stale123'; stale.write_text('stale'); stale.chmod(0o600)
+    module.cleanup_stale_sources(str(run_root), uid, gid)
+    assert not stale.exists()
+    outside = run_root / 'outside'; outside.write_text('keep')
+    stale_link = run_root / 'kinvest-v5.journal.Link123'; stale_link.symlink_to(outside)
+    try: module.cleanup_stale_sources(str(run_root), uid, gid)
+    except module.RuntimeErrorCode: pass
+    else: raise AssertionError('stale source symlink accepted')
+    assert outside.read_text() == 'keep'
 
     state_root = pathlib.Path(temporary) / 'state'; state_root.mkdir(mode=0o700)
     events = []
@@ -134,6 +139,46 @@ with tempfile.TemporaryDirectory() as temporary:
     finally: os.unlink, os.fsync = original_unlink, original_fsync
     assert events == ['unlink', 'fsync-dir']
 
+    journal = {'version': 2, 'phase': 'prepared', 'intent': 'FORWARD',
+               'candidateAccessId': 'none', 'candidateIfindId': 'none',
+               'pendingBackupPath': 'none', 'pendingBackupChecksum': 'none'}
+    journal_bytes = (json.dumps(journal, separators=(',', ':'), sort_keys=True) + '\n').encode('ascii')
+    module.durable_state_write(str(state_root), 'deploy-v5.journal', journal_bytes, uid, gid)
+    journal_before = (state_root / 'deploy-v5.journal').read_bytes()
+    try: module.durable_state_write(str(state_root), 'deploy-v5.journal', b'{"phase":"prepared"}\n', uid, gid)
+    except module.RuntimeErrorCode: pass
+    else: raise AssertionError('malformed journal committed')
+    assert (state_root / 'deploy-v5.journal').read_bytes() == journal_before
+    try: module.durable_state_write(str(state_root), 'deploy-v5.journal', (json.dumps(journal) + '\n').encode(), uid, gid)
+    except module.RuntimeErrorCode: pass
+    else: raise AssertionError('non-canonical journal committed')
+    assert (state_root / 'deploy-v5.journal').read_bytes() == journal_before
+    journal_source = run_root / 'kinvest-v5.journal.Enospc123'
+    journal_source.write_bytes(b''); journal_source.chmod(0o600)
+    original_write = os.write
+    def source_enospc(fd, data): raise OSError(28, 'synthetic source ENOSPC')
+    os.write = source_enospc
+    try:
+        try:
+            module.build_journal_source(
+                str(journal_source), str(run_root), str(state_root), 'prepared', 'FORWARD',
+                'none', 'none', 'none', 'none', uid, gid
+            )
+        except (module.RuntimeErrorCode, OSError): pass
+        else: raise AssertionError('ENOSPC journal source accepted')
+    finally: os.write = original_write
+    module.remove_runtime_source(str(journal_source), str(run_root), uid, gid)
+    assert not journal_source.exists() and (state_root / 'deploy-v5.journal').read_bytes() == journal_before
+    original_write = os.write
+    def enospc(fd, data): raise OSError(28, 'synthetic ENOSPC')
+    os.write = enospc
+    try:
+        try: module.durable_state_write(str(state_root), 'deploy-v5.journal', journal_bytes, uid, gid)
+        except (module.RuntimeErrorCode, OSError): pass
+        else: raise AssertionError('ENOSPC journal write committed')
+    finally: os.write = original_write
+    assert (state_root / 'deploy-v5.journal').read_bytes() == journal_before
+
     backup_root = pathlib.Path(temporary) / 'backups'; backup_root.mkdir(mode=0o700)
     first_temp = backup_root / '.first'; first_temp.write_bytes(b'first'); first_temp.chmod(0o600)
     second_temp = backup_root / '.second'; second_temp.write_bytes(b'second'); second_temp.chmod(0o600)
@@ -155,6 +200,41 @@ with tempfile.TemporaryDirectory() as temporary:
     try: module.verify_backup(str(first), first_hash, str(backup_root), uid, gid)
     except module.RuntimeErrorCode: pass
     else: raise AssertionError('wide backup root accepted')
+    backup_root.chmod(0o700)
+    (state_root / 'current.state').write_text(
+        f'databaseBackupPath={first}\ndatabaseBackupChecksum={first_hash}\n'
+    ); (state_root / 'current.state').chmod(0o600)
+    orphan = backup_root / 'orphan.sqlite'; orphan.write_bytes(b'orphan'); orphan.chmod(0o600)
+    module.recover_orphan_backups(str(backup_root), str(state_root), uid, gid)
+    assert pathlib.Path(first).exists() and not orphan.exists()
+
+    txn_temp = backup_root / '.backup-v5.crash'; txn_temp.write_bytes(b'crash'); txn_temp.chmod(0o600)
+    txn_final = backup_root / 'crash.sqlite'; os.link(txn_temp, txn_final)
+    txn_hash = hashlib.sha256(b'crash').hexdigest()
+    registry_value = dict(value, backupTemp=txn_temp.name, backupFinal=txn_final.name,
+                          backupChecksum=txn_hash)
+    module.write_registry(str(reserved), str(run_root), registry_value, uid, gid)
+    module.recover_registry(str(reserved), str(run_root), str(access_root), str(ifind_root),
+                            str(backup_root), str(state_root), uid, gid)
+    assert not txn_temp.exists() and not txn_final.exists()
+
+    collision_registry = pathlib.Path(module.reserve_registry(str(run_root), uid, gid))
+    collision_temp = backup_root / '.backup-v5.collision'; collision_temp.write_bytes(b'new'); collision_temp.chmod(0o600)
+    collision_final = backup_root / 'collision.sqlite'; collision_final.write_bytes(b'existing'); collision_final.chmod(0o600)
+    collision_value = dict(value, backupTemp=collision_temp.name, backupFinal=collision_final.name,
+                           backupChecksum=hashlib.sha256(b'new').hexdigest())
+    module.write_registry(str(collision_registry), str(run_root), collision_value, uid, gid)
+    module.recover_registry(str(collision_registry), str(run_root), str(access_root), str(ifind_root),
+                            str(backup_root), str(state_root), uid, gid)
+    assert not collision_temp.exists() and collision_final.read_bytes() == b'existing'
+    collision_final.unlink()
+
+    empty = run_root / 'kinvest-v5.candidates.Empty123'
+    fd = os.open(empty, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW, 0o600)
+    os.fchmod(fd, 0o600); os.fchown(fd, uid, gid); os.close(fd)
+    module.recover_registry(str(empty), str(run_root), str(access_root), str(ifind_root),
+                            str(backup_root), str(state_root), uid, gid)
+    assert not empty.exists()
 `
   const result = spawnSync(process.env.PYTHON || 'python3', ['-c', script, runtimeHelperPath], {
     encoding: 'utf8', env: { ...process.env, PYTHONDONTWRITEBYTECODE: '1', KINVEST_V5_TEST_ALLOW_NON_TMPFS: '1' }
@@ -227,7 +307,9 @@ function intentPayload(intent, digest, commit, verificationRunId = '999', ifindM
 }
 
 function makeHarness(options = {}) {
-  const temp = fs.mkdtempSync(path.join(os.tmpdir(), 'kinvest-deploy-v5-test-'))
+  const linuxTmpfs = process.platform === 'linux' && fs.existsSync('/dev/shm') &&
+    fs.statfsSync('/dev/shm').type === 0x01021994
+  const temp = fs.mkdtempSync(path.join(linuxTmpfs ? '/dev/shm' : os.tmpdir(), 'kinvest-deploy-v5-test-'))
   const root = path.join(temp, 'root')
   const runRoot = path.join(temp, 'run')
   const bin = path.join(temp, 'bin')
@@ -274,8 +356,10 @@ function makeHarness(options = {}) {
     stateValue.databaseBackupChecksum = crypto.createHash('sha256').update('trusted-backup').digest('hex')
   }
   fs.writeFileSync(path.join(root, 'state/current.state'), canonicalState(contract, stateValue))
+  fs.chmodSync(path.join(root, 'state/current.state'), 0o600)
   if (options.previousState) {
     fs.writeFileSync(path.join(root, 'state/previous.state'), canonicalState(contract, options.previousState))
+    fs.chmodSync(path.join(root, 'state/previous.state'), 0o600)
   }
   spawnSync(process.env.PYTHON || 'python3', ['-c',
     'import sqlite3,sys; db=sqlite3.connect(sys.argv[1]); db.execute("PRAGMA user_version=0"); db.commit(); db.close()',
@@ -293,6 +377,9 @@ function makeHarness(options = {}) {
     .replace("BUNDLE_GID='10001'", `BUNDLE_GID='${process.getgid()}'`)
     .replace("ROOT_UID='0'", `ROOT_UID='${process.getuid()}'`)
     .replace("ROOT_GID='0'", `ROOT_GID='${process.getgid()}'`)
+  if (!linuxTmpfs && !options.disableTmpfsMock) {
+    transformed = transformed.replace('set -euo pipefail', 'set -euo pipefail\nexport KINVEST_V5_TEST_ALLOW_NON_TMPFS=1')
+  }
   if (options.signalWindow) {
     transformed = transformed.replace(
       `# ${options.signalWindow}`,
@@ -423,7 +510,7 @@ else
 fi
 `)
   return {
-    temp, root, runRoot, bin, executor, operations, contract,
+    temp, root, runRoot, bin, executor, operations, contract, runtimeHelper,
     observable: path.join(temp, 'process-observable'),
     release: path.join(temp, 'process-release'),
     containerEnv: path.join(temp, 'container-env.inspect')
@@ -506,6 +593,10 @@ async function run() {
   assert.match(implementation, /TMPFS_MAGIC/)
   assert.match(implementation, /fstatfs|statfs_fd/)
   assert.match(implementation, /validate_tmpfs_bundle_root/)
+  assert.match(implementation, /cleanup_stale_sources/)
+  assert.match(implementation, /validate_journal_payload/)
+  assert.match(implementation, /recover_orphan_backups/)
+  assert.doesNotMatch(runtimeSource, /if not sys\.platform\.startswith\('linux'\):[\s\S]{0,180}return TMPFS_MAGIC/)
   assert.match(implementation, /MATERIALIZE_STAGE_(DIRECTORY|MANIFEST|MATERIAL)/)
   assert.match(implementation, /rollback_materialization/)
   assert.match(source, /KINVEST_DEPLOY_V5/)
@@ -516,7 +607,7 @@ async function run() {
   assert.match(source, /--read-only/)
   assert.match(source, /--cap-drop ALL/)
   assert.match(source, /--user 10001:10001/)
-  assert.match(source, /O_NOFOLLOW/)
+  assert.match(implementation, /O_NOFOLLOW/)
   assert.match(source, /ROLLBACK_REQUIRES_DB_RESTORE/)
   assert.match(source, /DEPLOY_V5_IFIND_PREFLIGHT_FAILED/)
   assert.match(source, /resolve_offline_image/)
@@ -539,6 +630,8 @@ async function run() {
   assert.match(source, /collect_referenced_bundle_ids/)
   assert.match(source, /verify_state_backup_references/)
   assert.match(source, /run_stable_command/)
+  assert.match(source, /cleanup-stale-sources/)
+  assert.match(source, /recover-orphan-backups/)
   assert.match(source, /exec 3>&2/)
   assert.match(source, /exec 2>\/dev\/null/)
   assert.ok(source.indexOf('write_journal prepared') < source.indexOf('release-registry "$candidate_registry"'),
@@ -562,6 +655,43 @@ async function run() {
 
   const harness = makeHarness({ seedBundles: true })
   try {
+    const backupRecoveryProbe = spawnSync(process.env.PYTHON || 'python3', ['-c', `
+import importlib.util, os, sys
+spec = importlib.util.spec_from_file_location('runtime', sys.argv[1])
+module = importlib.util.module_from_spec(spec); spec.loader.exec_module(module)
+module.recover_orphan_backups(sys.argv[2], sys.argv[3], os.getuid(), os.getgid())
+`, harness.runtimeHelper, path.join(harness.root, 'backups'), path.join(harness.root, 'state')], {
+      encoding: 'utf8', env: { ...process.env, KINVEST_V5_TEST_ALLOW_NON_TMPFS: '1', PYTHONDONTWRITEBYTECODE: '1' }
+    })
+    assert.equal(backupRecoveryProbe.status, 0, backupRecoveryProbe.stderr)
+    const probePayload = path.join(harness.runRoot, 'kinvest-v5.probe.payload')
+    fs.writeFileSync(probePayload, diagnosticPayload(), { mode: 0o600 })
+    const reserveProbe = spawnSync(process.env.PYTHON || 'python3', [
+      harness.runtimeHelper, 'reserve-registry', harness.runRoot,
+      String(process.getuid()), String(process.getgid())
+    ], { encoding: 'utf8', env: { ...process.env, KINVEST_V5_TEST_ALLOW_NON_TMPFS: '1' } })
+    assert.equal(reserveProbe.status, 0, reserveProbe.stderr)
+    const probeRegistry = reserveProbe.stdout.trim()
+    const materializeProbe = spawnSync(process.env.PYTHON || 'python3', ['-c', `
+import importlib.util, os, sys
+spec = importlib.util.spec_from_file_location('runtime', sys.argv[1])
+module = importlib.util.module_from_spec(spec); spec.loader.exec_module(module)
+module.materialize(sys.argv[2], sys.argv[3], sys.argv[4], sys.argv[5],
+                   os.getuid(), os.getgid(), os.getuid(), os.getgid(), sys.argv[6])
+`, harness.runtimeHelper, probePayload, harness.runRoot,
+    path.join(harness.runRoot, 'kinvest-secrets'),
+    path.join(harness.runRoot, 'kinvest-ifind-secrets'), probeRegistry], {
+      encoding: 'utf8', env: { ...process.env, KINVEST_V5_TEST_ALLOW_NON_TMPFS: '1', PYTHONDONTWRITEBYTECODE: '1' }
+    })
+    assert.equal(materializeProbe.status, 0, materializeProbe.stderr)
+    const recoverProbe = spawnSync(process.env.PYTHON || 'python3', [
+      harness.runtimeHelper, 'recover', probeRegistry, harness.runRoot,
+      path.join(harness.runRoot, 'kinvest-secrets'), path.join(harness.runRoot, 'kinvest-ifind-secrets'),
+      path.join(harness.root, 'backups'), path.join(harness.root, 'state'),
+      String(process.getuid()), String(process.getgid())
+    ], { encoding: 'utf8', env: { ...process.env, KINVEST_V5_TEST_ALLOW_NON_TMPFS: '1' } })
+    assert.equal(recoverProbe.status, 0, recoverProbe.stderr)
+    fs.rmSync(probePayload)
     const executable = process.env.KINVEST_TEST_TRACE === '1' ? 'bash' : harness.executor
     const args = process.env.KINVEST_TEST_TRACE === '1' ? ['-x', harness.executor] : []
     const deployed = spawnSync(executable, args, {
@@ -801,7 +931,7 @@ async function run() {
 
   for (const [name, options, expected] of [
     ['symlink-root', { symlinkIfindRoot: true }, 'DEPLOY_V5_BUNDLE_CREATE_FAILED\n'],
-    ['non-tmpfs-root', { runtimeTransform: source => source.replace('return TMPFS_MAGIC', 'return 0') }, 'DEPLOY_V5_CANDIDATE_REGISTRY_FAILED\n']
+    ['non-tmpfs-root', { disableTmpfsMock: true }, 'DEPLOY_V5_RUNTIME_SOURCE_RECOVERY_FAILED\n']
   ]) {
     const invalidRoot = makeHarness(options)
     try {
@@ -848,8 +978,9 @@ async function run() {
       env: { ...process.env, PATH: `${badBackup.bin}:${process.env.PATH}` }
     })
     assert.notEqual(result.status, 0)
-    assert.equal(result.stderr, 'DEPLOY_V5_EXISTING_BACKUP_INVALID\n')
-    assert.equal(fs.readFileSync(badBackup.operations, 'utf8').includes(' compose '), false)
+    assert.equal(result.stderr, 'DEPLOY_V5_BACKUP_RECOVERY_FAILED\n')
+    assert.equal(fs.existsSync(badBackup.operations) &&
+      fs.readFileSync(badBackup.operations, 'utf8').includes(' compose '), false)
   } finally { cleanupHarness(badBackup) }
 
   for (const window of [

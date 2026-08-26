@@ -100,7 +100,7 @@ async function run() {
     assert.ok(zeroRegistry)
     assert.equal(fs.statSync(path.join(runRoot, zeroRegistry)).size, 0)
     assert.equal(runHelper(['recover', path.join(runRoot, zeroRegistry), runRoot,
-      accessRoot, ifindRoot, uid, gid]).status, 0)
+      accessRoot, ifindRoot, path.join(root, 'backups'), stateRoot, uid, gid]).status, 0)
 
     const reserved = runHelper(['reserve-registry', runRoot, uid, gid])
     assert.equal(reserved.status, 0, reserved.stderr)
@@ -113,7 +113,30 @@ async function run() {
     ].join('\n') + '\n', { mode: 0o600 })
     await killAtBarrier(['materialize', payload, runRoot, accessRoot, ifindRoot,
       uid, gid, uid, gid, registry], barrierRoot, 'registry-after-replace', 'SIGKILL')
-    assert.equal(runHelper(['recover', registry, runRoot, accessRoot, ifindRoot, uid, gid]).status, 0)
+    const backupRoot = path.join(root, 'backups')
+    fs.mkdirSync(backupRoot, { mode: 0o700 })
+    fs.chmodSync(backupRoot, 0o700)
+    assert.equal(runHelper(['recover', registry, runRoot, accessRoot, ifindRoot,
+      backupRoot, stateRoot, uid, gid]).status, 0)
+
+    for (const [point, signal] of [
+      ['backup-before-link', 'SIGTERM'],
+      ['backup-after-link', 'SIGKILL'],
+      ['backup-after-unlink', 'SIGKILL']
+    ]) {
+      const reservedBackup = runHelper(['reserve-registry', runRoot, uid, gid])
+      assert.equal(reservedBackup.status, 0, reservedBackup.stderr)
+      const backupRegistry = reservedBackup.stdout.trim()
+      const sourceBackup = path.join(backupRoot, `.backup-v5.${point.replaceAll('-', '')}`)
+      fs.writeFileSync(sourceBackup, point, { mode: 0o600 })
+      fs.chmodSync(sourceBackup, 0o600)
+      await killAtBarrier(['commit-backup', backupRoot, sourceBackup,
+        `${point}.sqlite`, uid, gid, backupRegistry, runRoot],
+      barrierRoot, point, signal)
+      assert.equal(runHelper(['recover', backupRegistry, runRoot, accessRoot, ifindRoot,
+        backupRoot, stateRoot, uid, gid]).status, 0)
+      assert.equal(fs.readdirSync(backupRoot).some(name => name.includes(point)), false)
+    }
 
     const source = path.join(root, 'state-source')
     fs.writeFileSync(source, 'durable-state\n', { mode: 0o600 })

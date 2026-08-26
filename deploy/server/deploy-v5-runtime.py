@@ -20,6 +20,13 @@ VERSION_PATTERN = __import__('re').compile(r'^v[0-9]{8}-[0-9]{3}$')
 BUNDLE_ID_PATTERN = __import__('re').compile(r'^[0-9a-f]{32}$')
 REGISTRY_NAME_PATTERN = __import__('re').compile(r'^kinvest-v5\.candidates\.[A-Za-z0-9]+$')
 BACKUP_NAME_PATTERN = __import__('re').compile(r'^[0-9A-Za-z._-]+\.sqlite$')
+BACKUP_TEMP_PATTERN = __import__('re').compile(r'^\.backup-v5\.[A-Za-z0-9]+$')
+RUNTIME_SOURCE_PATTERN = __import__('re').compile(
+    r'^kinvest-v5\.(?:state(?:-[a-z]+)?|journal)\.[A-Za-z0-9]+$'
+)
+REGISTRY_FIELDS = {
+    'accessId', 'ifindId', 'backupTemp', 'backupFinal', 'backupChecksum',
+}
 STATE_NAMES = {
     'current.state', 'previous.state', 'attempt.state',
     'deploy-v5.journal', 'deploy-v5-current.before',
@@ -43,10 +50,8 @@ class LinuxStatFs(ctypes.Structure):
 
 def statfs_fd(fd: int) -> int:
     if not sys.platform.startswith('linux'):
-        # Darwin CI still exercises descriptor and same-device checks. Production
-        # is Linux and always enforces the kernel filesystem magic below.
         os.fstatvfs(fd)
-        return TMPFS_MAGIC
+        return 0
     value = LinuxStatFs()
     if ctypes.CDLL(None, use_errno=True).fstatfs(fd, ctypes.byref(value)) != 0:
         raise RuntimeErrorCode('DEPLOY_V5_TMPFS_INVALID')
@@ -71,6 +76,65 @@ def write_all(fd: int, payload: bytes) -> None:
         if count <= 0:
             raise RuntimeErrorCode('DEPLOY_V5_DURABILITY_FAILED')
         view = view[count:]
+
+
+def empty_registry() -> dict[str, str]:
+    return {
+        'accessId': 'none', 'ifindId': 'none', 'backupTemp': 'none',
+        'backupFinal': 'none', 'backupChecksum': 'none',
+    }
+
+
+def validate_registry_value(value: object) -> dict[str, str]:
+    if not isinstance(value, dict) or set(value) != REGISTRY_FIELDS:
+        raise RuntimeErrorCode('DEPLOY_V5_CANDIDATE_REGISTRY_INVALID')
+    for field in ('accessId', 'ifindId'):
+        item = value[field]
+        if item != 'none' and (not isinstance(item, str) or BUNDLE_ID_PATTERN.fullmatch(item) is None):
+            raise RuntimeErrorCode('DEPLOY_V5_CANDIDATE_REGISTRY_INVALID')
+    temporary, final, checksum = value['backupTemp'], value['backupFinal'], value['backupChecksum']
+    if temporary == final == checksum == 'none':
+        return value
+    if not isinstance(temporary, str) or BACKUP_TEMP_PATTERN.fullmatch(temporary) is None or \
+            not isinstance(final, str) or BACKUP_NAME_PATTERN.fullmatch(final) is None or \
+            not isinstance(checksum, str) or len(checksum) != 64 or \
+            any(item not in '0123456789abcdef' for item in checksum):
+        raise RuntimeErrorCode('DEPLOY_V5_CANDIDATE_REGISTRY_INVALID')
+    return value
+
+
+def validate_journal_payload(payload: bytes, state_root: str) -> dict[str, object]:
+    try:
+        value = json.loads(payload)
+    except (ValueError, TypeError, UnicodeDecodeError) as error:
+        raise RuntimeErrorCode('DEPLOY_V5_JOURNAL_INVALID') from error
+    fields = {
+        'version', 'phase', 'intent', 'candidateAccessId', 'candidateIfindId',
+        'pendingBackupPath', 'pendingBackupChecksum',
+    }
+    if not isinstance(value, dict) or set(value) != fields or value['version'] != 2 or \
+            value['phase'] not in ('prepared', 'compose-active', 'state-committed') or \
+            value['intent'] not in ('FORWARD', 'ROLLBACK', 'RESTORE'):
+        raise RuntimeErrorCode('DEPLOY_V5_JOURNAL_INVALID')
+    for field in ('candidateAccessId', 'candidateIfindId'):
+        item = value[field]
+        if item != 'none' and (not isinstance(item, str) or BUNDLE_ID_PATTERN.fullmatch(item) is None):
+            raise RuntimeErrorCode('DEPLOY_V5_JOURNAL_INVALID')
+    backup, checksum = value['pendingBackupPath'], value['pendingBackupChecksum']
+    if backup == checksum == 'none':
+        pass
+    else:
+        backup_root = PurePosixPath(state_root).parent / 'backups'
+        candidate = PurePosixPath(backup) if isinstance(backup, str) else PurePosixPath('.')
+        if not candidate.is_absolute() or candidate.parent != backup_root or \
+                BACKUP_NAME_PATTERN.fullmatch(candidate.name) is None or \
+                not isinstance(checksum, str) or len(checksum) != 64 or \
+                any(item not in '0123456789abcdef' for item in checksum):
+            raise RuntimeErrorCode('DEPLOY_V5_JOURNAL_INVALID')
+    canonical = (json.dumps(value, separators=(',', ':'), sort_keys=True) + '\n').encode('ascii')
+    if payload != canonical:
+        raise RuntimeErrorCode('DEPLOY_V5_JOURNAL_INVALID')
+    return value
 
 
 def open_exact_directory(path: str, uid: int, gid: int, mode: int,
@@ -215,12 +279,7 @@ def read_registry(path: str, run_root: str, uid: int, gid: int) -> dict[str, str
             raise RuntimeErrorCode('DEPLOY_V5_CANDIDATE_REGISTRY_INVALID')
         raw = os.read(fd, 513)
         if len(raw) > 512: raise RuntimeErrorCode('DEPLOY_V5_CANDIDATE_REGISTRY_INVALID')
-        value = json.loads(raw)
-        if set(value) != {'accessId', 'ifindId'}: raise RuntimeErrorCode('DEPLOY_V5_CANDIDATE_REGISTRY_INVALID')
-        for item in value.values():
-            if item != 'none' and BUNDLE_ID_PATTERN.fullmatch(item) is None:
-                raise RuntimeErrorCode('DEPLOY_V5_CANDIDATE_REGISTRY_INVALID')
-        return value
+        return validate_registry_value(json.loads(raw))
     except (OSError, ValueError, TypeError) as error:
         raise RuntimeErrorCode('DEPLOY_V5_CANDIDATE_REGISTRY_INVALID') from error
     finally:
@@ -243,7 +302,7 @@ def reserve_registry(run_root: str, uid: int, gid: int) -> str:
                 os.fchmod(fd, 0o600)
                 os.fchown(fd, uid, gid)
                 fault_barrier('registry-after-create-zero')
-                payload = b'{"accessId":"none","ifindId":"none"}\n'
+                payload = (json.dumps(empty_registry(), separators=(',', ':'), sort_keys=True) + '\n').encode('ascii')
                 write_all(fd, payload)
                 os.fsync(fd)
             finally:
@@ -257,10 +316,83 @@ def reserve_registry(run_root: str, uid: int, gid: int) -> str:
     raise RuntimeErrorCode('DEPLOY_V5_CANDIDATE_REGISTRY_FAILED')
 
 
+def validate_runtime_source(path: str, run_root: str, uid: int, gid: int) -> tuple[int, int]:
+    candidate = PurePosixPath(path)
+    if candidate.parent != PurePosixPath(run_root) or \
+            RUNTIME_SOURCE_PATTERN.fullmatch(candidate.name) is None:
+        raise RuntimeErrorCode('DEPLOY_V5_RUNTIME_SOURCE_INVALID')
+    root_fd = open_exact_directory(run_root, uid, gid, 0o755,
+                                   'DEPLOY_V5_RUNTIME_SOURCE_INVALID', True)
+    try:
+        fd = os.open(candidate.name, os.O_RDONLY | os.O_NOFOLLOW, dir_fd=root_fd)
+    except OSError as error:
+        os.close(root_fd)
+        raise RuntimeErrorCode('DEPLOY_V5_RUNTIME_SOURCE_INVALID') from error
+    info = os.fstat(fd)
+    if not stat.S_ISREG(info.st_mode) or info.st_nlink != 1 or info.st_uid != uid or \
+            info.st_gid != gid or stat.S_IMODE(info.st_mode) != 0o600:
+        os.close(fd)
+        os.close(root_fd)
+        raise RuntimeErrorCode('DEPLOY_V5_RUNTIME_SOURCE_INVALID')
+    return root_fd, fd
+
+
+def remove_runtime_source(path: str, run_root: str, uid: int, gid: int) -> None:
+    root_fd, fd = validate_runtime_source(path, run_root, uid, gid)
+    try:
+        name = PurePosixPath(path).name
+        opened = os.fstat(fd)
+        current = os.stat(name, dir_fd=root_fd, follow_symlinks=False)
+        if (opened.st_dev, opened.st_ino) != (current.st_dev, current.st_ino):
+            raise RuntimeErrorCode('DEPLOY_V5_RUNTIME_SOURCE_INVALID')
+        os.unlink(name, dir_fd=root_fd)
+        os.fsync(root_fd)
+    finally:
+        os.close(fd)
+        os.close(root_fd)
+
+
+def cleanup_stale_sources(run_root: str, uid: int, gid: int) -> None:
+    root_fd = open_exact_directory(run_root, uid, gid, 0o755,
+                                   'DEPLOY_V5_RUNTIME_SOURCE_INVALID', True)
+    os.close(root_fd)
+    for name in os.listdir(run_root):
+        if RUNTIME_SOURCE_PATTERN.fullmatch(name) is None:
+            continue
+        remove_runtime_source(os.path.join(run_root, name), run_root, uid, gid)
+
+
+def build_journal_source(path: str, run_root: str, state_root: str, phase: str,
+                         intent: str, access_id: str, ifind_id: str,
+                         backup_path: str, backup_checksum: str,
+                         uid: int, gid: int) -> None:
+    value = {
+        'version': 2, 'phase': phase, 'intent': intent,
+        'candidateAccessId': access_id, 'candidateIfindId': ifind_id,
+        'pendingBackupPath': backup_path, 'pendingBackupChecksum': backup_checksum,
+    }
+    payload = (json.dumps(value, separators=(',', ':'), sort_keys=True) + '\n').encode('ascii')
+    validate_journal_payload(payload, state_root)
+    root_fd, existing_fd = validate_runtime_source(path, run_root, uid, gid)
+    os.close(existing_fd)
+    name = PurePosixPath(path).name
+    try:
+        fd = os.open(name, os.O_WRONLY | os.O_TRUNC | os.O_NOFOLLOW, dir_fd=root_fd)
+        try:
+            write_all(fd, payload)
+            os.fsync(fd)
+        finally:
+            os.close(fd)
+    finally:
+        os.close(root_fd)
+
+
 def durable_state_write(state_root: str, target_name: str, payload: bytes,
                         uid: int, gid: int) -> None:
     if target_name not in STATE_NAMES:
         raise RuntimeErrorCode('DEPLOY_V5_STATE_WRITE_FAILED')
+    if target_name == 'deploy-v5.journal':
+        validate_journal_payload(payload, state_root)
     root_fd = open_exact_directory(state_root, uid, gid, 0o700,
                                    'DEPLOY_V5_STATE_WRITE_FAILED')
     temporary = f'.{target_name}.{secrets.token_hex(12)}'
@@ -358,7 +490,8 @@ def validate_backup_temp(root_fd: int, root: str, path: str, uid: int, gid: int)
 
 
 def commit_backup_no_replace(root: str, temporary: str, desired_name: str,
-                             uid: int, gid: int) -> str:
+                             uid: int, gid: int, registry_path: str | None = None,
+                             run_root: str | None = None) -> str:
     if BACKUP_NAME_PATTERN.fullmatch(desired_name) is None:
         raise RuntimeErrorCode('DEPLOY_V5_BACKUP_INVALID')
     root_fd = open_backup_root(root, uid, gid)
@@ -366,17 +499,28 @@ def commit_backup_no_replace(root: str, temporary: str, desired_name: str,
     try:
         source_fd, source_name = validate_backup_temp(root_fd, root, temporary, uid, gid)
         os.fsync(source_fd)
+        checksum = hashlib.file_digest(os.fdopen(os.dup(source_fd), 'rb'), 'sha256').hexdigest()
         if os.environ.get('FAKE_FAILURE') == 'backup-mv':
             raise RuntimeErrorCode('DEPLOY_V5_BACKUP_INVALID')
         for attempt in range(128):
             candidate = desired_name if attempt == 0 else \
                 f'{desired_name[:-7]}.{secrets.token_hex(8)}.sqlite'
+            if registry_path is not None and run_root is not None:
+                registry = read_registry(registry_path, run_root, uid, gid)
+                registry.update({
+                    'backupTemp': source_name, 'backupFinal': candidate,
+                    'backupChecksum': checksum,
+                })
+                write_registry(registry_path, run_root, registry, uid, gid)
+            fault_barrier('backup-before-link')
             try:
                 os.link(source_name, candidate, src_dir_fd=root_fd,
                         dst_dir_fd=root_fd, follow_symlinks=False)
+                fault_barrier('backup-after-link')
                 os.fsync(root_fd)
                 os.unlink(source_name, dir_fd=root_fd)
                 os.fsync(root_fd)
+                fault_barrier('backup-after-unlink')
                 return os.path.join(root, candidate)
             except FileExistsError:
                 continue
@@ -403,6 +547,171 @@ def verify_backup(path: str, expected: str, root: str, uid: int, gid: int) -> No
         os.close(root_fd)
 
 
+def read_secure_bytes(root_fd: int, name: str, uid: int, gid: int,
+                      code: str) -> bytes | None:
+    try:
+        fd = os.open(name, os.O_RDONLY | os.O_NOFOLLOW, dir_fd=root_fd)
+    except FileNotFoundError:
+        return None
+    except OSError as error:
+        raise RuntimeErrorCode(code) from error
+    try:
+        info = os.fstat(fd)
+        if not stat.S_ISREG(info.st_mode) or info.st_nlink != 1 or info.st_uid != uid or \
+                info.st_gid != gid or stat.S_IMODE(info.st_mode) != 0o600 or info.st_size > 1024 * 1024:
+            raise RuntimeErrorCode(code)
+        return os.read(fd, info.st_size + 1)
+    except OSError as error:
+        raise RuntimeErrorCode(code) from error
+    finally:
+        os.close(fd)
+
+
+def read_secure_json(root_fd: int, name: str, uid: int, gid: int,
+                     code: str) -> dict[str, object] | None:
+    raw = read_secure_bytes(root_fd, name, uid, gid, code)
+    if raw is None:
+        return None
+    try:
+        value = json.loads(raw)
+    except (ValueError, TypeError, UnicodeDecodeError) as error:
+        raise RuntimeErrorCode(code) from error
+    if not isinstance(value, dict):
+        raise RuntimeErrorCode(code)
+    return value
+
+
+def read_secure_state_fields(root_fd: int, name: str, uid: int, gid: int,
+                             code: str) -> dict[str, str] | None:
+    raw = read_secure_bytes(root_fd, name, uid, gid, code)
+    if raw is None:
+        return None
+    try:
+        text = raw.decode('ascii')
+        fields: dict[str, str] = {}
+        for line in text.splitlines():
+            key, separator, value = line.partition('=')
+            if not separator or not key or key in fields:
+                raise RuntimeErrorCode(code)
+            fields[key] = value
+        return fields
+    except UnicodeDecodeError as error:
+        raise RuntimeErrorCode(code) from error
+
+
+def collect_backup_references(state_root: str, backup_root: str,
+                              uid: int, gid: int) -> dict[str, str]:
+    root_fd = open_exact_directory(state_root, uid, gid, 0o700,
+                                   'DEPLOY_V5_BACKUP_REFERENCE_INVALID')
+    references: dict[str, str] = {}
+    try:
+        for name in ('current.state', 'previous.state', 'attempt.state'):
+            value = read_secure_state_fields(root_fd, name, uid, gid,
+                                             'DEPLOY_V5_BACKUP_REFERENCE_INVALID')
+            if value is None:
+                continue
+            path = value.get('databaseBackupPath', 'none')
+            checksum = value.get('databaseBackupChecksum', 'none')
+            if path == checksum == 'none':
+                continue
+            candidate = PurePosixPath(path) if isinstance(path, str) else PurePosixPath('.')
+            if candidate.parent != PurePosixPath(backup_root) or \
+                    BACKUP_NAME_PATTERN.fullmatch(candidate.name) is None or \
+                    not isinstance(checksum, str) or len(checksum) != 64:
+                raise RuntimeErrorCode('DEPLOY_V5_BACKUP_REFERENCE_INVALID')
+            references[str(candidate)] = checksum
+        journal_raw = read_secure_bytes(root_fd, 'deploy-v5.journal', uid, gid,
+                                        'DEPLOY_V5_BACKUP_REFERENCE_INVALID')
+        if journal_raw is not None:
+            validated = validate_journal_payload(journal_raw, state_root)
+            path = validated['pendingBackupPath']
+            checksum = validated['pendingBackupChecksum']
+            if path != 'none':
+                references[str(path)] = str(checksum)
+    finally:
+        os.close(root_fd)
+    return references
+
+
+def unlink_backup_entry(root_fd: int, name: str) -> None:
+    os.unlink(name, dir_fd=root_fd)
+    os.fsync(root_fd)
+
+
+def recover_registered_backup(value: dict[str, str], backup_root: str,
+                              state_root: str, uid: int, gid: int) -> None:
+    temporary, final, checksum = value['backupTemp'], value['backupFinal'], value['backupChecksum']
+    if temporary == final == checksum == 'none':
+        return
+    references = collect_backup_references(state_root, backup_root, uid, gid)
+    root_fd = open_backup_root(backup_root, uid, gid)
+    try:
+        entries: dict[str, tuple[int, os.stat_result]] = {}
+        for name, pattern in ((temporary, BACKUP_TEMP_PATTERN), (final, BACKUP_NAME_PATTERN)):
+            if pattern.fullmatch(name) is None:
+                raise RuntimeErrorCode('DEPLOY_V5_BACKUP_INVALID')
+            try:
+                fd = os.open(name, os.O_RDONLY | os.O_NOFOLLOW, dir_fd=root_fd)
+            except FileNotFoundError:
+                continue
+            info = os.fstat(fd)
+            if not stat.S_ISREG(info.st_mode) or info.st_uid != uid or info.st_gid != gid or \
+                    stat.S_IMODE(info.st_mode) != 0o600 or info.st_nlink not in (1, 2):
+                os.close(fd)
+                raise RuntimeErrorCode('DEPLOY_V5_BACKUP_INVALID')
+            digest = hashlib.file_digest(os.fdopen(os.dup(fd), 'rb'), 'sha256').hexdigest()
+            if digest != checksum:
+                os.close(fd)
+                if name == final:
+                    continue
+                raise RuntimeErrorCode('DEPLOY_V5_BACKUP_INVALID')
+            entries[name] = (fd, info)
+        if temporary in entries and final in entries:
+            left, right = entries[temporary][1], entries[final][1]
+            if (left.st_dev, left.st_ino) != (right.st_dev, right.st_ino) or left.st_nlink != 2:
+                raise RuntimeErrorCode('DEPLOY_V5_BACKUP_INVALID')
+        final_path = os.path.join(backup_root, final)
+        keep_final = references.get(final_path) == checksum
+        if temporary in entries:
+            unlink_backup_entry(root_fd, temporary)
+        if final in entries and not keep_final:
+            unlink_backup_entry(root_fd, final)
+        if keep_final:
+            verify_backup(final_path, checksum, backup_root, uid, gid)
+    finally:
+        for fd, _ in locals().get('entries', {}).values():
+            os.close(fd)
+        os.close(root_fd)
+
+
+def recover_orphan_backups(backup_root: str, state_root: str, uid: int, gid: int) -> None:
+    references = collect_backup_references(state_root, backup_root, uid, gid)
+    root_fd = open_backup_root(backup_root, uid, gid)
+    try:
+        for name in os.listdir(root_fd):
+            if BACKUP_TEMP_PATTERN.fullmatch(name) is not None:
+                expected = None
+            elif BACKUP_NAME_PATTERN.fullmatch(name) is not None:
+                expected = references.get(os.path.join(backup_root, name))
+            else:
+                raise RuntimeErrorCode('DEPLOY_V5_BACKUP_INVALID')
+            fd = os.open(name, os.O_RDONLY | os.O_NOFOLLOW, dir_fd=root_fd)
+            try:
+                info = os.fstat(fd)
+                if not stat.S_ISREG(info.st_mode) or info.st_nlink != 1 or info.st_uid != uid or \
+                        info.st_gid != gid or stat.S_IMODE(info.st_mode) != 0o600:
+                    raise RuntimeErrorCode('DEPLOY_V5_BACKUP_INVALID')
+                digest = hashlib.file_digest(os.fdopen(os.dup(fd), 'rb'), 'sha256').hexdigest()
+                if expected is not None and digest != expected:
+                    raise RuntimeErrorCode('DEPLOY_V5_BACKUP_INVALID')
+            finally:
+                os.close(fd)
+            if expected is None:
+                unlink_backup_entry(root_fd, name)
+    finally:
+        os.close(root_fd)
+
+
 def create_candidate(root_fd: int, uid: int, gid: int, registry_path: str,
                      run_root: str, registry: dict[str, str], field: str,
                      registry_uid: int, registry_gid: int) -> tuple[str, int]:
@@ -422,7 +731,7 @@ def create_candidate(root_fd: int, uid: int, gid: int, registry_path: str,
         root = os.fstat(root_fd)
         if not exact_directory(candidate, uid, gid, 0o700) or candidate.st_dev != root.st_dev:
             raise RuntimeErrorCode('DEPLOY_V5_TMPFS_INVALID')
-        if statfs_fd(candidate_fd) != TMPFS_MAGIC:
+        if not tmpfs_matches(candidate_fd):
             raise RuntimeErrorCode('DEPLOY_V5_TMPFS_INVALID')
         # CREATE_CANDIDATE_AFTER_STATFS
         return bundle_id, candidate_fd
@@ -457,7 +766,7 @@ def materialize(payload_path: str, run_root: str, access_root: str, ifind_root: 
     ifind_fd = validate_tmpfs_bundle_root(ifind_root, run_root, root_uid, root_gid)
     created: list[tuple[int, str]] = []
     owned: list[bytearray] = []
-    registry = {'accessId': 'none', 'ifindId': 'none'}
+    registry = empty_registry()
     write_registry(registry_path, run_root, registry, root_uid, root_gid)
     try:
         payload_fd = os.open(payload_path, os.O_RDONLY | os.O_NOFOLLOW)
@@ -558,7 +867,8 @@ def rollback_materialization(created: list[tuple[int, str]]) -> None:
 
 
 def recover_registry(registry_path: str, run_root: str, access_root: str,
-                     ifind_root: str, root_uid: int, root_gid: int) -> None:
+                     ifind_root: str, backup_root: str, state_root: str,
+                     root_uid: int, root_gid: int) -> None:
     if PurePosixPath(registry_path).parent != PurePosixPath(run_root) or \
             REGISTRY_NAME_PATTERN.fullmatch(PurePosixPath(registry_path).name) is None:
         raise RuntimeErrorCode('DEPLOY_V5_CANDIDATE_REGISTRY_INVALID')
@@ -586,6 +896,7 @@ def recover_registry(registry_path: str, run_root: str, access_root: str,
         value = read_registry(registry_path, run_root, root_uid, root_gid)
         remove_candidate(access_fd, value['accessId'])
         remove_candidate(ifind_fd, value['ifindId'])
+        recover_registered_backup(value, backup_root, state_root, root_uid, root_gid)
         os.unlink(registry_path)
         fsync_parent(run_root, root_uid, root_gid, 0o755,
                      'DEPLOY_V5_CANDIDATE_REGISTRY_INVALID', True)
@@ -594,8 +905,14 @@ def recover_registry(registry_path: str, run_root: str, access_root: str,
         os.close(ifind_fd)
 
 
-def release_registry(registry_path: str, run_root: str, root_uid: int, root_gid: int) -> None:
-    read_registry(registry_path, run_root, root_uid, root_gid)
+def release_registry(registry_path: str, run_root: str, state_root: str,
+                     backup_root: str, root_uid: int, root_gid: int) -> None:
+    value = read_registry(registry_path, run_root, root_uid, root_gid)
+    if value['backupFinal'] != 'none':
+        references = collect_backup_references(state_root, backup_root, root_uid, root_gid)
+        final_path = os.path.join(backup_root, value['backupFinal'])
+        if references.get(final_path) != value['backupChecksum']:
+            raise RuntimeErrorCode('DEPLOY_V5_CANDIDATE_REGISTRY_INVALID')
     os.unlink(registry_path)
     fsync_parent(run_root, root_uid, root_gid, 0o755,
                  'DEPLOY_V5_CANDIDATE_REGISTRY_INVALID', True)
@@ -616,25 +933,40 @@ def main() -> int:
             sys.argv[10],
         )
         print(json.dumps(result, separators=(',', ':'), sort_keys=True))
-    elif len(sys.argv) == 8 and sys.argv[1] == 'recover':
+    elif len(sys.argv) == 10 and sys.argv[1] == 'recover':
         recover_registry(
             sys.argv[2], sys.argv[3], sys.argv[4], sys.argv[5],
-            int(sys.argv[6]), int(sys.argv[7]),
+            sys.argv[6], sys.argv[7], int(sys.argv[8]), int(sys.argv[9]),
         )
-    elif len(sys.argv) == 6 and sys.argv[1] == 'release-registry':
-        release_registry(sys.argv[2], sys.argv[3], int(sys.argv[4]), int(sys.argv[5]))
+    elif len(sys.argv) == 8 and sys.argv[1] == 'release-registry':
+        release_registry(sys.argv[2], sys.argv[3], sys.argv[4], sys.argv[5],
+                         int(sys.argv[6]), int(sys.argv[7]))
+    elif len(sys.argv) == 5 and sys.argv[1] == 'cleanup-stale-sources':
+        cleanup_stale_sources(sys.argv[2], int(sys.argv[3]), int(sys.argv[4]))
+    elif len(sys.argv) == 6 and sys.argv[1] == 'remove-runtime-source':
+        remove_runtime_source(sys.argv[2], sys.argv[3], int(sys.argv[4]), int(sys.argv[5]))
+    elif len(sys.argv) == 13 and sys.argv[1] == 'build-journal-source':
+        build_journal_source(
+            sys.argv[2], sys.argv[3], sys.argv[4], sys.argv[5], sys.argv[6],
+            sys.argv[7], sys.argv[8], sys.argv[9], sys.argv[10],
+            int(sys.argv[11]), int(sys.argv[12]),
+        )
     elif len(sys.argv) == 7 and sys.argv[1] == 'state-write':
         payload = read_regular_file(sys.argv[4], 1024 * 1024, 'DEPLOY_V5_STATE_WRITE_FAILED')
         durable_state_write(sys.argv[2], sys.argv[3], payload,
                             int(sys.argv[5]), int(sys.argv[6]))
     elif len(sys.argv) >= 6 and sys.argv[1] == 'state-delete':
         durable_state_delete(sys.argv[2], sys.argv[5:], int(sys.argv[3]), int(sys.argv[4]))
-    elif len(sys.argv) == 7 and sys.argv[1] == 'commit-backup':
+    elif len(sys.argv) == 9 and sys.argv[1] == 'commit-backup':
         print(commit_backup_no_replace(sys.argv[2], sys.argv[3], sys.argv[4],
-                                       int(sys.argv[5]), int(sys.argv[6])))
+                                       int(sys.argv[5]), int(sys.argv[6]),
+                                       sys.argv[7], sys.argv[8]))
     elif len(sys.argv) == 7 and sys.argv[1] == 'verify-backup':
         verify_backup(sys.argv[2], sys.argv[3], sys.argv[4],
                       int(sys.argv[5]), int(sys.argv[6]))
+    elif len(sys.argv) == 6 and sys.argv[1] == 'recover-orphan-backups':
+        recover_orphan_backups(sys.argv[2], sys.argv[3],
+                               int(sys.argv[4]), int(sys.argv[5]))
     else:
         raise RuntimeErrorCode('DEPLOY_V5_RUNTIME_USAGE')
     return 0
