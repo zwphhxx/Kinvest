@@ -667,6 +667,9 @@ async function run() {
   assert.match(source, /DEPLOY_V5_IFIND_PREFLIGHT_FAILED/)
   assert.match(source, /resolve_offline_image/)
   assert.match(source, /verify_repo_digest/)
+  assert.match(source, /backup-identity/)
+  assert.match(source, /resolve-backup-handoff/)
+  assert.doesNotMatch(source, /commit-backup[^\n]*\|\|\s*\{[^\n]*rm -f -- "\$temporary"/)
 
   const preflightAt = source.indexOf('run_ifind_preflight')
   const backupAt = source.indexOf('create_database_backup')
@@ -1103,6 +1106,72 @@ module.materialize(sys.argv[2], sys.argv[3], sys.argv[4], sys.argv[5],
   } finally {
     if (collisionChild && collisionChild.exitCode === null) process.kill(-collisionChild.pid, 'SIGKILL')
     cleanupHarness(collision)
+  }
+
+  for (const point of [
+    'backup-helper-startup',
+    'backup-before-open-root',
+    'backup-after-open-root-before-validate',
+    'backup-after-validate-before-registry'
+  ]) {
+    for (const signal of ['SIGTERM', 'SIGKILL']) {
+      const gap = makeHarness({
+        runtimeTransform: source => source.replace(
+          "write_all(fd, b'reached\\n')",
+          "write_all(fd, (str(os.getpid()) + '\\n').encode('ascii'))"
+        )
+      })
+      let gapChild
+      try {
+        const protectedFinal = path.join(gap.root, 'backups', `manual-${point}-${signal}.sqlite`)
+        fs.writeFileSync(protectedFinal, 'preexisting-manual-backup', { mode: 0o600 })
+        fs.chmodSync(protectedFinal, 0o600)
+        const barrierRoot = path.join(gap.runRoot, 'backup-gap-barriers')
+        fs.mkdirSync(barrierRoot, { mode: 0o700 })
+        fs.chmodSync(barrierRoot, 0o700)
+        const marker = path.join(barrierRoot, `${point}.reached`)
+        const output = { stdout: '', stderr: '' }
+        gapChild = spawn(gap.executor, [], {
+          detached: true,
+          env: {
+            ...process.env,
+            PATH: `${gap.bin}:${process.env.PATH}`,
+            KINVEST_V5_TEST_BARRIER_ROOT: barrierRoot,
+            KINVEST_V5_TEST_BARRIER: point
+          },
+          stdio: ['pipe', 'pipe', 'pipe']
+        })
+        gapChild.stdout.on('data', chunk => { output.stdout += chunk })
+        gapChild.stderr.on('data', chunk => { output.stderr += chunk })
+        gapChild.stdin.end(diagnosticPayload())
+        await waitForFile(marker, gapChild, output, 15000)
+        const helperPid = Number.parseInt(fs.readFileSync(marker, 'utf8').trim(), 10)
+        assert.equal(Number.isSafeInteger(helperPid) && helperPid > 1, true)
+        process.kill(helperPid, signal)
+        const interrupted = await new Promise((resolve, reject) => {
+          const timer = setTimeout(() => {
+            process.kill(-gapChild.pid, 'SIGKILL')
+            reject(new Error(`${point}/${signal} executor did not terminate`))
+          }, 10000)
+          gapChild.once('close', code => { clearTimeout(timer); resolve({ code, ...output }) })
+        })
+        assert.notEqual(interrupted.code, 0, `${point}/${signal}`)
+        assert.equal(fs.readFileSync(protectedFinal, 'utf8'), 'preexisting-manual-backup')
+        assert.deepEqual(fs.readdirSync(path.join(gap.root, 'backups'))
+          .filter(name => name.startsWith('.backup-v5.')), [], `${point}/${signal}: temporary leaked`)
+        assert.deepEqual(fs.readdirSync(gap.runRoot)
+          .filter(name => name.startsWith('kinvest-v5.candidates.')), [], `${point}/${signal}: registry leaked`)
+
+        const recovered = spawnSync(gap.executor, [], {
+          encoding: 'utf8', input: diagnosticPayload(), timeout: 30000,
+          env: { ...process.env, PATH: `${gap.bin}:${process.env.PATH}` }
+        })
+        assert.equal(recovered.status, 0, `${point}/${signal}: ${recovered.stderr}`)
+      } finally {
+        if (gapChild && gapChild.exitCode === null) process.kill(-gapChild.pid, 'SIGKILL')
+        cleanupHarness(gap)
+      }
+    }
   }
 
   for (const window of [

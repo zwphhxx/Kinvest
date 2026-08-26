@@ -489,16 +489,77 @@ def validate_backup_temp(root_fd: int, root: str, path: str, uid: int, gid: int)
     return fd, name
 
 
+def backup_identity(root: str, temporary: str, uid: int, gid: int) -> str:
+    root_fd = open_backup_root(root, uid, gid)
+    source_fd = -1
+    try:
+        source_fd, _ = validate_backup_temp(root_fd, root, temporary, uid, gid)
+        info = os.fstat(source_fd)
+        checksum = hashlib.file_digest(os.fdopen(os.dup(source_fd), 'rb'), 'sha256').hexdigest()
+        return f'{info.st_dev}:{info.st_ino}:{checksum}'
+    finally:
+        if source_fd >= 0:
+            os.close(source_fd)
+        os.close(root_fd)
+
+
+def resolve_backup_handoff(root: str, temporary: str, identity: str,
+                           registry_path: str, run_root: str,
+                           uid: int, gid: int) -> None:
+    parts = identity.split(':')
+    if len(parts) != 3 or not parts[0].isdigit() or not parts[1].isdigit() or \
+            len(parts[2]) != 64 or any(value not in '0123456789abcdef' for value in parts[2]):
+        raise RuntimeErrorCode('DEPLOY_V5_BACKUP_HANDOFF_INVALID')
+    expected_device, expected_inode, expected_checksum = int(parts[0]), int(parts[1]), parts[2]
+    root_fd = open_backup_root(root, uid, gid)
+    source_fd = -1
+    try:
+        if not os.path.isabs(temporary) or PurePosixPath(temporary).parent != PurePosixPath(root):
+            raise RuntimeErrorCode('DEPLOY_V5_BACKUP_HANDOFF_INVALID')
+        source_name = PurePosixPath(temporary).name
+        if BACKUP_TEMP_PATTERN.fullmatch(source_name) is None:
+            raise RuntimeErrorCode('DEPLOY_V5_BACKUP_HANDOFF_INVALID')
+        source_fd = os.open(source_name, os.O_RDONLY | os.O_NOFOLLOW, dir_fd=root_fd)
+        info = os.fstat(source_fd)
+        if not stat.S_ISREG(info.st_mode) or info.st_uid != uid or info.st_gid != gid or \
+                stat.S_IMODE(info.st_mode) != 0o600 or info.st_nlink not in (1, 2) or \
+                (info.st_dev, info.st_ino) != (expected_device, expected_inode):
+            raise RuntimeErrorCode('DEPLOY_V5_BACKUP_HANDOFF_INVALID')
+        checksum = hashlib.file_digest(os.fdopen(os.dup(source_fd), 'rb'), 'sha256').hexdigest()
+        if checksum != expected_checksum:
+            raise RuntimeErrorCode('DEPLOY_V5_BACKUP_HANDOFF_INVALID')
+        registry = read_registry(registry_path, run_root, uid, gid)
+        registered = registry['backupTemp'] == source_name and \
+            registry['backupChecksum'] == expected_checksum and \
+            BACKUP_NAME_PATTERN.fullmatch(registry['backupFinal']) is not None
+        unregistered = registry['backupTemp'] == registry['backupFinal'] == \
+            registry['backupChecksum'] == 'none'
+        if registered:
+            return
+        if not unregistered or info.st_nlink != 1:
+            raise RuntimeErrorCode('DEPLOY_V5_BACKUP_HANDOFF_INVALID')
+        os.unlink(source_name, dir_fd=root_fd)
+        os.fsync(root_fd)
+    except OSError as error:
+        raise RuntimeErrorCode('DEPLOY_V5_BACKUP_HANDOFF_INVALID') from error
+    finally:
+        if source_fd >= 0:
+            os.close(source_fd)
+        os.close(root_fd)
+
+
 def commit_backup_no_replace(root: str, temporary: str, desired_name: str,
                              uid: int, gid: int, registry_path: str | None = None,
                              run_root: str | None = None) -> str:
     if BACKUP_NAME_PATTERN.fullmatch(desired_name) is None:
         raise RuntimeErrorCode('DEPLOY_V5_BACKUP_INVALID')
-    root_fd = open_backup_root(root, uid, gid)
+    root_fd = -1
     source_fd = -1
-    registry_recorded = False
     source_name = ''
     try:
+        fault_barrier('backup-before-open-root')
+        root_fd = open_backup_root(root, uid, gid)
+        fault_barrier('backup-after-open-root-before-validate')
         source_fd, source_name = validate_backup_temp(root_fd, root, temporary, uid, gid)
         os.fsync(source_fd)
         checksum = hashlib.file_digest(os.fdopen(os.dup(source_fd), 'rb'), 'sha256').hexdigest()
@@ -507,24 +568,14 @@ def commit_backup_no_replace(root: str, temporary: str, desired_name: str,
         for attempt in range(128):
             candidate = desired_name if attempt == 0 else \
                 f'{desired_name[:-7]}.{secrets.token_hex(8)}.sqlite'
+            fault_barrier('backup-after-validate-before-registry')
             if registry_path is not None and run_root is not None:
                 registry = read_registry(registry_path, run_root, uid, gid)
                 registry.update({
                     'backupTemp': source_name, 'backupFinal': candidate,
                     'backupChecksum': checksum,
                 })
-                try:
-                    write_registry(registry_path, run_root, registry, uid, gid)
-                    registry_recorded = True
-                except BaseException:
-                    if not registry_recorded:
-                        try:
-                            persisted = read_registry(registry_path, run_root, uid, gid)
-                            registry_recorded = persisted['backupTemp'] == source_name and \
-                                persisted['backupChecksum'] == checksum
-                        except Exception:
-                            registry_recorded = False
-                    raise
+                write_registry(registry_path, run_root, registry, uid, gid)
             fault_barrier('backup-before-link')
             try:
                 os.link(source_name, candidate, src_dir_fd=root_fd,
@@ -538,21 +589,11 @@ def commit_backup_no_replace(root: str, temporary: str, desired_name: str,
             except FileExistsError:
                 continue
         raise RuntimeErrorCode('DEPLOY_V5_BACKUP_INVALID')
-    except BaseException:
-        if not registry_recorded and source_fd >= 0 and source_name:
-            try:
-                opened = os.fstat(source_fd)
-                current = os.stat(source_name, dir_fd=root_fd, follow_symlinks=False)
-                if (opened.st_dev, opened.st_ino) == (current.st_dev, current.st_ino):
-                    os.unlink(source_name, dir_fd=root_fd)
-                    os.fsync(root_fd)
-            except OSError:
-                pass
-        raise
     finally:
         if source_fd >= 0:
             os.close(source_fd)
-        os.close(root_fd)
+        if root_fd >= 0:
+            os.close(root_fd)
 
 
 def verify_backup(path: str, expected: str, root: str, uid: int, gid: int) -> None:
@@ -973,9 +1014,17 @@ def main() -> int:
     elif len(sys.argv) >= 6 and sys.argv[1] == 'state-delete':
         durable_state_delete(sys.argv[2], sys.argv[5:], int(sys.argv[3]), int(sys.argv[4]))
     elif len(sys.argv) == 9 and sys.argv[1] == 'commit-backup':
+        fault_barrier('backup-helper-startup')
         print(commit_backup_no_replace(sys.argv[2], sys.argv[3], sys.argv[4],
                                        int(sys.argv[5]), int(sys.argv[6]),
                                        sys.argv[7], sys.argv[8]))
+    elif len(sys.argv) == 6 and sys.argv[1] == 'backup-identity':
+        print(backup_identity(sys.argv[2], sys.argv[3], int(sys.argv[4]), int(sys.argv[5])))
+    elif len(sys.argv) == 9 and sys.argv[1] == 'resolve-backup-handoff':
+        resolve_backup_handoff(
+            sys.argv[2], sys.argv[3], sys.argv[4], sys.argv[5], sys.argv[6],
+            int(sys.argv[7]), int(sys.argv[8]),
+        )
     elif len(sys.argv) == 7 and sys.argv[1] == 'verify-backup':
         verify_backup(sys.argv[2], sys.argv[3], sys.argv[4],
                       int(sys.argv[5]), int(sys.argv[6]))
