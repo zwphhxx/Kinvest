@@ -562,6 +562,7 @@ async function testSafeStatusAndOutcomeMappings() {
     { outcome: { status: 'failed', safeErrorClass: 'AUTH', diagnostic: latest({ authStatus: 'success', probeStatus: 'failed', safeErrorClass: 'AUTH', completeness: 'unavailable', dataVol: null }), cooldownUntil: NOW, localAttemptCount: 1 } },
     { outcome: { status: 'failed', safeErrorClass: 'AUTH', diagnostic: latest({ authStatus: 'failed', probeStatus: 'not_run', safeErrorClass: 'AUTH', completeness: 'unavailable', dataVol: null }), cooldownUntil: NOW - 1, localAttemptCount: 1 } },
     { outcome: { status: 'failed', safeErrorClass: 'PERMISSION', diagnostic: latest({ authStatus: 'success', probeStatus: 'failed', safeErrorClass: 'PERMISSION', completeness: 'complete', dataVol: 1 }), cooldownUntil: NOW, localAttemptCount: 1 } },
+    { outcome: { status: 'failed', safeErrorClass: 'NETWORK', diagnostic: latest({ authStatus: 'unknown', probeStatus: 'failed', safeErrorClass: 'NETWORK', completeness: 'complete', dataVol: 7 }), cooldownUntil: NOW, localAttemptCount: 1 } },
     { outcome: { status: 'completed', safeErrorClass: null, diagnostic: latest({ requestCount: 1 }), cooldownUntil: NOW, localAttemptCount: 1 } },
     { outcome: { status: 'completed', safeErrorClass: null, diagnostic: latest(), cooldownUntil: NOW, localAttemptCount: 0 } },
     { outcome: { status: 'completed', safeErrorClass: null, diagnostic: latest({ requestCount: 99 }), cooldownUntil: NOW, localAttemptCount: 1 } },

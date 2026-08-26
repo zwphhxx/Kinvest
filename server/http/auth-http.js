@@ -372,7 +372,8 @@ function createAuthHttpController({
       (probeFailed && (dto.safeErrorClass === null ||
         dto.requestCount < 2 || dto.completeness !== 'unavailable')) ||
       (authUnknown &&
-        (dto.requestCount < 1 ||
+        (dto.requestCount < 1 || dto.completeness !== 'unavailable' ||
+          dto.dataVol !== null ||
           (dto.safeErrorClass !== 'NETWORK' && dto.safeErrorClass !== 'API'))) ||
       ((dto.safeErrorClass === 'AUTH' || dto.safeErrorClass === 'CONFIG') &&
         !authFailed) ||
