@@ -38,6 +38,7 @@ async function run() {
     'Docker',
     'CVM',
     'tmpfs',
+    'state-reproof',
     'fingerprint',
     'real',
     'Mock'
@@ -47,6 +48,10 @@ async function run() {
 
   assert.match(runbook, /H4[\s\S]{0,160}(?:code|代码)[\s\S]{0,160}(?:not enabled|尚未启用|未启用)/i)
   assert.match(runbook, /CVM[\s\S]{0,240}tmpfs[\s\S]{0,240}(?:fail closed|失败关闭)[\s\S]{0,240}RESTORE/i)
+  assert.match(runbook, /artifact[\s\S]{0,240}(?:30 天|过期|不可用)[\s\S]{0,360}state-reproof/i)
+  assert.match(runbook, /state-reproof[\s\S]{0,360}(?:root-owned|root 所有|root 持有)[\s\S]{0,360}(?:runtime image|运行时镜像)/i)
+  assert.match(runbook, /ROLLBACK_STATE_REPROOF/)
+  assert.match(runbook, /RESTORE_STATE_REPROOF/)
   assert.match(runbook, /Agent[\s\S]{0,500}(?:user|用户)[\s\S]{0,500}(?:approval|批准)/i)
   assert.match(runbook, /administrator|管理员/i)
   assert.match(runbook, /family display|家庭展示/i)

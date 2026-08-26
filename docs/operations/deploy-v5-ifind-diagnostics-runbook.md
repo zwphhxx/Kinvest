@@ -29,7 +29,7 @@ TMPFS_IFIND_REFRESH_TOKEN_VERSION_ID
 
 `KINVEST_IFIND_DIAGNOSTIC_MODE` 的部署值只允许 `disabled` 或 `diagnostic`；`diagnostic` 在容器内映射为应用的 `admin-diagnostic` 模式。VersionId 使用 `vYYYYMMDD-NNN`，它是非秘密元数据。
 
-`Deploy production v5 (manual)` 的四个输入都是必填项。精确组合如下：
+`Deploy production v5 (manual)` 默认使用 `provenance_mode=artifact-v2`。此模式的精确组合如下：
 
 | intent | release run | ifind mode | confirm |
 |---|---|---|---|
@@ -39,6 +39,15 @@ TMPFS_IFIND_REFRESH_TOKEN_VERSION_ID
 | `RESTORE` | `<release_run_id>` | 当前 `current.state` 的模式 | `RESTORE_V4` |
 
 `FORWARD` 的 `<release_run_id>` 必须是包含目标 release-record v2 的成功 main `Deploy Kinvest` run。`ROLLBACK` 的 `<release_run_id>` 必须填写目标 `previous.state` 所记录的 verification run，但 `ifind_mode` 必须填写当前 `current.state` 的模式；`RESTORE` 必须填写当前 `current.state` 所记录的 verification run 和模式。所选当前安全状态为 `disabled` 时 workflow 精确填写 `disabled`；为 `admin-diagnostic` 时 workflow 精确填写 `diagnostic`。disabled `FORWARD` 也必须填写 confirm，精确值是 `DEPLOY_V5`，不得留空。`ROLLBACK_V4` 与 `RESTORE_V4` 是从 v4 迁移时为调用方兼容保留的 confirm 名称，不表示请求改走 deploy-v4。
+
+release-record artifact 可能在 30 天后过期或因 GitHub 暂时不可用而无法下载。此时只允许 `ROLLBACK` 或 `RESTORE` 选择 `provenance_mode=state-reproof`，绝不允许 `FORWARD`。用户先通过服务器只读命令查看 root 持有、`0600` 的 `current.state` 或 `previous.state`，只录入其中的非秘密字段；不要把状态文件或任何 secret 材料粘贴到聊天。
+
+| intent | provenance mode | release run | target fields | confirm |
+|---|---|---|---|---|
+| `ROLLBACK` | `state-reproof` | 留空 | 精确 `previous.state` 的 digest、commit、verificationRunId | `ROLLBACK_STATE_REPROOF` |
+| `RESTORE` | `state-reproof` | 留空 | 精确权威 `current.state` 的 digest、commit、verificationRunId | `RESTORE_STATE_REPROOF` |
+
+`state-reproof` 不是降低验证：GitHub 在 Production 审批后仍重新验证 trusted main 与部署 gate，目标 commit 必须存在且是 `origin/main` 祖先；服务器再将输入与 root-owned 权威状态中的 digest、commit、verificationRunId、artifactSource、schema 和本地精确 runtime image ID 绑定。runtime image ID 不能由用户覆盖，也不会拉取镜像。任一字段、VersionId、fingerprint、数据库备份引用或本地镜像不匹配都失败关闭。
 
 绝不在聊天、仓库、Issue、PR、普通文件、`.env`、终端历史、命令参数、截图或日志中粘贴 refresh token。不得以长期腾讯云 `SecretId`/`SecretKey`、CAM/SSM、Docker 环境变量或持久磁盘文件作为替代路线。
 
@@ -149,6 +158,10 @@ Expected state: <VERSION_ID> and fingerprint only; no secret material
 ### RESTORE
 
 `RESTORE` 仅用于 CVM 重启后 tmpfs 丢失的恢复：它只允许按 `current.state` 的同一 VersionId、同一材料 fingerprint 重建 access bundle 和 iFinD bundle，并恢复当前精确 Image ID。`RESTORE` 不允许更换 token、VersionId 或材料；它不拉镜像、不迁移数据库，也不改变 digest、commit、schema 或 release provenance。
+
+若重启发生时存在持久 deploy-v5 journal，执行器会先严格验证本次 payload。journal 引用的 bundle 仍存在时沿用正常恢复；bundle 已随 `/run` 消失时，FORWARD 和 ROLLBACK 返回稳定的 `DEPLOY_V5_RESTORE_REQUIRED`。只有与 `deploy-v5-current.before`（`compose-active`）或 `current.state`（`state-committed`）精确匹配的 RESTORE 才能先重建两个 bundle、完成离线 preflight，再收敛 Compose、状态和 journal。
+
+若原 release artifact 仍可用，RESTORE 继续选择 `artifact-v2`。artifact 已过期或不可用时，选择 `state-reproof`、填写当前权威状态的三个非秘密目标字段并输入 `RESTORE_STATE_REPROOF`，再单独批准 Production deployment。
 
 ### Docker 与 CVM 重启
 
