@@ -230,6 +230,16 @@ async function run() {
     withDuplicate(resolveInput, `"adminPasswordVerifier":"${'e'.repeat(64)}",`, `"adminPasswordVerifier":"${'9'.repeat(64)}",`)
   ]) assertFailure(runContract('resolve-intent', injected), 'DEPLOY_V5_INPUT_INVALID')
 
+  for (const invalidIntent of [[], {}, null]) {
+    const malformedIntent = runContract('resolve-intent', {
+      intent: invalidIntent,
+      request: request(),
+      current: state(),
+      previous: null
+    })
+    assertFailure(malformedIntent, 'DEPLOY_V5_INTENT_INVALID')
+  }
+
   const reuse = runContract('resolve-intent', {
     intent: 'FORWARD',
     request: request({ ifindSecretMaterialFingerprint: '4'.repeat(64) }),

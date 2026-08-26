@@ -597,7 +597,7 @@ def security_matches(current: dict[str, Any], request: dict[str, Any]) -> bool:
 def resolve_intent(value: Any) -> dict[str, Any]:
     value = require_exact_keys(value, {"intent", "request", "current", "previous"}, "DEPLOY_V5_INTENT_STATE_INVALID")
     intent = value["intent"]
-    if intent not in {"FORWARD", "ROLLBACK", "RESTORE"}:
+    if not isinstance(intent, str) or intent not in {"FORWARD", "ROLLBACK", "RESTORE"}:
         fail("DEPLOY_V5_INTENT_INVALID")
     request = validate_request(value["request"])
     current = validate_state(value["current"])

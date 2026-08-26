@@ -1,8 +1,6 @@
 const assert = require('node:assert/strict')
 const { createHash } = require('node:crypto')
 const { spawnSync } = require('node:child_process')
-const fs = require('node:fs')
-const os = require('node:os')
 const path = require('node:path')
 
 const rootDir = path.resolve(__dirname, '../..')
@@ -53,8 +51,8 @@ function payload(overrides = {}) {
   ].join('\n') + '\n'
 }
 
-function runContract(input) {
-  return spawnSync(process.env.PYTHON || 'python3', [contractPath, 'validate-payload'], {
+function runContract(input, spawn = spawnSync) {
+  return spawn(process.env.PYTHON || 'python3', [contractPath, 'validate-payload'], {
     encoding: 'utf8',
     input,
     env: { ...process.env, PYTHONDONTWRITEBYTECODE: '1' },
@@ -84,28 +82,26 @@ async function run() {
   assert.equal(valid.stdout.includes(refreshToken), false)
   assert.equal(Object.hasOwn(parsed, 'ifindRefreshTokenMaterial'), false)
 
-  const pythonProbe = fs.mkdtempSync(path.join(os.tmpdir(), 'kinvest-v5-python-'))
-  const pythonWrapper = path.join(pythonProbe, 'python-probe')
-  const pythonMarker = path.join(pythonProbe, 'used')
+  const configuredPython = process.env.PYTHON || 'python3'
+  const resolvedPython = spawnSync(configuredPython, ['-c', 'import sys; print(sys.executable)'], {
+    encoding: 'utf8'
+  })
+  assert.equal(resolvedPython.status, 0, resolvedPython.stderr)
+  const resolvedPythonPath = resolvedPython.stdout.trim()
+  assert.notEqual(resolvedPythonPath, '')
   const previousPython = process.env.PYTHON
-  const previousMarker = process.env.KINVEST_PYTHON_PROBE
+  let selectedPython
   try {
-    fs.writeFileSync(
-      pythonWrapper,
-      '#!/bin/sh\n: > "$KINVEST_PYTHON_PROBE"\nexec python3 "$@"\n',
-      { mode: 0o700 }
-    )
-    process.env.PYTHON = pythonWrapper
-    process.env.KINVEST_PYTHON_PROBE = pythonMarker
-    const probed = runContract(payload())
+    process.env.PYTHON = 'kinvest-python-override-probe'
+    const probed = runContract(payload(), (command, args, options) => {
+      selectedPython = command
+      return spawnSync(resolvedPythonPath, args, options)
+    })
+    assert.equal(selectedPython, 'kinvest-python-override-probe')
     assert.equal(probed.status, 0, probed.stderr)
-    assert.equal(fs.existsSync(pythonMarker), true)
   } finally {
     if (previousPython === undefined) delete process.env.PYTHON
     else process.env.PYTHON = previousPython
-    if (previousMarker === undefined) delete process.env.KINVEST_PYTHON_PROBE
-    else process.env.KINVEST_PYTHON_PROBE = previousMarker
-    fs.rmSync(pythonProbe, { recursive: true, force: true })
   }
 
   const disabled = runContract(payload({
