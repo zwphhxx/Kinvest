@@ -1,13 +1,13 @@
 # Kinvest 生产运维手册
 
-更新日期：2026-08-25
+更新日期：2026-08-26
 
 ## 1. 适用范围与当前状态
 
 - 线上地址：[https://dearmina.cn](https://dearmina.cn)
 - 当前运行内容：Kinvest Mock 前后端、SQLite 数据层和安全 Mock 研究状态
-- 当前不包含：真实 iFinD 数据、真实模型调用、腾讯云密钥管理服务运行时读取
-- 阶段 5 才接入真实 iFinD、模型服务和腾讯云密钥管理服务；在外部配置完成前，不得把 fixture 或 Mock 标记成真实数据
+- 当前不包含：真实 iFinD 数据、真实模型调用或已启用的 iFinD Production Secret 运行时读取
+- H4 只实现 deploy-v5 与管理员 iFinD 诊断的代码能力，尚未生产启用；在独立外部批准门完成前，不得把 fixture 或 Mock 标记成真实数据
 
 本文只记录操作名称、文件位置和检查方法，不记录任何密钥值。运维人员也不得把密钥粘贴到聊天、工单、终端历史或截图中。
 
@@ -104,6 +104,19 @@ SQLite 持久化目录
 发布，但手工部署任务会拒绝执行。`TCR_USERNAME` 和 `TCR_PASSWORD` 只允许被
 `RegistryPublish` Environment 中的 verify 任务读取（仅用于只读查询）；自动
 流程与 PR 事件都无法访问这两个 secret。
+
+### deploy-v5 iFinD 管理员诊断候选路线
+
+deploy-v4 及其家庭访问控制行为保持不变。H4 新增的候选工作流是
+`.github/workflows/deploy-production-v5-manual.yml`，它使用 GitHub `Production`
+Environment Secret `KINVEST_IFIND_REFRESH_TOKEN`、Variables `DEPLOY_V5_ENABLED`、
+`KINVEST_IFIND_DIAGNOSTIC_MODE` 和 `TMPFS_IFIND_REFRESH_TOKEN_VERSION_ID`，经人工
+批准后通过加密 SSH stdin 构建独立 iFinD tmpfs bundle。当前尚未启用该生产路线。
+
+disabled 基线、服务器资产安装、离线精确镜像、diagnostic 激活、ROLLBACK、
+RESTORE、重启、轮换和紧急关闭的完整审批顺序见
+[deploy-v5 iFinD 管理员诊断运行手册](deploy-v5-ifind-diagnostics-runbook.md)。真实结果只允许
+进入管理员诊断，家庭展示继续保持 Mock，并禁止 real/Mock 静默混合。
 
 ### 发布检查
 
@@ -561,30 +574,21 @@ docker image inspect 'ghcr.io/zwphhxx/kinvest@sha256:REVIEWED_DIGEST'
 
 ## 10. 人工安全更新 iFinD refresh_token
 
-网站只提醒管理员 token 即将到期或已经失效，绝不执行一键轮换、定时轮换或绕过 iFinD 登录流程。
+网站只提醒管理员 token 即将到期或已经失效，绝不执行一键轮换、定时轮换或绕过 iFinD 登录流程。最终免费路线使用 GitHub `Production` Environment Secret
+`KINVEST_IFIND_REFRESH_TOKEN`，经 Production 人工审批和 deploy-v5 加密 stdin 写入
+独立 `/run` tmpfs bundle；不使用付费 SSM/CAM，也不使用长期 SecretId/Key。
 
-阶段 5 配置完成后的标准操作：
+标准操作：
 
 1. 管理员人工进入 iFinD 官方登录页完成登录和必要验证。
-2. 管理员取得新的 `refresh_token`，不在网页表单、聊天或工单中转发。
-3. 管理员直接在腾讯云密钥管理服务中更新对应 secret 的新版本。
-4. 确认应用运行身份只具备读取所需 secret 的最小权限。
-5. 触发 Kinvest 应用安全重载，使进程重新从腾讯云密钥管理服务读取 token。
-6. 执行一个最小、低额度、已验证指标的 iFinD 查询。
-7. 只记录“更新时间、操作者、secret 版本、验证成功/失败”等审计元数据，不记录 token。
-8. 验证成功后按腾讯云策略停用旧 secret 版本；失败时恢复旧版本并调查，不把 token 改写到本地文件。
+2. 用户直接在 GitHub `Production` Environment 更新 `KINVEST_IFIND_REFRESH_TOKEN`，不通过网页业务表单、聊天、终端命令或普通文件转发。
+3. 用户设置新的 `TMPFS_IFIND_REFRESH_TOKEN_VERSION_ID`，不得复用旧 VersionId 对应不同材料。
+4. 用户分别批准 deploy-v5 Production deployment 和首次管理员 L2 最小诊断。
+5. 只记录 VersionId、secret fingerprint、部署 provenance、时间和成功/失败，不记录 token。
+6. 成功后恢复 `DEPLOY_V5_ENABLED=false`；失败时保持或恢复最近已验证状态，不创建磁盘 token 副本。
 
-强制边界：
-
-- token 不落盘。
-- token 不进入网页。
-- token 不进入 SQLite 或未来数据库。
-- token 不进入应用日志、Nginx 日志或审计正文。
-- token 不进入 Git 仓库、Docker 镜像、GitHub Actions 普通变量或构建缓存。
-- token 不在聊天中粘贴。
-- 网站不自动轮换 token，只显示到期提醒和人工操作指引。
-
-阶段 5 尚未完成腾讯云密钥管理服务的外部配置，因此当前不得创建本地临时 token 方案作为替代。
+token 不进入仓库、`.env`、SQLite、镜像、Docker 环境、状态、应用/Nginx/部署日志、终端历史、命令参数或聊天。CVM 重启后 tmpfs 消失，应用失败关闭，必须经过获批 `RESTORE` 重建 bundle。完整流程见
+[deploy-v5 iFinD 管理员诊断运行手册](deploy-v5-ifind-diagnostics-runbook.md)。H4 当前只完成代码能力，真实 iFinD 尚未启用。
 
 ## 11. 故障处置顺序
 
