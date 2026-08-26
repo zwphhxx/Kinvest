@@ -23,6 +23,9 @@ async function run() {
     createAdminBootstrapGate,
     createAdminSessionLifecycle,
     createAdminSecurityState,
+    createIfindDiagnosticView,
+    ifindDiagnosticApiFailure,
+    ifindDiagnosticErrorMessage,
     logoutFailureDecision,
     mutationFailureDecision
   } = require('../../public/admin-contract')
@@ -284,6 +287,111 @@ async function run() {
     restore: false,
     refresh: false,
     replay: false
+  })
+
+  const now = Date.UTC(2026, 7, 26, 4, 0, 0)
+  const latest = {
+    startedAt: now - 220,
+    completedAt: now - 100,
+    authStatus: 'success',
+    probeStatus: 'success',
+    safeErrorClass: null,
+    route: '/api/v1/get_trade_dates',
+    scope: 'market-trade-dates:212001:D:-10',
+    requestCount: 2,
+    dataVol: 7,
+    elapsedMs: 120,
+    completeness: 'complete',
+    tokenVersionId: 'v20260826-001',
+    officialQuotaStatus: 'unavailable'
+  }
+  const readyDiagnostic = createIfindDiagnosticView({
+    mode: 'admin-diagnostic',
+    configured: true,
+    tokenVersionId: 'v20260826-001',
+    officialQuotaStatus: 'unavailable',
+    cooldownUntil: null,
+    localAttemptCount: 3,
+    latest
+  }, { running: false, now })
+  assert.deepEqual(readyDiagnostic.authStage, { label: '认证通过', tone: 'success' })
+  assert.deepEqual(readyDiagnostic.probeStage, { label: '交易日探针通过', tone: 'success' })
+  assert.equal(readyDiagnostic.enabledLabel, '已启用')
+  assert.equal(readyDiagnostic.versionId, 'v20260826-001')
+  assert.equal(readyDiagnostic.requestCount, '2 次')
+  assert.equal(readyDiagnostic.elapsed, '120 ms')
+  assert.equal(readyDiagnostic.dataVol, '7 条')
+  assert.equal(readyDiagnostic.completeness, '完整')
+  assert.equal(readyDiagnostic.localAttempt, '3 / 20')
+  assert.equal(readyDiagnostic.officialQuota, '官方剩余额度不可用')
+  assert.deepEqual(readyDiagnostic.run, {
+    disabled: false,
+    label: '运行双级诊断',
+    tone: 'ready'
+  })
+
+  assert.deepEqual(createIfindDiagnosticView(null, { running: false, now }).run, {
+    disabled: true,
+    label: '诊断未启用',
+    tone: 'disabled'
+  })
+  assert.deepEqual(createIfindDiagnosticView({
+    mode: 'admin-diagnostic', configured: true, tokenVersionId: 'v20260826-001',
+    officialQuotaStatus: 'unavailable', cooldownUntil: null, localAttemptCount: 1, latest: null
+  }, { running: true, now }).run, {
+    disabled: true,
+    label: '正在运行双级诊断…',
+    tone: 'running'
+  })
+  assert.deepEqual(createIfindDiagnosticView({
+    mode: 'admin-diagnostic', configured: true, tokenVersionId: 'v20260826-001',
+    officialQuotaStatus: 'unavailable', cooldownUntil: now + 60_000, localAttemptCount: 4, latest
+  }, { running: false, now }).run, {
+    disabled: true,
+    label: '冷却中，稍后再试',
+    tone: 'cooldown'
+  })
+  assert.deepEqual(createIfindDiagnosticView({
+    mode: 'admin-diagnostic', configured: true, tokenVersionId: 'v20260826-001',
+    officialQuotaStatus: 'unavailable', cooldownUntil: null, localAttemptCount: 20, latest
+  }, { running: false, now }).run, {
+    disabled: true,
+    label: '今日本地诊断已达上限',
+    tone: 'daily-limit'
+  })
+
+  const failedDiagnostic = createIfindDiagnosticView({
+    mode: 'admin-diagnostic', configured: true, tokenVersionId: 'v20260826-002',
+    officialQuotaStatus: 'unavailable', cooldownUntil: now + 60_000, localAttemptCount: 5,
+    latest: {
+      ...latest,
+      authStatus: 'failed', probeStatus: 'not_run', safeErrorClass: 'AUTH',
+      requestCount: 1, dataVol: null, completeness: 'unavailable'
+    }
+  }, { running: false, now })
+  assert.deepEqual(failedDiagnostic.authStage, { label: '认证未通过', tone: 'failed' })
+  assert.deepEqual(failedDiagnostic.probeStage, { label: '交易日探针未运行', tone: 'idle' })
+  assert.equal(failedDiagnostic.errorMessage, '认证阶段未通过，请核对管理员维护的凭据配置。')
+  assert.equal(ifindDiagnosticErrorMessage('PERMISSION'), '交易日探针未获授权，请核对 iFinD 权限范围。')
+  assert.equal(ifindDiagnosticErrorMessage('raw provider text'), '诊断未完成，请根据阶段状态检查配置后重试。')
+  assert.equal(
+    ifindDiagnosticApiFailure(401, { error: 'ADMIN_AUTH_REQUIRED' }).code,
+    'ADMIN_AUTH_REQUIRED'
+  )
+  assert.equal(
+    ifindDiagnosticApiFailure(403, { error: 'ADMIN_CSRF_INVALID' }).code,
+    'ADMIN_CSRF_INVALID'
+  )
+  const unavailableDiagnostic = createIfindDiagnosticView(
+    { mode: 'unavailable' },
+    { running: false, now }
+  )
+  assert.equal(unavailableDiagnostic.enabledLabel, '状态不可用')
+  assert.equal(unavailableDiagnostic.errorMessage, '暂时无法读取诊断状态，设备审批功能不受影响。')
+  assert.deepEqual(unavailableDiagnostic.run, {
+    disabled: true,
+    label: '诊断状态不可用',
+    tone: 'disabled'
   })
 }
 

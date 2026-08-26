@@ -162,6 +162,36 @@ function assertAdminDeskContract() {
   assert.match(script, /approvedRequestDecision/)
   assert.match(script, /clearAdminSensitiveState\(\)/)
   assert.match(adminContract, /replay:\s*false/)
+
+  assert.match(html, /id="ifind-diagnostic"/)
+  assert.match(html, />管理员诊断</)
+  assert.match(html, /id="ifind-mock-boundary"[^>]*>[^<]*家庭看板仍为 Mock/)
+  assert.match(html, /id="ifind-diagnostic-stages"/)
+  assert.match(html, /id="ifind-auth-stage"/)
+  assert.match(html, /id="ifind-probe-stage"/)
+  for (const id of [
+    'ifind-enabled',
+    'ifind-version-id',
+    'ifind-last-run',
+    'ifind-request-count',
+    'ifind-elapsed',
+    'ifind-data-vol',
+    'ifind-completeness',
+    'ifind-local-attempt',
+    'ifind-cooldown',
+    'ifind-official-quota',
+    'ifind-run'
+  ]) assert.match(html, new RegExp(`id="${id}"`))
+  assert.match(html, /官方剩余额度不可用/)
+  assert.match(script, /\/api\/admin\/ifind\/diagnostics/)
+  assert.match(script, /\/api\/admin\/ifind\/diagnostics\/run/)
+  assert.match(script, /renderIfindDiagnostic/)
+  assert.match(script, /runAdminWrite\(/)
+  assert.match(script, /sessionLifecycle\.beginRequest\(\)/)
+  assert.doesNotMatch(script, /setInterval|setTimeout\([^)]*ifind/i)
+  assert.doesNotMatch(script, /RequestId|refresh_token|access_token|providerMessage/)
+  assert.match(adminContract, /createIfindDiagnosticView/)
+  assert.match(adminContract, /ifindDiagnosticErrorMessage/)
 }
 
 function assertVisualAndBuildContract() {
@@ -177,6 +207,9 @@ function assertVisualAndBuildContract() {
   assert.match(css, /@keyframes auth-entry/)
   assert.match(css, /min-height:\s*44px/)
   assert.match(css, /overflow-wrap:\s*anywhere/)
+  assert.match(css, /\.ifind-diagnostic/)
+  assert.match(css, /\.ifind-stage-line/)
+  assert.match(css, /\.ifind-stage-node/)
 
   const robustHidden = extractLastCssRule(css, '.checking-shell.hidden')
   assert.match(robustHidden.declarations, /display:\s*none\s*!important;/)
