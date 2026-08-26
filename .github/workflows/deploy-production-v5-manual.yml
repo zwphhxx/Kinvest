@@ -191,43 +191,43 @@ jobs:
           set -euo pipefail
           set +x
           main_sha="$(gh api "repos/${GITHUB_REPOSITORY}/git/ref/heads/main" --jq '.object.sha')"
-          [[ "$main_sha" =~ ^[0-9a-f]{40}$ && "$WORKFLOW_SHA" == "$main_sha" ]]
-          [[ "$RELEASE_RUN_ID" == "$VALIDATED_RUN_ID" && "$RELEASE_RUN_ID" =~ ^[0-9]+$ ]]
+          [[ "$main_sha" =~ ^[0-9a-f]{40}$ && "$WORKFLOW_SHA" == "$main_sha" ]] || exit 1
+          [[ "$RELEASE_RUN_ID" == "$VALIDATED_RUN_ID" && "$RELEASE_RUN_ID" =~ ^[0-9]+$ ]] || exit 1
           run_json="$(gh api "repos/${GITHUB_REPOSITORY}/actions/runs/${RELEASE_RUN_ID}")"
-          [[ "$(jq -r '.path' <<<"$run_json")" == '.github/workflows/deploy.yml' ]]
-          [[ "$(jq -r '.event' <<<"$run_json")" == "push" ]]
-          [[ "$(jq -r '.head_branch' <<<"$run_json")" == "main" ]]
-          [[ "$(jq -r '.conclusion' <<<"$run_json")" == "success" ]]
+          [[ "$(jq -r '.path' <<<"$run_json")" == '.github/workflows/deploy.yml' ]] || exit 1
+          [[ "$(jq -r '.event' <<<"$run_json")" == "push" ]] || exit 1
+          [[ "$(jq -r '.head_branch' <<<"$run_json")" == "main" ]] || exit 1
+          [[ "$(jq -r '.conclusion' <<<"$run_json")" == "success" ]] || exit 1
           run_attempt="$(jq -r '.run_attempt' <<<"$run_json")"
           run_head_sha="$(jq -r '.head_sha' <<<"$run_json")"
-          [[ "$run_attempt" =~ ^[0-9]+$ && "$run_head_sha" =~ ^[0-9a-f]{40}$ ]]
+          [[ "$run_attempt" =~ ^[0-9]+$ && "$run_head_sha" =~ ^[0-9a-f]{40}$ ]] || exit 1
           artifacts="$(gh api "repos/${GITHUB_REPOSITORY}/actions/runs/${RELEASE_RUN_ID}/artifacts")"
           expected_name="kinvest-release-record-v2-${RELEASE_RUN_ID}-${run_attempt}"
           matches="$(jq --arg name "$expected_name" "[.artifacts[] | select(.expired == false and .name == \$name)]" <<<"$artifacts")"
-          [[ "$(jq "length" <<<"$matches")" == "1" ]]
+          [[ "$(jq "length" <<<"$matches")" == "1" ]] || exit 1
           record_dir="$(mktemp -d)"
           trap "rm -rf \"$record_dir\"" EXIT
           gh run download "$RELEASE_RUN_ID" --name "$expected_name" --dir "$record_dir"
           record="$record_dir/release-record.json"
           expected_keys='artifact_source commit_sha created_at ghcr_digest schema_version source_digest source_repository tcr_digest verification_run_attempt verification_run_id'
-          [[ "$(jq -r "keys | join(\" \")" "$record")" == "$expected_keys" ]]
-          [[ "$(jq -r '.schema_version' "$record")" == "2" ]]
-          [[ "$(jq -r '.verification_run_id' "$record")" == "$RELEASE_RUN_ID" ]]
-          [[ "$(jq -r '.verification_run_attempt' "$record")" == "$run_attempt" ]]
+          [[ "$(jq -r "keys | join(\" \")" "$record")" == "$expected_keys" ]] || exit 1
+          [[ "$(jq -r '.schema_version' "$record")" == "2" ]] || exit 1
+          [[ "$(jq -r '.verification_run_id' "$record")" == "$RELEASE_RUN_ID" ]] || exit 1
+          [[ "$(jq -r '.verification_run_attempt' "$record")" == "$run_attempt" ]] || exit 1
           commit_sha="$(jq -r '.commit_sha' "$record")"
           artifact_source="$(jq -r '.artifact_source' "$record")"
           source_repository="$(jq -r '.source_repository' "$record")"
           source_digest="$(jq -r '.source_digest' "$record")"
           ghcr_digest="$(jq -r '.ghcr_digest' "$record")"
-          [[ "$commit_sha" == "$run_head_sha" && "$commit_sha" == "$VALIDATED_COMMIT" ]]
-          [[ "$artifact_source" == "ghcr-public" ]]
-          [[ "$source_repository" == "ghcr.io/zwphhxx/kinvest" ]]
-          [[ "$source_digest" =~ ^sha256:[0-9a-f]{64}$ ]]
-          [[ "$source_digest" == "$ghcr_digest" && "$source_digest" == "$VALIDATED_DIGEST" ]]
-          [[ "$(jq -r '.tcr_digest == null' "$record")" == "true" ]]
-          [[ "$VALIDATED_SCHEMA" == "2" ]]
-          git merge-base --is-ancestor "$commit_sha" origin/main
-          if [[ "$INTENT" == "FORWARD" ]]; then [[ "$commit_sha" == "$main_sha" ]]; fi
+          [[ "$commit_sha" == "$run_head_sha" && "$commit_sha" == "$VALIDATED_COMMIT" ]] || exit 1
+          [[ "$artifact_source" == "ghcr-public" ]] || exit 1
+          [[ "$source_repository" == "ghcr.io/zwphhxx/kinvest" ]] || exit 1
+          [[ "$source_digest" =~ ^sha256:[0-9a-f]{64}$ ]] || exit 1
+          [[ "$source_digest" == "$ghcr_digest" && "$source_digest" == "$VALIDATED_DIGEST" ]] || exit 1
+          [[ "$(jq -r '.tcr_digest == null' "$record")" == "true" ]] || exit 1
+          [[ "$VALIDATED_SCHEMA" == "2" ]] || exit 1
+          git merge-base --is-ancestor "$commit_sha" origin/main || exit 1
+          if [[ "$INTENT" == "FORWARD" ]]; then [[ "$commit_sha" == "$main_sha" ]] || exit 1; fi
       - name: Configure strict SSH trust
         shell: bash
         env:
@@ -434,43 +434,43 @@ jobs:
           set -euo pipefail
           set +x
           main_sha="$(gh api "repos/${GITHUB_REPOSITORY}/git/ref/heads/main" --jq '.object.sha')"
-          [[ "$main_sha" =~ ^[0-9a-f]{40}$ && "$WORKFLOW_SHA" == "$main_sha" ]]
-          [[ "$RELEASE_RUN_ID" == "$VALIDATED_RUN_ID" && "$RELEASE_RUN_ID" =~ ^[0-9]+$ ]]
+          [[ "$main_sha" =~ ^[0-9a-f]{40}$ && "$WORKFLOW_SHA" == "$main_sha" ]] || exit 1
+          [[ "$RELEASE_RUN_ID" == "$VALIDATED_RUN_ID" && "$RELEASE_RUN_ID" =~ ^[0-9]+$ ]] || exit 1
           run_json="$(gh api "repos/${GITHUB_REPOSITORY}/actions/runs/${RELEASE_RUN_ID}")"
-          [[ "$(jq -r '.path' <<<"$run_json")" == '.github/workflows/deploy.yml' ]]
-          [[ "$(jq -r '.event' <<<"$run_json")" == "push" ]]
-          [[ "$(jq -r '.head_branch' <<<"$run_json")" == "main" ]]
-          [[ "$(jq -r '.conclusion' <<<"$run_json")" == "success" ]]
+          [[ "$(jq -r '.path' <<<"$run_json")" == '.github/workflows/deploy.yml' ]] || exit 1
+          [[ "$(jq -r '.event' <<<"$run_json")" == "push" ]] || exit 1
+          [[ "$(jq -r '.head_branch' <<<"$run_json")" == "main" ]] || exit 1
+          [[ "$(jq -r '.conclusion' <<<"$run_json")" == "success" ]] || exit 1
           run_attempt="$(jq -r '.run_attempt' <<<"$run_json")"
           run_head_sha="$(jq -r '.head_sha' <<<"$run_json")"
-          [[ "$run_attempt" =~ ^[0-9]+$ && "$run_head_sha" =~ ^[0-9a-f]{40}$ ]]
+          [[ "$run_attempt" =~ ^[0-9]+$ && "$run_head_sha" =~ ^[0-9a-f]{40}$ ]] || exit 1
           artifacts="$(gh api "repos/${GITHUB_REPOSITORY}/actions/runs/${RELEASE_RUN_ID}/artifacts")"
           expected_name="kinvest-release-record-v2-${RELEASE_RUN_ID}-${run_attempt}"
           matches="$(jq --arg name "$expected_name" "[.artifacts[] | select(.expired == false and .name == \$name)]" <<<"$artifacts")"
-          [[ "$(jq "length" <<<"$matches")" == "1" ]]
+          [[ "$(jq "length" <<<"$matches")" == "1" ]] || exit 1
           record_dir="$(mktemp -d)"
           trap "rm -rf \"$record_dir\"" EXIT
           gh run download "$RELEASE_RUN_ID" --name "$expected_name" --dir "$record_dir"
           record="$record_dir/release-record.json"
           expected_keys='artifact_source commit_sha created_at ghcr_digest schema_version source_digest source_repository tcr_digest verification_run_attempt verification_run_id'
-          [[ "$(jq -r "keys | join(\" \")" "$record")" == "$expected_keys" ]]
-          [[ "$(jq -r '.schema_version' "$record")" == "2" ]]
-          [[ "$(jq -r '.verification_run_id' "$record")" == "$RELEASE_RUN_ID" ]]
-          [[ "$(jq -r '.verification_run_attempt' "$record")" == "$run_attempt" ]]
+          [[ "$(jq -r "keys | join(\" \")" "$record")" == "$expected_keys" ]] || exit 1
+          [[ "$(jq -r '.schema_version' "$record")" == "2" ]] || exit 1
+          [[ "$(jq -r '.verification_run_id' "$record")" == "$RELEASE_RUN_ID" ]] || exit 1
+          [[ "$(jq -r '.verification_run_attempt' "$record")" == "$run_attempt" ]] || exit 1
           commit_sha="$(jq -r '.commit_sha' "$record")"
           artifact_source="$(jq -r '.artifact_source' "$record")"
           source_repository="$(jq -r '.source_repository' "$record")"
           source_digest="$(jq -r '.source_digest' "$record")"
           ghcr_digest="$(jq -r '.ghcr_digest' "$record")"
-          [[ "$commit_sha" == "$run_head_sha" && "$commit_sha" == "$VALIDATED_COMMIT" ]]
-          [[ "$artifact_source" == "ghcr-public" ]]
-          [[ "$source_repository" == "ghcr.io/zwphhxx/kinvest" ]]
-          [[ "$source_digest" =~ ^sha256:[0-9a-f]{64}$ ]]
-          [[ "$source_digest" == "$ghcr_digest" && "$source_digest" == "$VALIDATED_DIGEST" ]]
-          [[ "$(jq -r '.tcr_digest == null' "$record")" == "true" ]]
-          [[ "$VALIDATED_SCHEMA" == "2" ]]
-          git merge-base --is-ancestor "$commit_sha" origin/main
-          if [[ "$INTENT" == "FORWARD" ]]; then [[ "$commit_sha" == "$main_sha" ]]; fi
+          [[ "$commit_sha" == "$run_head_sha" && "$commit_sha" == "$VALIDATED_COMMIT" ]] || exit 1
+          [[ "$artifact_source" == "ghcr-public" ]] || exit 1
+          [[ "$source_repository" == "ghcr.io/zwphhxx/kinvest" ]] || exit 1
+          [[ "$source_digest" =~ ^sha256:[0-9a-f]{64}$ ]] || exit 1
+          [[ "$source_digest" == "$ghcr_digest" && "$source_digest" == "$VALIDATED_DIGEST" ]] || exit 1
+          [[ "$(jq -r '.tcr_digest == null' "$record")" == "true" ]] || exit 1
+          [[ "$VALIDATED_SCHEMA" == "2" ]] || exit 1
+          git merge-base --is-ancestor "$commit_sha" origin/main || exit 1
+          if [[ "$INTENT" == "FORWARD" ]]; then [[ "$commit_sha" == "$main_sha" ]] || exit 1; fi
       - name: Configure strict SSH trust
         shell: bash
         env:

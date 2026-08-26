@@ -18,8 +18,11 @@ GATE_USER="${KINVEST_DEPLOY_GATE_USER:-}"
 GATE_GROUP="${KINVEST_DEPLOY_GATE_GROUP:-}"
 GATE_GROUP_GID=''
 GATE_IDENTITY_CONTENT=''
-GATE_SOURCE="$SOURCE_DIR/kinvest-ssh-command-v3"
+GATE_SOURCE=''
 GATE_TARGET="$LOCAL_SBIN/kinvest-ssh-command"
+TRUSTED_SOURCE_DIR=''
+SOURCE_EXPECTED_UID='0'
+STAGING_ROOT_OWNER='0:0'
 GATE_EXPECTED_HASH='366f860645396e26178fecb9f91179182df5cc2282f593c0d3dd576b11589c9e'
 MANIFEST_EXPECTED_HASH='fcfd7004165bb4c8656dfb0148e7449340d6c83daf576c03b5741b67074c1b5a'
 SOURCE_ASSETS=('deploy-kinvest-v5' 'deploy-v5-runtime.py' 'deploy-v5-contract.py' 'docker-compose-v5.yml' 'kinvest-deploy-v5.sudoers.in' 'deploy-v5-assets.sha256' 'deploy-kinvest-v3.sh' 'deploy-v3-contract.py' 'docker-compose-v3.yml' 'offline-image-attestation.py' 'kinvest-ssh-command-v3')
@@ -50,6 +53,32 @@ fsync_directory() {
 }
 fsync_file() {
   python3 -c 'import os,sys; descriptor=os.open(sys.argv[1],os.O_RDONLY|os.O_NOFOLLOW); os.fsync(descriptor); os.close(descriptor)' "$1"
+}
+
+validate_secure_source_path() {
+  python3 -c 'import os,stat,sys
+path, expected_uid, expected_kind = sys.argv[1], int(sys.argv[2]), sys.argv[3]
+value = os.lstat(path)
+kind_ok = stat.S_ISDIR(value.st_mode) if expected_kind == "directory" else stat.S_ISREG(value.st_mode)
+safe = kind_ok and value.st_uid == expected_uid and stat.S_IMODE(value.st_mode) & 0o022 == 0
+raise SystemExit(0 if safe else 1)' "$1" "$SOURCE_EXPECTED_UID" "$2"
+}
+
+cleanup_trusted_source() {
+  [[ -n "$TRUSTED_SOURCE_DIR" ]] || return 0
+  [[ "$TRUSTED_SOURCE_DIR" == "$RUN_ROOT"/kinvest-deploy-v5-input.* ]] || return 1
+  [[ -d "$TRUSTED_SOURCE_DIR" && ! -L "$TRUSTED_SOURCE_DIR" ]] || return 1
+  [[ "$(file_attributes "$TRUSTED_SOURCE_DIR")" == "$STAGING_ROOT_OWNER:700" ]] || return 1
+  rm -rf -- "$TRUSTED_SOURCE_DIR" || return 1
+  fsync_directory "$RUN_ROOT" || return 1
+  TRUSTED_SOURCE_DIR=''
+}
+
+trusted_source_early_cleanup() {
+  local result=$?
+  trap - EXIT
+  cleanup_trusted_source || result=1
+  exit "$result"
 }
 
 gate_inode_identity() {
@@ -191,19 +220,47 @@ clear_public_marker() {
 [[ "$#" -eq 1 && "$SOURCE_DIR" == /* && -d "$SOURCE_DIR" && ! -L "$SOURCE_DIR" ]] || fail 'usage: install-deploy-v5.sh /absolute/canonical/source/dir' 2
 [[ "$(id -u)" -eq 0 ]] || fail 'deploy-v5 installation must run as root'
 [[ "$(realpath -e "$SOURCE_DIR")" == "$SOURCE_DIR" ]] || fail 'deploy-v5 source directory must be canonical'
+if [[ "${KINVEST_INSTALL_V5_TEST_MODE:-}" == 1 ]]; then
+  [[ "${KINVEST_INSTALL_V5_TEST_ROOT:-}" == 1 && "$(id -u)" -ne 0 ]] || fail 'deploy-v5 test source uid override is unavailable in production'
+  [[ "${KINVEST_INSTALL_V5_EXPECTED_SOURCE_UID:-}" =~ ^[0-9]+$ ]] || fail 'invalid deploy-v5 test source uid'
+  SOURCE_EXPECTED_UID="$KINVEST_INSTALL_V5_EXPECTED_SOURCE_UID"
+fi
+validate_secure_source_path "$SOURCE_DIR" directory || fail 'unsafe deploy-v5 source directory ownership or mode'
 resolve_gate_identity || fail 'DEPLOY_V5_GATE_IDENTITY_INVALID'
 
 for index in "${!SOURCE_ASSETS[@]}"; do
   source="$SOURCE_DIR/${SOURCE_ASSETS[$index]}"
-  [[ -f "$source" && ! -L "$source" ]] || fail "invalid deploy-v5 source file: ${SOURCE_ASSETS[$index]}"
+  validate_secure_source_path "$source" file || fail "invalid deploy-v5 source file ownership or mode: ${SOURCE_ASSETS[$index]}"
   [[ "$(file_hash "$source")" == "${EXPECTED_ASSET_HASHES[$index]}" ]] || fail "untrusted deploy-v5 source hash: ${SOURCE_ASSETS[$index]}"
 done
 [[ "$(file_hash "$SOURCE_DIR/deploy-v5-assets.sha256")" == "$MANIFEST_EXPECTED_HASH" ]] || fail 'untrusted deploy-v5 asset manifest'
 (cd "$SOURCE_DIR" && sha256sum -c deploy-v5-assets.sha256 >/dev/null) || fail 'deploy-v5 asset manifest mismatch'
-bash -n "$SOURCE_DIR/deploy-kinvest-v5"
-bash -n "$SOURCE_DIR/deploy-kinvest-v3.sh"
-bash -n "$SOURCE_DIR/kinvest-ssh-command-v3"
-PYTHONDONTWRITEBYTECODE=1 python3 -m py_compile "$SOURCE_DIR/deploy-v5-runtime.py" "$SOURCE_DIR/deploy-v5-contract.py" "$SOURCE_DIR/deploy-v3-contract.py" "$SOURCE_DIR/offline-image-attestation.py"
+# deploy-v5-source-initially-validated
+
+trap trusted_source_early_cleanup EXIT
+TRUSTED_SOURCE_DIR="$(mktemp -d "$RUN_ROOT/kinvest-deploy-v5-input.XXXXXX")"
+chown root:root "$TRUSTED_SOURCE_DIR"
+chmod 0700 "$TRUSTED_SOURCE_DIR"
+[[ "$(file_attributes "$TRUSTED_SOURCE_DIR")" == "$STAGING_ROOT_OWNER:700" ]] || fail 'unsafe deploy-v5 trusted staging directory'
+for index in "${!SOURCE_ASSETS[@]}"; do
+  source="$SOURCE_DIR/${SOURCE_ASSETS[$index]}"
+  trusted="$TRUSTED_SOURCE_DIR/${SOURCE_ASSETS[$index]}"
+  install -o root -g root -m 0600 "$source" "$trusted"
+  [[ -f "$trusted" && ! -L "$trusted" ]] || fail "invalid staged deploy-v5 asset: ${SOURCE_ASSETS[$index]}"
+  [[ "$(file_attributes "$trusted")" == "$STAGING_ROOT_OWNER:600" ]] || fail "unsafe staged deploy-v5 asset attributes: ${SOURCE_ASSETS[$index]}"
+  [[ "$(file_hash "$trusted")" == "${EXPECTED_ASSET_HASHES[$index]}" ]] || fail "untrusted staged deploy-v5 asset hash: ${SOURCE_ASSETS[$index]}"
+  fsync_file "$trusted"
+done
+fsync_directory "$TRUSTED_SOURCE_DIR"
+[[ "$(file_hash "$TRUSTED_SOURCE_DIR/deploy-v5-assets.sha256")" == "$MANIFEST_EXPECTED_HASH" ]] || fail 'untrusted staged deploy-v5 asset manifest'
+(cd "$TRUSTED_SOURCE_DIR" && sha256sum -c deploy-v5-assets.sha256 >/dev/null) || fail 'staged deploy-v5 asset manifest mismatch'
+# deploy-v5-input-staging-validated
+
+GATE_SOURCE="$TRUSTED_SOURCE_DIR/kinvest-ssh-command-v3"
+bash -n "$TRUSTED_SOURCE_DIR/deploy-kinvest-v5"
+bash -n "$TRUSTED_SOURCE_DIR/deploy-kinvest-v3.sh"
+bash -n "$TRUSTED_SOURCE_DIR/kinvest-ssh-command-v3"
+PYTHONDONTWRITEBYTECODE=1 python3 -m py_compile "$TRUSTED_SOURCE_DIR/deploy-v5-runtime.py" "$TRUSTED_SOURCE_DIR/deploy-v5-contract.py" "$TRUSTED_SOURCE_DIR/deploy-v3-contract.py" "$TRUSTED_SOURCE_DIR/offline-image-attestation.py"
 [[ -f "$GATE_SOURCE" && ! -L "$GATE_SOURCE" ]] || fail 'invalid deploy-v5 forced-command gate'
 [[ "$(file_hash "$GATE_SOURCE")" == "$GATE_EXPECTED_HASH" ]] || fail 'untrusted deploy-v5 forced-command gate hash'
 
@@ -221,6 +278,7 @@ early_cleanup() {
   local result=$?
   trap - EXIT
   cleanup_tracked_gate_temporaries || result=1
+  cleanup_trusted_source || result=1
   exit "$result"
 }
 trap early_cleanup EXIT
@@ -397,12 +455,12 @@ for index in "${!TARGETS[@]}"; do
     chmod 0600 "$backup/${BACKUP_FILES[$index]}.absent"
   fi
   if [[ "$index" == 4 ]]; then
-    sed "s/@KINVEST_DEPLOY_GATE_USER@/$GATE_USER/g" "$SOURCE_DIR/${SOURCE_ASSETS[$index]}" >"$stage/$index"
+    sed "s/@KINVEST_DEPLOY_GATE_USER@/$GATE_USER/g" "$TRUSTED_SOURCE_DIR/${SOURCE_ASSETS[$index]}" >"$stage/$index"
     chown root:root "$stage/$index"
     chmod "${MODES[$index]}" "$stage/$index"
     visudo -cf "$stage/$index" >/dev/null
   else
-    install -o root -g root -m "${MODES[$index]}" "$SOURCE_DIR/${SOURCE_ASSETS[$index]}" "$stage/$index"
+    install -o root -g root -m "${MODES[$index]}" "$TRUSTED_SOURCE_DIR/${SOURCE_ASSETS[$index]}" "$stage/$index"
     [[ "$(file_hash "$stage/$index")" == "${EXPECTED_ASSET_HASHES[$index]}" ]] || fail "staged deploy-v5 hash mismatch: ${SOURCE_ASSETS[$index]}"
   fi
 done
@@ -432,6 +490,7 @@ cleanup() {
   fi
   rm -f "$temporary"
   rm -rf "$stage"
+  cleanup_trusted_source || rollback_ok='false'
   cleanup_tracked_gate_temporaries || rollback_ok='false'
   if [[ "$rollback_ok" != true ]]; then
     printf 'deploy-v5 rollback failed; recovery backup preserved at %s\n' "$backup" >&2

@@ -42,12 +42,110 @@ function jobSection(name) {
   return lines.slice(start, end).join('\n')
 }
 
+function jobStepScript(jobName, stepName) {
+  const section = jobSection(jobName)
+  const lines = section.split('\n')
+  const start = lines.findIndex((line) => line === `      - name: ${stepName}`)
+  assert.notEqual(start, -1, `missing ${jobName} step ${stepName}`)
+  const run = lines.findIndex((line, index) => index > start && line === '        run: |')
+  assert.notEqual(run, -1, `missing ${jobName} run block ${stepName}`)
+  let end = lines.length
+  for (let index = run + 1; index < lines.length; index += 1) {
+    if (lines[index].startsWith('      - ')) { end = index; break }
+  }
+  return lines.slice(run + 1, end).map((line) => line.slice(10)).join('\n')
+}
+
 function secretMaterial() {
   const admin = JSON.stringify({
     digest: Buffer.alloc(32, 1).toString('base64url'), format: 'kinvest-admin-scrypt-v1',
     n: 65536, p: 1, r: 8, salt: Buffer.alloc(16, 2).toString('base64url')
   })
   return { admin: Buffer.from(admin).toString('base64url'), hmac: Buffer.alloc(32, 3).toString('base64url') }
+}
+
+function provenanceState() {
+  const commit = 'b'.repeat(40)
+  const digest = `sha256:${'a'.repeat(64)}`
+  const runId = '123'
+  const attempt = 2
+  return {
+    artifacts: { artifacts: [{ expired: false, name: `kinvest-release-record-v2-${runId}-${attempt}` }] },
+    commit,
+    digest,
+    mainSha: commit,
+    record: {
+      artifact_source: 'ghcr-public', commit_sha: commit, created_at: '2026-08-26T00:00:00Z',
+      ghcr_digest: digest, schema_version: 2, source_digest: digest,
+      source_repository: 'ghcr.io/zwphhxx/kinvest', tcr_digest: null,
+      verification_run_attempt: attempt, verification_run_id: runId
+    },
+    releaseRunId: runId,
+    run: {
+      conclusion: 'success', event: 'push', head_branch: 'main', head_sha: commit,
+      path: '.github/workflows/deploy.yml', run_attempt: attempt
+    },
+    validatedCommit: commit,
+    validatedDigest: digest,
+    validatedRunId: runId,
+    workflowSha: commit
+  }
+}
+
+function runProvenanceScript(script, mutate = () => {}) {
+  const fixture = fs.mkdtempSync(path.join(os.tmpdir(), 'kinvest-v5-provenance-'))
+  try {
+    const state = provenanceState()
+    mutate(state)
+    const bin = path.join(fixture, 'bin')
+    const sentinel = path.join(fixture, 'secret-ssh-reached')
+    fs.mkdirSync(bin)
+    fs.writeFileSync(path.join(bin, 'gh'), `#!/usr/bin/env node
+const fs = require('node:fs')
+const path = require('node:path')
+const args = process.argv.slice(2)
+if (args[0] === 'api' && args[1].includes('/git/ref/heads/main')) {
+  process.stdout.write(process.env.MOCK_MAIN_SHA)
+} else if (args[0] === 'api' && args[1].endsWith('/artifacts')) {
+  process.stdout.write(process.env.MOCK_ARTIFACTS)
+} else if (args[0] === 'api' && args[1].includes('/actions/runs/')) {
+  process.stdout.write(process.env.MOCK_RUN)
+} else if (args[0] === 'run' && args[1] === 'download') {
+  const directory = args[args.indexOf('--dir') + 1]
+  fs.mkdirSync(directory, { recursive: true })
+  fs.writeFileSync(path.join(directory, 'release-record.json'), process.env.MOCK_RECORD)
+} else {
+  process.exitCode = 97
+}
+`, { mode: 0o755 })
+    fs.writeFileSync(path.join(bin, 'git'), '#!/bin/sh\n[ "$1:$2" = "merge-base:--is-ancestor" ]\n', { mode: 0o755 })
+    const command = `${script}\nprintf '%s\\n' reached >"$SECRET_SSH_SENTINEL"`
+    const result = spawnSync('bash', ['-c', command], {
+      cwd: rootDir,
+      encoding: 'utf8',
+      env: {
+        ...process.env,
+        GH_TOKEN: 'synthetic-github-token',
+        GITHUB_REPOSITORY: 'zwphhxx/Kinvest',
+        INTENT: 'FORWARD',
+        MOCK_ARTIFACTS: JSON.stringify(state.artifacts),
+        MOCK_MAIN_SHA: state.mainSha,
+        MOCK_RECORD: JSON.stringify(state.record),
+        MOCK_RUN: JSON.stringify(state.run),
+        PATH: `${bin}:${process.env.PATH}`,
+        RELEASE_RUN_ID: state.releaseRunId,
+        SECRET_SSH_SENTINEL: sentinel,
+        VALIDATED_COMMIT: state.validatedCommit,
+        VALIDATED_DIGEST: state.validatedDigest,
+        VALIDATED_RUN_ID: state.validatedRunId,
+        VALIDATED_SCHEMA: '2',
+        WORKFLOW_SHA: state.workflowSha
+      }
+    })
+    return { reached: fs.existsSync(sentinel), result, state }
+  } finally {
+    fs.rmSync(fixture, { recursive: true, force: true })
+  }
 }
 
 async function run() {
@@ -73,6 +171,39 @@ async function run() {
     }
   }
   assert.doesNotMatch(workflow, /^  deploy:$/m)
+
+  const provenanceScripts = ['deploy-disabled', 'deploy-diagnostic'].map((job) =>
+    jobStepScript(job, 'Revalidate full release provenance after approval'))
+  const mismatchCases = [
+    ['run id', (state) => { state.validatedRunId = '124' }],
+    ['run attempt', (state) => { state.run.run_attempt = 3 }],
+    ['attempt', (state) => { state.record.verification_run_attempt = 3 }],
+    ['conclusion', (state) => { state.run.conclusion = 'failure' }],
+    ['artifact identity', (state) => { state.artifacts.artifacts[0].name = 'wrong-artifact' }],
+    ['release record', (state) => { delete state.record.created_at }],
+    ['commit', (state) => { state.record.commit_sha = 'c'.repeat(40) }],
+    ['digest', (state) => {
+      state.record.source_digest = `sha256:${'d'.repeat(64)}`
+      state.record.ghcr_digest = state.record.source_digest
+    }]
+  ]
+  for (const script of provenanceScripts) {
+    assert.doesNotMatch(script, /\|\|\s*true/)
+    const accepted = runProvenanceScript(script)
+    assert.equal(accepted.result.status, 0, accepted.result.stderr)
+    assert.equal(accepted.reached, true)
+    for (const [name, mutate] of mismatchCases) {
+      const rejected = runProvenanceScript(script, mutate)
+      assert.notEqual(rejected.result.status, 0, `${name} mismatch reached protected steps: ${JSON.stringify({ releaseRunId: rejected.state.releaseRunId, validatedRunId: rejected.state.validatedRunId })}`)
+      assert.equal(rejected.reached, false, `${name} mismatch touched Secret/SSH sentinel`)
+    }
+  }
+  const conclusionCheck = `[[ "$(jq -r '.conclusion' <<<"$run_json")" == "success" ]]`
+  const weakened = provenanceScripts[0].replace(conclusionCheck, ': # intentionally removed conclusion check')
+  assert.notEqual(weakened, provenanceScripts[0])
+  const bypassed = runProvenanceScript(weakened, (state) => { state.run.conclusion = 'failure' })
+  assert.equal(bypassed.result.status, 0, bypassed.result.stderr)
+  assert.equal(bypassed.reached, true, 'executable fixture must expose a commented-out trust check')
 
   const fixture = fs.mkdtempSync(path.join(os.tmpdir(), 'kinvest-v5-workflow-'))
   try {

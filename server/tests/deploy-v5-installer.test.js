@@ -10,6 +10,12 @@ const sourceDir = path.join(rootDir, 'deploy/server')
 const installerSource = fs.readFileSync(path.join(sourceDir, 'install-deploy-v5.sh'), 'utf8')
 const gateSource = fs.readFileSync(path.join(sourceDir, 'kinvest-ssh-command-v3'), 'utf8')
 const targetCount = 11
+const sourceAssets = [
+  'deploy-kinvest-v5', 'deploy-v5-runtime.py', 'deploy-v5-contract.py', 'docker-compose-v5.yml',
+  'kinvest-deploy-v5.sudoers.in', 'deploy-v5-assets.sha256', 'deploy-kinvest-v3.sh',
+  'deploy-v3-contract.py', 'docker-compose-v3.yml', 'offline-image-attestation.py',
+  'kinvest-ssh-command-v3'
+]
 
 function sha256(contents) {
   return crypto.createHash('sha256').update(contents).digest('hex')
@@ -19,7 +25,7 @@ function writeExecutable(file, source) {
   fs.writeFileSync(file, source, { mode: 0o755 })
 }
 
-function fixture({ existing = true, replaceFailure = null, postFailure = false, rollbackPause = false, pauseBeforeGate = false, killAfterReplacement = null, killStage = '', failGateTemp = '', killGateTemp = '', killGateTempStage = '', killIdentityTempStage = '', failIdentityTempStage = '' } = {}) {
+function fixture({ existing = true, replaceFailure = null, postFailure = false, rollbackPause = false, pauseBeforeGate = false, killAfterReplacement = null, killStage = '', failGateTemp = '', killGateTemp = '', killGateTempStage = '', killIdentityTempStage = '', failIdentityTempStage = '', tamperAfterInitialAsset = '', tamperAfterStagingAsset = '' } = {}) {
   const base = fs.mkdtempSync(path.join(os.tmpdir(), 'kinvest-v5-installer-'))
   const sbin = path.join(base, 'sbin')
   const libexec = path.join(base, 'libexec')
@@ -36,9 +42,18 @@ function fixture({ existing = true, replaceFailure = null, postFailure = false, 
   const rollbackRelease = path.join(base, 'rollback.release')
   const killMarker = path.join(base, 'kill.once')
   const fsyncTrace = path.join(base, 'fsync.trace')
+  const privilegeLog = path.join(base, 'privilege.log')
   const gateStateDir = path.join(base, 'gate-state')
+  const fixtureSource = path.join(base, 'source')
   for (const directory of [sbin, libexec, serverRoot, path.join(serverRoot, 'state'), sudoers, runRoot, bin]) {
     fs.mkdirSync(directory, { recursive: true })
+  }
+  fs.mkdirSync(fixtureSource, { mode: 0o755 })
+  for (const asset of sourceAssets) {
+    const original = path.join(sourceDir, asset)
+    const copy = path.join(fixtureSource, asset)
+    fs.copyFileSync(original, copy)
+    fs.chmodSync(copy, fs.statSync(original).mode & 0o777)
   }
   writeExecutable(path.join(bin, 'flock'), `#!/usr/bin/env bash
 kind='gate'
@@ -88,14 +103,14 @@ exec /usr/bin/id "$@"
 `)
   writeExecutable(path.join(bin, 'sha256sum'), `#!/usr/bin/env bash
 for argument in "$@"; do
-  if [[ -n "\${INSTALL_TARGET_ROOT:-}" && "$argument" == "$INSTALL_TARGET_ROOT"* ]]; then
+  if [[ -n "\${INSTALL_TARGET_ROOT:-}" && "$argument" == "$INSTALL_TARGET_ROOT"* && "$argument" != "\${INSTALL_SOURCE_ROOT:-}"* && "$argument" != "\${INSTALL_STAGING_ROOT:-}"* ]]; then
     printf '%s:target-read\\n' "$INSTALLER_ID" >>"$INSTALL_EVENTS"
   fi
 done
 exec "$REAL_SHA256SUM" "$@"
 `)
-  writeExecutable(path.join(bin, 'sudo'), '#!/bin/sh\nexit 0\n')
-  writeExecutable(path.join(bin, 'visudo'), '#!/bin/sh\nexit 0\n')
+  writeExecutable(path.join(bin, 'sudo'), '#!/bin/sh\nprintf \'sudo:%s\\n\' "$*" >>"$PRIVILEGE_LOG"\nexit 0\n')
+  writeExecutable(path.join(bin, 'visudo'), '#!/bin/sh\nprintf \'visudo:%s\\n\' "$*" >>"$PRIVILEGE_LOG"\nexit 0\n')
   writeExecutable(path.join(bin, 'realpath'), '#!/bin/sh\n[ "${1:-}" = -e ] && shift\nprintf \'%s\\n\' "$1"\n')
   writeExecutable(path.join(bin, 'mv'), `#!/usr/bin/env bash
 args=()
@@ -144,6 +159,7 @@ exec /bin/mv -f "\${args[@]}"
     .replace("RUN_ROOT='/run'", `RUN_ROOT='${runRoot}'`)
     .replace("GATE_STATE_DIR='/var/lib/kinvest-deploy-gate'", `GATE_STATE_DIR='${gateStateDir}'`)
     .replace("GATE_ROOT_OWNER='0:0'", `GATE_ROOT_OWNER='${process.getuid()}:${process.getgid()}'`)
+    .replace("STAGING_ROOT_OWNER='0:0'", `STAGING_ROOT_OWNER='${process.getuid()}:${process.getgid()}'`)
     .replace('[[ "$(id -u)" -eq 0 ]]', '[[ "${KINVEST_INSTALL_V5_TEST_ROOT:-}" == 1 ]]')
     .replaceAll('-o root -g root', `-o ${process.getuid()} -g ${process.getgid()}`)
     .replaceAll('chown root:root', `chown ${process.getuid()}:${process.getgid()}`)
@@ -163,6 +179,18 @@ exec /bin/mv -f "\${args[@]}"
   printf 'clear\\n' >>'${fsyncTrace}'`)
     .replace('clear_public_marker() {', `clear_public_marker() {
   printf 'public-clear\\n' >>'${fsyncTrace}'`)
+  if (tamperAfterInitialAsset) {
+    instrumented = instrumented.replace(
+      '# deploy-v5-source-initially-validated',
+      `# deploy-v5-source-initially-validated\nprintf '%s\\n' '# tampered after initial hash' >>'${path.join(fixtureSource, tamperAfterInitialAsset)}'`
+    )
+  }
+  if (tamperAfterStagingAsset) {
+    instrumented = instrumented.replace(
+      '# deploy-v5-input-staging-validated',
+      `# deploy-v5-input-staging-validated\nprintf '%s\\n' '# tampered after trusted staging' >>'${path.join(fixtureSource, tamperAfterStagingAsset)}'`
+    )
+  }
   if (replaceFailure !== null) {
     instrumented = instrumented.replace(
       '  mv -fT "$temporary" "${TARGETS[$index]}"',
@@ -239,24 +267,29 @@ if [[ ! -e '${killMarker}' ]]; then : >'${killMarker}'; kill -KILL $$; fi`]
   }
   const script = path.join(base, 'installer.sh')
   writeExecutable(script, instrumented)
-  return { base, bin, eventLog, fsyncTrace, gate, oldGateContent, gateStateDir, installerLockDir, deployLockDir, lockRelease, locksHeldMarker, rollbackMarker, rollbackRelease, script, serverRoot, targets }
+  return { base, bin, eventLog, fixtureSource, fsyncTrace, gate, oldGateContent, gateStateDir, installerLockDir, deployLockDir, lockRelease, locksHeldMarker, privilegeLog, rollbackMarker, rollbackRelease, runRoot, script, serverRoot, targets }
 }
 
 function installerEnvironment(context, overrides = {}) {
   return {
     ...process.env,
     KINVEST_INSTALL_V5_TEST_ROOT: '1',
+    KINVEST_INSTALL_V5_TEST_MODE: '1',
+    KINVEST_INSTALL_V5_EXPECTED_SOURCE_UID: String(process.getuid()),
     KINVEST_DEPLOY_GATE_USER: 'lighthouse',
     KINVEST_DEPLOY_GATE_GROUP: 'lighthouse',
     PATH: `${context.bin}:${process.env.PATH}`,
     REAL_SHA256SUM: spawnSync('which', ['sha256sum'], { encoding: 'utf8' }).stdout.trim(),
     FSYNC_TRACE: context.fsyncTrace,
+    PRIVILEGE_LOG: context.privilegeLog,
+    INSTALL_SOURCE_ROOT: context.fixtureSource,
+    INSTALL_STAGING_ROOT: context.runRoot,
     ...overrides
   }
 }
 
 function execute(context, overrides = {}) {
-  return spawnSync('bash', [context.script, sourceDir], {
+  return spawnSync('bash', [context.script, context.fixtureSource], {
     encoding: 'utf8',
     env: installerEnvironment(context, overrides)
   })
@@ -339,6 +372,69 @@ function assertDurableRenames(trace, fragment) {
   }
 }
 
+function runLinuxSudoersIntegration(sudoersSource) {
+  if (process.platform !== 'linux') {
+    process.stdout.write('deploy-v5 sudoers integration: SKIP non-Linux\n')
+    return
+  }
+  const visudo = '/usr/sbin/visudo'
+  const sudo = '/usr/bin/sudo'
+  assert.equal(fs.existsSync(visudo), true, 'Linux CI requires real visudo')
+  assert.equal(fs.existsSync(sudo), true, 'Linux CI requires real sudo')
+  const base = fs.mkdtempSync(path.join(os.tmpdir(), 'kinvest-v5-sudoers-'))
+  const username = os.userInfo().username
+  assert.match(username, /^[a-z_][a-z0-9_-]{0,31}$/)
+  const command = path.join(base, 'deploy-kinvest-v5')
+  const harness = path.join(base, 'sudo-harness')
+  const parserPolicy = path.join(base, 'parser-policy')
+  const semanticPolicy = path.join(base, 'semantic-policy')
+  const installedPolicy = `/etc/sudoers.d/kinvest-v5-test-${process.pid}`
+  try {
+    writeExecutable(command, '#!/bin/sh\nprintf \'argc=%s\\n\' "$#"\n/usr/bin/env | /usr/bin/sort\n')
+    fs.writeFileSync(parserPolicy, sudoersSource.replaceAll('@KINVEST_DEPLOY_GATE_USER@', username), { mode: 0o440 })
+    const parsed = spawnSync(visudo, ['-cf', parserPolicy], { encoding: 'utf8' })
+    assert.equal(parsed.status, 0, parsed.stderr)
+    const semantic = sudoersSource
+      .split('\n')
+      .filter((line) => line.includes('/usr/local/sbin/deploy-kinvest-v5'))
+      .join('\n')
+      .replaceAll('@KINVEST_DEPLOY_GATE_USER@', username)
+      .replaceAll('/usr/local/sbin/deploy-kinvest-v5', command) + '\n'
+    fs.writeFileSync(semanticPolicy, semantic, { mode: 0o440 })
+    const semanticParsed = spawnSync(visudo, ['-cf', semanticPolicy], { encoding: 'utf8' })
+    assert.equal(semanticParsed.status, 0, semanticParsed.stderr)
+    const privileged = spawnSync(sudo, ['-n', 'true'], { encoding: 'utf8' })
+    const listing = spawnSync(sudo, ['-n', '-l'], { encoding: 'utf8' })
+    if (privileged.status !== 0 || listing.status !== 0 || /NOPASSWD:\s*ALL/.test(listing.stdout)) {
+      process.stdout.write('deploy-v5 sudoers integration: parser-only (isolated deny semantics unavailable)\n')
+      return
+    }
+    writeExecutable(harness, `#!/bin/bash
+set -euo pipefail
+policy="$1"
+installed="$2"
+command="$3"
+cleanup() { /usr/bin/sudo -n /usr/bin/rm -f "$installed"; }
+trap cleanup EXIT HUP INT TERM
+/usr/bin/sudo -n /usr/bin/install -o root -g root -m 0440 "$policy" "$installed"
+allowed="$(BASH_ENV=/attacker/bash-env PYTHONPATH=/attacker/python SUDO_COMMAND=attacker /usr/bin/sudo -n "$command")"
+[[ "$allowed" == *$'argc=0'* ]]
+[[ "$allowed" != *$'BASH_ENV='* && "$allowed" != *$'PYTHONPATH='* && "$allowed" != *$'SUDO_COMMAND=attacker'* ]]
+if /usr/bin/sudo -n "$command" unexpected >/dev/null 2>&1; then exit 91; fi
+if /usr/bin/sudo -n -E "$command" >/dev/null 2>&1; then exit 92; fi
+printf '%s\n' "$allowed"
+`)
+    const semanticResult = spawnSync(harness, [semanticPolicy, installedPolicy, command], { encoding: 'utf8' })
+    assert.equal(semanticResult.status, 0, semanticResult.stderr)
+    assert.match(semanticResult.stdout, /^argc=0$/m)
+    assert.doesNotMatch(semanticResult.stdout, /^(BASH_ENV|PYTHONPATH)=/m)
+    assert.doesNotMatch(semanticResult.stdout, /^SUDO_COMMAND=attacker$/m)
+  } finally {
+    spawnSync(sudo, ['-n', '/usr/bin/rm', '-f', installedPolicy], { encoding: 'utf8' })
+    fs.rmSync(base, { recursive: true, force: true })
+  }
+}
+
 function canWriteAs(info, uid, gid) {
   if (uid === info.uid) return (info.mode & 0o200) !== 0
   if (gid === info.gid) return (info.mode & 0o020) !== 0
@@ -347,6 +443,8 @@ function canWriteAs(info, uid, gid) {
 
 async function run() {
   assert.match(installerSource, /deploy-v5-assets\.sha256/)
+  assert.match(installerSource, /TRUSTED_SOURCE_DIR=/)
+  assert.match(installerSource, /kinvest-deploy-v5-input\./)
   assert.match(installerSource, /TARGETS=.*\$GATE_TARGET/)
   assert.doesNotMatch(installerSource, /install_forced_command_gate/)
   assert.doesNotMatch(installerSource, /systemctl restart|docker compose|DEPLOY_V5_ENABLED/)
@@ -374,6 +472,7 @@ async function run() {
   assert.match(sudoersSource, /secure_path/)
   assert.match(sudoersSource, /set_home/)
   assert.match(sudoersSource, /!setenv/)
+  runLinuxSudoersIntegration(sudoersSource)
 
   const environmentFixture = fs.mkdtempSync(path.join(os.tmpdir(), 'kinvest-v5-wrapper-env-'))
   try {
@@ -407,6 +506,57 @@ async function run() {
     assert.match(cleanEnv, /^HOME=\/nonexistent$/m)
   } finally {
     fs.rmSync(environmentFixture, { recursive: true, force: true })
+  }
+
+  for (const [name, prepare, overrides = {}] of [
+    ['group-writable source directory', (context) => fs.chmodSync(context.fixtureSource, 0o775)],
+    ['group-writable source file', (context) => fs.chmodSync(path.join(context.fixtureSource, 'deploy-v5-runtime.py'), 0o664)],
+    ['source owner mismatch', () => {}, { KINVEST_INSTALL_V5_EXPECTED_SOURCE_UID: String(process.getuid() + 1) }],
+    ['symlink source asset', (context) => {
+      const asset = path.join(context.fixtureSource, 'deploy-v5-runtime.py')
+      fs.rmSync(asset)
+      fs.symlinkSync(path.join(sourceDir, 'deploy-v5-runtime.py'), asset)
+    }]
+  ]) {
+    const context = fixture()
+    try {
+      prepare(context)
+      const result = execute(context, overrides)
+      assert.notEqual(result.status, 0, name)
+      assertOld(context, true)
+      assert.equal(fs.existsSync(context.privilegeLog), false, `${name} reached visudo/sudo`)
+    } finally {
+      fs.rmSync(context.base, { recursive: true, force: true })
+    }
+  }
+
+  for (const asset of ['kinvest-deploy-v5.sudoers.in', 'deploy-v5-runtime.py']) {
+    const context = fixture({ tamperAfterInitialAsset: asset })
+    try {
+      const result = execute(context)
+      assert.notEqual(result.status, 0, `${asset} mutation after initial hash was accepted`)
+      assertOld(context, true)
+      assert.equal(fs.existsSync(context.privilegeLog), false, `${asset} mutation reached privilege checks`)
+    } finally {
+      fs.rmSync(context.base, { recursive: true, force: true })
+    }
+  }
+
+  for (const asset of ['kinvest-deploy-v5.sudoers.in', 'deploy-v5-runtime.py']) {
+    const context = fixture({ tamperAfterStagingAsset: asset })
+    try {
+      const result = execute(context)
+      assert.equal(result.status, 0, result.stderr)
+      assert.match(fs.readFileSync(path.join(context.fixtureSource, asset), 'utf8'), /tampered after trusted staging/)
+      const index = sourceAssets.indexOf(asset)
+      const expected = fs.readFileSync(path.join(sourceDir, asset), 'utf8')
+        .replaceAll('@KINVEST_DEPLOY_GATE_USER@', 'lighthouse')
+      assert.equal(fs.readFileSync(context.targets[index], 'utf8'), expected)
+      assert.doesNotMatch(fs.readFileSync(context.targets[index], 'utf8'), /tampered after trusted staging/)
+      assert.equal(fs.readdirSync(path.join(context.base, 'run')).some((name) => name.startsWith('kinvest-deploy-v5-input.')), false)
+    } finally {
+      fs.rmSync(context.base, { recursive: true, force: true })
+    }
   }
 
   const timeoutChild = trackChild(spawn(process.execPath, ['-e', 'setInterval(() => {}, 1000)'], { stdio: 'ignore' }))
@@ -721,7 +871,7 @@ PY
       INSTALL_LOCK_RELEASE: concurrent.lockRelease,
       INSTALL_TARGET_ROOT: concurrent.base
     }
-    first = trackChild(spawn('bash', [concurrent.script, sourceDir], {
+    first = trackChild(spawn('bash', [concurrent.script, concurrent.fixtureSource], {
       env: installerEnvironment(concurrent, { ...sharedEnvironment, HOLD_LOCK_KIND: 'install', INSTALLER_ID: 'first' }),
       stdio: 'ignore'
     }))
@@ -751,7 +901,7 @@ PY
       INSTALL_LOCK_RELEASE: gateWindow.lockRelease,
       INSTALLER_ID: 'installer'
     }
-    gateWindowChild = trackChild(spawn('bash', [gateWindow.script, sourceDir], {
+    gateWindowChild = trackChild(spawn('bash', [gateWindow.script, gateWindow.fixtureSource], {
       env: installerEnvironment(gateWindow, lockEnvironment), stdio: 'ignore'
     }))
     await waitFor(() => fs.existsSync(gateWindow.locksHeldMarker))
@@ -790,7 +940,7 @@ PY
   const signalled = fixture({ replaceFailure: 3, rollbackPause: true })
   let signalledChild
   try {
-    signalledChild = trackChild(spawn('bash', [signalled.script, sourceDir], {
+    signalledChild = trackChild(spawn('bash', [signalled.script, signalled.fixtureSource], {
       env: installerEnvironment(signalled),
       stdio: 'ignore'
     }))
