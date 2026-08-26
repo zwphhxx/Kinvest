@@ -1,5 +1,6 @@
-#!/usr/bin/env bash
+#!/bin/bash
 set -euo pipefail
+unset BASH_ENV ENV PYTHONPATH PYTHONHOME LD_PRELOAD LD_LIBRARY_PATH SUDO_ASKPASS SUDO_COMMAND SUDO_USER SUDO_UID SUDO_GID
 
 GATE_STATE_DIR='/var/lib/kinvest-deploy-gate'
 INSTALL_MARKER="$GATE_STATE_DIR/install-incomplete"
@@ -73,10 +74,10 @@ fi
 # makes the legacy deployer fail closed until its explicit retirement.
 case "${SSH_ORIGINAL_COMMAND:-}" in
   deploy-v2)
-    exec sudo -n /usr/local/sbin/deploy-kinvest
+    exec /usr/bin/env -i PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin HOME=/nonexistent LANG=C LC_ALL=C /usr/bin/sudo -n /usr/local/sbin/deploy-kinvest
     ;;
   deploy-v3)
-    exec sudo -n /usr/local/sbin/deploy-kinvest-v3
+    exec /usr/bin/env -i PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin HOME=/nonexistent LANG=C LC_ALL=C /usr/bin/sudo -n /usr/local/sbin/deploy-kinvest-v3
     ;;
   deploy-v4)
     if [[ ! -x /usr/local/sbin/deploy-kinvest-v4 \
@@ -86,7 +87,7 @@ case "${SSH_ORIGINAL_COMMAND:-}" in
       printf '%s\n' 'DEPLOY_V4_ASSETS_MISSING' >&2
       exit 69
     fi
-    exec sudo -n /usr/local/sbin/deploy-kinvest-v4
+    exec /usr/bin/env -i PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin HOME=/nonexistent LANG=C LC_ALL=C /usr/bin/sudo -n /usr/local/sbin/deploy-kinvest-v4
     ;;
   deploy-v5)
     if [[ ! -x /usr/local/sbin/deploy-kinvest-v5 \
@@ -95,7 +96,7 @@ case "${SSH_ORIGINAL_COMMAND:-}" in
       printf '%s\n' 'DEPLOY_V5_ASSETS_MISSING' >&2
       exit 69
     fi
-    exec sudo -n /usr/local/sbin/deploy-kinvest-v5
+    exec /usr/bin/env -i PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin HOME=/nonexistent LANG=C LC_ALL=C /usr/bin/sudo -n /usr/local/sbin/deploy-kinvest-v5
     ;;
   *)
     printf '%s\n' 'KINVEST_DEPLOY_WRAPPER_COMMAND_REJECTED' >&2

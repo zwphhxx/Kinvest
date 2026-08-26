@@ -20,23 +20,24 @@ GATE_GROUP_GID=''
 GATE_IDENTITY_CONTENT=''
 GATE_SOURCE="$SOURCE_DIR/kinvest-ssh-command-v3"
 GATE_TARGET="$LOCAL_SBIN/kinvest-ssh-command"
-GATE_EXPECTED_HASH='ea3c6bf2d5f0b7822ca1dc5f331c6c0987c170d9ef90ca08793422af6f4d3815'
-MANIFEST_EXPECTED_HASH='442e9e286fb400ed432569fb707a0101aebbbbfc92a07fcf8089b6ed3f06320c'
-SOURCE_ASSETS=('deploy-kinvest-v5' 'deploy-v5-runtime.py' 'deploy-v5-contract.py' 'docker-compose-v5.yml' 'kinvest-deploy-v5.sudoers.in' 'deploy-v5-assets.sha256' 'deploy-kinvest-v3.sh' 'deploy-v3-contract.py' 'docker-compose-v3.yml' 'offline-image-attestation.py')
-TARGETS=("$LOCAL_SBIN/deploy-kinvest-v5" "$LOCAL_LIBEXEC/kinvest-deploy-v5-runtime" "$LOCAL_LIBEXEC/kinvest-deploy-v5-contract" "$SERVER_ROOT/docker-compose-v5.yml" "$SUDOERS_DIR/kinvest-deploy-v5" "$SERVER_ROOT/deploy-v5-assets.sha256" "$LOCAL_SBIN/deploy-kinvest-v3" "$LOCAL_LIBEXEC/kinvest-deploy-v3-contract" "$SERVER_ROOT/docker-compose-v3.yml" "$LOCAL_LIBEXEC/kinvest-offline-image-attestation")
-TARGET_KEYS=('deploy-kinvest-v5' 'kinvest-deploy-v5-runtime' 'kinvest-deploy-v5-contract' 'docker-compose-v5.yml' 'kinvest-deploy-v5.sudoers' 'deploy-v5-assets.sha256' 'deploy-kinvest-v3' 'kinvest-deploy-v3-contract' 'docker-compose-v3.yml' 'kinvest-offline-image-attestation')
-MODES=('0755' '0755' '0755' '0644' '0440' '0600' '0755' '0755' '0644' '0755')
+GATE_EXPECTED_HASH='366f860645396e26178fecb9f91179182df5cc2282f593c0d3dd576b11589c9e'
+MANIFEST_EXPECTED_HASH='fcfd7004165bb4c8656dfb0148e7449340d6c83daf576c03b5741b67074c1b5a'
+SOURCE_ASSETS=('deploy-kinvest-v5' 'deploy-v5-runtime.py' 'deploy-v5-contract.py' 'docker-compose-v5.yml' 'kinvest-deploy-v5.sudoers.in' 'deploy-v5-assets.sha256' 'deploy-kinvest-v3.sh' 'deploy-v3-contract.py' 'docker-compose-v3.yml' 'offline-image-attestation.py' 'kinvest-ssh-command-v3')
+TARGETS=("$LOCAL_SBIN/deploy-kinvest-v5" "$LOCAL_LIBEXEC/kinvest-deploy-v5-runtime" "$LOCAL_LIBEXEC/kinvest-deploy-v5-contract" "$SERVER_ROOT/docker-compose-v5.yml" "$SUDOERS_DIR/kinvest-deploy-v5" "$SERVER_ROOT/deploy-v5-assets.sha256" "$LOCAL_SBIN/deploy-kinvest-v3" "$LOCAL_LIBEXEC/kinvest-deploy-v3-contract" "$SERVER_ROOT/docker-compose-v3.yml" "$LOCAL_LIBEXEC/kinvest-offline-image-attestation" "$GATE_TARGET")
+TARGET_KEYS=('deploy-kinvest-v5' 'kinvest-deploy-v5-runtime' 'kinvest-deploy-v5-contract' 'docker-compose-v5.yml' 'kinvest-deploy-v5.sudoers' 'deploy-v5-assets.sha256' 'deploy-kinvest-v3' 'kinvest-deploy-v3-contract' 'docker-compose-v3.yml' 'kinvest-offline-image-attestation' 'kinvest-ssh-command')
+MODES=('0755' '0755' '0755' '0644' '0440' '0600' '0755' '0755' '0644' '0755' '0755')
 EXPECTED_ASSET_HASHES=(
   '01cb61e16ae8c0e041cd1d6be02ec82eeabdb4c103a331cba45f5e42ed712c00'
   '2664c8f7a52f7decbc3a2758013e1e0c51ed1d2833ca0490d664a8bc6ad2e05d'
   'ccec93bcce7a8e7bf5871f7269446a93b88caf6a971360d7e8269c43161468bd'
   '1e9a52d1025350fc21539d21fbfbdc9b51f818f1896ec26bc3ba572188eca2df'
-  'e7185be9b5236736b1e7c0f6f499320d0aac3083dea0b4a4b11a0597f15fdc3b'
-  '442e9e286fb400ed432569fb707a0101aebbbbfc92a07fcf8089b6ed3f06320c'
+  '5166b3a77f2a2e8579e493cd0c477302ad362dcdb13c265cd1a8b5c9eb1c409f'
+  'fcfd7004165bb4c8656dfb0148e7449340d6c83daf576c03b5741b67074c1b5a'
   '3bb3abdfee9b33cd9bd703730c3eb4fc7c1a25d3b6dc3e1ae00e2a775dd36bb1'
   '68040b9177cc8d2bb929a351e289eee7e9c6e446fda447ceec12d9ad382afe23'
   '7698dd619fb6a441763f85e4e35c819af55e431c6d0ac9c4b527930d07a644aa'
   '424e9fa9b013727ef75c489cfa25cf5144efbabb34d2bbb630115efe86de7bc1'
+  '366f860645396e26178fecb9f91179182df5cc2282f593c0d3dd576b11589c9e'
 )
 
 fail() { printf '%s\n' "$1" >&2; exit "${2:-1}"; }
@@ -342,17 +343,6 @@ fsync_target_directories() {
   done
 }
 
-install_forced_command_gate() {
-  local gate_temporary
-  gate_temporary="$(mktemp "$LOCAL_SBIN/.kinvest-command-gate.XXXXXX")"
-  install -o root -g root -m 0755 "$GATE_SOURCE" "$gate_temporary"
-  [[ "$(file_hash "$gate_temporary")" == "$GATE_EXPECTED_HASH" ]] || return 1
-  fsync_file "$gate_temporary"
-  mv -fT "$gate_temporary" "$GATE_TARGET"
-  fsync_directory "$LOCAL_SBIN"
-  [[ -f "$GATE_TARGET" && ! -L "$GATE_TARGET" && "$(file_hash "$GATE_TARGET")" == "$GATE_EXPECTED_HASH" ]] || return 1
-}
-
 clear_install_journal() {
   rm -f "$INSTALL_JOURNAL"
   fsync_directory "$SERVER_ROOT/state"
@@ -383,7 +373,6 @@ elif [[ -e "$GATE_INSTALL_MARKER" || -L "$GATE_INSTALL_MARKER" ]]; then
   clear_public_marker || fail 'DEPLOY_V5_INSTALL_RECONCILE_FAILED'
 fi
 
-install_forced_command_gate # stable-gate-commit
 
 for target in "${TARGETS[@]}"; do
   [[ ! -L "$target" && ( ! -e "$target" || -f "$target" ) ]] || fail "unsafe deploy-v5 target: $target"

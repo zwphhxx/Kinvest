@@ -15,6 +15,13 @@ on:
           - FORWARD
           - ROLLBACK
           - RESTORE
+      ifind_mode:
+        description: 'Select disabled or diagnostic iFinD bootstrap'
+        required: true
+        type: choice
+        options:
+          - disabled
+          - diagnostic
       confirm:
         description: 'Type DEPLOY_V5, ROLLBACK_V4, or RESTORE_V4 to match intent'
         required: true
@@ -53,11 +60,13 @@ jobs:
           RELEASE_RUN_ID: ${{ inputs.release_run_id }}
           CONFIRM: ${{ inputs.confirm }}
           INTENT: ${{ inputs.intent }}
+          IFIND_MODE: ${{ inputs.ifind_mode }}
           WORKFLOW_REF: ${{ github.ref }}
         run: |
           set -euo pipefail
           [[ "$WORKFLOW_REF" == 'refs/heads/main' ]]
           [[ "$RELEASE_RUN_ID" =~ ^[0-9]+$ ]]
+          [[ "$IFIND_MODE" =~ ^(disabled|diagnostic)$ ]]
           case "$INTENT:$CONFIRM" in
             FORWARD:DEPLOY_V5|ROLLBACK:ROLLBACK_V4|RESTORE:RESTORE_V4) ;;
             *) exit 1 ;;
@@ -127,46 +136,98 @@ jobs:
           printf 'release_record_schema_version=2\n' >> "$GITHUB_OUTPUT"
           printf 'verification_run_id=%s\n' "$RELEASE_RUN_ID" >> "$GITHUB_OUTPUT"
 
-  deploy:
-    name: deploy-v5
+  deploy-disabled:
+    name: deploy-v5-disabled
     needs: validate
+    if: ${{ inputs.ifind_mode == 'disabled' }}
     runs-on: ubuntu-latest
     timeout-minutes: 40
     environment: Production
     permissions:
       contents: read
+      actions: read
     steps:
-      - name: Check Production v5 gate after approval
+      - name: Check disabled Production gate identity after approval
         shell: bash
         env:
           DEPLOY_V5_ENABLED: ${{ vars.DEPLOY_V5_ENABLED }}
+          DEPLOY_HOST: ${{ vars.DEPLOY_HOST }}
+          DEPLOY_PORT: ${{ vars.DEPLOY_PORT }}
+          KINVEST_DEPLOY_GATE_USER: ${{ vars.KINVEST_DEPLOY_GATE_USER }}
           KINVEST_ACCESS_CONTROL_MODE: ${{ vars.KINVEST_ACCESS_CONTROL_MODE }}
           KINVEST_IFIND_DIAGNOSTIC_MODE: ${{ vars.KINVEST_IFIND_DIAGNOSTIC_MODE }}
+          REQUESTED_IFIND_MODE: ${{ inputs.ifind_mode }}
+          WORKFLOW_REF: ${{ github.ref }}
         run: |
           set -euo pipefail
-          test "$DEPLOY_V5_ENABLED" = 'true'
+          set +x
+          [[ "$WORKFLOW_REF" == 'refs/heads/main' ]]
+          [[ "$DEPLOY_V5_ENABLED" == 'true' ]]
+          [[ "$REQUESTED_IFIND_MODE" == 'disabled' ]]
+          [[ "$KINVEST_IFIND_DIAGNOSTIC_MODE" == "$REQUESTED_IFIND_MODE" ]]
+          [[ "$KINVEST_DEPLOY_GATE_USER" =~ ^[a-z_][a-z0-9_-]{0,31}$ ]] || { printf '%s\n' 'KINVEST_DEPLOY_GATE_IDENTITY_MISMATCH' >&2; exit 76; }
+          [[ "$DEPLOY_HOST" =~ ^[A-Za-z0-9.-]+$ ]]
+          [[ "$DEPLOY_PORT" =~ ^[0-9]{1,5}$ ]]
+          ((DEPLOY_PORT >= 1 && DEPLOY_PORT <= 65535))
           [[ "$KINVEST_ACCESS_CONTROL_MODE" =~ ^(disabled|device-approval)$ ]]
-          [[ "$KINVEST_IFIND_DIAGNOSTIC_MODE" =~ ^(disabled|diagnostic)$ ]]
-      - name: Revalidate trusted control plane after approval
-        shell: bash
-        env:
-          GH_TOKEN: ${{ github.token }}
-          INTENT: ${{ inputs.intent }}
-          TARGET_SHA: ${{ needs.validate.outputs.commit_sha }}
-          WORKFLOW_SHA: ${{ github.sha }}
-        run: |
-          set -euo pipefail
-          main_sha="$(gh api "repos/${GITHUB_REPOSITORY}/git/ref/heads/main" --jq '.object.sha')"
-          [[ "$main_sha" =~ ^[0-9a-f]{40}$ ]]
-          [[ "$WORKFLOW_SHA" == "$main_sha" ]]
-          if [[ "$INTENT" == 'FORWARD' ]]; then
-            [[ "$TARGET_SHA" == "$main_sha" ]]
-          fi
       - name: Check out trusted deployment control plane
         uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683
         with:
           ref: ${{ github.sha }}
+          fetch-depth: 0
           persist-credentials: false
+      - name: Revalidate full release provenance after approval
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+          RELEASE_RUN_ID: ${{ inputs.release_run_id }}
+          INTENT: ${{ inputs.intent }}
+          WORKFLOW_SHA: ${{ github.sha }}
+          VALIDATED_COMMIT: ${{ needs.validate.outputs.commit_sha }}
+          VALIDATED_DIGEST: ${{ needs.validate.outputs.image_digest }}
+          VALIDATED_SCHEMA: ${{ needs.validate.outputs.release_record_schema_version }}
+          VALIDATED_RUN_ID: ${{ needs.validate.outputs.verification_run_id }}
+        run: |
+          set -euo pipefail
+          set +x
+          main_sha="$(gh api "repos/${GITHUB_REPOSITORY}/git/ref/heads/main" --jq '.object.sha')"
+          [[ "$main_sha" =~ ^[0-9a-f]{40}$ && "$WORKFLOW_SHA" == "$main_sha" ]]
+          [[ "$RELEASE_RUN_ID" == "$VALIDATED_RUN_ID" && "$RELEASE_RUN_ID" =~ ^[0-9]+$ ]]
+          run_json="$(gh api "repos/${GITHUB_REPOSITORY}/actions/runs/${RELEASE_RUN_ID}")"
+          [[ "$(jq -r '.path' <<<"$run_json")" == '.github/workflows/deploy.yml' ]]
+          [[ "$(jq -r '.event' <<<"$run_json")" == "push" ]]
+          [[ "$(jq -r '.head_branch' <<<"$run_json")" == "main" ]]
+          [[ "$(jq -r '.conclusion' <<<"$run_json")" == "success" ]]
+          run_attempt="$(jq -r '.run_attempt' <<<"$run_json")"
+          run_head_sha="$(jq -r '.head_sha' <<<"$run_json")"
+          [[ "$run_attempt" =~ ^[0-9]+$ && "$run_head_sha" =~ ^[0-9a-f]{40}$ ]]
+          artifacts="$(gh api "repos/${GITHUB_REPOSITORY}/actions/runs/${RELEASE_RUN_ID}/artifacts")"
+          expected_name="kinvest-release-record-v2-${RELEASE_RUN_ID}-${run_attempt}"
+          matches="$(jq --arg name "$expected_name" "[.artifacts[] | select(.expired == false and .name == \$name)]" <<<"$artifacts")"
+          [[ "$(jq "length" <<<"$matches")" == "1" ]]
+          record_dir="$(mktemp -d)"
+          trap "rm -rf \"$record_dir\"" EXIT
+          gh run download "$RELEASE_RUN_ID" --name "$expected_name" --dir "$record_dir"
+          record="$record_dir/release-record.json"
+          expected_keys='artifact_source commit_sha created_at ghcr_digest schema_version source_digest source_repository tcr_digest verification_run_attempt verification_run_id'
+          [[ "$(jq -r "keys | join(\" \")" "$record")" == "$expected_keys" ]]
+          [[ "$(jq -r '.schema_version' "$record")" == "2" ]]
+          [[ "$(jq -r '.verification_run_id' "$record")" == "$RELEASE_RUN_ID" ]]
+          [[ "$(jq -r '.verification_run_attempt' "$record")" == "$run_attempt" ]]
+          commit_sha="$(jq -r '.commit_sha' "$record")"
+          artifact_source="$(jq -r '.artifact_source' "$record")"
+          source_repository="$(jq -r '.source_repository' "$record")"
+          source_digest="$(jq -r '.source_digest' "$record")"
+          ghcr_digest="$(jq -r '.ghcr_digest' "$record")"
+          [[ "$commit_sha" == "$run_head_sha" && "$commit_sha" == "$VALIDATED_COMMIT" ]]
+          [[ "$artifact_source" == "ghcr-public" ]]
+          [[ "$source_repository" == "ghcr.io/zwphhxx/kinvest" ]]
+          [[ "$source_digest" =~ ^sha256:[0-9a-f]{64}$ ]]
+          [[ "$source_digest" == "$ghcr_digest" && "$source_digest" == "$VALIDATED_DIGEST" ]]
+          [[ "$(jq -r '.tcr_digest == null' "$record")" == "true" ]]
+          [[ "$VALIDATED_SCHEMA" == "2" ]]
+          git merge-base --is-ancestor "$commit_sha" origin/main
+          if [[ "$INTENT" == "FORWARD" ]]; then [[ "$commit_sha" == "$main_sha" ]]; fi
       - name: Configure strict SSH trust
         shell: bash
         env:
@@ -195,7 +256,6 @@ jobs:
         env:
           DEPLOY_HOST: ${{ vars.DEPLOY_HOST }}
           DEPLOY_PORT: ${{ vars.DEPLOY_PORT }}
-          SSH_USER: ${{ secrets.SSH_USER }}
           KINVEST_DEPLOY_GATE_USER: ${{ vars.KINVEST_DEPLOY_GATE_USER }}
           DEPLOY_SHA: ${{ needs.validate.outputs.commit_sha }}
           IMAGE_DIGEST: ${{ needs.validate.outputs.image_digest }}
@@ -213,14 +273,7 @@ jobs:
         run: |
           set -euo pipefail
           set +x
-          if [[ -z "${SSH_USER-}" || -z "${KINVEST_DEPLOY_GATE_USER-}" || \
-                "$SSH_USER" != "$KINVEST_DEPLOY_GATE_USER" ]]; then
-            unset SSH_USER
-            printf '%s\n' 'KINVEST_DEPLOY_GATE_IDENTITY_MISMATCH' >&2
-            exit 76
-          fi
           deploy_user="$KINVEST_DEPLOY_GATE_USER"
-          unset SSH_USER
           secret_admin_material="${ADMIN_MATERIAL-}"
           secret_hmac_material="${HMAC_MATERIAL-}"
           secret_ifind_material="${IFIND_MATERIAL-}"
@@ -315,13 +368,137 @@ jobs:
               -p "$DEPLOY_PORT" \
               "$deploy_user@$DEPLOY_HOST" \
               'deploy-v5'
+      - name: Verify public HTTPS health
+        shell: bash
+        run: |
+          set -euo pipefail
+          response="$(curl -fsS --retry 3 --retry-all-errors --max-time 15 https://dearmina.cn/api/health)"
+          jq -e '.status == "ok" and .service == "kinvest"' <<<"$response" >/dev/null
+      - name: Remove ephemeral SSH material
+        if: ${{ always() }}
+        shell: bash
+        run: rm -f "$HOME/.ssh/id_ed25519" "$HOME/.ssh/known_hosts"
+
+  deploy-diagnostic:
+    name: deploy-v5-diagnostic
+    needs: validate
+    if: ${{ inputs.ifind_mode == 'diagnostic' }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 40
+    environment: Production
+    permissions:
+      contents: read
+      actions: read
+    steps:
+      - name: Check diagnostic Production gate identity after approval
+        shell: bash
+        env:
+          DEPLOY_V5_ENABLED: ${{ vars.DEPLOY_V5_ENABLED }}
+          DEPLOY_HOST: ${{ vars.DEPLOY_HOST }}
+          DEPLOY_PORT: ${{ vars.DEPLOY_PORT }}
+          KINVEST_DEPLOY_GATE_USER: ${{ vars.KINVEST_DEPLOY_GATE_USER }}
+          KINVEST_ACCESS_CONTROL_MODE: ${{ vars.KINVEST_ACCESS_CONTROL_MODE }}
+          KINVEST_IFIND_DIAGNOSTIC_MODE: ${{ vars.KINVEST_IFIND_DIAGNOSTIC_MODE }}
+          REQUESTED_IFIND_MODE: ${{ inputs.ifind_mode }}
+          WORKFLOW_REF: ${{ github.ref }}
+        run: |
+          set -euo pipefail
+          set +x
+          [[ "$WORKFLOW_REF" == 'refs/heads/main' ]]
+          [[ "$DEPLOY_V5_ENABLED" == 'true' ]]
+          [[ "$REQUESTED_IFIND_MODE" == 'diagnostic' ]]
+          [[ "$KINVEST_IFIND_DIAGNOSTIC_MODE" == "$REQUESTED_IFIND_MODE" ]]
+          [[ "$KINVEST_DEPLOY_GATE_USER" =~ ^[a-z_][a-z0-9_-]{0,31}$ ]] || { printf '%s\n' 'KINVEST_DEPLOY_GATE_IDENTITY_MISMATCH' >&2; exit 76; }
+          [[ "$DEPLOY_HOST" =~ ^[A-Za-z0-9.-]+$ ]]
+          [[ "$DEPLOY_PORT" =~ ^[0-9]{1,5}$ ]]
+          ((DEPLOY_PORT >= 1 && DEPLOY_PORT <= 65535))
+          [[ "$KINVEST_ACCESS_CONTROL_MODE" =~ ^(disabled|device-approval)$ ]]
+      - name: Check out trusted deployment control plane
+        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683
+        with:
+          ref: ${{ github.sha }}
+          fetch-depth: 0
+          persist-credentials: false
+      - name: Revalidate full release provenance after approval
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+          RELEASE_RUN_ID: ${{ inputs.release_run_id }}
+          INTENT: ${{ inputs.intent }}
+          WORKFLOW_SHA: ${{ github.sha }}
+          VALIDATED_COMMIT: ${{ needs.validate.outputs.commit_sha }}
+          VALIDATED_DIGEST: ${{ needs.validate.outputs.image_digest }}
+          VALIDATED_SCHEMA: ${{ needs.validate.outputs.release_record_schema_version }}
+          VALIDATED_RUN_ID: ${{ needs.validate.outputs.verification_run_id }}
+        run: |
+          set -euo pipefail
+          set +x
+          main_sha="$(gh api "repos/${GITHUB_REPOSITORY}/git/ref/heads/main" --jq '.object.sha')"
+          [[ "$main_sha" =~ ^[0-9a-f]{40}$ && "$WORKFLOW_SHA" == "$main_sha" ]]
+          [[ "$RELEASE_RUN_ID" == "$VALIDATED_RUN_ID" && "$RELEASE_RUN_ID" =~ ^[0-9]+$ ]]
+          run_json="$(gh api "repos/${GITHUB_REPOSITORY}/actions/runs/${RELEASE_RUN_ID}")"
+          [[ "$(jq -r '.path' <<<"$run_json")" == '.github/workflows/deploy.yml' ]]
+          [[ "$(jq -r '.event' <<<"$run_json")" == "push" ]]
+          [[ "$(jq -r '.head_branch' <<<"$run_json")" == "main" ]]
+          [[ "$(jq -r '.conclusion' <<<"$run_json")" == "success" ]]
+          run_attempt="$(jq -r '.run_attempt' <<<"$run_json")"
+          run_head_sha="$(jq -r '.head_sha' <<<"$run_json")"
+          [[ "$run_attempt" =~ ^[0-9]+$ && "$run_head_sha" =~ ^[0-9a-f]{40}$ ]]
+          artifacts="$(gh api "repos/${GITHUB_REPOSITORY}/actions/runs/${RELEASE_RUN_ID}/artifacts")"
+          expected_name="kinvest-release-record-v2-${RELEASE_RUN_ID}-${run_attempt}"
+          matches="$(jq --arg name "$expected_name" "[.artifacts[] | select(.expired == false and .name == \$name)]" <<<"$artifacts")"
+          [[ "$(jq "length" <<<"$matches")" == "1" ]]
+          record_dir="$(mktemp -d)"
+          trap "rm -rf \"$record_dir\"" EXIT
+          gh run download "$RELEASE_RUN_ID" --name "$expected_name" --dir "$record_dir"
+          record="$record_dir/release-record.json"
+          expected_keys='artifact_source commit_sha created_at ghcr_digest schema_version source_digest source_repository tcr_digest verification_run_attempt verification_run_id'
+          [[ "$(jq -r "keys | join(\" \")" "$record")" == "$expected_keys" ]]
+          [[ "$(jq -r '.schema_version' "$record")" == "2" ]]
+          [[ "$(jq -r '.verification_run_id' "$record")" == "$RELEASE_RUN_ID" ]]
+          [[ "$(jq -r '.verification_run_attempt' "$record")" == "$run_attempt" ]]
+          commit_sha="$(jq -r '.commit_sha' "$record")"
+          artifact_source="$(jq -r '.artifact_source' "$record")"
+          source_repository="$(jq -r '.source_repository' "$record")"
+          source_digest="$(jq -r '.source_digest' "$record")"
+          ghcr_digest="$(jq -r '.ghcr_digest' "$record")"
+          [[ "$commit_sha" == "$run_head_sha" && "$commit_sha" == "$VALIDATED_COMMIT" ]]
+          [[ "$artifact_source" == "ghcr-public" ]]
+          [[ "$source_repository" == "ghcr.io/zwphhxx/kinvest" ]]
+          [[ "$source_digest" =~ ^sha256:[0-9a-f]{64}$ ]]
+          [[ "$source_digest" == "$ghcr_digest" && "$source_digest" == "$VALIDATED_DIGEST" ]]
+          [[ "$(jq -r '.tcr_digest == null' "$record")" == "true" ]]
+          [[ "$VALIDATED_SCHEMA" == "2" ]]
+          git merge-base --is-ancestor "$commit_sha" origin/main
+          if [[ "$INTENT" == "FORWARD" ]]; then [[ "$commit_sha" == "$main_sha" ]]; fi
+      - name: Configure strict SSH trust
+        shell: bash
+        env:
+          DEPLOY_HOST: ${{ vars.DEPLOY_HOST }}
+          DEPLOY_PORT: ${{ vars.DEPLOY_PORT }}
+          DEPLOY_KEY: ${{ secrets.DEPLOY_SSH_KEY }}
+          DEPLOY_KNOWN_HOSTS: ${{ secrets.DEPLOY_KNOWN_HOSTS }}
+        run: |
+          set -euo pipefail
+          [[ "$DEPLOY_HOST" =~ ^[A-Za-z0-9.-]+$ ]]
+          [[ "$DEPLOY_PORT" =~ ^[0-9]{1,5}$ ]]
+          ((DEPLOY_PORT >= 1 && DEPLOY_PORT <= 65535))
+          test -n "$DEPLOY_KEY"
+          test -n "$DEPLOY_KNOWN_HOSTS"
+          umask 077
+          install -d -m 700 "$HOME/.ssh"
+          printf '%s\n' "$DEPLOY_KEY" > "$HOME/.ssh/id_ed25519"
+          printf '%s\n' "$DEPLOY_KNOWN_HOSTS" > "$HOME/.ssh/known_hosts"
+          chmod 600 "$HOME/.ssh/id_ed25519" "$HOME/.ssh/known_hosts"
+          known_host="$DEPLOY_HOST"
+          if [[ "$DEPLOY_PORT" != '22' ]]; then known_host="[$DEPLOY_HOST]:$DEPLOY_PORT"; fi
+          ssh-keygen -F "$known_host" -f "$HOME/.ssh/known_hosts" >/dev/null
       - name: Deploy diagnostic payload with deploy-v5 stdin
         if: ${{ vars.KINVEST_IFIND_DIAGNOSTIC_MODE == 'diagnostic' }}
         shell: bash
         env:
           DEPLOY_HOST: ${{ vars.DEPLOY_HOST }}
           DEPLOY_PORT: ${{ vars.DEPLOY_PORT }}
-          SSH_USER: ${{ secrets.SSH_USER }}
           KINVEST_DEPLOY_GATE_USER: ${{ vars.KINVEST_DEPLOY_GATE_USER }}
           DEPLOY_SHA: ${{ needs.validate.outputs.commit_sha }}
           IMAGE_DIGEST: ${{ needs.validate.outputs.image_digest }}
@@ -340,14 +517,7 @@ jobs:
         run: |
           set -euo pipefail
           set +x
-          if [[ -z "${SSH_USER-}" || -z "${KINVEST_DEPLOY_GATE_USER-}" || \
-                "$SSH_USER" != "$KINVEST_DEPLOY_GATE_USER" ]]; then
-            unset SSH_USER
-            printf '%s\n' 'KINVEST_DEPLOY_GATE_IDENTITY_MISMATCH' >&2
-            exit 76
-          fi
           deploy_user="$KINVEST_DEPLOY_GATE_USER"
-          unset SSH_USER
           secret_admin_material="${ADMIN_MATERIAL-}"
           secret_hmac_material="${HMAC_MATERIAL-}"
           secret_ifind_material="${IFIND_MATERIAL-}"

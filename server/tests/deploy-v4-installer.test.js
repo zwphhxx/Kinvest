@@ -257,6 +257,7 @@ function fixtureGateSource(context, source) {
   return source
     .replace("GATE_STATE_DIR='/var/lib/kinvest-deploy-gate'", `GATE_STATE_DIR='${context.gateStateDir}'`)
     .replace('/usr/bin/flock', path.join(context.bin, 'gate-flock'))
+    .replaceAll('/usr/bin/sudo', path.join(context.bin, 'sudo'))
     .replaceAll('directory_info.st_uid != 0', `directory_info.st_uid != ${process.getuid()}`)
     .replaceAll('marker_info.st_uid != 0', `marker_info.st_uid != ${process.getuid()}`)
 }
@@ -434,6 +435,7 @@ PY
     writeExecutable(gate, gateSource
       .replace("GATE_STATE_DIR='/var/lib/kinvest-deploy-gate'", `GATE_STATE_DIR='${publicState}'`)
       .replace('/usr/bin/flock', path.join(bin, 'flock'))
+      .replaceAll('/usr/bin/sudo', path.join(bin, 'sudo'))
       .replaceAll('info.st_uid != 0', `info.st_uid != ${uid}`)
       .replaceAll('info.st_gid != 0', `info.st_gid != ${gid}`))
     writeExecutable(noGroupGate, fs.readFileSync(gate, 'utf8')

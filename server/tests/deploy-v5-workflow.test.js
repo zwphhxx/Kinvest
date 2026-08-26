@@ -31,6 +31,17 @@ function stepSection(name) {
   return lines.slice(start, end).join('\n')
 }
 
+function jobSection(name) {
+  const lines = workflow.split('\n')
+  const start = lines.findIndex((line) => line === `  ${name}:`)
+  assert.notEqual(start, -1, `missing job ${name}`)
+  let end = lines.length
+  for (let index = start + 1; index < lines.length; index += 1) {
+    if (/^  [a-zA-Z0-9_-]+:$/.test(lines[index])) { end = index; break }
+  }
+  return lines.slice(start, end).join('\n')
+}
+
 function secretMaterial() {
   const admin = JSON.stringify({
     digest: Buffer.alloc(32, 1).toString('base64url'), format: 'kinvest-admin-scrypt-v1',
@@ -40,6 +51,29 @@ function secretMaterial() {
 }
 
 async function run() {
+  const disabledJob = jobSection('deploy-disabled')
+  const diagnosticJob = jobSection('deploy-diagnostic')
+  assert.match(disabledJob, /environment: Production/)
+  assert.match(diagnosticJob, /environment: Production/)
+  assert.match(disabledJob, /actions: read/)
+  assert.match(diagnosticJob, /actions: read/)
+  assert.doesNotMatch(disabledJob, /secrets\.KINVEST_IFIND_REFRESH_TOKEN/)
+  assert.match(diagnosticJob, /secrets\.KINVEST_IFIND_REFRESH_TOKEN/)
+  assert.match(disabledJob, /if:.*inputs\.ifind_mode.*disabled/)
+  assert.match(diagnosticJob, /if:.*inputs\.ifind_mode.*diagnostic/)
+  for (const [name, section] of [['disabled', disabledJob], ['diagnostic', diagnosticJob]]) {
+    const gate = section.indexOf(`Check ${name} Production gate identity after approval`)
+    const checkout = section.indexOf('Check out trusted deployment control plane')
+    const revalidate = section.indexOf('Revalidate full release provenance after approval')
+    const firstSecret = section.indexOf('secrets.')
+    assert.ok(gate >= 0 && checkout > gate && revalidate > checkout, `${name} trust order`)
+    assert.ok(firstSecret > revalidate, `${name} secrets must follow full revalidation`)
+    for (const evidence of ['run_attempt', 'conclusion', '/artifacts', 'gh run download', 'release-record.json']) {
+      assert.match(section.slice(revalidate), new RegExp(evidence.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')), `${name} ${evidence}`)
+    }
+  }
+  assert.doesNotMatch(workflow, /^  deploy:$/m)
+
   const fixture = fs.mkdtempSync(path.join(os.tmpdir(), 'kinvest-v5-workflow-'))
   try {
     const bin = path.join(fixture, 'bin')
@@ -66,7 +100,7 @@ async function run() {
         ...process.env,
         ADMIN_MATERIAL: secret.admin,
         HMAC_MATERIAL: secret.hmac,
-        SSH_USER: 'lighthouse', KINVEST_DEPLOY_GATE_USER: 'lighthouse',
+        KINVEST_DEPLOY_GATE_USER: 'lighthouse',
         DEPLOY_HOST: 'example.invalid', DEPLOY_PORT: '4334',
         DEPLOY_SHA: 'b'.repeat(40), IMAGE_DIGEST: `sha256:${'a'.repeat(64)}`,
         RELEASE_SCHEMA: '2', VERIFICATION_RUN_ID: '123', INTENT: 'FORWARD',
@@ -112,7 +146,6 @@ async function run() {
       assert.equal((result.stdout + result.stderr).includes(material), false)
     }
     assert.doesNotMatch(environment, /^(ADMIN_MATERIAL|HMAC_MATERIAL|IFIND_MATERIAL)=/m)
-    assert.doesNotMatch(environment, /^SSH_USER=/m)
     assert.equal(fs.readFileSync(githubEnv, 'utf8'), '')
 
     const disabledPayload = path.join(fixture, 'disabled-payload')
@@ -122,7 +155,7 @@ async function run() {
       env: {
         ...process.env,
         ADMIN_MATERIAL: secret.admin, HMAC_MATERIAL: secret.hmac,
-        SSH_USER: 'lighthouse', KINVEST_DEPLOY_GATE_USER: 'lighthouse',
+        KINVEST_DEPLOY_GATE_USER: 'lighthouse',
         DEPLOY_HOST: 'example.invalid', DEPLOY_PORT: '4334',
         DEPLOY_SHA: 'b'.repeat(40), IMAGE_DIGEST: `sha256:${'a'.repeat(64)}`,
         RELEASE_SCHEMA: '2', VERIFICATION_RUN_ID: '123', INTENT: 'FORWARD',
@@ -140,32 +173,24 @@ async function run() {
     assert.equal(disabledLines.length, 16)
     assert.deepEqual(disabledLines.slice(12, 15), ['disabled', '', ''])
 
-    const mismatch = spawnSync('bash', ['-c', stepScript(diagnosticStep)], {
+    const mismatch = spawnSync('bash', ['-c', stepScript('Check diagnostic Production gate identity after approval')], {
       cwd: rootDir,
       encoding: 'utf8',
       env: {
         ...process.env,
-        ADMIN_MATERIAL: secret.admin,
-        HMAC_MATERIAL: secret.hmac,
-        SSH_USER: 'review-secret-user', KINVEST_DEPLOY_GATE_USER: 'lighthouse',
+        KINVEST_DEPLOY_GATE_USER: '',
         DEPLOY_HOST: 'example.invalid', DEPLOY_PORT: '4334',
-        DEPLOY_SHA: 'b'.repeat(40), IMAGE_DIGEST: `sha256:${'a'.repeat(64)}`,
-        RELEASE_SCHEMA: '2', VERIFICATION_RUN_ID: '123', INTENT: 'FORWARD',
-        TMPFS_BOOTSTRAP_ENABLED: 'true',
-        TMPFS_ADMIN_PASSWORD_VERIFIER_VERSION_ID: 'v20260813-001',
-        TMPFS_DEVICE_TOKEN_HMAC_VERSION_ID: 'v20260813-002',
+        DEPLOY_V5_ENABLED: 'true',
         KINVEST_ACCESS_CONTROL_MODE: 'device-approval',
         KINVEST_IFIND_DIAGNOSTIC_MODE: 'diagnostic',
-        TMPFS_IFIND_REFRESH_TOKEN_VERSION_ID: 'v20260826-001',
-        IFIND_MATERIAL: ifind,
-        HOME: fixture, PATH: `${bin}:${process.env.PATH}`
+        REQUESTED_IFIND_MODE: 'diagnostic',
+        WORKFLOW_REF: 'refs/heads/main'
       }
     })
     assert.notEqual(mismatch.status, 0)
     assert.equal(mismatch.stderr, 'KINVEST_DEPLOY_GATE_IDENTITY_MISMATCH\n')
-    assert.equal((mismatch.stdout + mismatch.stderr).includes('review-secret-user'), false)
 
-    assert.match(workflow, /SSH_USER: \$\{\{ secrets\.SSH_USER \}\}/)
+    assert.doesNotMatch(workflow, /secrets\.SSH_USER/)
     assert.match(workflow, /KINVEST_DEPLOY_GATE_USER: \$\{\{ vars\.KINVEST_DEPLOY_GATE_USER \}\}/)
     assert.doesNotMatch(workflow, /DEPLOY_USER: \$\{\{ vars\.DEPLOY_USER \}\}/)
     assert.match(workflow, /environment: Production/)
@@ -179,7 +204,7 @@ async function run() {
     for (const use of workflow.matchAll(/uses:\s*[^@\s]+@([^\s]+)/g)) {
       assert.match(use[1], /^[0-9a-f]{40}$/)
     }
-    const validateJob = workflow.slice(workflow.indexOf('  validate:'), workflow.indexOf('  deploy:'))
+    const validateJob = workflow.slice(workflow.indexOf('  validate:'), workflow.indexOf('  deploy-disabled:'))
     assert.doesNotMatch(validateJob, /environment:|secrets\./)
 
     const prWorkflow = fs.readFileSync(path.join(rootDir, '.github/workflows/deploy.yml'), 'utf8')
