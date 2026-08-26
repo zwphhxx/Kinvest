@@ -52,6 +52,13 @@ jobs:
           cache: npm
       - name: Install locked dependencies
         run: npm ci
+      - name: Verify isolated deploy-v5 sudoers semantics
+        shell: bash
+        env:
+          KINVEST_RUN_SUDOERS_INTEGRATION: '1'
+        run: |
+          set -euo pipefail
+          node -e "Promise.resolve(require('./server/tests/deploy-v5-installer.test').runSudoersIntegrationOnly()).catch((error) => { console.error(error); process.exit(1) })"
       - name: Audit high severity dependencies
         run: npm audit --audit-level=high
       - name: Scan tracked files for secrets

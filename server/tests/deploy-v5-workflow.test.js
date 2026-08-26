@@ -339,6 +339,12 @@ async function run() {
     assert.doesNotMatch(validateJob, /environment:|secrets\./)
 
     const prWorkflow = fs.readFileSync(path.join(rootDir, '.github/workflows/deploy.yml'), 'utf8')
+    const securityJob = prWorkflow.slice(prWorkflow.indexOf('  security:'), prWorkflow.indexOf('  container-build:'))
+    assert.match(securityJob, /permissions:\n      contents: read/)
+    assert.doesNotMatch(securityJob, /environment:|secrets\./)
+    assert.match(securityJob, /name: Verify isolated deploy-v5 sudoers semantics/)
+    assert.match(securityJob, /KINVEST_RUN_SUDOERS_INTEGRATION: ['"]1['"]/)
+    assert.match(securityJob, /runSudoersIntegrationOnly/)
     const containerBuild = prWorkflow.slice(prWorkflow.indexOf('  container-build:'), prWorkflow.indexOf('  publish:'))
     assert.doesNotMatch(containerBuild, /environment: Production|secrets\./)
     assert.match(containerBuild, /push: false/)

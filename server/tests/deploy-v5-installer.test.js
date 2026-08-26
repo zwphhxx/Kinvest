@@ -9,6 +9,7 @@ const rootDir = path.resolve(__dirname, '../..')
 const sourceDir = path.join(rootDir, 'deploy/server')
 const installerSource = fs.readFileSync(path.join(sourceDir, 'install-deploy-v5.sh'), 'utf8')
 const gateSource = fs.readFileSync(path.join(sourceDir, 'kinvest-ssh-command-v3'), 'utf8')
+const sudoersIntegrationPath = path.join(__dirname, 'fixtures/deploy-v5-sudoers-integration.sh')
 const targetCount = 11
 const sourceAssets = [
   'deploy-kinvest-v5', 'deploy-v5-runtime.py', 'deploy-v5-contract.py', 'docker-compose-v5.yml',
@@ -372,67 +373,21 @@ function assertDurableRenames(trace, fragment) {
   }
 }
 
-function runLinuxSudoersIntegration(sudoersSource) {
-  if (process.platform !== 'linux') {
-    process.stdout.write('deploy-v5 sudoers integration: SKIP non-Linux\n')
+function runLinuxSudoersIntegration() {
+  const enabled = process.env.KINVEST_RUN_SUDOERS_INTEGRATION === '1'
+  if (!enabled) {
+    process.stdout.write(`deploy-v5 sudoers integration: SKIP ${process.platform === 'linux' ? 'integration flag not enabled' : 'non-Linux'}\n`)
     return
   }
-  const visudo = '/usr/sbin/visudo'
-  const sudo = '/usr/bin/sudo'
-  assert.equal(fs.existsSync(visudo), true, 'Linux CI requires real visudo')
-  assert.equal(fs.existsSync(sudo), true, 'Linux CI requires real sudo')
-  const base = fs.mkdtempSync(path.join(os.tmpdir(), 'kinvest-v5-sudoers-'))
-  const username = os.userInfo().username
-  assert.match(username, /^[a-z_][a-z0-9_-]{0,31}$/)
-  const command = path.join(base, 'deploy-kinvest-v5')
-  const harness = path.join(base, 'sudo-harness')
-  const parserPolicy = path.join(base, 'parser-policy')
-  const semanticPolicy = path.join(base, 'semantic-policy')
-  const installedPolicy = `/etc/sudoers.d/kinvest-v5-test-${process.pid}`
-  try {
-    writeExecutable(command, '#!/bin/sh\nprintf \'argc=%s\\n\' "$#"\n/usr/bin/env | /usr/bin/sort\n')
-    fs.writeFileSync(parserPolicy, sudoersSource.replaceAll('@KINVEST_DEPLOY_GATE_USER@', username), { mode: 0o440 })
-    const parsed = spawnSync(visudo, ['-cf', parserPolicy], { encoding: 'utf8' })
-    assert.equal(parsed.status, 0, parsed.stderr)
-    const semantic = sudoersSource
-      .split('\n')
-      .filter((line) => line.includes('/usr/local/sbin/deploy-kinvest-v5'))
-      .join('\n')
-      .replaceAll('@KINVEST_DEPLOY_GATE_USER@', username)
-      .replaceAll('/usr/local/sbin/deploy-kinvest-v5', command) + '\n'
-    fs.writeFileSync(semanticPolicy, semantic, { mode: 0o440 })
-    const semanticParsed = spawnSync(visudo, ['-cf', semanticPolicy], { encoding: 'utf8' })
-    assert.equal(semanticParsed.status, 0, semanticParsed.stderr)
-    const privileged = spawnSync(sudo, ['-n', 'true'], { encoding: 'utf8' })
-    const listing = spawnSync(sudo, ['-n', '-l'], { encoding: 'utf8' })
-    if (privileged.status !== 0 || listing.status !== 0 || /NOPASSWD:\s*ALL/.test(listing.stdout)) {
-      process.stdout.write('deploy-v5 sudoers integration: parser-only (isolated deny semantics unavailable)\n')
-      return
-    }
-    writeExecutable(harness, `#!/bin/bash
-set -euo pipefail
-policy="$1"
-installed="$2"
-command="$3"
-cleanup() { /usr/bin/sudo -n /usr/bin/rm -f "$installed"; }
-trap cleanup EXIT HUP INT TERM
-/usr/bin/sudo -n /usr/bin/install -o root -g root -m 0440 "$policy" "$installed"
-allowed="$(BASH_ENV=/attacker/bash-env PYTHONPATH=/attacker/python SUDO_COMMAND=attacker /usr/bin/sudo -n "$command")"
-[[ "$allowed" == *$'argc=0'* ]]
-[[ "$allowed" != *$'BASH_ENV='* && "$allowed" != *$'PYTHONPATH='* && "$allowed" != *$'SUDO_COMMAND=attacker'* ]]
-if /usr/bin/sudo -n "$command" unexpected >/dev/null 2>&1; then exit 91; fi
-if /usr/bin/sudo -n -E "$command" >/dev/null 2>&1; then exit 92; fi
-printf '%s\n' "$allowed"
-`)
-    const semanticResult = spawnSync(harness, [semanticPolicy, installedPolicy, command], { encoding: 'utf8' })
-    assert.equal(semanticResult.status, 0, semanticResult.stderr)
-    assert.match(semanticResult.stdout, /^argc=0$/m)
-    assert.doesNotMatch(semanticResult.stdout, /^(BASH_ENV|PYTHONPATH)=/m)
-    assert.doesNotMatch(semanticResult.stdout, /^SUDO_COMMAND=attacker$/m)
-  } finally {
-    spawnSync(sudo, ['-n', '/usr/bin/rm', '-f', installedPolicy], { encoding: 'utf8' })
-    fs.rmSync(base, { recursive: true, force: true })
-  }
+  assert.equal(process.platform, 'linux', 'enabled sudoers integration requires Linux')
+  assert.equal(fs.existsSync('/usr/bin/sudo'), true, 'enabled sudoers integration requires real sudo')
+  assert.equal(fs.existsSync('/usr/sbin/visudo'), true, 'enabled sudoers integration requires real visudo')
+  assert.equal(fs.existsSync(sudoersIntegrationPath), true, 'enabled sudoers integration requires root harness')
+  const semanticResult = spawnSync('/usr/bin/sudo', [
+    '-n', '/bin/bash', sudoersIntegrationPath, path.join(sourceDir, 'kinvest-deploy-v5.sudoers.in')
+  ], { encoding: 'utf8' })
+  assert.equal(semanticResult.status, 0, semanticResult.stderr || semanticResult.stdout)
+  assert.equal(semanticResult.stdout, 'deploy-v5 sudoers integration: PASS\n')
 }
 
 function canWriteAs(info, uid, gid) {
@@ -442,6 +397,23 @@ function canWriteAs(info, uid, gid) {
 }
 
 async function run() {
+  assert.equal(fs.existsSync(sudoersIntegrationPath), true, 'missing isolated sudoers integration harness')
+  const sudoersIntegrationSource = fs.readFileSync(sudoersIntegrationPath, 'utf8')
+  assert.match(sudoersIntegrationSource, /^#!\/bin\/bash/)
+  assert.match(sudoersIntegrationSource, /trap cleanup EXIT/)
+  assert.match(sudoersIntegrationSource, /trap 'exit 129' HUP/)
+  assert.match(sudoersIntegrationSource, /trap 'exit 130' INT/)
+  assert.match(sudoersIntegrationSource, /trap 'exit 143' TERM/)
+  assert.match(sudoersIntegrationSource, /useradd/)
+  assert.match(sudoersIntegrationSource, /userdel/)
+  assert.match(sudoersIntegrationSource, /runuser/)
+  assert.match(sudoersIntegrationSource, /\/usr\/sbin\/visudo/)
+  assert.match(sudoersIntegrationSource, /\/usr\/bin\/sudo/)
+  assert.match(sudoersIntegrationSource, /sudo -n -l -U/)
+  assert.match(sudoersIntegrationSource, /unexpected/)
+  assert.match(sudoersIntegrationSource, /sudo -n -E/)
+  assert.match(sudoersIntegrationSource, /BASH_ENV/)
+  assert.doesNotMatch(sudoersIntegrationSource, /parser-only|isolated deny semantics unavailable/)
   assert.match(installerSource, /deploy-v5-assets\.sha256/)
   assert.match(installerSource, /TRUSTED_SOURCE_DIR=/)
   assert.match(installerSource, /kinvest-deploy-v5-input\./)
@@ -472,7 +444,7 @@ async function run() {
   assert.match(sudoersSource, /secure_path/)
   assert.match(sudoersSource, /set_home/)
   assert.match(sudoersSource, /!setenv/)
-  runLinuxSudoersIntegration(sudoersSource)
+  runLinuxSudoersIntegration()
 
   const environmentFixture = fs.mkdtempSync(path.join(os.tmpdir(), 'kinvest-v5-wrapper-env-'))
   try {
@@ -1164,4 +1136,4 @@ PY
   }
 }
 
-module.exports = { run }
+module.exports = { run, runSudoersIntegrationOnly: runLinuxSudoersIntegration }
