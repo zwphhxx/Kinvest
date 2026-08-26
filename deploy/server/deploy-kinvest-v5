@@ -157,24 +157,30 @@ prune_access_bundles() { prune_bundle_root "$ACCESS_BUNDLE_ROOT" "$(collect_refe
 prune_ifind_bundles() { prune_bundle_root "$IFIND_BUNDLE_ROOT" "$(collect_referenced_bundle_ids ifindSecretBundleId)"; }
 
 atomic_state_from_json() {
-  local source="$1" target="$2" prefix="$3" temporary
-  secure_temp temporary "$STATE_ROOT/.${prefix}-v5.XXXXXX" || return 1
+  local source="$1" target="$2" prefix="$3" temporary target_name
+  secure_temp temporary "$RUN_ROOT/kinvest-v5.state-${prefix}.XXXXXX" || return 1
   if ! "$CONTRACT" canonical-state <"$source" >"$temporary" 2>/dev/null; then
     rm -f -- "$temporary"; return 1
   fi
-  mv -f -- "$temporary" "$target" 2>/dev/null
+  target_name="${target##*/}"
+  "$RUNTIME_HELPER" state-write "$STATE_ROOT" "$target_name" "$temporary" "$ROOT_UID" "$ROOT_GID" >/dev/null 2>&1
 }
 
 atomic_state_from_text() {
-  local source="$1" target="$2" prefix="$3" temporary
-  secure_temp temporary "$STATE_ROOT/.${prefix}-v5.XXXXXX" || return 1
+  local source="$1" target="$2" prefix="$3" temporary target_name
+  secure_temp temporary "$RUN_ROOT/kinvest-v5.state-${prefix}.XXXXXX" || return 1
   cat -- "$source" >"$temporary" 2>/dev/null || { rm -f -- "$temporary"; return 1; }
-  mv -f -- "$temporary" "$target" 2>/dev/null
+  target_name="${target##*/}"
+  "$RUNTIME_HELPER" state-write "$STATE_ROOT" "$target_name" "$temporary" "$ROOT_UID" "$ROOT_GID" >/dev/null 2>&1
+}
+
+durable_state_delete() {
+  "$RUNTIME_HELPER" state-delete "$STATE_ROOT" "$ROOT_UID" "$ROOT_GID" "$@" >/dev/null 2>&1
 }
 
 write_journal() {
   local phase="$1" temporary
-  secure_temp temporary "$STATE_ROOT/.deploy-v5-journal.XXXXXX" || return 1
+  secure_temp temporary "$RUN_ROOT/kinvest-v5.journal.XXXXXX" || return 1
   python3 - "$temporary" "$phase" "$intent" "$candidate_access_id" "$candidate_ifind_id" 2>/dev/null <<'PY' || { rm -f -- "$temporary"; return 1; }
 import json, os, sys
 path, phase, intent, access_id, ifind_id = sys.argv[1:]
@@ -186,7 +192,7 @@ try:
     os.fsync(fd)
 finally: os.close(fd)
 PY
-  mv -f -- "$temporary" "$JOURNAL" 2>/dev/null
+  "$RUNTIME_HELPER" state-write "$STATE_ROOT" "${JOURNAL##*/}" "$temporary" "$ROOT_UID" "$ROOT_GID" >/dev/null 2>&1
 }
 
 compose_state_file() {
@@ -249,7 +255,7 @@ reconcile_transaction_journal() {
       ;;
     *) return 1 ;;
   esac
-  rm -f -- "$ATTEMPT_STATE" "$JOURNAL" "$BEFORE_STATE"
+  durable_state_delete "${ATTEMPT_STATE##*/}" "${JOURNAL##*/}" "${BEFORE_STATE##*/}" || return 1
   prune_access_bundles && prune_ifind_bundles
 }
 
@@ -304,7 +310,8 @@ grep -Fqx 'KINVEST_DEPLOY_V5' <(head -n 1 "$payload_file") || fail DEPLOY_V5_PAY
 secure_temp prepared_file "$RUN_ROOT/kinvest-v5.prepared.XXXXXX" || fail DEPLOY_V5_PAYLOAD_FILE_FAILED
 "$CONTRACT" validate-payload <"$payload_file" >"$prepared_file" 2>/dev/null || fail DEPLOY_V5_PAYLOAD_REJECTED 2
 
-secure_temp candidate_registry "$RUN_ROOT/kinvest-v5.candidates.XXXXXX" || fail DEPLOY_V5_CANDIDATE_REGISTRY_FAILED
+candidate_registry="$("$RUNTIME_HELPER" reserve-registry "$RUN_ROOT" "$ROOT_UID" "$ROOT_GID" 2>/dev/null)" || fail DEPLOY_V5_CANDIDATE_REGISTRY_FAILED
+[[ "$candidate_registry" == "$RUN_ROOT"/kinvest-v5.candidates.* ]] || fail DEPLOY_V5_CANDIDATE_REGISTRY_FAILED
 bundle_result="$("$RUNTIME_HELPER" materialize "$payload_file" "$RUN_ROOT" "$ACCESS_BUNDLE_ROOT" "$IFIND_BUNDLE_ROOT" \
   "$BUNDLE_UID" "$BUNDLE_GID" "$ROOT_UID" "$ROOT_GID" "$candidate_registry" 2>/dev/null)" || fail DEPLOY_V5_BUNDLE_CREATE_FAILED
 # HELPER_WINDOW_AFTER_SUCCESS_BEFORE_ID_RECORD
@@ -432,22 +439,7 @@ run_stable_command DEPLOY_V5_ACCESS_PREFLIGHT_FAILED run_access_preflight
 run_stable_command DEPLOY_V5_IFIND_PREFLIGHT_FAILED run_ifind_preflight
 
 verify_backup_file() {
-  python3 - "$1" "$2" "$BACKUP_ROOT" 2>/dev/null <<'PY'
-import hashlib, os, stat, sys
-path, expected, root = sys.argv[1:]
-if os.path.abspath(path) != path or os.path.islink(root) or os.path.realpath(os.path.dirname(path)) != os.path.realpath(root) or os.path.basename(path) in ('', '.', '..'):
-    raise SystemExit(1)
-root_fd = os.open(root, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW)
-fd = os.open(os.path.basename(path), os.O_RDONLY | os.O_NOFOLLOW, dir_fd=root_fd)
-try:
-    info = os.fstat(fd)
-    if not stat.S_ISREG(info.st_mode) or info.st_nlink != 1: raise SystemExit(1)
-    digest = hashlib.file_digest(os.fdopen(os.dup(fd), 'rb'), 'sha256').hexdigest()
-    if digest != expected: raise SystemExit(1)
-finally:
-    os.close(fd)
-    os.close(root_fd)
-PY
+  "$RUNTIME_HELPER" verify-backup "$1" "$2" "$BACKUP_ROOT" "$ROOT_UID" "$ROOT_GID" >/dev/null 2>&1
 }
 
 verify_state_backup_references() {
@@ -471,8 +463,8 @@ fi
 backup_path='none'
 backup_checksum='none'
 create_database_backup() {
-  local temporary
-  backup_path="$BACKUP_ROOT/$(date -u +%Y%m%dT%H%M%SZ)-$target_commit.sqlite"
+  local temporary desired
+  desired="$(date -u +%Y%m%dT%H%M%SZ)-$target_commit.sqlite"
   secure_temp temporary "$BACKUP_ROOT/.backup-v5.XXXXXX" || return 1
   python3 - "$DATABASE" "$temporary" 2>/dev/null <<'PY'
 import sqlite3, sys
@@ -481,7 +473,8 @@ with sqlite3.connect('file:' + sys.argv[1] + '?mode=ro', uri=True) as source, sq
     if target.execute('PRAGMA quick_check').fetchone()[0] != 'ok': raise SystemExit(1)
 PY
   chmod 0600 "$temporary" 2>/dev/null || { rm -f -- "$temporary" 2>/dev/null; return 1; }
-  mv -- "$temporary" "$backup_path" 2>/dev/null || { rm -f -- "$temporary" 2>/dev/null; return 1; }
+  chown "$ROOT_UID:$ROOT_GID" "$temporary" 2>/dev/null || { rm -f -- "$temporary" 2>/dev/null; return 1; }
+  backup_path="$("$RUNTIME_HELPER" commit-backup "$BACKUP_ROOT" "$temporary" "$desired" "$ROOT_UID" "$ROOT_GID" 2>/dev/null)" || { rm -f -- "$temporary" 2>/dev/null; return 1; }
   backup_checksum="$(sha256sum "$backup_path" 2>/dev/null | awk '{print $1}')" || return 1
   [[ "$backup_checksum" =~ ^[0-9a-f]{64}$ ]] || return 1
   verify_backup_file "$backup_path" "$backup_checksum"
@@ -547,7 +540,7 @@ atomic_state_from_json "$current_json" "$BEFORE_STATE" before || fail DEPLOY_V5_
 # REGISTRY_WINDOW_BEFORE_PREPARED_JOURNAL
 write_journal prepared || fail DEPLOY_V5_STATE_WRITE_FAILED
 # REGISTRY_WINDOW_AFTER_PREPARED_BEFORE_DELETE
-rm -f -- "$candidate_registry" 2>/dev/null || fail DEPLOY_V5_CANDIDATE_REGISTRY_FAILED
+"$RUNTIME_HELPER" release-registry "$candidate_registry" "$RUN_ROOT" "$ROOT_UID" "$ROOT_GID" >/dev/null 2>&1 || fail DEPLOY_V5_CANDIDATE_REGISTRY_FAILED
 candidate_registry=''
 atomic_state_from_text "$candidate_state" "$ATTEMPT_STATE" attempt || fail DEPLOY_V5_STATE_WRITE_FAILED
 transaction_started='true'
@@ -564,17 +557,15 @@ done
 [[ "$(run_docker inspect --format '{{.Image}}' kinvest 2>/dev/null)" == "$runtime_image_id" ]] || fail DEPLOY_V5_RUNTIME_IMAGE_MISMATCH
 curl -fsS --max-time 15 "$PUBLIC_HEALTH_URL" >/dev/null 2>&1 || fail DEPLOY_V5_PUBLIC_HEALTH_FAILED
 
-secure_temp current_temporary "$STATE_ROOT/.current-v5.XXXXXX" || fail DEPLOY_V5_STATE_WRITE_FAILED
-cat -- "$candidate_state" >"$current_temporary" 2>/dev/null || fail DEPLOY_V5_STATE_WRITE_FAILED
-mv -f -- "$current_temporary" "$CURRENT_STATE" 2>/dev/null || fail DEPLOY_V5_STATE_WRITE_FAILED
+atomic_state_from_text "$candidate_state" "$CURRENT_STATE" current || fail DEPLOY_V5_STATE_WRITE_FAILED
 write_journal state-committed || fail DEPLOY_V5_STATE_WRITE_FAILED
 # TRANSACTION_WINDOW_AFTER_CURRENT_BEFORE_KEEP
 if [[ "$intent" != RESTORE ]]; then
   atomic_state_from_text "$BEFORE_STATE" "$PREVIOUS_STATE" previous || fail DEPLOY_V5_STATE_WRITE_FAILED
 fi
-rm -f -- "$ATTEMPT_STATE" 2>/dev/null || fail DEPLOY_V5_JOURNAL_CLEANUP_FAILED
+durable_state_delete "${ATTEMPT_STATE##*/}" || fail DEPLOY_V5_JOURNAL_CLEANUP_FAILED
 prune_access_bundles || fail DEPLOY_V5_CLEANUP_PENDING 71
 prune_ifind_bundles || fail DEPLOY_V5_CLEANUP_PENDING 71
 candidate_keep='true'
-rm -f -- "$JOURNAL" "$BEFORE_STATE" 2>/dev/null || fail DEPLOY_V5_JOURNAL_CLEANUP_FAILED
+durable_state_delete "${JOURNAL##*/}" "${BEFORE_STATE##*/}" || fail DEPLOY_V5_JOURNAL_CLEANUP_FAILED
 printf 'KINVEST_DEPLOY_V5_OK intent=%s commit=%s ifind=%s\n' "$intent" "$target_commit" "$ifind_mode"

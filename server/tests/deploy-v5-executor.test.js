@@ -10,6 +10,7 @@ const { spawn, spawnSync } = require('node:child_process')
 const rootDir = path.resolve(__dirname, '../..')
 const executorPath = path.join(rootDir, 'deploy/server/deploy-kinvest-v5')
 const runtimeHelperPath = path.join(rootDir, 'deploy/server/deploy-v5-runtime.py')
+const { run: runLinuxTmpfsIntegration } = require('./deploy-v5-linux-tmpfs-integration.test')
 
 const DIGEST = `ghcr.io/zwphhxx/kinvest@sha256:${'a'.repeat(64)}`
 const IMAGE_ID = `sha256:${'b'.repeat(64)}`
@@ -72,6 +73,93 @@ function createProviderFsAdapter(bundlePath) {
 
 function writeExecutable(file, source) {
   fs.writeFileSync(file, source, { mode: 0o755 })
+}
+
+function testRuntimeDurabilityPrimitives() {
+  const script = String.raw`
+import hashlib, importlib.util, os, pathlib, stat, sys, tempfile
+spec = importlib.util.spec_from_file_location('deploy_v5_runtime', sys.argv[1])
+module = importlib.util.module_from_spec(spec); spec.loader.exec_module(module)
+uid, gid = os.getuid(), os.getgid()
+with tempfile.TemporaryDirectory() as temporary:
+    os.environ['KINVEST_V5_TEST_ALLOW_NON_TMPFS'] = '1'
+    run_root = pathlib.Path(temporary) / 'run'; run_root.mkdir(mode=0o755)
+    legal = run_root / 'kinvest-v5.candidates.Abc123'
+    value = {'accessId': 'none', 'ifindId': 'none'}
+    legal.write_text('{"accessId":"none","ifindId":"none"}\n'); legal.chmod(0o600)
+    module.write_registry(str(legal), str(run_root), value, uid, gid)
+    assert module.read_registry(str(legal), str(run_root), uid, gid) == value
+    reserved = pathlib.Path(module.reserve_registry(str(run_root), uid, gid))
+    assert reserved.parent == run_root and module.read_registry(str(reserved), str(run_root), uid, gid) == value
+    for invalid in (run_root / '../escape', run_root / 'bad-name'):
+        try: module.write_registry(str(invalid), str(run_root), value, uid, gid)
+        except module.RuntimeErrorCode: pass
+        else: raise AssertionError('invalid registry name accepted')
+    target = run_root / 'target'; target.write_text('{}'); target.chmod(0o600)
+    link = run_root / 'kinvest-v5.candidates.Link123'; link.symlink_to(target)
+    try: module.write_registry(str(link), str(run_root), value, uid, gid)
+    except module.RuntimeErrorCode: pass
+    else: raise AssertionError('symlink registry overwritten')
+    try: module.read_registry(str(link), str(run_root), uid, gid)
+    except module.RuntimeErrorCode: pass
+    else: raise AssertionError('symlink registry accepted')
+    access_root = run_root / 'kinvest-secrets'; access_root.mkdir(mode=0o700)
+    ifind_root = run_root / 'kinvest-ifind-secrets'; ifind_root.mkdir(mode=0o700)
+    empty = run_root / 'kinvest-v5.candidates.Empty123'
+    fd = os.open(empty, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW, 0o600)
+    os.fchmod(fd, 0o600); os.fchown(fd, uid, gid); os.close(fd)
+    module.recover_registry(str(empty), str(run_root), str(access_root), str(ifind_root), uid, gid)
+    assert not empty.exists()
+
+    state_root = pathlib.Path(temporary) / 'state'; state_root.mkdir(mode=0o700)
+    events = []
+    original_write, original_fsync, original_replace = os.write, os.fsync, os.replace
+    def short_write(fd, data): return original_write(fd, data[:max(1, min(3, len(data)))])
+    def record_fsync(fd):
+        events.append('fsync-dir' if stat.S_ISDIR(os.fstat(fd).st_mode) else 'fsync-file')
+        return original_fsync(fd)
+    def record_replace(source, target, *args, **kwargs):
+        events.append('replace'); return original_replace(source, target, *args, **kwargs)
+    os.write, os.fsync, os.replace = short_write, record_fsync, record_replace
+    try: module.durable_state_write(str(state_root), 'current.state', b'complete-state\n', uid, gid)
+    finally: os.write, os.fsync, os.replace = original_write, original_fsync, original_replace
+    assert (state_root / 'current.state').read_bytes() == b'complete-state\n'
+    assert events.index('fsync-file') < events.index('replace') < events.index('fsync-dir')
+    events.clear()
+    original_unlink, original_fsync = os.unlink, os.fsync
+    def record_unlink(*args, **kwargs): events.append('unlink'); return original_unlink(*args, **kwargs)
+    def record_delete_fsync(fd): events.append('fsync-dir'); return original_fsync(fd)
+    os.unlink, os.fsync = record_unlink, record_delete_fsync
+    try: module.durable_state_delete(str(state_root), ['current.state'], uid, gid)
+    finally: os.unlink, os.fsync = original_unlink, original_fsync
+    assert events == ['unlink', 'fsync-dir']
+
+    backup_root = pathlib.Path(temporary) / 'backups'; backup_root.mkdir(mode=0o700)
+    first_temp = backup_root / '.first'; first_temp.write_bytes(b'first'); first_temp.chmod(0o600)
+    second_temp = backup_root / '.second'; second_temp.write_bytes(b'second'); second_temp.chmod(0o600)
+    first = module.commit_backup_no_replace(str(backup_root), str(first_temp), 'same.sqlite', uid, gid)
+    first_hash = hashlib.sha256(pathlib.Path(first).read_bytes()).hexdigest()
+    second = module.commit_backup_no_replace(str(backup_root), str(second_temp), 'same.sqlite', uid, gid)
+    assert first != second and pathlib.Path(first).read_bytes() == b'first'
+    assert hashlib.sha256(pathlib.Path(first).read_bytes()).hexdigest() == first_hash
+    module.verify_backup(str(first), first_hash, str(backup_root), uid, gid)
+    pathlib.Path(first).chmod(0o640)
+    try: module.verify_backup(str(first), first_hash, str(backup_root), uid, gid)
+    except module.RuntimeErrorCode: pass
+    else: raise AssertionError('wide backup mode accepted')
+    pathlib.Path(first).chmod(0o600)
+    try: module.verify_backup(str(first), first_hash, str(backup_root), uid + 1, gid)
+    except module.RuntimeErrorCode: pass
+    else: raise AssertionError('wrong backup owner accepted')
+    backup_root.chmod(0o755)
+    try: module.verify_backup(str(first), first_hash, str(backup_root), uid, gid)
+    except module.RuntimeErrorCode: pass
+    else: raise AssertionError('wide backup root accepted')
+`
+  const result = spawnSync(process.env.PYTHON || 'python3', ['-c', script, runtimeHelperPath], {
+    encoding: 'utf8', env: { ...process.env, PYTHONDONTWRITEBYTECODE: '1', KINVEST_V5_TEST_ALLOW_NON_TMPFS: '1' }
+  })
+  assert.equal(result.status, 0, result.stderr)
 }
 
 function canonicalState(contract, value) {
@@ -149,6 +237,9 @@ function makeHarness(options = {}) {
   fs.mkdirSync(path.join(root, 'state'), { recursive: true })
   fs.mkdirSync(path.join(root, 'backups'), { recursive: true })
   fs.mkdirSync(runRoot)
+  fs.chmodSync(path.join(root, 'state'), 0o700)
+  fs.chmodSync(path.join(root, 'backups'), 0o700)
+  fs.chmodSync(runRoot, 0o755)
   fs.mkdirSync(bin)
   fs.mkdirSync(libexec)
   fs.copyFileSync(path.join(rootDir, 'deploy/server/docker-compose-v5.yml'), path.join(root, 'docker-compose-v5.yml'))
@@ -170,6 +261,7 @@ function makeHarness(options = {}) {
   if (options.currentBackup === 'valid') {
     const backupPath = path.join(root, 'backups', 'current.sqlite')
     fs.writeFileSync(backupPath, 'trusted-backup')
+    fs.chmodSync(backupPath, 0o600)
     stateValue.databaseBackupPath = backupPath
     stateValue.databaseBackupChecksum = crypto.createHash('sha256').update('trusted-backup').digest('hex')
   }
@@ -399,6 +491,7 @@ function scanPersistentFiles(root) {
 }
 
 async function run() {
+  testRuntimeDurabilityPrimitives()
   assert.equal(fs.existsSync(executorPath), true, 'deploy-v5 executor must exist')
   const syntax = spawnSync('bash', ['-n', executorPath], { encoding: 'utf8' })
   assert.equal(syntax.status, 0, syntax.stderr)
@@ -448,7 +541,7 @@ async function run() {
   assert.match(source, /run_stable_command/)
   assert.match(source, /exec 3>&2/)
   assert.match(source, /exec 2>\/dev\/null/)
-  assert.ok(source.indexOf('write_journal prepared') < source.indexOf('rm -f -- "$candidate_registry"'),
+  assert.ok(source.indexOf('write_journal prepared') < source.indexOf('release-registry "$candidate_registry"'),
     'candidate registry must survive until prepared journal is durable')
   assert.match(source, /RESTORE/)
   assert.match(source, /ROLLBACK/)
@@ -500,7 +593,7 @@ async function run() {
       env: { ...process.env, PYTHONDONTWRITEBYTECODE: '1' }
     })
     assert.equal(previous.status, 0, previous.stderr)
-    assert.match(source, /secure_temp current_temporary "\$STATE_ROOT\/\.current-v5\./)
+    assert.match(source, /atomic_state_from_text "\$candidate_state" "\$CURRENT_STATE" current/)
     const bundles = fs.readdirSync(path.join(harness.runRoot, 'kinvest-ifind-secrets'))
     assert.equal(bundles.length, 1)
     assert.equal(bundles.includes('8'.repeat(32)), false)
@@ -572,7 +665,7 @@ async function run() {
     try {
       const result = spawnSync(faulted.executor, [], {
         encoding: 'utf8', input: diagnosticPayload(),
-        env: { ...process.env, PATH: `${faulted.bin}:${process.env.PATH}` }
+        env: { ...process.env, PATH: `${faulted.bin}:${process.env.PATH}`, KINVEST_V5_TEST_ALLOW_NON_TMPFS: '1' }
       })
       assert.notEqual(result.status, 0, `${stage} must fail`)
       assert.equal(result.stderr, 'DEPLOY_V5_BUNDLE_CREATE_FAILED\n')
@@ -657,7 +750,7 @@ async function run() {
   for (const [failure, expected] of [
     ['capture-rm', 'DEPLOY_V5_CAPTURE_CLEANUP_FAILED\n'],
     ['cleanup-rm', 'DEPLOY_V5_IFIND_PREFLIGHT_FAILED\n'],
-    ['journal-rm', 'DEPLOY_V5_JOURNAL_CLEANUP_FAILED\n']
+    ['journal-rm', 'DEPLOY_V5_JOURNAL_CLEANUP_FAILED\nDEPLOY_V5_RECOVERY_FAILED\n']
   ]) {
     const removalFailure = makeHarness()
     try {
@@ -706,9 +799,9 @@ async function run() {
     cleanupHarness(observable)
   }
 
-  for (const [name, options] of [
-    ['symlink-root', { symlinkIfindRoot: true }],
-    ['non-tmpfs-root', { runtimeTransform: source => source.replace('return TMPFS_MAGIC', 'return 0') }]
+  for (const [name, options, expected] of [
+    ['symlink-root', { symlinkIfindRoot: true }, 'DEPLOY_V5_BUNDLE_CREATE_FAILED\n'],
+    ['non-tmpfs-root', { runtimeTransform: source => source.replace('return TMPFS_MAGIC', 'return 0') }, 'DEPLOY_V5_CANDIDATE_REGISTRY_FAILED\n']
   ]) {
     const invalidRoot = makeHarness(options)
     try {
@@ -717,7 +810,7 @@ async function run() {
         env: { ...process.env, PATH: `${invalidRoot.bin}:${process.env.PATH}` }
       })
       assert.notEqual(result.status, 0, name)
-      assert.equal(result.stderr, 'DEPLOY_V5_BUNDLE_CREATE_FAILED\n')
+      assert.equal(result.stderr, expected)
     } finally { cleanupHarness(invalidRoot) }
   }
 
@@ -838,6 +931,8 @@ async function run() {
     assert.notEqual(result.status, 0)
     assert.equal(result.stderr, 'DEPLOY_V5_IFIND_PROVIDER_INCOMPATIBLE\n')
   } finally { cleanupHarness(providerIncompatible) }
+
+  await runLinuxTmpfsIntegration()
 }
 
 module.exports = { run }
