@@ -574,7 +574,7 @@ docker image inspect 'ghcr.io/zwphhxx/kinvest@sha256:REVIEWED_DIGEST'
 
 ## 10. 人工安全更新 iFinD refresh_token
 
-网站只提醒管理员 token 即将到期或已经失效，绝不执行一键轮换、定时轮换或绕过 iFinD 登录流程。最终免费路线使用 GitHub `Production` Environment Secret
+当前只提供 VersionId、模式、冷却、调用次数和最近诊断状态。到期日期由管理员在轮换流程中人工记录并检查。自动提醒是 T10-H 后续能力，当前未实现，不得声称已上线。网站绝不执行一键轮换、定时轮换或绕过 iFinD 登录流程。最终免费路线使用 GitHub `Production` Environment Secret
 `KINVEST_IFIND_REFRESH_TOKEN`，经 Production 人工审批和 deploy-v5 加密 stdin 写入
 独立 `/run` tmpfs bundle；不使用付费 SSM/CAM，也不使用长期 SecretId/Key。
 

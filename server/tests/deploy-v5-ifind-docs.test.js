@@ -67,6 +67,14 @@ async function run() {
   assert.match(familyDesign, /SSM|Secrets Manager/)
   assert.match(familyDesign, /replaced|替代|取代/i)
 
+  for (const document of [productionRunbook, familyDesign]) {
+    assert.doesNotMatch(document, /网站只提醒管理员 token 即将到期或已经失效/)
+    assert.doesNotMatch(document, /网站每天检查令牌声明或接口返回的可用期限/)
+    assert.match(document, /当前只提供 VersionId、模式、冷却、调用次数和最近诊断状态/)
+    assert.match(document, /到期日期[\s\S]{0,120}管理员[\s\S]{0,120}人工记录[\s\S]{0,120}检查/)
+    assert.match(document, /自动提醒[\s\S]{0,120}T10-H[\s\S]{0,120}后续[\s\S]{0,120}未实现/)
+  }
+
   console.log('deploy-v5-ifind-docs: PASS')
 }
 
