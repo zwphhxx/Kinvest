@@ -51,6 +51,10 @@ function payload(overrides = {}) {
   ].join('\n') + '\n'
 }
 
+/**
+ * @param {string | Buffer} input
+ * @param {(...args: any[]) => any} spawn
+ */
 function runContract(input, spawn = spawnSync) {
   return spawn(process.env.PYTHON || 'python3', [contractPath, 'validate-payload'], {
     encoding: 'utf8',
