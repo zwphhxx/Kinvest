@@ -66,7 +66,14 @@ function createProviderFsAdapter(bundlePath) {
     closeSync(fd) { descriptors.delete(fd); return fs.closeSync(fd) },
     fstatSync: (fd, options) => fs.fstatSync(fd, options),
     lstatSync: (input, options) => fs.lstatSync(mapPath(input), options),
-    readSync: (...args) => fs.readSync(...args),
+    /**
+     * @param {number} fd
+     * @param {Buffer} buffer
+     * @param {number} offset
+     * @param {number} length
+     * @param {number | null} position
+     */
+    readSync: (fd, buffer, offset, length, position) => fs.readSync(fd, buffer, offset, length, position),
     readdirSync: (input) => fs.readdirSync(mapPath(input))
   }
 }
@@ -370,6 +377,21 @@ function intentPayload(intent, digest, commit, verificationRunId = '999', ifindM
   ].join('\n') + '\n'
 }
 
+/**
+ * @typedef {Object} HarnessOptions
+ * @property {'valid' | 'symlink'} [currentBackup]
+ * @property {Record<string, unknown>} [currentStateOverrides]
+ * @property {boolean} [disableTmpfsMock]
+ * @property {string} [materializeFault]
+ * @property {Record<string, unknown>} [previousState]
+ * @property {(source: string) => string} [runtimeTransform]
+ * @property {boolean} [seedBundles]
+ * @property {string} [signalType]
+ * @property {string} [signalWindow]
+ * @property {boolean} [symlinkIfindRoot]
+ */
+
+/** @param {HarnessOptions} [options] */
 function makeHarness(options = {}) {
   const linuxTmpfs = process.platform === 'linux' && fs.existsSync('/dev/shm') &&
     fs.statfsSync('/dev/shm').type === 0x01021994
@@ -459,10 +481,12 @@ function makeHarness(options = {}) {
     fs.symlinkSync(escaped, path.join(runRoot, 'kinvest-ifind-secrets'))
   }
   if (options.seedBundles) {
-    for (const [rootName, ids] of [
+    /** @type {Array<[string, string[]]>} */
+    const seededBundleRoots = [
       ['kinvest-secrets', ['1'.repeat(32), '9'.repeat(32)]],
       ['kinvest-ifind-secrets', ['8'.repeat(32)]]
-    ]) {
+    ]
+    for (const [rootName, ids] of seededBundleRoots) {
       const bundleRoot = path.join(runRoot, rootName)
       fs.mkdirSync(bundleRoot, { recursive: true, mode: 0o700 })
       for (const id of ids) fs.mkdirSync(path.join(bundleRoot, id), { mode: 0o550 })
@@ -999,10 +1023,12 @@ module.materialize(sys.argv[2], sys.argv[3], sys.argv[4], sys.argv[5],
     cleanupHarness(observable)
   }
 
-  for (const [name, options, expected] of [
+  /** @type {Array<[string, HarnessOptions, string]>} */
+  const invalidRootCases = [
     ['symlink-root', { symlinkIfindRoot: true }, 'DEPLOY_V5_BUNDLE_CREATE_FAILED\n'],
     ['non-tmpfs-root', { disableTmpfsMock: true }, 'DEPLOY_V5_RUNTIME_SOURCE_RECOVERY_FAILED\n']
-  ]) {
+  ]
+  for (const [name, options, expected] of invalidRootCases) {
     const invalidRoot = makeHarness(options)
     try {
       const result = spawnSync(invalidRoot.executor, [], {

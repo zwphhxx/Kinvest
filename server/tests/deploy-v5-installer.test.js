@@ -480,7 +480,8 @@ async function run() {
     fs.rmSync(environmentFixture, { recursive: true, force: true })
   }
 
-  for (const [name, prepare, overrides = {}] of [
+  /** @type {Array<[string, (context: ReturnType<typeof fixture>) => void, Record<string, string>?]>} */
+  const invalidSourceCases = [
     ['group-writable source directory', (context) => fs.chmodSync(context.fixtureSource, 0o775)],
     ['group-writable source file', (context) => fs.chmodSync(path.join(context.fixtureSource, 'deploy-v5-runtime.py'), 0o664)],
     ['source owner mismatch', () => {}, { KINVEST_INSTALL_V5_EXPECTED_SOURCE_UID: String(process.getuid() + 1) }],
@@ -489,7 +490,8 @@ async function run() {
       fs.rmSync(asset)
       fs.symlinkSync(path.join(sourceDir, 'deploy-v5-runtime.py'), asset)
     }]
-  ]) {
+  ]
+  for (const [name, prepare, overrides = {}] of invalidSourceCases) {
     const context = fixture()
     try {
       prepare(context)

@@ -92,6 +92,10 @@ function provenanceState() {
   }
 }
 
+/**
+ * @param {string} script
+ * @param {(state: ReturnType<typeof provenanceState>) => void} [mutate]
+ */
 function runProvenanceScript(script, mutate = () => {}) {
   const fixture = fs.mkdtempSync(path.join(os.tmpdir(), 'kinvest-v5-provenance-'))
   try {
@@ -174,6 +178,7 @@ async function run() {
 
   const provenanceScripts = ['deploy-disabled', 'deploy-diagnostic'].map((job) =>
     jobStepScript(job, 'Revalidate full release provenance after approval'))
+  /** @type {Array<[string, (state: ReturnType<typeof provenanceState>) => void]>} */
   const mismatchCases = [
     ['run id', (state) => { state.validatedRunId = '124' }],
     ['run attempt', (state) => { state.run.run_attempt = 3 }],

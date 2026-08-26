@@ -8,7 +8,13 @@ const rootDir = path.resolve(__dirname, '../..')
 const helper = path.join(rootDir, 'deploy/server/deploy-v5-runtime.py')
 const executor = path.join(rootDir, 'deploy/server/deploy-kinvest-v5')
 
-function waitForFile(file, child, timeoutMs = 5000) {
+/**
+ * @param {string} file
+ * @param {import('node:child_process').ChildProcess} child
+ * @param {() => string} getStderrText
+ * @param {number} [timeoutMs]
+ */
+function waitForFile(file, child, getStderrText, timeoutMs = 5000) {
   return new Promise((resolve, reject) => {
     const deadline = Date.now() + timeoutMs
     const timer = setInterval(() => {
@@ -17,7 +23,7 @@ function waitForFile(file, child, timeoutMs = 5000) {
         resolve()
       } else if (child.exitCode !== null) {
         clearInterval(timer)
-        reject(new Error(`fault-barrier child exited early: ${child.stderrText}`))
+        reject(new Error(`fault-barrier child exited early: ${getStderrText()}`))
       } else if (Date.now() > deadline) {
         clearInterval(timer)
         reject(new Error(`fault barrier timeout: ${path.basename(file)}`))
@@ -26,8 +32,16 @@ function waitForFile(file, child, timeoutMs = 5000) {
   })
 }
 
+/**
+ * @param {string[]} args
+ * @param {Record<string, string>} [env]
+ */
 function runHelper(args, env = {}) {
-  const childEnv = { ...process.env, PYTHONDONTWRITEBYTECODE: '1', ...env }
+  /** @type {Record<string, string>} */
+  const childEnv = Object.fromEntries(
+    Object.entries(process.env).filter((entry) => typeof entry[1] === 'string')
+  )
+  Object.assign(childEnv, { PYTHONDONTWRITEBYTECODE: '1' }, env)
   delete childEnv.KINVEST_V5_TEST_ALLOW_NON_TMPFS
   return spawnSync(process.env.PYTHON || 'python3', [helper, ...args], {
     encoding: 'utf8', env: childEnv, timeout: 15000
@@ -38,19 +52,22 @@ async function killAtBarrier(args, barrierRoot, point, signal) {
   for (const suffix of ['reached', 'release']) {
     fs.rmSync(path.join(barrierRoot, `${point}.${suffix}`), { force: true })
   }
-  const env = {
-    ...process.env,
+  /** @type {Record<string, string>} */
+  const env = Object.fromEntries(
+    Object.entries(process.env).filter((entry) => typeof entry[1] === 'string')
+  )
+  Object.assign(env, {
     PYTHONDONTWRITEBYTECODE: '1',
     KINVEST_V5_TEST_BARRIER_ROOT: barrierRoot,
     KINVEST_V5_TEST_BARRIER: point
-  }
+  })
   delete env.KINVEST_V5_TEST_ALLOW_NON_TMPFS
   const child = spawn(process.env.PYTHON || 'python3', [helper, ...args], {
     detached: true, env, stdio: ['ignore', 'pipe', 'pipe']
   })
-  child.stderrText = ''
-  child.stderr.on('data', value => { child.stderrText += value })
-  await waitForFile(path.join(barrierRoot, `${point}.reached`), child)
+  let stderrText = ''
+  child.stderr.on('data', value => { stderrText += String(value) })
+  await waitForFile(path.join(barrierRoot, `${point}.reached`), child, () => stderrText)
   process.kill(-child.pid, signal)
   await new Promise((resolve, reject) => {
     const timer = setTimeout(() => reject(new Error(`child did not die at ${point}`)), 5000)
