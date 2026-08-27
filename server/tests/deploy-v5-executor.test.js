@@ -214,8 +214,39 @@ with tempfile.TemporaryDirectory() as temporary:
     ); (state_root / 'current.state').chmod(0o600)
     manual = backup_root / 'manual.sqlite'; manual.write_bytes(b'manual'); manual.chmod(0o600)
     historical = backup_root / 'historical.sqlite'; historical.write_bytes(b'historical'); historical.chmod(0o600)
+    if hasattr(hashlib, 'file_digest'):
+        delattr(hashlib, 'file_digest')
     module.recover_orphan_backups(str(backup_root), str(state_root), uid, gid)
     assert pathlib.Path(first).exists() and manual.exists() and historical.exists()
+
+    empty = backup_root / 'empty.sqlite'; empty.write_bytes(b''); empty.chmod(0o600)
+    large = backup_root / 'large.sqlite'; large_bytes = b'python39-compatibility' * 65537
+    large.write_bytes(large_bytes); large.chmod(0o600)
+    for candidate, expected in (
+        (empty, hashlib.sha256(b'').hexdigest()),
+        (large, hashlib.sha256(large_bytes).hexdigest()),
+    ):
+        descriptor = os.open(candidate, os.O_RDONLY | os.O_NOFOLLOW)
+        try:
+            os.lseek(descriptor, 7 if candidate == large else 0, os.SEEK_SET)
+            offset_before = os.lseek(descriptor, 0, os.SEEK_CUR)
+            assert module.sha256_fd(descriptor) == expected
+            assert os.lseek(descriptor, 0, os.SEEK_CUR) == offset_before
+        finally:
+            os.close(descriptor)
+
+    original_pread = module.os.pread
+    offsets = []
+    short_reads = {0: b'ab', 2: b'c', 3: b''}
+    def controlled_short_read(_descriptor, _size, offset):
+        offsets.append(offset)
+        return short_reads[offset]
+    module.os.pread = controlled_short_read
+    try:
+        assert module.sha256_fd(-1) == hashlib.sha256(b'abc').hexdigest()
+    finally:
+        module.os.pread = original_pread
+    assert offsets == [0, 2, 3]
 
     protected = {item.name: item.read_bytes() for item in backup_root.iterdir()}
     (state_root / 'previous.state').write_text('databaseBackupPath=missing-only\n')
@@ -231,8 +262,9 @@ with tempfile.TemporaryDirectory() as temporary:
     else: raise AssertionError('malformed state accepted')
     assert {item.name: item.read_bytes() for item in backup_root.iterdir()} == protected
 
+    wrong_checksum = '0' * 64
     (state_root / 'previous.state').write_text(
-        f'databaseBackupPath={historical}\ndatabaseBackupChecksum={'0' * 64}\n'
+        f'databaseBackupPath={historical}\ndatabaseBackupChecksum={wrong_checksum}\n'
     )
     try: module.recover_orphan_backups(str(backup_root), str(state_root), uid, gid)
     except module.RuntimeErrorCode: pass
@@ -736,6 +768,8 @@ async function run() {
   assert.match(implementation, /cleanup_stale_sources/)
   assert.match(implementation, /validate_journal_payload/)
   assert.match(implementation, /recover_orphan_backups/)
+  assert.doesNotMatch(runtimeSource, /hashlib\.file_digest/)
+  assert.match(runtimeSource, /def sha256_fd\(/)
   assert.doesNotMatch(runtimeSource, /if not sys\.platform\.startswith\('linux'\):[\s\S]{0,180}return TMPFS_MAGIC/)
   assert.match(implementation, /MATERIALIZE_STAGE_(DIRECTORY|MANIFEST|MATERIAL)/)
   assert.match(implementation, /rollback_materialization/)
