@@ -395,7 +395,8 @@ function intentPayload(intent, digest, commit, verificationRunId = '999', ifindM
 function makeHarness(options = {}) {
   const linuxTmpfs = process.platform === 'linux' && fs.existsSync('/dev/shm') &&
     fs.statfsSync('/dev/shm').type === 0x01021994
-  const temp = fs.mkdtempSync(path.join(linuxTmpfs ? '/dev/shm' : os.tmpdir(), 'kinvest-deploy-v5-test-'))
+  const useLinuxTmpfs = linuxTmpfs && !options.disableTmpfsMock
+  const temp = fs.mkdtempSync(path.join(useLinuxTmpfs ? '/dev/shm' : os.tmpdir(), 'kinvest-deploy-v5-test-'))
   const root = path.join(temp, 'root')
   const runRoot = path.join(temp, 'run')
   const bin = path.join(temp, 'bin')
