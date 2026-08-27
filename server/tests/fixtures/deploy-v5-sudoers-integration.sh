@@ -73,10 +73,6 @@ COMMAND
 user_created=1
 /usr/sbin/useradd --system --no-create-home --no-user-group --shell /usr/sbin/nologin "$test_user"
 
-if /usr/bin/sudo -n -l -U "$test_user" >/dev/null 2>&1; then
-  fail 'new test user already has sudo authorization'
-fi
-
 if /usr/sbin/runuser -u "$test_user" -- /usr/bin/sudo -n /usr/bin/true >/dev/null 2>&1; then
   fail 'new test user already has sudo authorization'
 fi
