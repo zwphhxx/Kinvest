@@ -38,6 +38,17 @@ class RuntimeErrorCode(Exception):
     pass
 
 
+def sha256_fd(file_descriptor: int) -> str:
+    digest = hashlib.sha256()
+    offset = 0
+    while True:
+        chunk = os.pread(file_descriptor, 1024 * 1024, offset)
+        if not chunk:
+            return digest.hexdigest()
+        digest.update(chunk)
+        offset += len(chunk)
+
+
 class LinuxStatFs(ctypes.Structure):
     _fields_ = [
         ('f_type', ctypes.c_long), ('f_bsize', ctypes.c_long),
@@ -511,7 +522,7 @@ def backup_identity(root: str, temporary: str, uid: int, gid: int) -> str:
     try:
         source_fd, _ = validate_backup_temp(root_fd, root, temporary, uid, gid)
         info = os.fstat(source_fd)
-        checksum = hashlib.file_digest(os.fdopen(os.dup(source_fd), 'rb'), 'sha256').hexdigest()
+        checksum = sha256_fd(source_fd)
         return f'{info.st_dev}:{info.st_ino}:{checksum}'
     finally:
         if source_fd >= 0:
@@ -541,7 +552,7 @@ def resolve_backup_handoff(root: str, temporary: str, identity: str,
                 stat.S_IMODE(info.st_mode) != 0o600 or info.st_nlink not in (1, 2) or \
                 (info.st_dev, info.st_ino) != (expected_device, expected_inode):
             raise RuntimeErrorCode('DEPLOY_V5_BACKUP_HANDOFF_INVALID')
-        checksum = hashlib.file_digest(os.fdopen(os.dup(source_fd), 'rb'), 'sha256').hexdigest()
+        checksum = sha256_fd(source_fd)
         if checksum != expected_checksum:
             raise RuntimeErrorCode('DEPLOY_V5_BACKUP_HANDOFF_INVALID')
         registry = read_registry(registry_path, run_root, uid, gid)
@@ -612,7 +623,7 @@ def seal_backup_temporary(root: str, temporary: str, registry_path: str,
                 registry['backupInode'] != str(info.st_ino):
             raise RuntimeErrorCode('DEPLOY_V5_BACKUP_SEAL_INVALID')
         os.fsync(source_fd)
-        checksum = hashlib.file_digest(os.fdopen(os.dup(source_fd), 'rb'), 'sha256').hexdigest()
+        checksum = sha256_fd(source_fd)
         fault_barrier('backup-before-temporary-only-registry')
         registry.update({'backupPhase': 'temporary', 'backupChecksum': checksum})
         write_registry(registry_path, run_root, registry, uid, gid)
@@ -638,7 +649,7 @@ def commit_backup_no_replace(root: str, temporary: str, desired_name: str,
         fault_barrier('backup-after-open-root-before-validate')
         source_fd, source_name = validate_backup_temp(root_fd, root, temporary, uid, gid)
         os.fsync(source_fd)
-        checksum = hashlib.file_digest(os.fdopen(os.dup(source_fd), 'rb'), 'sha256').hexdigest()
+        checksum = sha256_fd(source_fd)
         source_info = os.fstat(source_fd)
         if os.environ.get('FAKE_FAILURE') == 'backup-mv':
             raise RuntimeErrorCode('DEPLOY_V5_BACKUP_INVALID')
@@ -689,7 +700,7 @@ def verify_backup(path: str, expected: str, root: str, uid: int, gid: int) -> No
     file_fd = -1
     try:
         file_fd, _ = validate_backup_temp(root_fd, root, path, uid, gid)
-        digest = hashlib.file_digest(os.fdopen(os.dup(file_fd), 'rb'), 'sha256').hexdigest()
+        digest = sha256_fd(file_fd)
         if digest != expected:
             raise RuntimeErrorCode('DEPLOY_V5_BACKUP_INVALID')
     finally:
@@ -820,7 +831,7 @@ def recover_registered_backup(value: dict[str, str], backup_root: str,
                                              str(info.st_ino) != value['backupInode']):
                     raise RuntimeErrorCode('DEPLOY_V5_BACKUP_INVALID')
                 if phase == 'temporary':
-                    digest = hashlib.file_digest(os.fdopen(os.dup(fd), 'rb'), 'sha256').hexdigest()
+                    digest = sha256_fd(fd)
                     if digest != checksum:
                         raise RuntimeErrorCode('DEPLOY_V5_BACKUP_INVALID')
             finally:
@@ -843,7 +854,7 @@ def recover_registered_backup(value: dict[str, str], backup_root: str,
                     stat.S_IMODE(info.st_mode) != 0o600 or info.st_nlink not in (1, 2):
                 os.close(fd)
                 raise RuntimeErrorCode('DEPLOY_V5_BACKUP_INVALID')
-            digest = hashlib.file_digest(os.fdopen(os.dup(fd), 'rb'), 'sha256').hexdigest()
+            digest = sha256_fd(fd)
             if digest != checksum:
                 os.close(fd)
                 if name == final:
