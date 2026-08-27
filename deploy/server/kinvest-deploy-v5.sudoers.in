@@ -1,0 +1,5 @@
+Defaults!/usr/local/sbin/deploy-kinvest-v5 env_reset,secure_path=/usr/local/sbin\:/usr/local/bin\:/usr/sbin\:/usr/bin\:/sbin\:/bin,set_home,!setenv
+@KINVEST_DEPLOY_GATE_USER@ ALL=(root) NOPASSWD:NOSETENV: /usr/local/sbin/deploy-kinvest ""
+@KINVEST_DEPLOY_GATE_USER@ ALL=(root) NOPASSWD:NOSETENV: /usr/local/sbin/deploy-kinvest-v3 ""
+@KINVEST_DEPLOY_GATE_USER@ ALL=(root) NOPASSWD:NOSETENV: /usr/local/sbin/deploy-kinvest-v4 ""
+@KINVEST_DEPLOY_GATE_USER@ ALL=(root) NOPASSWD:NOSETENV: /usr/local/sbin/deploy-kinvest-v5 ""

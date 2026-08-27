@@ -46,7 +46,7 @@
 - 图表使用混合模式：默认趋势线与估值区间，可切换前复权 K 线。
 - 部署使用 Docker Compose，入口使用 Nginx，证书使用 Certbot 管理。
 - 应用采用 Next.js 模块化单体，数据存储使用 PostgreSQL。
-- iFinD `refresh_token` 存放于腾讯云密钥管理服务；由管理员按照产品说明书手动更新，不建设自动轮换工具。
+- iFinD `refresh_token` 最终存放于 GitHub `Production` Environment Secret `KINVEST_IFIND_REFRESH_TOKEN`，经人工审批和 deploy-v5 加密 stdin 写入独立 iFinD tmpfs bundle；由管理员按照产品说明书手动更新，不建设自动轮换工具。该路线尚未生产启用。
 - 原 Codex iFinD 技能继续只从 macOS 钥匙串读取密钥。
 
 ## 4. 信息分类与页面边界
@@ -358,7 +358,7 @@ PostgreSQL
   ├─ iFinD HTTP API
   ├─ 公司/交易所/监管机构与授权资讯源
   ├─ OpenAI 兼容模型 API
-  └─ 腾讯云密钥管理服务
+  └─ GitHub Production Secret → 独立 iFinD /run tmpfs bundle
 ```
 
 Docker Compose 包含：
@@ -547,12 +547,17 @@ PostgreSQL 不保存：
 
 ## 12. 密钥管理与手动更新
 
-### 12.1 腾讯云
+### 12.1 GitHub Production Secret 与独立 tmpfs bundle
 
-- iFinD `refresh_token` 和模型 API 密钥存放于腾讯云密钥管理服务。
-- CVM 使用腾讯云实例角色访问指定密钥，不写入长期腾讯云访问密钥。
-- 应用只在内存中使用密钥。
-- 密钥不得进入浏览器、PostgreSQL、镜像、日志或错误详情。
+- iFinD `refresh_token` 使用唯一 GitHub `Production` Environment Secret `KINVEST_IFIND_REFRESH_TOKEN`。
+- 非秘密 VersionId 使用 `TMPFS_IFIND_REFRESH_TOKEN_VERSION_ID`，部署模式使用 `KINVEST_IFIND_DIAGNOSTIC_MODE=disabled|diagnostic`，部署门使用 `DEPLOY_V5_ENABLED`。
+- Secret 只有在 Production 人工审批后的 diagnostic job 中可用，经 deploy-v5 加密 SSH stdin 进入服务器，并只写入独立 iFinD `/run` tmpfs bundle。
+- 家庭登录 access bundle 与 iFinD bundle 相互独立；状态仅保存 VersionId、bundle ID 和 secret fingerprint，不保存 token。
+- 应用只在内存中交换并使用 `access_token`。refresh token 和 access token 均不得进入浏览器、PostgreSQL、SQLite、镜像、Docker 环境、日志、错误详情、命令参数或持久磁盘。
+- CVM 重启后 tmpfs 消失，应用失败关闭，必须通过获批 `RESTORE` 重建 bundle；不得回退到 `.env`、长期 SecretId/Key、SSM/CAM 或聊天传密。
+- `RESTORE` 仅用于 CVM 重启后按 `current.state` 的同一 VersionId、同一材料 fingerprint 重建 tmpfs，不允许更换 token、VersionId 或材料。token/VersionId 轮换只允许 `FORWARD`。
+- 实现自动比较 `current.state` 和 `previous.state`；更早历史没有全局 ledger，必须通过非秘密轮换台账人工禁止复用。全历史自动防复用是后续能力，当前未实现。
+- H4 仅实现代码能力，该路线尚未生产启用；真实 iFinD 结果只允许进入管理员诊断，家庭展示另设授权门，禁止 real/Mock 混合。
 
 ### 12.2 iFinD `access_token`
 
@@ -565,16 +570,20 @@ PostgreSQL 不保存：
 第一版不建设自动轮换工具，也不自动从 iFinD 登录页面读取 `refresh_token`。产品说明书必须提供以下管理员流程：
 
 1. 管理员亲自登录 iFinD 官方账号详情页，完成可能出现的验证码，并取得新的 `refresh_token`。
-2. 在腾讯云密钥管理服务控制台为现有 iFinD 密钥创建新版本；不把令牌写入 `.env`、终端命令、脚本参数或普通文本文件。
-3. 通知应用重新加载密钥；第一版可通过重启 `app` 容器完成，但不得重建数据库或清空缓存。
-4. 检查应用健康状态，确认新的密钥版本已加载且日志中没有令牌。
-5. 执行一次最小行情查询，确认鉴权、额度记录和返回时间正常。
+2. 用户直接在 GitHub `Production` Environment 更新 `KINVEST_IFIND_REFRESH_TOKEN`；不把令牌写入 `.env`、终端命令、脚本参数、聊天或普通文本文件。
+3. 用户设置新的 `TMPFS_IFIND_REFRESH_TOKEN_VERSION_ID`，不得让同一 VersionId 对应不同 secret fingerprint。
+4. 用户以 `FORWARD` 分别批准 deploy-v5 Production deployment 和首次管理员两级最小诊断；部署先执行离线 L1 bootstrap/权限/格式预检，再由管理员在 `https://dearmina.cn/admin.html` 的“管理员诊断”卡片点击“运行双级诊断”执行 L2 固定最小查询。
+5. 检查应用健康、部署 provenance、VersionId 和零匹配日志扫描，确认日志、状态和数据库中没有令牌。
 6. 若 Codex iFinD 技能也需要使用同一令牌，单独更新 macOS 钥匙串项目 `codex.ifind.quantapi`，账户名称保持 `refresh_token`。
 7. 清理剪贴板，并退出包含令牌的 iFinD 页面。
 
-产品说明书同时提供更新失败的回退步骤：腾讯云密钥仍保留上一版本；若新版本验证失败，管理员恢复上一版本并重新加载应用。产品不保存 iFinD 账号密码，不自动绕过验证码。
+产品说明书同时提供更新失败的回退步骤：若新版本验证失败，管理员保持或恢复最近已验证部署状态；`ROLLBACK` 使用当前获批材料，`RESTORE` 只按 `current.state` 的同一 VersionId、同一材料重建当前精确镜像的 tmpfs bundle，不能用于轮换。产品不保存 iFinD 账号密码，不自动绕过验证码。
 
-网站每天检查令牌声明或接口返回的可用期限，在剩余 7 天、3 天和 1 天时显示提醒。实际有效期以令牌和接口行为为准，不假设官方文档中的长期有效描述。
+### 12.4 历史决策说明
+
+早期设计曾选择腾讯云 Secrets Manager（SSM）与 CVM CAM 实例角色保存 iFinD token。该方案因初期固定成本和不必要的云依赖被 GitHub Production Secret + 独立 iFinD tmpfs bundle 取代。历史 SSM/CAM 文档仅保留审计背景，不是当前实施建议，也不得被解释为生产已启用。
+
+当前只提供 VersionId、模式、冷却、调用次数和最近诊断状态。到期日期由管理员在轮换流程中人工记录并检查。自动提醒是 T10-H 后续能力，当前未实现，不得声称已上线。未来实现前，实际有效期仍以管理员核验的令牌和接口行为为准，不假设官方文档中的长期有效描述。
 
 ## 13. 无登录状态下的安全边界
 
@@ -701,7 +710,7 @@ PostgreSQL 不保存：
 
 ### 17.5 令牌与安全边界
 - 删除自动轮换与自动更新动作；仅保留管理员手工从 iFinD 登录页获取 refresh_token 的说明。
-- 明确要求：不落盘、不进页面、数据库、日志、仓库、容器镜像。
+- token 只经 GitHub Production 人工审批、deploy-v5 加密 stdin 和独立 iFinD tmpfs bundle 进入应用内存，不落持久磁盘、不进页面、数据库、日志、仓库或容器镜像。
 
 ### 17.6 反向代理与运行时
 - 统一使用 Nginx，职责包括 HTTPS、反向代理、静态资源缓存、请求体大小限制、安全响应头、基础限速。
@@ -711,4 +720,3 @@ PostgreSQL 不保存：
 - 后续可平滑迁移至 PostgreSQL（通过 schema + repository layer）。
 - 调度仍为单实例，后续高并发时再拆 worker/队列/Redis。
 - 预留家庭登录、RBAC、审计、水平扩容接口，不把它们提前固化为假设前提。
-

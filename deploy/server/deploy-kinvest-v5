@@ -1,0 +1,672 @@
+#!/usr/bin/env bash
+set -euo pipefail
+umask 077
+exec 3>&2
+exec 2>/dev/null
+
+KINVEST_DEPLOY_PROTOCOL='5'
+BUNDLE_UID='0'
+BUNDLE_GID='10001'
+ROOT_UID='0'
+ROOT_GID='0'
+ROOT='/root/docker/kinvest'
+RUN_ROOT='/run'
+STATE_ROOT="$ROOT/state"
+BACKUP_ROOT="$ROOT/backups"
+ACCESS_BUNDLE_ROOT="$RUN_ROOT/kinvest-secrets"
+IFIND_BUNDLE_ROOT="$RUN_ROOT/kinvest-ifind-secrets"
+CURRENT_STATE="$STATE_ROOT/current.state"
+PREVIOUS_STATE="$STATE_ROOT/previous.state"
+ATTEMPT_STATE="$STATE_ROOT/attempt.state"
+JOURNAL="$STATE_ROOT/deploy-v5.journal"
+BEFORE_STATE="$STATE_ROOT/deploy-v5-current.before"
+DATABASE="$ROOT/data/kinvest.sqlite"
+COMPOSE="$ROOT/docker-compose-v5.yml"
+CONTRACT='/usr/local/libexec/kinvest-deploy-v5-contract'
+RUNTIME_HELPER='/usr/local/libexec/kinvest-deploy-v5-runtime'
+OFFLINE_ATTESTATION='/usr/local/libexec/kinvest-offline-image-attestation'
+NETWORK_CONFIG='/etc/kinvest/metadata-network.conf'
+PUBLIC_HEALTH_URL='https://dearmina.cn/api/health'
+
+fail() { printf '%s\n' "$1" >&3; exit "${2:-1}"; }
+bootstrap_capture=''
+bootstrap_cleanup() {
+  [[ -n "$bootstrap_capture" && "$bootstrap_capture" == "$RUN_ROOT"/kinvest-v5.bootstrap.* ]] && rm -f -- "$bootstrap_capture" 2>/dev/null || true
+}
+bootstrap_command() {
+  local code="$1" status=0
+  shift
+  bootstrap_capture="$(mktemp "$RUN_ROOT/kinvest-v5.bootstrap.XXXXXX" 2>/dev/null)" || fail "$code"
+  chmod 0600 "$bootstrap_capture" 2>/dev/null || { bootstrap_cleanup; fail "$code"; }
+  "$@" >"$bootstrap_capture" 2>&1 || status=$?
+  bootstrap_cleanup
+  bootstrap_capture=''
+  [[ "$status" -eq 0 ]] || fail "$code"
+}
+trap bootstrap_cleanup EXIT
+trap 'bootstrap_cleanup; exit 129' HUP
+trap 'bootstrap_cleanup; exit 130' INT
+trap 'bootstrap_cleanup; exit 143' TERM
+[[ "$#" -eq 0 ]] || fail DEPLOY_V5_ARGUMENTS_FORBIDDEN 2
+[[ "$(id -u)" -eq 0 ]] || fail DEPLOY_V5_ROOT_REQUIRED
+[[ -x "$CONTRACT" && -x "$RUNTIME_HELPER" && -x "$OFFLINE_ATTESTATION" && -f "$COMPOSE" && ! -L "$COMPOSE" ]] || fail DEPLOY_V5_ASSETS_MISSING
+[[ "$(findmnt -n -o FSTYPE --target "$RUN_ROOT" 2>/dev/null)" == tmpfs ]] || fail DEPLOY_V5_RUN_NOT_TMPFS
+bootstrap_command DEPLOY_V5_INITIALIZE_FAILED install -d -o root -g root -m 0700 -- "$STATE_ROOT" "$BACKUP_ROOT" "$ACCESS_BUNDLE_ROOT" "$IFIND_BUNDLE_ROOT"
+exec 9>"$STATE_ROOT/deploy.lock" 2>/dev/null || fail DEPLOY_V5_INITIALIZE_FAILED
+bootstrap_command DEPLOY_V5_LOCKED flock -n 9
+
+payload_file=''
+prepared_file=''
+current_json=''
+previous_json=''
+plan_file=''
+target_file=''
+candidate_state=''
+candidate_access_id='none'
+candidate_access_path="$ACCESS_BUNDLE_ROOT/disabled"
+candidate_ifind_id='none'
+candidate_ifind_path=''
+candidate_registry=''
+candidate_keep='false'
+transaction_started='false'
+current_image=''
+current_access_path=''
+current_ifind_path=''
+stable_output=''
+stable_error=''
+candidate_state_text=''
+reboot_restore_phase=''
+journal_intent=''
+journal_handling_started='false'
+
+safe_runtime_file() { [[ -n "${1:-}" && "$1" == "$RUN_ROOT"/kinvest-v5.* ]]; }
+
+secure_temp() {
+  local variable="$1" template="$2" value
+  value="$(mktemp "$template" 2>/dev/null)" || return 1
+  if ! chmod 0600 "$value" 2>/dev/null; then rm -f -- "$value" 2>/dev/null || true; return 1; fi
+  printf -v "$variable" '%s' "$value"
+}
+
+json_field() {
+  python3 - "$1" "$2" 2>/dev/null <<'PY'
+import json, sys
+try:
+    with open(sys.argv[1], encoding='ascii') as stream:
+        value = json.load(stream)[sys.argv[2]]
+    print(json.dumps(value, separators=(',', ':'), sort_keys=True) if isinstance(value, (dict, list)) else value)
+except Exception:
+    raise SystemExit(1)
+PY
+}
+
+run_docker() { timeout --signal=TERM --kill-after=10s 120s docker "$@"; }
+
+run_stable_command() {
+  local code="$1" status=0
+  shift
+  secure_temp stable_output "$RUN_ROOT/kinvest-v5.command-out.XXXXXX" || fail DEPLOY_V5_CAPTURE_FAILED
+  secure_temp stable_error "$RUN_ROOT/kinvest-v5.command-err.XXXXXX" || { rm -f -- "$stable_output" 2>/dev/null; stable_output=''; fail DEPLOY_V5_CAPTURE_FAILED; }
+  "$@" >"$stable_output" 2>"$stable_error" || status=$?
+  if ! rm -f -- "$stable_output" "$stable_error" 2>/dev/null; then
+    fail DEPLOY_V5_CAPTURE_CLEANUP_FAILED
+  fi
+  stable_output=''; stable_error=''
+  [[ "$status" -eq 0 ]] || fail "$code"
+}
+
+remove_tree_safe() {
+  local root="$1" id="$2" path entry
+  [[ "$id" =~ ^[0-9a-f]{32}$ ]] || return 0
+  path="$root/$id"
+  [[ "$path" == "$root"/* && -d "$path" && ! -L "$path" ]] || return 0
+  chmod 0700 "$path" || return 1
+  while IFS= read -r -d '' entry; do
+    [[ -f "$entry" && ! -L "$entry" ]] || return 1
+    rm -f -- "$entry" || return 1
+  done < <(find "$path" -mindepth 1 -maxdepth 1 -print0)
+  rmdir -- "$path"
+}
+
+prune_bundle_root() {
+  local root="$1" keep="$2" entry id
+  [[ -d "$root" && ! -L "$root" ]] || return 1
+  while IFS= read -r -d '' entry; do
+    id="${entry##*/}"
+    [[ "$id" == disabled ]] && continue
+    [[ "$id" =~ ^[0-9a-f]{32}$ ]] || return 1
+    [[ " $keep " == *" $id "* ]] || remove_tree_safe "$root" "$id"
+  done < <(find "$root" -mindepth 1 -maxdepth 1 -print0)
+}
+
+collect_referenced_bundle_ids() {
+  local field="$1" file parsed id values=''
+  for file in "$CURRENT_STATE" "$PREVIOUS_STATE"; do
+    [[ -f "$file" && ! -L "$file" ]] || continue
+    secure_temp parsed "$RUN_ROOT/kinvest-v5.reference.XXXXXX" || return 1
+    if "$CONTRACT" parse-state <"$file" >"$parsed" 2>/dev/null; then
+      id="$(json_field "$parsed" "$field")" || { rm -f -- "$parsed"; return 1; }
+      [[ "$id" == none ]] || values+=" $id"
+    else
+      rm -f -- "$parsed"
+      return 1
+    fi
+    rm -f -- "$parsed"
+  done
+  printf '%s\n' "$values"
+}
+
+prune_access_bundles() { prune_bundle_root "$ACCESS_BUNDLE_ROOT" "$(collect_referenced_bundle_ids secretBundleId)"; }
+prune_ifind_bundles() { prune_bundle_root "$IFIND_BUNDLE_ROOT" "$(collect_referenced_bundle_ids ifindSecretBundleId)"; }
+
+atomic_state_from_json() {
+  local source="$1" target="$2" prefix="$3" temporary target_name status=0
+  secure_temp temporary "$RUN_ROOT/kinvest-v5.state-${prefix}.XXXXXX" || return 1
+  if ! "$CONTRACT" canonical-state <"$source" >"$temporary" 2>/dev/null; then
+    status=1
+  else
+    target_name="${target##*/}"
+    "$RUNTIME_HELPER" state-write "$STATE_ROOT" "$target_name" "$temporary" "$ROOT_UID" "$ROOT_GID" >/dev/null 2>&1 || status=1
+  fi
+  "$RUNTIME_HELPER" remove-runtime-source "$temporary" "$RUN_ROOT" "$ROOT_UID" "$ROOT_GID" >/dev/null 2>&1 || return 1
+  return "$status"
+}
+
+atomic_state_from_text() {
+  local source="$1" target="$2" prefix="$3" temporary target_name status=0
+  secure_temp temporary "$RUN_ROOT/kinvest-v5.state-${prefix}.XXXXXX" || return 1
+  if ! cat -- "$source" >"$temporary" 2>/dev/null; then
+    status=1
+  else
+    target_name="${target##*/}"
+    "$RUNTIME_HELPER" state-write "$STATE_ROOT" "$target_name" "$temporary" "$ROOT_UID" "$ROOT_GID" >/dev/null 2>&1 || status=1
+  fi
+  "$RUNTIME_HELPER" remove-runtime-source "$temporary" "$RUN_ROOT" "$ROOT_UID" "$ROOT_GID" >/dev/null 2>&1 || return 1
+  return "$status"
+}
+
+durable_state_delete() {
+  "$RUNTIME_HELPER" state-delete "$STATE_ROOT" "$ROOT_UID" "$ROOT_GID" "$@" >/dev/null 2>&1
+}
+
+write_journal() {
+  local phase="$1" temporary status=0
+  secure_temp temporary "$RUN_ROOT/kinvest-v5.journal.XXXXXX" || return 1
+  "$RUNTIME_HELPER" build-journal-source "$temporary" "$RUN_ROOT" "$STATE_ROOT" "$phase" "$intent" \
+    "$candidate_access_id" "$candidate_ifind_id" "$backup_path" "$backup_checksum" \
+    "$ROOT_UID" "$ROOT_GID" >/dev/null 2>&1 || status=1
+  if [[ "$status" -eq 0 ]]; then
+    "$RUNTIME_HELPER" state-write "$STATE_ROOT" "${JOURNAL##*/}" "$temporary" "$ROOT_UID" "$ROOT_GID" >/dev/null 2>&1 || status=1
+  fi
+  "$RUNTIME_HELPER" remove-runtime-source "$temporary" "$RUN_ROOT" "$ROOT_UID" "$ROOT_GID" >/dev/null 2>&1 || return 1
+  return "$status"
+}
+
+compose_state_file() {
+  local state_file="$1" parsed image provider_value versions_value access_id access_path access_value proxies_value ifind_value ifind_version_value ifind_id ifind_path profile service
+  secure_temp parsed "$RUN_ROOT/kinvest-v5.compose-state.XXXXXX" || return 1
+  "$CONTRACT" parse-state <"$state_file" >"$parsed" 2>/dev/null || { rm -f -- "$parsed"; return 1; }
+  image="$(json_field "$parsed" runtimeImageId)" || { rm -f -- "$parsed"; return 1; }
+  provider_value="$(json_field "$parsed" secretProviderMode)" || { rm -f -- "$parsed"; return 1; }
+  versions_value="$(json_field "$parsed" secretVersionIds)" || { rm -f -- "$parsed"; return 1; }
+  access_id="$(json_field "$parsed" secretBundleId)" || { rm -f -- "$parsed"; return 1; }
+  access_value="$(json_field "$parsed" accessControlMode)" || { rm -f -- "$parsed"; return 1; }
+  proxies_value="$(json_field "$parsed" trustedProxyAddresses)" || { rm -f -- "$parsed"; return 1; }
+  ifind_value="$(json_field "$parsed" ifindDiagnosticMode)" || { rm -f -- "$parsed"; return 1; }
+  ifind_version_value="$(json_field "$parsed" ifindRefreshTokenVersionId)" || { rm -f -- "$parsed"; return 1; }
+  ifind_id="$(json_field "$parsed" ifindSecretBundleId)" || { rm -f -- "$parsed"; return 1; }
+  rm -f -- "$parsed"
+  [[ "$access_id" == none ]] && access_path="$ACCESS_BUNDLE_ROOT/disabled" || access_path="$ACCESS_BUNDLE_ROOT/$access_id"
+  if [[ "$ifind_value" == diagnostic ]]; then
+    profile=ifind-diagnostic; service=kinvest-diagnostic; ifind_path="$IFIND_BUNDLE_ROOT/$ifind_id"
+  else
+    profile=ifind-disabled; service=kinvest-disabled; ifind_path=''
+  fi
+  (
+    export COMPOSE_PROFILES="$profile" KINVEST_IMAGE="$image"
+    export KINVEST_SECRET_PROVIDER_MODE="$provider_value" KINVEST_SECRET_VERSION_IDS="$versions_value"
+    export KINVEST_SECRET_BUNDLE_HOST_PATH="$access_path" KINVEST_ACCESS_CONTROL_MODE="$access_value"
+    export KINVEST_TRUSTED_PROXY_ADDRESSES="$proxies_value"
+    export KINVEST_IFIND_REFRESH_TOKEN_VERSION_ID="$ifind_version_value" KINVEST_IFIND_SECRET_BUNDLE_HOST_PATH="$ifind_path"
+    run_docker compose -f "$COMPOSE" --env-file "$NETWORK_CONFIG" up -d --remove-orphans "$service" >/dev/null 2>&1
+  )
+}
+
+restore_previous_runtime() {
+  [[ -f "$BEFORE_STATE" && ! -L "$BEFORE_STATE" ]] || return 1
+  compose_state_file "$BEFORE_STATE" || return 1
+  atomic_state_from_text "$BEFORE_STATE" "$CURRENT_STATE" current || return 1
+}
+
+reconcile_transaction_journal() {
+  [[ -e "$JOURNAL" ]] || return 0
+  [[ -f "$JOURNAL" && ! -L "$JOURNAL" && -f "$BEFORE_STATE" && ! -L "$BEFORE_STATE" ]] || return 1
+  local phase journal_intent access_id ifind_id
+  phase="$(json_field "$JOURNAL" phase)" || return 1
+  journal_intent="$(json_field "$JOURNAL" intent)" || return 1
+  access_id="$(json_field "$JOURNAL" candidateAccessId)" || return 1
+  ifind_id="$(json_field "$JOURNAL" candidateIfindId)" || return 1
+  case "$phase" in
+    prepared)
+      remove_tree_safe "$ACCESS_BUNDLE_ROOT" "$access_id" || return 1
+      remove_tree_safe "$IFIND_BUNDLE_ROOT" "$ifind_id" || return 1
+      ;;
+    compose-active)
+      restore_previous_runtime || return 1
+      remove_tree_safe "$ACCESS_BUNDLE_ROOT" "$access_id" || return 1
+      remove_tree_safe "$IFIND_BUNDLE_ROOT" "$ifind_id" || return 1
+      ;;
+    state-committed)
+      compose_state_file "$CURRENT_STATE" || return 1
+      if [[ "$journal_intent" != RESTORE ]]; then atomic_state_from_text "$BEFORE_STATE" "$PREVIOUS_STATE" previous || return 1; fi
+      ;;
+    *) return 1 ;;
+  esac
+  durable_state_delete "${ATTEMPT_STATE##*/}" "${JOURNAL##*/}" "${BEFORE_STATE##*/}" || return 1
+  prune_access_bundles && prune_ifind_bundles
+}
+
+state_bundles_present() {
+  local state_file="$1" parsed provider_value access_id ifind_value ifind_id
+  secure_temp parsed "$RUN_ROOT/kinvest-v5.bundle-state.XXXXXX" || return 1
+  "$CONTRACT" parse-state <"$state_file" >"$parsed" 2>/dev/null || { rm -f -- "$parsed"; return 1; }
+  provider_value="$(json_field "$parsed" secretProviderMode)" || { rm -f -- "$parsed"; return 1; }
+  access_id="$(json_field "$parsed" secretBundleId)" || { rm -f -- "$parsed"; return 1; }
+  ifind_value="$(json_field "$parsed" ifindDiagnosticMode)" || { rm -f -- "$parsed"; return 1; }
+  ifind_id="$(json_field "$parsed" ifindSecretBundleId)" || { rm -f -- "$parsed"; return 1; }
+  rm -f -- "$parsed"
+  if [[ "$provider_value" == github-tmpfs-v1 ]]; then
+    [[ -d "$ACCESS_BUNDLE_ROOT/$access_id" && ! -L "$ACCESS_BUNDLE_ROOT/$access_id" ]] || return 1
+  fi
+  if [[ "$ifind_value" == diagnostic ]]; then
+    [[ -d "$IFIND_BUNDLE_ROOT/$ifind_id" && ! -L "$IFIND_BUNDLE_ROOT/$ifind_id" ]] || return 1
+  fi
+}
+
+pending_candidate_registry_exists() {
+  local registry
+  shopt -s nullglob
+  for registry in "$RUN_ROOT"/kinvest-v5.candidates.*; do
+    [[ "$registry" == *.tmp.* ]] && continue
+    shopt -u nullglob
+    return 0
+  done
+  shopt -u nullglob
+  return 1
+}
+
+prepare_journal_recovery() {
+  [[ -e "$JOURNAL" ]] || return 0
+  [[ -f "$JOURNAL" && ! -L "$JOURNAL" && -f "$BEFORE_STATE" && ! -L "$BEFORE_STATE" ]] || return 1
+  local phase authority request_intent
+  phase="$(json_field "$JOURNAL" phase)" || return 1
+  journal_intent="$(json_field "$JOURNAL" intent)" || return 1
+  request_intent="$(json_field "$prepared_file" intent)" || return 1
+  case "$phase" in
+    prepared) reconcile_transaction_journal || return 1; return 0 ;;
+    compose-active) authority="$BEFORE_STATE" ;;
+    state-committed) authority="$CURRENT_STATE" ;;
+    *) return 1 ;;
+  esac
+  if state_bundles_present "$authority" && ! pending_candidate_registry_exists; then
+    reconcile_transaction_journal
+    return $?
+  fi
+  reboot_restore_phase="$phase"
+  [[ "$request_intent" == RESTORE ]] || fail DEPLOY_V5_RESTORE_REQUIRED 72
+}
+
+cleanup() {
+  local status=$?
+  trap - EXIT
+  if [[ -n "$candidate_registry" && -f "$candidate_registry" && ! -L "$candidate_registry" ]]; then
+    "$RUNTIME_HELPER" recover "$candidate_registry" "$RUN_ROOT" "$ACCESS_BUNDLE_ROOT" "$IFIND_BUNDLE_ROOT" "$BACKUP_ROOT" "$STATE_ROOT" "$ROOT_UID" "$ROOT_GID" >/dev/null 2>&1 || true
+  fi
+  if [[ -e "$JOURNAL" && "$journal_handling_started" == true && -z "$reboot_restore_phase" ]]; then
+    if ! reconcile_transaction_journal >/dev/null 2>&1; then
+      printf '%s\n' DEPLOY_V5_RECOVERY_FAILED >&3
+      status=70
+      candidate_keep='true'
+    fi
+  elif [[ "$candidate_keep" != true ]]; then
+    remove_tree_safe "$ACCESS_BUNDLE_ROOT" "$candidate_access_id" >/dev/null 2>&1 || true
+    remove_tree_safe "$IFIND_BUNDLE_ROOT" "$candidate_ifind_id" >/dev/null 2>&1 || true
+  fi
+  for file in "$payload_file" "$prepared_file" "$current_json" "$previous_json" "$plan_file" "$target_file" "$candidate_state" "$candidate_state_text" "$stable_output" "$stable_error" "$candidate_registry"; do
+    if safe_runtime_file "$file"; then
+      shred -u -z -- "$file" 2>/dev/null || true
+      rm -f -- "$file" 2>/dev/null || true
+    fi
+  done
+  exit "$status"
+}
+trap - EXIT HUP INT TERM
+trap cleanup EXIT
+trap 'exit 129' HUP
+trap 'exit 130' INT
+trap 'exit 143' TERM
+
+recover_stale_candidate_registries() {
+  local registry
+  shopt -s nullglob
+  for registry in "$RUN_ROOT"/kinvest-v5.candidates.*; do
+    [[ "$registry" == *.tmp.* ]] && continue
+    "$RUNTIME_HELPER" recover "$registry" "$RUN_ROOT" "$ACCESS_BUNDLE_ROOT" "$IFIND_BUNDLE_ROOT" "$BACKUP_ROOT" "$STATE_ROOT" "$ROOT_UID" "$ROOT_GID" >/dev/null 2>&1 || return 1
+  done
+  shopt -u nullglob
+}
+secure_temp payload_file "$RUN_ROOT/kinvest-v5.payload.XXXXXX" || fail DEPLOY_V5_PAYLOAD_FILE_FAILED
+run_stable_command DEPLOY_V5_PAYLOAD_READ_FAILED dd bs=4096 count=5 of="$payload_file" status=none
+[[ "$(wc -c <"$payload_file" | tr -d '[:space:]')" -le 16384 ]] || fail DEPLOY_V5_PAYLOAD_TOO_LARGE 2
+grep -Fqx 'KINVEST_DEPLOY_V5' <(head -n 1 "$payload_file") || fail DEPLOY_V5_PAYLOAD_REJECTED 2
+
+secure_temp prepared_file "$RUN_ROOT/kinvest-v5.prepared.XXXXXX" || fail DEPLOY_V5_PAYLOAD_FILE_FAILED
+"$CONTRACT" validate-payload <"$payload_file" >"$prepared_file" 2>/dev/null || fail DEPLOY_V5_PAYLOAD_REJECTED 2
+journal_handling_started='true'
+prepare_journal_recovery || fail DEPLOY_V5_RECOVERY_FAILED 70
+
+recover_stale_candidate_registries || fail DEPLOY_V5_CANDIDATE_RECOVERY_FAILED 70
+"$RUNTIME_HELPER" cleanup-stale-sources "$RUN_ROOT" "$ROOT_UID" "$ROOT_GID" >/dev/null 2>&1 || fail DEPLOY_V5_RUNTIME_SOURCE_RECOVERY_FAILED 70
+"$RUNTIME_HELPER" recover-orphan-backups "$BACKUP_ROOT" "$STATE_ROOT" "$ROOT_UID" "$ROOT_GID" >/dev/null 2>&1 || fail DEPLOY_V5_BACKUP_RECOVERY_FAILED 70
+
+candidate_registry="$("$RUNTIME_HELPER" reserve-registry "$RUN_ROOT" "$ROOT_UID" "$ROOT_GID" 2>/dev/null)" || fail DEPLOY_V5_CANDIDATE_REGISTRY_FAILED
+[[ "$candidate_registry" == "$RUN_ROOT"/kinvest-v5.candidates.* ]] || fail DEPLOY_V5_CANDIDATE_REGISTRY_FAILED
+bundle_result="$("$RUNTIME_HELPER" materialize "$payload_file" "$RUN_ROOT" "$ACCESS_BUNDLE_ROOT" "$IFIND_BUNDLE_ROOT" \
+  "$BUNDLE_UID" "$BUNDLE_GID" "$ROOT_UID" "$ROOT_GID" "$candidate_registry" 2>/dev/null)" || fail DEPLOY_V5_BUNDLE_CREATE_FAILED
+# HELPER_WINDOW_AFTER_SUCCESS_BEFORE_ID_RECORD
+candidate_access_id="$(python3 -c 'import json,sys; print(json.load(sys.stdin)["accessId"])' 2>/dev/null <<<"$bundle_result")" || fail DEPLOY_V5_BUNDLE_CREATE_FAILED
+candidate_access_path="$ACCESS_BUNDLE_ROOT/$candidate_access_id"
+candidate_ifind_id="$(python3 -c 'import json,sys; print(json.load(sys.stdin)["ifindId"])' 2>/dev/null <<<"$bundle_result")" || fail DEPLOY_V5_BUNDLE_CREATE_FAILED
+candidate_ifind_path="$IFIND_BUNDLE_ROOT/$candidate_ifind_id"
+# REGISTRY_WINDOW_AFTER_ID_RECORD
+unset bundle_result
+
+if [[ "$candidate_access_id" == none ]]; then
+  candidate_access_path="$ACCESS_BUNDLE_ROOT/disabled"
+  run_stable_command DEPLOY_V5_INITIALIZE_FAILED install -d -o root -g 10001 -m 0550 -- "$candidate_access_path"
+fi
+if [[ "$candidate_ifind_id" == none ]]; then candidate_ifind_path=''; fi
+
+secure_temp current_json "$RUN_ROOT/kinvest-v5.current.XXXXXX" || fail DEPLOY_V5_STATE_READ_FAILED
+secure_temp previous_json "$RUN_ROOT/kinvest-v5.previous.XXXXXX" || fail DEPLOY_V5_STATE_READ_FAILED
+[[ -f "$CURRENT_STATE" && ! -L "$CURRENT_STATE" ]] || fail DEPLOY_V5_CURRENT_STATE_MISSING
+"$CONTRACT" parse-state <"$CURRENT_STATE" >"$current_json" 2>/dev/null || fail DEPLOY_V5_CURRENT_STATE_INVALID
+if [[ -e "$PREVIOUS_STATE" ]]; then
+  [[ -f "$PREVIOUS_STATE" && ! -L "$PREVIOUS_STATE" ]] || fail DEPLOY_V5_PREVIOUS_STATE_INVALID
+  "$CONTRACT" parse-state <"$PREVIOUS_STATE" >"$previous_json" 2>/dev/null || fail DEPLOY_V5_PREVIOUS_STATE_INVALID
+else
+  printf 'null\n' >"$previous_json"
+fi
+
+secure_temp plan_file "$RUN_ROOT/kinvest-v5.plan.XXXXXX" || fail DEPLOY_V5_STATE_READ_FAILED
+if ! python3 - "$prepared_file" "$current_json" "$previous_json" 2>/dev/null <<'PY' | "$CONTRACT" resolve-intent >"$plan_file" 2>/dev/null
+import json, sys
+with open(sys.argv[1]) as stream: request = json.load(stream)
+with open(sys.argv[2]) as stream: current = json.load(stream)
+with open(sys.argv[3]) as stream: previous = json.load(stream)
+request_fields = (
+    'imageDigest', 'commit', 'artifactSource', 'provenanceMode',
+    'releaseRecordSchemaVersion', 'verificationRunId',
+    'secretProviderMode', 'secretVersionIds',
+    'secretMaterialFingerprints', 'accessControlMode', 'ifindDiagnosticMode',
+    'ifindRefreshTokenVersionId', 'ifindSecretMaterialFingerprint',
+)
+projected = {key: request[key] for key in request_fields}
+print(json.dumps({'intent': request['intent'], 'request': projected, 'current': current, 'previous': previous}, separators=(',', ':'), sort_keys=True))
+PY
+then
+  fail DEPLOY_V5_INTENT_RESOLUTION_FAILED
+fi
+[[ -s "$plan_file" ]] || fail DEPLOY_V5_INTENT_RESOLUTION_FAILED
+
+intent="$(json_field "$prepared_file" intent)"
+provenance_mode="$(json_field "$prepared_file" provenanceMode)"
+if [[ "$intent" == FORWARD ]]; then
+  target_digest="$(json_field "$prepared_file" imageDigest)"
+  target_commit="$(json_field "$prepared_file" commit)"
+  target_verification_run_id="$(json_field "$prepared_file" verificationRunId)"
+  target_file="$prepared_file"
+else
+  secure_temp target_file "$RUN_ROOT/kinvest-v5.target.XXXXXX" || fail DEPLOY_V5_STATE_READ_FAILED
+  if ! python3 - "$plan_file" >"$target_file" 2>/dev/null <<'PY'
+import json, sys
+with open(sys.argv[1]) as stream: print(json.dumps(json.load(stream)['target'], separators=(',', ':'), sort_keys=True))
+PY
+  then
+    fail DEPLOY_V5_INTENT_RESOLUTION_FAILED
+  fi
+  [[ -s "$target_file" ]] || fail DEPLOY_V5_INTENT_RESOLUTION_FAILED
+  target_digest="$(json_field "$target_file" imageDigest)"
+  target_commit="$(json_field "$target_file" commit)"
+  target_verification_run_id="$(json_field "$target_file" verificationRunId)"
+fi
+ifind_mode="$(json_field "$prepared_file" ifindDiagnosticMode)"
+ifind_version="$(json_field "$prepared_file" ifindRefreshTokenVersionId)"
+access_mode="$(json_field "$prepared_file" accessControlMode)"
+provider="$(json_field "$prepared_file" secretProviderMode)"
+versions="$(json_field "$prepared_file" secretVersionIds)"
+
+inspect_id() { run_docker image inspect "$1" --format '{{.Id}}' 2>/dev/null; }
+read_label() { run_docker image inspect "$1" --format "{{index .Config.Labels \"$2\"}}" 2>/dev/null; }
+verify_repo_digest() { run_docker image inspect "$1" --format '{{json .RepoDigests}}' 2>/dev/null | grep -Fq -- "\"$2\""; }
+
+resolve_offline_image() {
+  local id
+  id="$(timeout 15s "$OFFLINE_ATTESTATION" resolve "$target_digest" "$target_commit" "$target_verification_run_id" 2>/dev/null)" || return 1
+  [[ "$id" =~ ^sha256:[0-9a-f]{64}$ && "$(inspect_id "$id")" == "$id" ]] || return 1
+  verify_repo_digest "$id" "$target_digest" || return 1
+  printf '%s\n' "$id"
+}
+
+if [[ "$provenance_mode" == state-reproof ]]; then
+  [[ "$intent" != FORWARD ]] || fail DEPLOY_V5_STATE_REPROOF_FORWARD_FORBIDDEN
+  runtime_image_id="$(json_field "$target_file" runtimeImageId)"
+  [[ "$runtime_image_id" =~ ^sha256:[0-9a-f]{64}$ && "$(inspect_id "$runtime_image_id")" == "$runtime_image_id" ]] || fail DEPLOY_V5_IMAGE_PROVENANCE_INVALID
+  verify_repo_digest "$runtime_image_id" "$target_digest" || fail DEPLOY_V5_IMAGE_PROVENANCE_INVALID
+else
+  attested_image_id="$(resolve_offline_image)" || fail DEPLOY_V5_IMAGE_PROVENANCE_INVALID
+  if [[ "$intent" == FORWARD ]]; then
+    runtime_image_id="$attested_image_id"
+  else
+    runtime_image_id="$(json_field "$target_file" runtimeImageId)"
+    [[ "$runtime_image_id" == "$attested_image_id" ]] || fail DEPLOY_V5_IMAGE_PROVENANCE_INVALID
+  fi
+fi
+
+schema_before="$(python3 - "$DATABASE" 2>/dev/null <<'PY'
+import sqlite3, sys
+with sqlite3.connect('file:' + sys.argv[1] + '?mode=ro', uri=True) as db: print(db.execute('PRAGMA user_version').fetchone()[0])
+PY
+)" || fail DEPLOY_V5_SCHEMA_READ_FAILED
+schema_min="$(read_label "$runtime_image_id" io.kinvest.schema.min)"
+schema_max="$(read_label "$runtime_image_id" io.kinvest.schema.max)"
+[[ "$schema_min" =~ ^[0-9]+$ && "$schema_max" =~ ^[0-9]+$ && "$schema_before" -ge "$schema_min" && "$schema_before" -le "$schema_max" ]] || fail ROLLBACK_REQUIRES_DB_RESTORE 75
+[[ "$(read_label "$runtime_image_id" io.kinvest.access-control.contract)" == 1 ]] || fail DEPLOY_V5_ACCESS_CONTRACT_INVALID
+if [[ "$ifind_mode" == diagnostic ]]; then
+  [[ "$(read_label "$runtime_image_id" io.kinvest.ifind-secret-bootstrap)" == 1 ]] || fail DEPLOY_V5_IFIND_PROVIDER_INCOMPATIBLE
+fi
+
+run_access_preflight() {
+  run_docker run --rm --network none --read-only --cap-drop ALL --user 10001:10001 \
+    --volume "$candidate_access_path:/run/secrets/kinvest:ro" \
+    --env "KINVEST_SECRET_PROVIDER_MODE=$provider" --env "KINVEST_SECRET_VERSION_IDS=$versions" \
+    --env KINVEST_SECRET_BUNDLE_PATH=/run/secrets/kinvest \
+    --entrypoint node "$runtime_image_id" server/secret-preflight.js
+}
+
+run_ifind_preflight() {
+  [[ "$ifind_mode" == diagnostic ]] || return 0
+  run_docker run --rm --network none --read-only --cap-drop ALL --user 10001:10001 \
+    --volume "$candidate_ifind_path:/run/secrets/kinvest-ifind:ro" \
+    --env KINVEST_IFIND_DIAGNOSTIC_MODE=admin-diagnostic \
+    --env "KINVEST_IFIND_REFRESH_TOKEN_VERSION_ID=$ifind_version" \
+    --env KINVEST_IFIND_SECRET_BUNDLE_PATH=/run/secrets/kinvest-ifind \
+    --entrypoint node "$runtime_image_id" server/ifind-secret-preflight.js
+}
+
+run_stable_command DEPLOY_V5_ACCESS_PREFLIGHT_FAILED run_access_preflight
+run_stable_command DEPLOY_V5_IFIND_PREFLIGHT_FAILED run_ifind_preflight
+
+verify_backup_file() {
+  "$RUNTIME_HELPER" verify-backup "$1" "$2" "$BACKUP_ROOT" "$ROOT_UID" "$ROOT_GID" >/dev/null 2>&1
+}
+
+verify_state_backup_references() {
+  local state_file="$1" path checksum
+  [[ -f "$state_file" && ! -L "$state_file" ]] || return 1
+  path="$(json_field "$state_file" databaseBackupPath)" || return 1
+  checksum="$(json_field "$state_file" databaseBackupChecksum)" || return 1
+  if [[ "$path" == none && "$checksum" == none ]]; then return 0; fi
+  [[ "$path" != none && "$checksum" =~ ^[0-9a-f]{64}$ ]] || return 1
+  verify_backup_file "$path" "$checksum"
+}
+
+verify_state_backup_references "$current_json" || fail DEPLOY_V5_EXISTING_BACKUP_INVALID
+if ! grep -Fqx null "$previous_json"; then
+  verify_state_backup_references "$previous_json" || fail DEPLOY_V5_EXISTING_BACKUP_INVALID
+fi
+if [[ "$intent" != FORWARD ]]; then
+  verify_state_backup_references "$target_file" || fail DEPLOY_V5_EXISTING_BACKUP_INVALID
+fi
+
+backup_path='none'
+backup_checksum='none'
+create_database_backup() {
+  local temporary desired sealed_checksum
+  desired="$(date -u +%Y%m%dT%H%M%SZ)-$target_commit.sqlite"
+  temporary="$("$RUNTIME_HELPER" reserve-backup-temp "$BACKUP_ROOT" "$candidate_registry" "$RUN_ROOT" "$ROOT_UID" "$ROOT_GID" 2>/dev/null)" || return 1
+  [[ "$temporary" == "$BACKUP_ROOT"/.backup-v5.* ]] || return 1
+  if ! python3 - "$DATABASE" "$temporary" 2>/dev/null <<'PY'
+import sqlite3, sys
+with sqlite3.connect('file:' + sys.argv[1] + '?mode=ro', uri=True) as source, sqlite3.connect(sys.argv[2]) as target:
+    source.backup(target)
+    if target.execute('PRAGMA quick_check').fetchone()[0] != 'ok': raise SystemExit(1)
+PY
+  then
+    return 1
+  fi
+  sealed_checksum="$("$RUNTIME_HELPER" seal-backup-temp "$BACKUP_ROOT" "$temporary" "$candidate_registry" "$RUN_ROOT" "$ROOT_UID" "$ROOT_GID" 2>/dev/null)" || return 1
+  [[ "$sealed_checksum" =~ ^[0-9a-f]{64}$ ]] || return 1
+  backup_path="$("$RUNTIME_HELPER" commit-backup "$BACKUP_ROOT" "$temporary" "$desired" "$ROOT_UID" "$ROOT_GID" "$candidate_registry" "$RUN_ROOT" 2>/dev/null)" || return 1
+  backup_checksum="$(sha256sum "$backup_path" 2>/dev/null | awk '{print $1}')" || return 1
+  [[ "$backup_checksum" =~ ^[0-9a-f]{64}$ ]] || return 1
+  verify_backup_file "$backup_path" "$backup_checksum"
+}
+
+if [[ "$intent" != RESTORE ]]; then create_database_backup || fail DEPLOY_V5_DATABASE_BACKUP_FAILED; fi
+
+compose_up() {
+  local profile service
+  if [[ "$ifind_mode" == diagnostic ]]; then profile=ifind-diagnostic; service=kinvest-diagnostic; else profile=ifind-disabled; service=kinvest-disabled; fi
+  (
+    export COMPOSE_PROFILES="$profile" KINVEST_IMAGE="$runtime_image_id"
+    export KINVEST_SECRET_PROVIDER_MODE="$provider" KINVEST_SECRET_VERSION_IDS="$versions"
+    export KINVEST_SECRET_BUNDLE_HOST_PATH="$candidate_access_path"
+    export KINVEST_ACCESS_CONTROL_MODE="$access_mode" KINVEST_TRUSTED_PROXY_ADDRESSES='["172.19.0.2"]'
+    export KINVEST_IFIND_REFRESH_TOKEN_VERSION_ID="$ifind_version"
+    export KINVEST_IFIND_SECRET_BUNDLE_HOST_PATH="$candidate_ifind_path"
+    run_docker compose -f "$COMPOSE" --env-file "$NETWORK_CONFIG" up -d --remove-orphans "$service"
+  )
+}
+
+secure_temp candidate_state "$RUN_ROOT/kinvest-v5.state.XXXXXX" || fail DEPLOY_V5_STATE_WRITE_FAILED
+if ! python3 - "$target_file" "$prepared_file" "$current_json" "$runtime_image_id" "$schema_before" "$schema_min" "$schema_max" "$candidate_access_id" "$candidate_ifind_id" "$backup_path" "$backup_checksum" >"$candidate_state" 2>/dev/null <<'PY'
+import datetime, json, sys
+target_path, request_path, current_path, image_id, schema, minimum, maximum, access_id, ifind_id, backup, checksum = sys.argv[1:]
+with open(target_path) as stream: target = json.load(stream)
+with open(request_path) as stream: request = json.load(stream)
+with open(current_path) as stream: current = json.load(stream)
+state = dict(target) if 'protocolVersion' in target else {}
+identity = state if state else request
+proxy_source = state if state else current
+backup_value = state['databaseBackupPath'] if request['intent'] == 'RESTORE' else backup
+checksum_value = state['databaseBackupChecksum'] if request['intent'] == 'RESTORE' else checksum
+state.update({
+  'protocolVersion': 6, 'imageDigest': identity['imageDigest'],
+  'runtimeImageId': image_id, 'commit': identity['commit'],
+  'schemaVersion': int(schema), 'imageSchemaMin': int(minimum), 'imageSchemaMax': int(maximum),
+  'secretProviderMode': request['secretProviderMode'], 'secretVersionIds': request['secretVersionIds'],
+  'secretBundleId': access_id, 'secretMaterialFingerprints': request['secretMaterialFingerprints'],
+  'accessControlMode': request['accessControlMode'], 'imageAccessControlContract': 1,
+  'trustedProxyAddresses': proxy_source['trustedProxyAddresses'] if request['accessControlMode'] == 'device-approval' else [],
+  'trustedProxyConfigChecksum': proxy_source['trustedProxyConfigChecksum'] if request['accessControlMode'] == 'device-approval' else '',
+  'ifindDiagnosticMode': request['ifindDiagnosticMode'],
+  'ifindRefreshTokenVersionId': request['ifindRefreshTokenVersionId'],
+  'ifindSecretBundleId': ifind_id,
+  'ifindSecretMaterialFingerprint': request['ifindSecretMaterialFingerprint'],
+  'releaseRecordSchemaVersion': identity['releaseRecordSchemaVersion'],
+  'verificationRunId': identity['verificationRunId'], 'artifactSource': identity['artifactSource'],
+  'databaseBackupPath': backup_value, 'databaseBackupChecksum': checksum_value,
+  'deployedAt': datetime.datetime.now(datetime.timezone.utc).strftime('%Y-%m-%dT%H:%M:%SZ')
+})
+print(json.dumps(state, separators=(',', ':'), sort_keys=True))
+PY
+then
+  fail DEPLOY_V5_STATE_WRITE_FAILED
+fi
+secure_temp candidate_state_text "$RUN_ROOT/kinvest-v5.state-text.XXXXXX" || fail DEPLOY_V5_STATE_WRITE_FAILED
+"$CONTRACT" canonical-state <"$candidate_state" >"$candidate_state_text" 2>/dev/null || fail DEPLOY_V5_STATE_WRITE_FAILED
+mv -- "$candidate_state_text" "$candidate_state" 2>/dev/null || fail DEPLOY_V5_STATE_WRITE_FAILED
+candidate_state_text=''
+
+if [[ -n "$reboot_restore_phase" ]]; then
+  run_stable_command DEPLOY_V5_COMPOSE_FAILED compose_up
+  for _ in $(seq 1 60); do
+    [[ "$(run_docker inspect --format '{{.State.Health.Status}}' kinvest 2>/dev/null || true)" == healthy ]] && break
+    sleep 2
+  done
+  [[ "$(run_docker inspect --format '{{.State.Health.Status}}' kinvest 2>/dev/null || true)" == healthy ]] || fail DEPLOY_V5_HEALTH_FAILED
+  [[ "$(run_docker inspect --format '{{.Image}}' kinvest 2>/dev/null)" == "$runtime_image_id" ]] || fail DEPLOY_V5_RUNTIME_IMAGE_MISMATCH
+  curl -fsS --max-time 15 "$PUBLIC_HEALTH_URL" >/dev/null 2>&1 || fail DEPLOY_V5_PUBLIC_HEALTH_FAILED
+  atomic_state_from_text "$candidate_state" "$CURRENT_STATE" current || fail DEPLOY_V5_STATE_WRITE_FAILED
+  if [[ "$reboot_restore_phase" == state-committed && "$journal_intent" != RESTORE ]]; then
+    atomic_state_from_text "$BEFORE_STATE" "$PREVIOUS_STATE" previous || fail DEPLOY_V5_STATE_WRITE_FAILED
+  fi
+  # REBOOT_RESTORE_WINDOW_BEFORE_REGISTRY_RELEASE
+  "$RUNTIME_HELPER" release-registry "$candidate_registry" "$RUN_ROOT" "$STATE_ROOT" "$BACKUP_ROOT" "$ROOT_UID" "$ROOT_GID" >/dev/null 2>&1 || fail DEPLOY_V5_CANDIDATE_REGISTRY_FAILED
+  # REBOOT_RESTORE_WINDOW_AFTER_REGISTRY_RELEASE_BEFORE_CLEAR
+  candidate_registry=''
+  # REBOOT_RESTORE_WINDOW_AFTER_REGISTRY_CLEAR
+  candidate_keep='true'
+  # REBOOT_RESTORE_WINDOW_BEFORE_JOURNAL_DELETE
+  durable_state_delete "${ATTEMPT_STATE##*/}" "${JOURNAL##*/}" "${BEFORE_STATE##*/}" || fail DEPLOY_V5_JOURNAL_CLEANUP_FAILED
+  # REBOOT_RESTORE_WINDOW_AFTER_JOURNAL_DELETE
+  prune_access_bundles || fail DEPLOY_V5_CLEANUP_PENDING 71
+  prune_ifind_bundles || fail DEPLOY_V5_CLEANUP_PENDING 71
+  printf 'KINVEST_DEPLOY_V5_OK intent=RESTORE commit=%s ifind=%s\n' "$target_commit" "$ifind_mode"
+  exit 0
+fi
+
+atomic_state_from_json "$current_json" "$BEFORE_STATE" before || fail DEPLOY_V5_STATE_WRITE_FAILED
+# REGISTRY_WINDOW_BEFORE_PREPARED_JOURNAL
+write_journal prepared || fail DEPLOY_V5_STATE_WRITE_FAILED
+# REGISTRY_WINDOW_AFTER_PREPARED_BEFORE_DELETE
+"$RUNTIME_HELPER" release-registry "$candidate_registry" "$RUN_ROOT" "$STATE_ROOT" "$BACKUP_ROOT" "$ROOT_UID" "$ROOT_GID" >/dev/null 2>&1 || fail DEPLOY_V5_CANDIDATE_REGISTRY_FAILED
+candidate_registry=''
+atomic_state_from_text "$candidate_state" "$ATTEMPT_STATE" attempt || fail DEPLOY_V5_STATE_WRITE_FAILED
+transaction_started='true'
+# TRANSACTION_WINDOW_BEFORE_COMPOSE
+write_journal compose-active || fail DEPLOY_V5_STATE_WRITE_FAILED
+run_stable_command DEPLOY_V5_COMPOSE_FAILED compose_up
+# TRANSACTION_WINDOW_AFTER_COMPOSE_BEFORE_CURRENT
+
+for _ in $(seq 1 60); do
+  [[ "$(run_docker inspect --format '{{.State.Health.Status}}' kinvest 2>/dev/null || true)" == healthy ]] && break
+  sleep 2
+done
+[[ "$(run_docker inspect --format '{{.State.Health.Status}}' kinvest 2>/dev/null || true)" == healthy ]] || fail DEPLOY_V5_HEALTH_FAILED
+[[ "$(run_docker inspect --format '{{.Image}}' kinvest 2>/dev/null)" == "$runtime_image_id" ]] || fail DEPLOY_V5_RUNTIME_IMAGE_MISMATCH
+curl -fsS --max-time 15 "$PUBLIC_HEALTH_URL" >/dev/null 2>&1 || fail DEPLOY_V5_PUBLIC_HEALTH_FAILED
+
+atomic_state_from_text "$candidate_state" "$CURRENT_STATE" current || fail DEPLOY_V5_STATE_WRITE_FAILED
+write_journal state-committed || fail DEPLOY_V5_STATE_WRITE_FAILED
+# TRANSACTION_WINDOW_AFTER_CURRENT_BEFORE_KEEP
+if [[ "$intent" != RESTORE ]]; then
+  atomic_state_from_text "$BEFORE_STATE" "$PREVIOUS_STATE" previous || fail DEPLOY_V5_STATE_WRITE_FAILED
+fi
+durable_state_delete "${ATTEMPT_STATE##*/}" || fail DEPLOY_V5_JOURNAL_CLEANUP_FAILED
+prune_access_bundles || fail DEPLOY_V5_CLEANUP_PENDING 71
+prune_ifind_bundles || fail DEPLOY_V5_CLEANUP_PENDING 71
+candidate_keep='true'
+durable_state_delete "${JOURNAL##*/}" "${BEFORE_STATE##*/}" || fail DEPLOY_V5_JOURNAL_CLEANUP_FAILED
+printf 'KINVEST_DEPLOY_V5_OK intent=%s commit=%s ifind=%s\n' "$intent" "$target_commit" "$ifind_mode"

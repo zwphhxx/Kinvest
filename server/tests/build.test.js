@@ -59,6 +59,7 @@ async function runBuildArtifactsExist() {
     'server/http/auth-http.js',
     'server/http/trusted-client.js',
     'server/ifind-diagnostic-runtime.js',
+    'server/ifind-secret-preflight.js',
     'server/pre-listen-preparation.js',
     'server/secret-preflight.js',
     'server/security/access-control-runtime.js',
