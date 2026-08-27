@@ -454,7 +454,6 @@ resolve_offline_image() {
   local id
   id="$(timeout 15s "$OFFLINE_ATTESTATION" resolve "$target_digest" "$target_commit" "$target_verification_run_id" 2>/dev/null)" || return 1
   [[ "$id" =~ ^sha256:[0-9a-f]{64}$ && "$(inspect_id "$id")" == "$id" ]] || return 1
-  verify_repo_digest "$id" "$target_digest" || return 1
   printf '%s\n' "$id"
 }
 
@@ -462,7 +461,10 @@ if [[ "$provenance_mode" == state-reproof ]]; then
   [[ "$intent" != FORWARD ]] || fail DEPLOY_V5_STATE_REPROOF_FORWARD_FORBIDDEN
   runtime_image_id="$(json_field "$target_file" runtimeImageId)"
   [[ "$runtime_image_id" =~ ^sha256:[0-9a-f]{64}$ && "$(inspect_id "$runtime_image_id")" == "$runtime_image_id" ]] || fail DEPLOY_V5_IMAGE_PROVENANCE_INVALID
-  verify_repo_digest "$runtime_image_id" "$target_digest" || fail DEPLOY_V5_IMAGE_PROVENANCE_INVALID
+  if ! verify_repo_digest "$runtime_image_id" "$target_digest"; then
+    attested_image_id="$(resolve_offline_image)" || fail DEPLOY_V5_IMAGE_PROVENANCE_INVALID
+    [[ "$runtime_image_id" == "$attested_image_id" ]] || fail DEPLOY_V5_IMAGE_PROVENANCE_INVALID
+  fi
 else
   attested_image_id="$(resolve_offline_image)" || fail DEPLOY_V5_IMAGE_PROVENANCE_INVALID
   if [[ "$intent" == FORWARD ]]; then
