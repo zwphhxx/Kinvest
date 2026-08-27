@@ -262,8 +262,9 @@ with tempfile.TemporaryDirectory() as temporary:
     else: raise AssertionError('malformed state accepted')
     assert {item.name: item.read_bytes() for item in backup_root.iterdir()} == protected
 
+    wrong_checksum = '0' * 64
     (state_root / 'previous.state').write_text(
-        f'databaseBackupPath={historical}\ndatabaseBackupChecksum={'0' * 64}\n'
+        f'databaseBackupPath={historical}\ndatabaseBackupChecksum={wrong_checksum}\n'
     )
     try: module.recover_orphan_backups(str(backup_root), str(state_root), uid, gid)
     except module.RuntimeErrorCode: pass
