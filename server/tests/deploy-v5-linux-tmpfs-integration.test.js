@@ -23,7 +23,7 @@ function waitForFile(file, child, getStderrText, timeoutMs = 5000) {
         resolve()
       } else if (child.exitCode !== null) {
         clearInterval(timer)
-        reject(new Error(`fault-barrier child exited early: ${getStderrText()}`))
+        reject(new Error(`fault-barrier child exited early at ${path.basename(file)}: ${getStderrText()}`))
       } else if (Date.now() > deadline) {
         clearInterval(timer)
         reject(new Error(`fault barrier timeout: ${path.basename(file)}`))
@@ -188,14 +188,23 @@ async function run() {
     }
 
     const source = path.join(root, 'state-source')
-    fs.writeFileSync(source, 'durable-state\n', { mode: 0o600 })
-    for (const [name, point, signal] of [
-      ['deploy-v5.journal', 'journal-after-rename', 'SIGTERM'],
-      ['current.state', 'current-after-rename', 'SIGKILL']
+    const journalPayload = JSON.stringify({
+      candidateAccessId: 'none',
+      candidateIfindId: 'none',
+      intent: 'FORWARD',
+      pendingBackupChecksum: 'none',
+      pendingBackupPath: 'none',
+      phase: 'prepared',
+      version: 2
+    }) + '\n'
+    for (const [name, point, signal, payload] of [
+      ['deploy-v5.journal', 'journal-after-rename', 'SIGTERM', journalPayload],
+      ['current.state', 'current-after-rename', 'SIGKILL', 'durable-state\n']
     ]) {
+      fs.writeFileSync(source, payload, { mode: 0o600 })
       await killAtBarrier(['state-write', stateRoot, name, source, uid, gid],
         barrierRoot, point, signal)
-      assert.equal(fs.readFileSync(path.join(stateRoot, name), 'utf8'), 'durable-state\n')
+      assert.equal(fs.readFileSync(path.join(stateRoot, name), 'utf8'), payload)
       const retry = runHelper(['state-write', stateRoot, name, source, uid, gid])
       assert.equal(retry.status, 0, retry.stderr)
     }
