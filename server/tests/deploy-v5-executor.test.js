@@ -587,6 +587,7 @@ exit 127
 `)
   writeExecutable(path.join(libexec, 'attestation'), `#!/bin/sh
 printf 'attestation %s\n' "$*" >>'${operations}'
+[ "\${FAKE_ATTESTATION_FAILURE:-}" = 1 ] && exit 1
 printf '%s\n' "\${FAKE_ATTESTATION_ID:-${IMAGE_ID}}"
 `)
   writeExecutable(path.join(bin, 'docker'), `#!/usr/bin/env bash
@@ -599,12 +600,12 @@ if [[ "$command" == image && "$1" == inspect ]]; then
   ref="$2"; format="$4"
   if [[ "$ref" == '${CURRENT_ID}' || "$ref" == '${CURRENT_DIGEST}' ]]; then id='${CURRENT_ID}'; digest='${CURRENT_DIGEST}'; else id='${IMAGE_ID}'; digest='${DIGEST}'; fi
   case "$format" in
-    *RepoDigests*) printf '["%s"]\n' "$digest" ;;
+    *RepoDigests*) if [[ "\${FAKE_REPO_DIGESTS_EMPTY:-}" == 1 ]]; then printf '[]\n'; else printf '["%s"]\n' "$digest"; fi ;;
     *io.kinvest.schema.min*) echo "\${FAKE_SCHEMA_MIN:-0}" ;;
     *io.kinvest.schema.max*) echo "\${FAKE_SCHEMA_MAX:-0}" ;;
     *io.kinvest.access-control.contract*) echo 1 ;;
     *io.kinvest.ifind-secret-bootstrap*) echo "\${FAKE_IFIND_LABEL:-1}" ;;
-    *) echo "$id" ;;
+    *) echo "\${FAKE_INSPECT_ID:-$id}" ;;
   esac
 elif [[ "$command" == run ]]; then
   [[ " $* " == *' --network none '* && " $* " == *' --read-only '* && " $* " == *' --cap-drop ALL '* && " $* " == *' --user 10001:10001 '* ]] || exit 64
@@ -1124,16 +1125,31 @@ module.materialize(sys.argv[2], sys.argv[3], sys.argv[4], sys.argv[5],
     } finally { cleanupHarness(invalidRoot) }
   }
 
-  const provenance = makeHarness()
+  const unavailableAttestedImage = makeHarness()
   try {
-    const result = spawnSync(provenance.executor, [], {
+    const result = spawnSync(unavailableAttestedImage.executor, [], {
       encoding: 'utf8', input: diagnosticPayload(),
-      env: { ...process.env, PATH: `${provenance.bin}:${process.env.PATH}`, FAKE_ATTESTATION_ID: CURRENT_ID }
+      env: {
+        ...process.env, PATH: `${unavailableAttestedImage.bin}:${process.env.PATH}`,
+        FAKE_INSPECT_ID: CURRENT_ID, FAKE_REPO_DIGESTS_EMPTY: '1'
+      }
     })
     assert.notEqual(result.status, 0)
     assert.equal(result.stderr, 'DEPLOY_V5_IMAGE_PROVENANCE_INVALID\n')
-    assert.match(fs.readFileSync(provenance.operations, 'utf8'), /attestation resolve/)
-  } finally { cleanupHarness(provenance) }
+    const operations = fs.readFileSync(unavailableAttestedImage.operations, 'utf8')
+    assert.match(operations, new RegExp(`attestation resolve ${DIGEST} ${COMMIT} 123`))
+    assert.doesNotMatch(operations, /docker compose/)
+  } finally { cleanupHarness(unavailableAttestedImage) }
+
+  const offlineWithoutRepoDigest = makeHarness()
+  try {
+    const result = spawnSync(offlineWithoutRepoDigest.executor, [], {
+      encoding: 'utf8', input: diagnosticPayload(),
+      env: { ...process.env, PATH: `${offlineWithoutRepoDigest.bin}:${process.env.PATH}`, FAKE_REPO_DIGESTS_EMPTY: '1' }
+    })
+    assert.equal(result.status, 0, result.stderr)
+    assert.match(fs.readFileSync(offlineWithoutRepoDigest.operations, 'utf8'), new RegExp(`attestation resolve ${DIGEST} ${COMMIT} 123`))
+  } finally { cleanupHarness(offlineWithoutRepoDigest) }
 
   const leaked = makeHarness()
   try {
@@ -1333,6 +1349,64 @@ module.materialize(sys.argv[2], sys.argv[3], sys.argv[4], sys.argv[5],
     ifindDiagnosticMode: 'diagnostic', ifindRefreshTokenVersionId: 'v20260826-001',
     ifindSecretBundleId: '4'.repeat(32), ifindSecretMaterialFingerprint: crypto.createHash('sha256').update(TOKEN).digest('hex')
   })
+
+  const stateReproofWithoutRepoDigest = makeHarness({ currentStateOverrides: deployedState, currentBackup: 'valid' })
+  try {
+    const result = spawnSync(stateReproofWithoutRepoDigest.executor, [], {
+      encoding: 'utf8', input: intentPayload('RESTORE', DIGEST, COMMIT, '123', 'diagnostic', 'state-reproof'),
+      env: {
+        ...process.env, PATH: `${stateReproofWithoutRepoDigest.bin}:${process.env.PATH}`,
+        FAKE_ATTESTATION_ID: IMAGE_ID, FAKE_REPO_DIGESTS_EMPTY: '1'
+      }
+    })
+    assert.equal(result.status, 0, result.stderr)
+    assert.match(fs.readFileSync(stateReproofWithoutRepoDigest.operations, 'utf8'),
+      new RegExp(`attestation resolve ${DIGEST} ${COMMIT} 123`))
+  } finally { cleanupHarness(stateReproofWithoutRepoDigest) }
+
+  const stateReproofImageMismatch = makeHarness({ currentStateOverrides: deployedState, currentBackup: 'valid' })
+  try {
+    const stateBefore = fs.readFileSync(path.join(stateReproofImageMismatch.root, 'state/current.state'), 'utf8')
+    const result = spawnSync(stateReproofImageMismatch.executor, [], {
+      encoding: 'utf8', input: intentPayload('RESTORE', DIGEST, COMMIT, '123', 'diagnostic', 'state-reproof'),
+      env: {
+        ...process.env, PATH: `${stateReproofImageMismatch.bin}:${process.env.PATH}`,
+        FAKE_ATTESTATION_ID: CURRENT_ID, FAKE_REPO_DIGESTS_EMPTY: '1'
+      }
+    })
+    assert.notEqual(result.status, 0)
+    assert.equal(result.stderr, 'DEPLOY_V5_IMAGE_PROVENANCE_INVALID\n')
+    assert.equal(fs.readFileSync(path.join(stateReproofImageMismatch.root, 'state/current.state'), 'utf8'), stateBefore)
+    assert.doesNotMatch(fs.readFileSync(stateReproofImageMismatch.operations, 'utf8'), /docker compose/)
+  } finally { cleanupHarness(stateReproofImageMismatch) }
+
+  const stateReproofAttestationFailure = makeHarness({ currentStateOverrides: deployedState, currentBackup: 'valid' })
+  try {
+    const result = spawnSync(stateReproofAttestationFailure.executor, [], {
+      encoding: 'utf8', input: intentPayload('RESTORE', DIGEST, COMMIT, '123', 'diagnostic', 'state-reproof'),
+      env: {
+        ...process.env, PATH: `${stateReproofAttestationFailure.bin}:${process.env.PATH}`,
+        FAKE_ATTESTATION_FAILURE: '1', FAKE_REPO_DIGESTS_EMPTY: '1'
+      }
+    })
+    assert.notEqual(result.status, 0)
+    assert.equal(result.stderr, 'DEPLOY_V5_IMAGE_PROVENANCE_INVALID\n')
+    assert.doesNotMatch(fs.readFileSync(stateReproofAttestationFailure.operations, 'utf8'), /docker compose/)
+  } finally { cleanupHarness(stateReproofAttestationFailure) }
+
+  const stateReproofRepoDigest = makeHarness({ currentStateOverrides: deployedState, currentBackup: 'valid' })
+  try {
+    const result = spawnSync(stateReproofRepoDigest.executor, [], {
+      encoding: 'utf8', input: intentPayload('RESTORE', DIGEST, COMMIT, '123', 'diagnostic', 'state-reproof'),
+      env: {
+        ...process.env, PATH: `${stateReproofRepoDigest.bin}:${process.env.PATH}`,
+        FAKE_ATTESTATION_FAILURE: '1'
+      }
+    })
+    assert.equal(result.status, 0, result.stderr)
+    assert.doesNotMatch(fs.readFileSync(stateReproofRepoDigest.operations, 'utf8'), /attestation resolve/)
+  } finally { cleanupHarness(stateReproofRepoDigest) }
+
   const rollback = makeHarness({ currentStateOverrides: deployedState, previousState: currentState() })
   try {
     const result = spawnSync(rollback.executor, [], {
