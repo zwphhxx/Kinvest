@@ -404,7 +404,10 @@ jobs:
               ifind_version="$TMPFS_IFIND_REFRESH_TOKEN_VERSION_ID"
               ifind_material="$secret_ifind_material"
               [[ "$ifind_version" =~ ^v[0-9]{8}-[0-9]{3}$ ]]
-              [[ "$ifind_material" =~ ^[A-Za-z0-9._~-]{16,4096}$ ]]
+              if (( ${#ifind_material} < 16 || ${#ifind_material} > 4096 )); then
+                printf '%s\n' DEPLOY_V5_IFIND_MATERIAL_INVALID >&2
+                exit 1
+              fi
               ;;
             *) exit 1 ;;
           esac
@@ -665,7 +668,10 @@ jobs:
               ifind_version="$TMPFS_IFIND_REFRESH_TOKEN_VERSION_ID"
               ifind_material="$secret_ifind_material"
               [[ "$ifind_version" =~ ^v[0-9]{8}-[0-9]{3}$ ]]
-              [[ "$ifind_material" =~ ^[A-Za-z0-9._~-]{16,4096}$ ]]
+              if (( ${#ifind_material} < 16 || ${#ifind_material} > 4096 )); then
+                printf '%s\n' DEPLOY_V5_IFIND_MATERIAL_INVALID >&2
+                exit 1
+              fi
               ;;
             *) exit 1 ;;
           esac

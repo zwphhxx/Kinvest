@@ -235,13 +235,15 @@ async function run() {
     fs.writeFileSync(githubEnv, '')
     fs.writeFileSync(path.join(bin, 'ssh'), '#!/bin/sh\nprintf \'%s\\n\' "$@" >"$ARGS_FILE"\n/usr/bin/env >"$ENV_FILE"\ncat >"$PAYLOAD_FILE"\n', { mode: 0o755 })
     const secret = secretMaterial()
-    const ifind = 'synthetic-ifind-refresh-token-1234567890'
+    const ifind = 'SyntheticIfindRefreshToken0123456789+/=='
     const diagnosticStep = 'Deploy diagnostic payload with deploy-v5 stdin'
     const disabledStep = 'Deploy disabled payload with deploy-v5 stdin'
     assert.doesNotMatch(stepSection(disabledStep), /secrets\.KINVEST_IFIND_REFRESH_TOKEN/)
     assert.match(stepSection(diagnosticStep), /secrets\.KINVEST_IFIND_REFRESH_TOKEN/)
     assert.match(stepScript(disabledStep), /set \+x/)
     assert.match(stepScript(diagnosticStep), /set \+x/)
+    assert.match(stepScript(diagnosticStep), /DEPLOY_V5_IFIND_MATERIAL_INVALID/)
+    assert.doesNotMatch(stepScript(diagnosticStep), /A-Za-z0-9\._~-/)
 
     const result = spawnSync('bash', ['-c', stepScript(diagnosticStep)], {
       cwd: rootDir,

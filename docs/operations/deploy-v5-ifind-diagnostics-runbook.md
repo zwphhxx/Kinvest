@@ -51,6 +51,8 @@ release-record artifact 可能在 30 天后过期或因 GitHub 暂时不可用�
 
 绝不在聊天、仓库、Issue、PR、普通文件、`.env`、终端历史、命令参数、截图或日志中粘贴 refresh token。不得以长期腾讯云 `SecretId`/`SecretKey`、CAM/SSM、Docker 环境变量或持久磁盘文件作为替代路线。
 
+refresh token 是不透明的 HTTP Header 值。部署链允许长度 16 至 4096 的可见 ASCII，并由 canonical deploy-v5 contract 拒绝空白、换行、控制字符和非 ASCII；不得删除合法的标准 Base64 字符 `+`、`/`、`=` 来迁就前置校验。
+
 ## 2. 权限和暂停矩阵
 
 | 操作 | Agent 可直接完成 | 必须由用户明确批准或本人执行 |
