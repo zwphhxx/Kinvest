@@ -24,18 +24,18 @@ TRUSTED_SOURCE_DIR=''
 SOURCE_EXPECTED_UID='0'
 STAGING_ROOT_OWNER='0:0'
 GATE_EXPECTED_HASH='366f860645396e26178fecb9f91179182df5cc2282f593c0d3dd576b11589c9e'
-MANIFEST_EXPECTED_HASH='155ef38b3c5bc4776c187910ac1a8ad8c5c41b8acf6d124b77297e573ccac55a'
+MANIFEST_EXPECTED_HASH='bd612586042fc6f5957c6ece6b09f0245660de86c36018ab944b07d7c02353a5'
 SOURCE_ASSETS=('deploy-kinvest-v5' 'deploy-v5-runtime.py' 'deploy-v5-contract.py' 'docker-compose-v5.yml' 'kinvest-deploy-v5.sudoers.in' 'deploy-v5-assets.sha256' 'deploy-kinvest-v3.sh' 'deploy-v3-contract.py' 'docker-compose-v3.yml' 'offline-image-attestation.py' 'kinvest-ssh-command-v3')
 TARGETS=("$LOCAL_SBIN/deploy-kinvest-v5" "$LOCAL_LIBEXEC/kinvest-deploy-v5-runtime" "$LOCAL_LIBEXEC/kinvest-deploy-v5-contract" "$SERVER_ROOT/docker-compose-v5.yml" "$SUDOERS_DIR/kinvest-deploy-v5" "$SERVER_ROOT/deploy-v5-assets.sha256" "$LOCAL_SBIN/deploy-kinvest-v3" "$LOCAL_LIBEXEC/kinvest-deploy-v3-contract" "$SERVER_ROOT/docker-compose-v3.yml" "$LOCAL_LIBEXEC/kinvest-offline-image-attestation" "$GATE_TARGET")
 TARGET_KEYS=('deploy-kinvest-v5' 'kinvest-deploy-v5-runtime' 'kinvest-deploy-v5-contract' 'docker-compose-v5.yml' 'kinvest-deploy-v5.sudoers' 'deploy-v5-assets.sha256' 'deploy-kinvest-v3' 'kinvest-deploy-v3-contract' 'docker-compose-v3.yml' 'kinvest-offline-image-attestation' 'kinvest-ssh-command')
 MODES=('0755' '0755' '0755' '0644' '0440' '0600' '0755' '0755' '0644' '0755' '0755')
 EXPECTED_ASSET_HASHES=(
-  'ce644c622e475f0f87da1c6a004c12ff05cd0095cc486f8e3c1ddcc9b6da62b3'
+  '65f813123ff8fe8d0cd8a24084314d8ce7caf63cb64d155e5a04522ff01ae0db'
   'b351d476f3a040389e1e911802867eaa9be1f1dfe42bef4175f7ff24bfc76b44'
   '33f2b2896e4bba86e9ca967f461deb8de1294cb2997f08ca95b7dc1dec134915'
-  '0361b0f848bd9a5ba0a019e64932c1049ad417678b71c6c25582659447e57809'
+  '6ea9843cb5befe1d9974544abde2d352e1130e40691c60b432f95a6129c3df8d'
   '5166b3a77f2a2e8579e493cd0c477302ad362dcdb13c265cd1a8b5c9eb1c409f'
-  '155ef38b3c5bc4776c187910ac1a8ad8c5c41b8acf6d124b77297e573ccac55a'
+  'bd612586042fc6f5957c6ece6b09f0245660de86c36018ab944b07d7c02353a5'
   '3bb3abdfee9b33cd9bd703730c3eb4fc7c1a25d3b6dc3e1ae00e2a775dd36bb1'
   '68040b9177cc8d2bb929a351e289eee7e9c6e446fda447ceec12d9ad382afe23'
   '7698dd619fb6a441763f85e4e35c819af55e431c6d0ac9c4b527930d07a644aa'

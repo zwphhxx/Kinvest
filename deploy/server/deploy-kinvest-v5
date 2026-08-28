@@ -15,7 +15,6 @@ STATE_ROOT="$ROOT/state"
 BACKUP_ROOT="$ROOT/backups"
 ACCESS_BUNDLE_ROOT="$RUN_ROOT/kinvest-secrets"
 IFIND_BUNDLE_ROOT="$RUN_ROOT/kinvest-ifind-secrets"
-DISABLED_IFIND_COMPOSE_VERSION='v19700101-000'
 CURRENT_STATE="$STATE_ROOT/current.state"
 PREVIOUS_STATE="$STATE_ROOT/previous.state"
 ATTEMPT_STATE="$STATE_ROOT/attempt.state"
@@ -53,6 +52,7 @@ trap 'bootstrap_cleanup; exit 143' TERM
 [[ -x "$CONTRACT" && -x "$RUNTIME_HELPER" && -x "$OFFLINE_ATTESTATION" && -f "$COMPOSE" && ! -L "$COMPOSE" ]] || fail DEPLOY_V5_ASSETS_MISSING
 [[ "$(findmnt -n -o FSTYPE --target "$RUN_ROOT" 2>/dev/null)" == tmpfs ]] || fail DEPLOY_V5_RUN_NOT_TMPFS
 bootstrap_command DEPLOY_V5_INITIALIZE_FAILED install -d -o root -g root -m 0700 -- "$STATE_ROOT" "$BACKUP_ROOT" "$ACCESS_BUNDLE_ROOT" "$IFIND_BUNDLE_ROOT"
+bootstrap_command DEPLOY_V5_INITIALIZE_FAILED install -d -o root -g 10001 -m 0550 -- "$IFIND_BUNDLE_ROOT/disabled"
 exec 9>"$STATE_ROOT/deploy.lock" 2>/dev/null || fail DEPLOY_V5_INITIALIZE_FAILED
 bootstrap_command DEPLOY_V5_LOCKED flock -n 9
 
@@ -71,6 +71,7 @@ candidate_registry=''
 candidate_keep='false'
 transaction_started='false'
 current_image=''
+current_runtime_image_id=''
 current_access_path=''
 current_ifind_path=''
 stable_output=''
@@ -79,6 +80,7 @@ candidate_state_text=''
 reboot_restore_phase=''
 journal_intent=''
 journal_handling_started='false'
+legacy_container_id=''
 
 safe_runtime_file() { [[ -n "${1:-}" && "$1" == "$RUN_ROOT"/kinvest-v5.* ]]; }
 
@@ -161,7 +163,51 @@ prune_access_bundles() { prune_bundle_root "$ACCESS_BUNDLE_ROOT" "$(collect_refe
 prune_ifind_bundles() { prune_bundle_root "$IFIND_BUNDLE_ROOT" "$(collect_referenced_bundle_ids ifindSecretBundleId)"; }
 
 resolve_compose_ifind_version() {
-  if [[ "$1" == diagnostic ]]; then printf '%s\n' "$2"; else printf '%s\n' "$DISABLED_IFIND_COMPOSE_VERSION"; fi
+  case "$1" in
+    diagnostic) printf '%s\n' "$2" ;;
+    disabled) printf '\n' ;;
+    *) return 1 ;;
+  esac
+}
+
+resolve_compose_ifind_mode() {
+  case "$1" in
+    diagnostic) printf '%s\n' admin-diagnostic ;;
+    disabled) printf '%s\n' disabled ;;
+    *) return 1 ;;
+  esac
+}
+
+validate_compose_service_slot() {
+  local expected_image="$1" mode="${2:-strict}" container_id project service image
+  [[ "$mode" == strict || "$mode" == reconcile ]] || return 1
+  legacy_container_id=''
+  container_id="$(run_docker container inspect kinvest --format '{{.Id}}' 2>/dev/null)" || return 0
+  [[ "$container_id" =~ ^[0-9a-f]{64}$ ]] || return 1
+  project="$(run_docker container inspect kinvest --format '{{index .Config.Labels "com.docker.compose.project"}}' 2>/dev/null)" || return 1
+  service="$(run_docker container inspect kinvest --format '{{index .Config.Labels "com.docker.compose.service"}}' 2>/dev/null)" || return 1
+  image="$(run_docker container inspect kinvest --format '{{.Image}}' 2>/dev/null)" || return 1
+  [[ "$project" == kinvest ]] || return 1
+  case "$service" in
+    kinvest)
+      [[ "$mode" == reconcile || "$image" == "$expected_image" ]]
+      return $?
+      ;;
+    kinvest-disabled|kinvest-diagnostic)
+      [[ "$image" == "$expected_image" ]] || return 1
+      legacy_container_id="$container_id"
+      ;;
+    *) return 1 ;;
+  esac
+}
+
+migrate_compose_service_slot() {
+  local expected_image="$1" expected_id="$legacy_container_id"
+  [[ -n "$expected_id" ]] || return 0
+  validate_compose_service_slot "$expected_image" || return 1
+  [[ "$legacy_container_id" == "$expected_id" ]] || return 1
+  run_docker container rm -f "$expected_id" >/dev/null 2>&1 || return 1
+  legacy_container_id=''
 }
 
 atomic_state_from_json() {
@@ -208,7 +254,7 @@ write_journal() {
 }
 
 compose_state_file() {
-  local state_file="$1" parsed image provider_value versions_value access_id access_path access_value proxies_value ifind_value ifind_version_value ifind_compose_version ifind_id ifind_path profile service
+  local state_file="$1" parsed image provider_value versions_value access_id access_path access_value proxies_value ifind_value ifind_version_value ifind_compose_mode ifind_compose_version ifind_id ifind_path
   secure_temp parsed "$RUN_ROOT/kinvest-v5.compose-state.XXXXXX" || return 1
   "$CONTRACT" parse-state <"$state_file" >"$parsed" 2>/dev/null || { rm -f -- "$parsed"; return 1; }
   image="$(json_field "$parsed" runtimeImageId)" || { rm -f -- "$parsed"; return 1; }
@@ -221,20 +267,29 @@ compose_state_file() {
   ifind_version_value="$(json_field "$parsed" ifindRefreshTokenVersionId)" || { rm -f -- "$parsed"; return 1; }
   ifind_id="$(json_field "$parsed" ifindSecretBundleId)" || { rm -f -- "$parsed"; return 1; }
   rm -f -- "$parsed"
+  ifind_compose_mode="$(resolve_compose_ifind_mode "$ifind_value")" || return 1
   ifind_compose_version="$(resolve_compose_ifind_version "$ifind_value" "$ifind_version_value")" || return 1
   [[ "$access_id" == none ]] && access_path="$ACCESS_BUNDLE_ROOT/disabled" || access_path="$ACCESS_BUNDLE_ROOT/$access_id"
   if [[ "$ifind_value" == diagnostic ]]; then
-    profile=ifind-diagnostic; service=kinvest-diagnostic; ifind_path="$IFIND_BUNDLE_ROOT/$ifind_id"
+    ifind_path="$IFIND_BUNDLE_ROOT/$ifind_id"
   else
-    profile=ifind-disabled; service=kinvest-disabled; ifind_path=''
+    ifind_path="$IFIND_BUNDLE_ROOT/disabled"
   fi
   (
-    export COMPOSE_PROFILES="$profile" KINVEST_IMAGE="$image"
+    export KINVEST_IMAGE="$image"
     export KINVEST_SECRET_PROVIDER_MODE="$provider_value" KINVEST_SECRET_VERSION_IDS="$versions_value"
     export KINVEST_SECRET_BUNDLE_HOST_PATH="$access_path" KINVEST_ACCESS_CONTROL_MODE="$access_value"
     export KINVEST_TRUSTED_PROXY_ADDRESSES="$proxies_value"
-    export KINVEST_IFIND_REFRESH_TOKEN_VERSION_ID="$ifind_compose_version" KINVEST_IFIND_SECRET_BUNDLE_HOST_PATH="$ifind_path"
-    run_docker compose -f "$COMPOSE" --env-file "$NETWORK_CONFIG" up -d --remove-orphans "$service" >/dev/null 2>&1
+    export KINVEST_IFIND_DIAGNOSTIC_MODE="$ifind_compose_mode" KINVEST_IFIND_SECRET_BUNDLE_HOST_PATH="$ifind_path"
+    if [[ "$ifind_value" == diagnostic ]]; then
+      export KINVEST_IFIND_REFRESH_TOKEN_VERSION_ID="$ifind_compose_version"
+      export KINVEST_IFIND_SECRET_BUNDLE_PATH=/run/secrets/kinvest-ifind
+    else
+      unset KINVEST_IFIND_REFRESH_TOKEN_VERSION_ID KINVEST_IFIND_SECRET_BUNDLE_PATH
+    fi
+    validate_compose_service_slot "$image" reconcile || return 1
+    migrate_compose_service_slot "$image" || return 1
+    run_docker compose -f "$COMPOSE" --env-file "$NETWORK_CONFIG" up -d --remove-orphans kinvest >/dev/null 2>&1
   )
 }
 
@@ -391,7 +446,7 @@ if [[ "$candidate_access_id" == none ]]; then
   candidate_access_path="$ACCESS_BUNDLE_ROOT/disabled"
   run_stable_command DEPLOY_V5_INITIALIZE_FAILED install -d -o root -g 10001 -m 0550 -- "$candidate_access_path"
 fi
-if [[ "$candidate_ifind_id" == none ]]; then candidate_ifind_path=''; fi
+if [[ "$candidate_ifind_id" == none ]]; then candidate_ifind_path="$IFIND_BUNDLE_ROOT/disabled"; fi
 
 secure_temp current_json "$RUN_ROOT/kinvest-v5.current.XXXXXX" || fail DEPLOY_V5_STATE_READ_FAILED
 secure_temp previous_json "$RUN_ROOT/kinvest-v5.previous.XXXXXX" || fail DEPLOY_V5_STATE_READ_FAILED
@@ -514,6 +569,12 @@ run_ifind_preflight() {
 
 run_stable_command DEPLOY_V5_ACCESS_PREFLIGHT_FAILED run_access_preflight
 run_stable_command DEPLOY_V5_IFIND_PREFLIGHT_FAILED run_ifind_preflight
+current_runtime_image_id="$(json_field "$current_json" runtimeImageId)" || fail DEPLOY_V5_CURRENT_STATE_INVALID
+if [[ -n "$reboot_restore_phase" ]]; then
+  validate_compose_service_slot "$current_runtime_image_id" reconcile || fail DEPLOY_V5_LEGACY_MIGRATION_FAILED
+else
+  validate_compose_service_slot "$current_runtime_image_id" || fail DEPLOY_V5_LEGACY_MIGRATION_FAILED
+fi
 
 verify_backup_file() {
   "$RUNTIME_HELPER" verify-backup "$1" "$2" "$BACKUP_ROOT" "$ROOT_UID" "$ROOT_GID" >/dev/null 2>&1
@@ -564,17 +625,23 @@ PY
 if [[ "$intent" != RESTORE ]]; then create_database_backup || fail DEPLOY_V5_DATABASE_BACKUP_FAILED; fi
 
 compose_up() {
-  local profile service ifind_compose_version
-  if [[ "$ifind_mode" == diagnostic ]]; then profile=ifind-diagnostic; service=kinvest-diagnostic; else profile=ifind-disabled; service=kinvest-disabled; fi
+  local ifind_compose_mode ifind_compose_version
+  ifind_compose_mode="$(resolve_compose_ifind_mode "$ifind_mode")" || return 1
   ifind_compose_version="$(resolve_compose_ifind_version "$ifind_mode" "$ifind_version")" || return 1
   (
-    export COMPOSE_PROFILES="$profile" KINVEST_IMAGE="$runtime_image_id"
+    export KINVEST_IMAGE="$runtime_image_id"
     export KINVEST_SECRET_PROVIDER_MODE="$provider" KINVEST_SECRET_VERSION_IDS="$versions"
     export KINVEST_SECRET_BUNDLE_HOST_PATH="$candidate_access_path"
     export KINVEST_ACCESS_CONTROL_MODE="$access_mode" KINVEST_TRUSTED_PROXY_ADDRESSES='["172.19.0.2"]'
-    export KINVEST_IFIND_REFRESH_TOKEN_VERSION_ID="$ifind_compose_version"
+    export KINVEST_IFIND_DIAGNOSTIC_MODE="$ifind_compose_mode"
     export KINVEST_IFIND_SECRET_BUNDLE_HOST_PATH="$candidate_ifind_path"
-    run_docker compose -f "$COMPOSE" --env-file "$NETWORK_CONFIG" up -d --remove-orphans "$service"
+    if [[ "$ifind_mode" == diagnostic ]]; then
+      export KINVEST_IFIND_REFRESH_TOKEN_VERSION_ID="$ifind_compose_version"
+      export KINVEST_IFIND_SECRET_BUNDLE_PATH=/run/secrets/kinvest-ifind
+    else
+      unset KINVEST_IFIND_REFRESH_TOKEN_VERSION_ID KINVEST_IFIND_SECRET_BUNDLE_PATH
+    fi
+    run_docker compose -f "$COMPOSE" --env-file "$NETWORK_CONFIG" up -d --remove-orphans kinvest
   )
 }
 
@@ -656,6 +723,8 @@ atomic_state_from_text "$candidate_state" "$ATTEMPT_STATE" attempt || fail DEPLO
 transaction_started='true'
 # TRANSACTION_WINDOW_BEFORE_COMPOSE
 write_journal compose-active || fail DEPLOY_V5_STATE_WRITE_FAILED
+migrate_compose_service_slot "$current_runtime_image_id" || fail DEPLOY_V5_LEGACY_MIGRATION_FAILED
+# TRANSACTION_WINDOW_AFTER_LEGACY_REMOVAL_BEFORE_COMPOSE
 run_stable_command DEPLOY_V5_COMPOSE_FAILED compose_up
 # TRANSACTION_WINDOW_AFTER_COMPOSE_BEFORE_CURRENT
 

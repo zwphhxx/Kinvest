@@ -3,15 +3,18 @@ x-kinvest-common: &kinvest-common
   container_name: kinvest
   restart: unless-stopped
   user: "10001:10001"
-  environment: &kinvest-environment
-    TZ: ${TZ:-Asia/Shanghai}
-    PORT: "4173"
-    KINVEST_DB_PATH: /data/kinvest.sqlite
-    KINVEST_SECRET_PROVIDER_MODE: ${KINVEST_SECRET_PROVIDER_MODE:?set provider mode}
-    KINVEST_SECRET_VERSION_IDS: ${KINVEST_SECRET_VERSION_IDS:?set canonical VersionId JSON}
-    KINVEST_SECRET_BUNDLE_PATH: /run/secrets/kinvest
-    KINVEST_ACCESS_CONTROL_MODE: ${KINVEST_ACCESS_CONTROL_MODE:?set access control mode}
-    KINVEST_TRUSTED_PROXY_ADDRESSES: ${KINVEST_TRUSTED_PROXY_ADDRESSES:?set canonical trusted proxy JSON}
+  environment:
+    - "TZ=${TZ:-Asia/Shanghai}"
+    - PORT=4173
+    - KINVEST_DB_PATH=/data/kinvest.sqlite
+    - "KINVEST_SECRET_PROVIDER_MODE=${KINVEST_SECRET_PROVIDER_MODE:?set provider mode}"
+    - "KINVEST_SECRET_VERSION_IDS=${KINVEST_SECRET_VERSION_IDS:?set canonical VersionId JSON}"
+    - KINVEST_SECRET_BUNDLE_PATH=/run/secrets/kinvest
+    - "KINVEST_ACCESS_CONTROL_MODE=${KINVEST_ACCESS_CONTROL_MODE:?set access control mode}"
+    - "KINVEST_TRUSTED_PROXY_ADDRESSES=${KINVEST_TRUSTED_PROXY_ADDRESSES:?set canonical trusted proxy JSON}"
+    - KINVEST_IFIND_DIAGNOSTIC_MODE
+    - KINVEST_IFIND_REFRESH_TOKEN_VERSION_ID
+    - KINVEST_IFIND_SECRET_BUNDLE_PATH
   expose: ["4173"]
   networks:
     web: {}
@@ -29,31 +32,8 @@ x-kinvest-common: &kinvest-common
   cap_drop: ["ALL"]
 
 services:
-  kinvest-disabled:
+  kinvest:
     <<: *kinvest-common
-    profiles: ["ifind-disabled"]
-    environment:
-      <<: *kinvest-environment
-      KINVEST_IFIND_DIAGNOSTIC_MODE: disabled
-    volumes:
-      - type: bind
-        source: /root/docker/kinvest/data
-        target: /data
-        bind: { create_host_path: false }
-      - type: bind
-        source: ${KINVEST_SECRET_BUNDLE_HOST_PATH:?set access bundle host path}
-        target: /run/secrets/kinvest
-        read_only: true
-        bind: { create_host_path: false }
-
-  kinvest-diagnostic:
-    <<: *kinvest-common
-    profiles: ["ifind-diagnostic"]
-    environment:
-      <<: *kinvest-environment
-      KINVEST_IFIND_DIAGNOSTIC_MODE: admin-diagnostic
-      KINVEST_IFIND_REFRESH_TOKEN_VERSION_ID: ${KINVEST_IFIND_REFRESH_TOKEN_VERSION_ID:?set iFinD VersionId}
-      KINVEST_IFIND_SECRET_BUNDLE_PATH: /run/secrets/kinvest-ifind
     volumes:
       - type: bind
         source: /root/docker/kinvest/data
@@ -65,7 +45,7 @@ services:
         read_only: true
         bind: { create_host_path: false }
       - type: bind
-        source: ${KINVEST_IFIND_SECRET_BUNDLE_HOST_PATH:-/run/kinvest-ifind-secrets/not-mounted}
+        source: ${KINVEST_IFIND_SECRET_BUNDLE_HOST_PATH:?set iFinD bundle host path}
         target: /run/secrets/kinvest-ifind
         read_only: true
         bind: { create_host_path: false }
