@@ -477,6 +477,7 @@ function makeHarness(options = {}) {
   }
   fs.writeFileSync(path.join(root, 'state/current.state'), canonicalState(contract, stateValue))
   fs.chmodSync(path.join(root, 'state/current.state'), 0o600)
+  fs.writeFileSync(path.join(temp, 'container-state'), `kinvest ${stateValue.runtimeImageId}\n`)
   if (options.previousState) {
     fs.writeFileSync(path.join(root, 'state/previous.state'), canonicalState(contract, options.previousState))
     fs.chmodSync(path.join(root, 'state/previous.state'), 0o600)
@@ -501,9 +502,10 @@ function makeHarness(options = {}) {
     transformed = transformed.replace('set -euo pipefail', 'set -euo pipefail\nexport KINVEST_V5_TEST_ALLOW_NON_TMPFS=1')
   }
   if (options.signalWindow) {
+    const signalConsumed = path.join(temp, 'signal-consumed')
     transformed = transformed.replace(
       `# ${options.signalWindow}`,
-      () => `kill -${options.signalType || 'TERM'} $$  # ${options.signalWindow}`
+      () => `if [[ ! -e '${signalConsumed}' ]]; then : >'${signalConsumed}'; kill -${options.signalType || 'TERM'} $$; fi  # ${options.signalWindow}`
     )
   }
   const executor = path.join(temp, 'deploy-v5')
@@ -616,10 +618,45 @@ elif [[ "$command" == run ]]; then
     while [[ ! -e '${path.join(temp, 'process-release')}' ]]; do /bin/sleep 0.05; done
   fi
   exit 0
+elif [[ "$command" == container ]]; then
+  subcommand="$1"; shift
+  if [[ "$subcommand" == inspect ]]; then
+    [[ "\${FAKE_CONTAINER_ABSENT:-}" != 1 ]] || exit 1
+    state_service=''; state_image=''
+    if [[ -f '${path.join(temp, 'container-state')}' ]]; then
+      read -r state_service state_image <'${path.join(temp, 'container-state')}'
+      [[ "$state_service" != absent ]] || exit 1
+    fi
+    format="$3"
+    case "$format" in
+      *'{{.Id}}'*) printf '%s\n' "\${FAKE_CONTAINER_ID:-${'c'.repeat(64)}}" ;;
+      *com.docker.compose.project*) printf '%s\n' "\${FAKE_COMPOSE_PROJECT:-kinvest}" ;;
+      *com.docker.compose.service*) printf '%s\n' "\${FAKE_COMPOSE_SERVICE:-\${state_service:-kinvest}}" ;;
+      *'{{.Image}}'*)
+        if [[ -n "\${FAKE_CONTAINER_IMAGE:-}" ]]; then printf '%s\n' "$FAKE_CONTAINER_IMAGE"
+        elif [[ -n "$state_image" ]]; then printf '%s\n' "$state_image"
+        else printf '%s\n' '${CURRENT_ID}'
+        fi
+        ;;
+      *) exit 1 ;;
+    esac
+  elif [[ "$subcommand" == rm ]]; then
+    [[ "\${FAKE_LEGACY_REMOVE_FAILURE:-}" != 1 ]] || exit 1
+    printf 'absent -\n' >'${path.join(temp, 'container-state')}'
+    printf 'legacy-removed=%s\n' "\${2:-}" >>'${operations}'
+  else
+    exit 1
+  fi
 elif [[ "$command" == compose ]]; then
+  printf 'compose-image=%s\n' "$KINVEST_IMAGE" >>'${operations}'
+  printf 'compose-ifind-mode=%s\n' "\${KINVEST_IFIND_DIAGNOSTIC_MODE:-}" >>'${operations}'
   printf 'compose-ifind-version=%s\n' "\${KINVEST_IFIND_REFRESH_TOKEN_VERSION_ID:-}" >>'${operations}'
-  if [[ "\${FAKE_REQUIRE_IFIND_VERSION:-}" == 1 && ! "\${KINVEST_IFIND_REFRESH_TOKEN_VERSION_ID:-}" =~ ^v[0-9]{8}-[0-9]{3}$ ]]; then
-    exit 65
+  printf 'compose-ifind-bundle=%s\n' "\${KINVEST_IFIND_SECRET_BUNDLE_HOST_PATH:-}" >>'${operations}'
+  if [[ "\${FAKE_REQUIRE_IFIND_VERSION:-}" == 1 ]]; then
+    case "\${KINVEST_IFIND_DIAGNOSTIC_MODE:-}:\${KINVEST_IFIND_REFRESH_TOKEN_VERSION_ID:-}" in
+      admin-diagnostic:v[0-9][0-9][0-9][0-9][0-9][0-9][0-9][0-9]-[0-9][0-9][0-9]|disabled:) ;;
+      *) exit 65 ;;
+    esac
   fi
   if [[ "\${FAKE_FAILURE:-}" == compose-leak && ! -e '${path.join(temp, 'compose.failed')}' ]]; then
     touch '${path.join(temp, 'compose.failed')}'
@@ -627,6 +664,7 @@ elif [[ "$command" == compose ]]; then
     exit 91
   fi
   printf '%s\n' "$KINVEST_IMAGE" >'${path.join(temp, 'runtime-image')}'
+  printf 'kinvest %s\n' "$KINVEST_IMAGE" >'${path.join(temp, 'container-state')}'
   env | LC_ALL=C sort >'${path.join(temp, 'container-env.inspect')}'
   exit 0
 elif [[ "$command" == inspect ]]; then
@@ -829,6 +867,7 @@ async function run() {
   assert.match(source, /RESTORE/)
   assert.match(source, /ROLLBACK/)
   assert.match(source, /FORWARD/)
+  assert.doesNotMatch(source, new RegExp(DISABLED_IFIND_COMPOSE_VERSION))
 
   const token = 'synthetic-ifind-refresh-token-never-log'
   for (const relative of [
@@ -892,8 +931,8 @@ async function run() {
       diagnosticStateVersion: parseDeploymentState(diagnosticInterpolation).ifindRefreshTokenVersionId
     }, {
       disabledSucceeded: true,
-      disabledComposeVersions: [DISABLED_IFIND_COMPOSE_VERSION],
-      recoveryComposeVersions: ['v20260826-001', DISABLED_IFIND_COMPOSE_VERSION],
+      disabledComposeVersions: [''],
+      recoveryComposeVersions: ['v20260826-001', ''],
       diagnosticSucceeded: true,
       diagnosticComposeVersions: ['v20260826-001'],
       disabledPayloadContainsPlaceholder: false,
@@ -966,6 +1005,9 @@ module.materialize(sys.argv[2], sys.argv[3], sys.argv[4], sys.argv[5],
     assert.match(operations, new RegExp(`attestation resolve ${DIGEST} ${COMMIT} 123`))
     assert.ok(operations.indexOf('attestation ') < operations.indexOf('docker image inspect'))
     assert.ok(operations.indexOf('server/ifind-secret-preflight.js') < operations.indexOf(' compose '))
+    assert.match(operations, /compose-ifind-mode=admin-diagnostic/)
+    assert.match(operations, / compose .* up .* --remove-orphans kinvest/)
+    assert.doesNotMatch(operations, /kinvest-disabled|kinvest-diagnostic|COMPOSE_PROFILES/)
     assert.deepEqual(scanPersistentFiles(harness.root), [])
     const state = fs.readFileSync(path.join(harness.root, 'state/current.state'), 'utf8')
     assert.match(state, /ifindDiagnosticMode=diagnostic/)
@@ -979,7 +1021,9 @@ module.materialize(sys.argv[2], sys.argv[3], sys.argv[4], sys.argv[5],
     })
     assert.equal(previous.status, 0, previous.stderr)
     assert.match(source, /atomic_state_from_text "\$candidate_state" "\$CURRENT_STATE" current/)
-    const bundles = fs.readdirSync(path.join(harness.runRoot, 'kinvest-ifind-secrets'))
+    const ifindRootEntries = fs.readdirSync(path.join(harness.runRoot, 'kinvest-ifind-secrets'))
+    assert.equal(ifindRootEntries.includes('disabled'), true)
+    const bundles = ifindRootEntries.filter(name => name !== 'disabled')
     assert.equal(bundles.length, 1)
     assert.equal(bundles.includes('8'.repeat(32)), false)
     const accessBundles = fs.readdirSync(path.join(harness.runRoot, 'kinvest-secrets')).filter(name => name !== 'disabled')
@@ -1017,12 +1061,89 @@ module.materialize(sys.argv[2], sys.argv[3], sys.argv[4], sys.argv[5],
       stderr: deployed.stderr, stdout: deployed.stdout,
       operations: fs.existsSync(disabled.operations) ? fs.readFileSync(disabled.operations, 'utf8') : ''
     }))
-    assert.equal(fs.readdirSync(path.join(disabled.runRoot, 'kinvest-ifind-secrets')).length, 0)
+    assert.deepEqual(fs.readdirSync(path.join(disabled.runRoot, 'kinvest-ifind-secrets')), ['disabled'])
     const operations = fs.readFileSync(disabled.operations, 'utf8')
     assert.equal(operations.includes('server/ifind-secret-preflight.js'), false)
-    assert.match(operations, /kinvest-disabled/)
+    assert.match(operations, /compose-ifind-mode=disabled/)
+    assert.match(operations, /compose-ifind-version=\n/)
+    assert.match(operations, /compose-ifind-bundle=.*kinvest-ifind-secrets\/disabled/)
+    assert.match(operations, / compose .* up .* --remove-orphans kinvest/)
+    assert.doesNotMatch(operations, /kinvest-disabled|kinvest-diagnostic|COMPOSE_PROFILES/)
   } finally {
     cleanupHarness(disabled)
+  }
+
+  const legacy = makeHarness()
+  try {
+    const deployed = spawnSync(legacy.executor, [], {
+      encoding: 'utf8', input: disabledPayload(),
+      env: {
+        ...process.env, PATH: `${legacy.bin}:${process.env.PATH}`,
+        FAKE_COMPOSE_SERVICE: 'kinvest-disabled'
+      }
+    })
+    assert.equal(deployed.status, 0, JSON.stringify({
+      stderr: deployed.stderr, stdout: deployed.stdout,
+      operations: fs.existsSync(legacy.operations) ? fs.readFileSync(legacy.operations, 'utf8') : ''
+    }))
+    const operations = fs.readFileSync(legacy.operations, 'utf8')
+    assert.match(operations, new RegExp(`legacy-removed=${'c'.repeat(64)}`))
+    assert.ok(operations.indexOf('legacy-removed=') < operations.indexOf(' compose '))
+    assert.doesNotMatch(operations, /kinvest-diagnostic/)
+  } finally {
+    cleanupHarness(legacy)
+  }
+
+  const legacyFailure = makeHarness()
+  try {
+    const deployed = spawnSync(legacyFailure.executor, [], {
+      encoding: 'utf8', input: disabledPayload(),
+      env: {
+        ...process.env, PATH: `${legacyFailure.bin}:${process.env.PATH}`,
+        FAKE_COMPOSE_SERVICE: 'kinvest-disabled', FAKE_FAILURE: 'compose-leak'
+      }
+    })
+    assert.notEqual(deployed.status, 0)
+    assert.equal(deployed.stderr, 'DEPLOY_V5_COMPOSE_FAILED\n')
+    assert.equal(fs.existsSync(path.join(legacyFailure.root, 'state/deploy-v5.journal')), false)
+    assert.equal(fs.readFileSync(path.join(legacyFailure.temp, 'container-state'), 'utf8'),
+      `kinvest ${CURRENT_ID}\n`)
+    const operations = fs.readFileSync(legacyFailure.operations, 'utf8')
+    assert.match(operations, new RegExp(`legacy-removed=${'c'.repeat(64)}`))
+    assert.ok(operations.indexOf(`compose-image=${IMAGE_ID}`) <
+      operations.lastIndexOf(`compose-image=${CURRENT_ID}`))
+  } finally {
+    cleanupHarness(legacyFailure)
+  }
+
+  const legacyCrash = makeHarness({
+    signalWindow: 'TRANSACTION_WINDOW_AFTER_LEGACY_REMOVAL_BEFORE_COMPOSE', signalType: 'KILL',
+    seedBundles: true
+  })
+  try {
+    const crashed = spawnSync(legacyCrash.executor, [], {
+      encoding: 'utf8', input: disabledPayload(),
+      env: {
+        ...process.env, PATH: `${legacyCrash.bin}:${process.env.PATH}`,
+        FAKE_COMPOSE_SERVICE: 'kinvest-disabled'
+      }
+    })
+    assert.notEqual(crashed.status, 0)
+    assert.equal(fs.readFileSync(path.join(legacyCrash.temp, 'container-state'), 'utf8'), 'absent -\n')
+    assert.equal(fs.existsSync(path.join(legacyCrash.root, 'state/deploy-v5.journal')), true)
+    const recovered = spawnSync(legacyCrash.executor, [], {
+      encoding: 'utf8', input: disabledPayload(),
+      env: { ...process.env, PATH: `${legacyCrash.bin}:${process.env.PATH}` }
+    })
+    assert.equal(recovered.status, 0, recovered.stderr)
+    assert.equal(fs.existsSync(path.join(legacyCrash.root, 'state/deploy-v5.journal')), false)
+    const operations = fs.readFileSync(legacyCrash.operations, 'utf8')
+    assert.ok(operations.indexOf(`compose-image=${CURRENT_ID}`) <
+      operations.lastIndexOf(`compose-image=${IMAGE_ID}`))
+    assert.equal(fs.readFileSync(path.join(legacyCrash.temp, 'container-state'), 'utf8'),
+      `kinvest ${IMAGE_ID}\n`)
+  } finally {
+    cleanupHarness(legacyCrash)
   }
 
   const failed = makeHarness()
@@ -1034,7 +1155,7 @@ module.materialize(sys.argv[2], sys.argv[3], sys.argv[4], sys.argv[5],
     assert.notEqual(deployed.status, 0)
     assert.equal(deployed.stderr, 'DEPLOY_V5_IFIND_PREFLIGHT_FAILED\n')
     assert.equal(fs.readdirSync(path.join(failed.root, 'backups')).length, 0)
-    assert.equal(fs.readdirSync(path.join(failed.runRoot, 'kinvest-ifind-secrets')).length, 0)
+    assert.deepEqual(fs.readdirSync(path.join(failed.runRoot, 'kinvest-ifind-secrets')), ['disabled'])
     assert.match(fs.readFileSync(path.join(failed.root, 'state/current.state'), 'utf8'),
       new RegExp(`runtimeImageId=${CURRENT_ID}`))
   } finally {
@@ -1055,7 +1176,7 @@ module.materialize(sys.argv[2], sys.argv[3], sys.argv[4], sys.argv[5],
       assert.notEqual(result.status, 0, `${stage} must fail`)
       assert.equal(result.stderr, 'DEPLOY_V5_BUNDLE_CREATE_FAILED\n')
       assert.deepEqual(fs.readdirSync(path.join(faulted.runRoot, 'kinvest-secrets')), [])
-      assert.deepEqual(fs.readdirSync(path.join(faulted.runRoot, 'kinvest-ifind-secrets')), [])
+      assert.deepEqual(fs.readdirSync(path.join(faulted.runRoot, 'kinvest-ifind-secrets')), ['disabled'])
     } finally { cleanupHarness(faulted) }
   }
 
@@ -1079,7 +1200,7 @@ module.materialize(sys.argv[2], sys.argv[3], sys.argv[4], sys.argv[5],
         env: { ...process.env, PATH: `${interrupted.bin}:${process.env.PATH}` }
       })
       assert.equal(recovered.status, 0, recovered.stderr)
-      assert.deepEqual(fs.readdirSync(path.join(interrupted.runRoot, 'kinvest-ifind-secrets')), [])
+      assert.deepEqual(fs.readdirSync(path.join(interrupted.runRoot, 'kinvest-ifind-secrets')), ['disabled'])
       assert.equal(fs.readdirSync(interrupted.runRoot).some(name => name.startsWith('kinvest-v5.candidates.')), false)
     } finally { cleanupHarness(interrupted) }
   }
@@ -1106,7 +1227,7 @@ module.materialize(sys.argv[2], sys.argv[3], sys.argv[4], sys.argv[5],
         env: { ...process.env, PATH: `${interrupted.bin}:${process.env.PATH}` }
       })
       assert.equal(recovered.status, 0, `${window}: ${recovered.stderr}`)
-      assert.deepEqual(fs.readdirSync(path.join(interrupted.runRoot, 'kinvest-ifind-secrets')), [])
+      assert.deepEqual(fs.readdirSync(path.join(interrupted.runRoot, 'kinvest-ifind-secrets')), ['disabled'])
       assert.equal(fs.readdirSync(interrupted.runRoot).some(name => name.startsWith('kinvest-v5.candidates.')), false)
     } finally { cleanupHarness(interrupted) }
   }

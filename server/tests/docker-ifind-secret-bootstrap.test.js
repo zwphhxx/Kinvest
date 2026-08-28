@@ -83,7 +83,6 @@ async function run() {
   )
   Object.assign(composeEnvironment, {
     COMPOSE_DISABLE_ENV_FILE: '1',
-    COMPOSE_PROFILES: '',
     KINVEST_IMAGE: 'kinvest:test',
     KINVEST_SECRET_PROVIDER_MODE: 'tmpfs',
     KINVEST_SECRET_VERSION_IDS: '{"admin-password-verifier":"v-test"}',
@@ -95,27 +94,32 @@ async function run() {
     KINVEST_BRIDGE_INTERFACE: 'br-kinvest-tst',
     KINVEST_METADATA_SUBNET: '172.30.0.0/24',
     KINVEST_METADATA_GATEWAY: '172.30.0.1',
-    KINVEST_IFIND_REFRESH_TOKEN_VERSION_ID: 'v-ifind-test'
+    KINVEST_IFIND_DIAGNOSTIC_MODE: 'disabled',
+    KINVEST_IFIND_SECRET_BUNDLE_HOST_PATH: '/run/kinvest-test-ifind-secrets'
   })
   const composeModel = JSON.parse(execFileSync('docker', [
-    'compose', '--profile', 'ifind-disabled',
-    '-f', composePath, 'config', '--format', 'json'
+    'compose', '-f', composePath, 'config', '--format', 'json'
   ], {
     cwd: rootDir,
     env: composeEnvironment,
     encoding: 'utf8'
   }))
-  assert.deepEqual(Object.keys(composeModel.services), ['kinvest-disabled'])
-  const disabledEnvironment = composeModel.services['kinvest-disabled'].environment
+  assert.deepEqual(Object.keys(composeModel.services), ['kinvest'])
+  const disabledEnvironment = composeModel.services.kinvest.environment
   assert.equal(disabledEnvironment.TZ, 'Asia/Shanghai')
   assert.equal(disabledEnvironment.KINVEST_DB_PATH, '/data/kinvest.sqlite')
-  const disabledIfindEnvironment = Object.fromEntries(
+  const disabledIfindComposeEnvironment = Object.fromEntries(
     Object.entries(disabledEnvironment)
       .filter(([key]) => key.startsWith('KINVEST_IFIND_'))
   )
-  assert.deepEqual(disabledIfindEnvironment, {
-    KINVEST_IFIND_DIAGNOSTIC_MODE: 'disabled'
+  assert.deepEqual(disabledIfindComposeEnvironment, {
+    KINVEST_IFIND_DIAGNOSTIC_MODE: 'disabled',
+    KINVEST_IFIND_REFRESH_TOKEN_VERSION_ID: null,
+    KINVEST_IFIND_SECRET_BUNDLE_PATH: null
   })
+  const disabledIfindEnvironment = Object.fromEntries(
+    Object.entries(disabledIfindComposeEnvironment).filter(([, value]) => value !== null)
+  )
   const { createIfindDiagnosticRuntime } = require(runtimePath)
   const disabledRuntime = await createIfindDiagnosticRuntime({
     env: disabledIfindEnvironment
@@ -125,11 +129,12 @@ async function run() {
     configured: false,
     versionId: null
   })
-  assert.match(compose, /KINVEST_IFIND_DIAGNOSTIC_MODE:/)
-  assert.match(compose, /KINVEST_IFIND_REFRESH_TOKEN_VERSION_ID:/)
-  assert.match(compose, /KINVEST_IFIND_SECRET_BUNDLE_PATH:/)
+  assert.match(compose, /- KINVEST_IFIND_DIAGNOSTIC_MODE/)
+  assert.match(compose, /- KINVEST_IFIND_REFRESH_TOKEN_VERSION_ID/)
+  assert.match(compose, /- KINVEST_IFIND_SECRET_BUNDLE_PATH/)
   assert.match(compose, /target: \/run\/secrets\/kinvest-ifind/)
   assert.match(compose, /KINVEST_IFIND_SECRET_BUNDLE_HOST_PATH/)
+  assert.doesNotMatch(compose, /kinvest-disabled|kinvest-diagnostic|COMPOSE_PROFILES|profiles:/)
   assert.doesNotMatch(compose, /IFIND.*MATERIAL|refreshTokenMaterial|refresh-token:/i)
 
   const build = fs.readFileSync(path.join(rootDir, 'scripts/build.js'), 'utf8')
