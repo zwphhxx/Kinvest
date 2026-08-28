@@ -19,6 +19,7 @@ const CURRENT_ID = `sha256:${'d'.repeat(64)}`
 const COMMIT = 'e'.repeat(40)
 const CURRENT_COMMIT = 'f'.repeat(40)
 const TOKEN = 'synthetic-ifind-refresh-token-never-log'
+const DISABLED_IFIND_COMPOSE_VERSION = 'v19700101-000'
 const ADMIN_VERSION = 'v20260826-010'
 const HMAC_VERSION = 'v20260826-011'
 const ADMIN_JSON = JSON.stringify({
@@ -616,6 +617,10 @@ elif [[ "$command" == run ]]; then
   fi
   exit 0
 elif [[ "$command" == compose ]]; then
+  printf 'compose-ifind-version=%s\n' "\${KINVEST_IFIND_REFRESH_TOKEN_VERSION_ID:-}" >>'${operations}'
+  if [[ "\${FAKE_REQUIRE_IFIND_VERSION:-}" == 1 && ! "\${KINVEST_IFIND_REFRESH_TOKEN_VERSION_ID:-}" =~ ^v[0-9]{8}-[0-9]{3}$ ]]; then
+    exit 65
+  fi
   if [[ "\${FAKE_FAILURE:-}" == compose-leak && ! -e '${path.join(temp, 'compose.failed')}' ]]; then
     touch '${path.join(temp, 'compose.failed')}'
     printf '%s\n' '${TOKEN}' 'Traceback: docker internals' >&2
@@ -685,6 +690,12 @@ function cleanupHarness(harness) {
     }
   }
   fs.rmSync(harness.temp, { recursive: true, force: true })
+}
+
+function composeIfindVersions(harness) {
+  return fs.readFileSync(harness.operations, 'utf8').split('\n')
+    .filter(line => line.startsWith('compose-ifind-version='))
+    .map(line => line.slice('compose-ifind-version='.length))
 }
 
 function scanPersistentFiles(root) {
@@ -831,6 +842,71 @@ async function run() {
   const v4 = fs.readFileSync(path.join(rootDir, 'deploy/server/deploy-kinvest-v3.sh'), 'utf8')
   assert.match(v4, /if \[\[ "\$DEPLOY_PROTOCOL" == 4 \]\]/)
   assert.doesNotMatch(v4, /KINVEST_DEPLOY_PROTOCOL:-5/)
+
+  const disabledInterpolation = makeHarness()
+  const composeActiveRecovery = makeHarness({
+    signalWindow: 'TRANSACTION_WINDOW_AFTER_COMPOSE_BEFORE_CURRENT', signalType: 'TERM'
+  })
+  const diagnosticInterpolation = makeHarness()
+  try {
+    const disabledInput = disabledPayload()
+    const disabledResult = spawnSync(disabledInterpolation.executor, [], {
+      encoding: 'utf8', input: disabledInput,
+      env: {
+        ...process.env, PATH: `${disabledInterpolation.bin}:${process.env.PATH}`,
+        FAKE_REQUIRE_IFIND_VERSION: '1'
+      }
+    })
+
+    const recoveryResult = spawnSync(composeActiveRecovery.executor, [], {
+      encoding: 'utf8', input: diagnosticPayload(),
+      env: {
+        ...process.env, PATH: `${composeActiveRecovery.bin}:${process.env.PATH}`,
+        FAKE_REQUIRE_IFIND_VERSION: '1'
+      }
+    })
+
+    const diagnosticResult = spawnSync(diagnosticInterpolation.executor, [], {
+      encoding: 'utf8', input: diagnosticPayload(),
+      env: {
+        ...process.env, PATH: `${diagnosticInterpolation.bin}:${process.env.PATH}`,
+        FAKE_REQUIRE_IFIND_VERSION: '1'
+      }
+    })
+
+    assert.notEqual(recoveryResult.status, 0, 'controlled compose-active interruption must terminate')
+    assert.deepEqual({
+      disabledSucceeded: disabledResult.status === 0,
+      disabledComposeVersions: composeIfindVersions(disabledInterpolation),
+      recoveryComposeVersions: composeIfindVersions(composeActiveRecovery),
+      diagnosticSucceeded: diagnosticResult.status === 0,
+      diagnosticComposeVersions: composeIfindVersions(diagnosticInterpolation),
+      disabledPayloadContainsPlaceholder: disabledInput.includes(DISABLED_IFIND_COMPOSE_VERSION),
+      disabledStateVersion: parseDeploymentState(disabledInterpolation).ifindRefreshTokenVersionId,
+      disabledStateContainsPlaceholder: fs.readFileSync(
+        path.join(disabledInterpolation.root, 'state/current.state'), 'utf8'
+      ).includes(DISABLED_IFIND_COMPOSE_VERSION),
+      recoveryStateContainsPlaceholder: fs.readFileSync(
+        path.join(composeActiveRecovery.root, 'state/current.state'), 'utf8'
+      ).includes(DISABLED_IFIND_COMPOSE_VERSION),
+      diagnosticStateVersion: parseDeploymentState(diagnosticInterpolation).ifindRefreshTokenVersionId
+    }, {
+      disabledSucceeded: true,
+      disabledComposeVersions: [DISABLED_IFIND_COMPOSE_VERSION],
+      recoveryComposeVersions: ['v20260826-001', DISABLED_IFIND_COMPOSE_VERSION],
+      diagnosticSucceeded: true,
+      diagnosticComposeVersions: ['v20260826-001'],
+      disabledPayloadContainsPlaceholder: false,
+      disabledStateVersion: '',
+      disabledStateContainsPlaceholder: false,
+      recoveryStateContainsPlaceholder: false,
+      diagnosticStateVersion: 'v20260826-001'
+    })
+  } finally {
+    cleanupHarness(disabledInterpolation)
+    cleanupHarness(composeActiveRecovery)
+    cleanupHarness(diagnosticInterpolation)
+  }
 
   const harness = makeHarness({ seedBundles: true })
   try {

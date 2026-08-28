@@ -15,6 +15,7 @@ STATE_ROOT="$ROOT/state"
 BACKUP_ROOT="$ROOT/backups"
 ACCESS_BUNDLE_ROOT="$RUN_ROOT/kinvest-secrets"
 IFIND_BUNDLE_ROOT="$RUN_ROOT/kinvest-ifind-secrets"
+DISABLED_IFIND_COMPOSE_VERSION='v19700101-000'
 CURRENT_STATE="$STATE_ROOT/current.state"
 PREVIOUS_STATE="$STATE_ROOT/previous.state"
 ATTEMPT_STATE="$STATE_ROOT/attempt.state"
@@ -159,6 +160,10 @@ collect_referenced_bundle_ids() {
 prune_access_bundles() { prune_bundle_root "$ACCESS_BUNDLE_ROOT" "$(collect_referenced_bundle_ids secretBundleId)"; }
 prune_ifind_bundles() { prune_bundle_root "$IFIND_BUNDLE_ROOT" "$(collect_referenced_bundle_ids ifindSecretBundleId)"; }
 
+resolve_compose_ifind_version() {
+  if [[ "$1" == diagnostic ]]; then printf '%s\n' "$2"; else printf '%s\n' "$DISABLED_IFIND_COMPOSE_VERSION"; fi
+}
+
 atomic_state_from_json() {
   local source="$1" target="$2" prefix="$3" temporary target_name status=0
   secure_temp temporary "$RUN_ROOT/kinvest-v5.state-${prefix}.XXXXXX" || return 1
@@ -203,7 +208,7 @@ write_journal() {
 }
 
 compose_state_file() {
-  local state_file="$1" parsed image provider_value versions_value access_id access_path access_value proxies_value ifind_value ifind_version_value ifind_id ifind_path profile service
+  local state_file="$1" parsed image provider_value versions_value access_id access_path access_value proxies_value ifind_value ifind_version_value ifind_compose_version ifind_id ifind_path profile service
   secure_temp parsed "$RUN_ROOT/kinvest-v5.compose-state.XXXXXX" || return 1
   "$CONTRACT" parse-state <"$state_file" >"$parsed" 2>/dev/null || { rm -f -- "$parsed"; return 1; }
   image="$(json_field "$parsed" runtimeImageId)" || { rm -f -- "$parsed"; return 1; }
@@ -216,6 +221,7 @@ compose_state_file() {
   ifind_version_value="$(json_field "$parsed" ifindRefreshTokenVersionId)" || { rm -f -- "$parsed"; return 1; }
   ifind_id="$(json_field "$parsed" ifindSecretBundleId)" || { rm -f -- "$parsed"; return 1; }
   rm -f -- "$parsed"
+  ifind_compose_version="$(resolve_compose_ifind_version "$ifind_value" "$ifind_version_value")" || return 1
   [[ "$access_id" == none ]] && access_path="$ACCESS_BUNDLE_ROOT/disabled" || access_path="$ACCESS_BUNDLE_ROOT/$access_id"
   if [[ "$ifind_value" == diagnostic ]]; then
     profile=ifind-diagnostic; service=kinvest-diagnostic; ifind_path="$IFIND_BUNDLE_ROOT/$ifind_id"
@@ -227,7 +233,7 @@ compose_state_file() {
     export KINVEST_SECRET_PROVIDER_MODE="$provider_value" KINVEST_SECRET_VERSION_IDS="$versions_value"
     export KINVEST_SECRET_BUNDLE_HOST_PATH="$access_path" KINVEST_ACCESS_CONTROL_MODE="$access_value"
     export KINVEST_TRUSTED_PROXY_ADDRESSES="$proxies_value"
-    export KINVEST_IFIND_REFRESH_TOKEN_VERSION_ID="$ifind_version_value" KINVEST_IFIND_SECRET_BUNDLE_HOST_PATH="$ifind_path"
+    export KINVEST_IFIND_REFRESH_TOKEN_VERSION_ID="$ifind_compose_version" KINVEST_IFIND_SECRET_BUNDLE_HOST_PATH="$ifind_path"
     run_docker compose -f "$COMPOSE" --env-file "$NETWORK_CONFIG" up -d --remove-orphans "$service" >/dev/null 2>&1
   )
 }
@@ -558,14 +564,15 @@ PY
 if [[ "$intent" != RESTORE ]]; then create_database_backup || fail DEPLOY_V5_DATABASE_BACKUP_FAILED; fi
 
 compose_up() {
-  local profile service
+  local profile service ifind_compose_version
   if [[ "$ifind_mode" == diagnostic ]]; then profile=ifind-diagnostic; service=kinvest-diagnostic; else profile=ifind-disabled; service=kinvest-disabled; fi
+  ifind_compose_version="$(resolve_compose_ifind_version "$ifind_mode" "$ifind_version")" || return 1
   (
     export COMPOSE_PROFILES="$profile" KINVEST_IMAGE="$runtime_image_id"
     export KINVEST_SECRET_PROVIDER_MODE="$provider" KINVEST_SECRET_VERSION_IDS="$versions"
     export KINVEST_SECRET_BUNDLE_HOST_PATH="$candidate_access_path"
     export KINVEST_ACCESS_CONTROL_MODE="$access_mode" KINVEST_TRUSTED_PROXY_ADDRESSES='["172.19.0.2"]'
-    export KINVEST_IFIND_REFRESH_TOKEN_VERSION_ID="$ifind_version"
+    export KINVEST_IFIND_REFRESH_TOKEN_VERSION_ID="$ifind_compose_version"
     export KINVEST_IFIND_SECRET_BUNDLE_HOST_PATH="$candidate_ifind_path"
     run_docker compose -f "$COMPOSE" --env-file "$NETWORK_CONFIG" up -d --remove-orphans "$service"
   )
