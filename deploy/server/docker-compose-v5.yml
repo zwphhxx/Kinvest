@@ -35,8 +35,6 @@ services:
     environment:
       <<: *kinvest-environment
       KINVEST_IFIND_DIAGNOSTIC_MODE: disabled
-      KINVEST_IFIND_REFRESH_TOKEN_VERSION_ID: ""
-      KINVEST_IFIND_SECRET_BUNDLE_PATH: ""
     volumes:
       - type: bind
         source: /root/docker/kinvest/data
