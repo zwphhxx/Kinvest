@@ -407,8 +407,66 @@ function financialRequest(market) {
   })
 }
 
+async function executeSharedMarketOperation(client, operation, refreshToken, fixedRequest) {
+  const authentication = await client.authenticate(refreshToken)
+  try {
+    const result = await client[operation](authentication.accessToken, fixedRequest)
+    return result.payload
+  } finally {
+    Buffer.prototype.fill.call(authentication.accessToken, 0)
+  }
+}
+
 async function run() {
   const { createIfindHttpClient } = require('../adapters/ifind-http-client')
+
+  const directContractTransport = createRequestStub([
+    accessTokenSuccess,
+    marketOperationFixtures.HK.quote,
+    marketOperationFixtures.HK.financial
+  ])
+  const directContractClient = createIfindHttpClient({
+    request: directContractTransport.request
+  })
+  assert.deepEqual(
+    Object.keys(directContractClient),
+    ['diagnose', 'authenticate', 'quote', 'financial']
+  )
+  const directAuth = await directContractClient.authenticate(
+    Buffer.from(REFRESH_TOKEN, 'utf8')
+  )
+  assert.deepEqual(Object.keys(directAuth), ['accessToken', 'requestCount'])
+  assert.equal(Buffer.isBuffer(directAuth.accessToken), true)
+  assert.equal(directAuth.accessToken.toString('utf8'), ACCESS_TOKEN)
+  assert.equal(directAuth.requestCount, 1)
+  const directQuote = await directContractClient.quote(
+    directAuth.accessToken,
+    quoteRequest('HK')
+  )
+  assert.deepEqual(directQuote, {
+    payload: marketOperationFixtures.HK.quote,
+    requestCount: 1,
+    dataVol: marketOperationFixtures.HK.quote.dataVol
+  })
+  const directFinancial = await directContractClient.financial(
+    directAuth.accessToken,
+    financialRequest('HK')
+  )
+  assert.deepEqual(directFinancial, {
+    payload: marketOperationFixtures.HK.financial,
+    requestCount: 1,
+    dataVol: marketOperationFixtures.HK.financial.dataVol
+  })
+  assert.deepEqual(
+    directContractTransport.calls.map((call) => new URL(call.url).pathname),
+    [
+      '/api/v1/get_access_token',
+      '/api/v1/real_time_quotation',
+      '/api/v1/basic_data_service'
+    ]
+  )
+  directContractClient.clear()
+  assert.equal(directAuth.accessToken.every((byte) => byte === 0), true)
 
   for (const [market, fixtures] of Object.entries(marketOperationFixtures)) {
     for (const [operation, fixture] of Object.entries(fixtures)) {
@@ -428,10 +486,12 @@ async function run() {
         logger: operationLogger.logger
       })
       assert.equal(typeof operationClient[operation], 'function')
-      const execution = await captureGlobalOutput(() => operationClient[operation]({
-        refreshToken: REFRESH_TOKEN,
-        request: fixedRequest
-      }))
+      const execution = await captureGlobalOutput(() => executeSharedMarketOperation(
+        operationClient,
+        operation,
+        REFRESH_TOKEN,
+        fixedRequest
+      ))
       assert.equal(execution.status, 'fulfilled', `${market} ${operation}: expected fulfillment`)
       assert.deepEqual(operationTransport.calls, [
         {
@@ -516,10 +576,12 @@ async function run() {
 
     const pollutedTransport = createRequestStub([accessTokenSuccess, pollutedSuccess])
     const pollutedClient = createIfindHttpClient({ request: pollutedTransport.request })
-    const execution = await captureGlobalOutput(() => pollutedClient[operation]({
-      refreshToken: REFRESH_TOKEN,
-      request: operation === 'quote' ? quoteRequest('HK') : financialRequest('HK')
-    }))
+    const execution = await captureGlobalOutput(() => executeSharedMarketOperation(
+      pollutedClient,
+      operation,
+      REFRESH_TOKEN,
+      operation === 'quote' ? quoteRequest('HK') : financialRequest('HK')
+    ))
     assert.equal(execution.status, 'fulfilled')
     assert.deepEqual(execution.value, cleanFixture)
     assert.notStrictEqual(execution.value, pollutedSuccess)
@@ -567,10 +629,7 @@ async function run() {
     }
   })
   await assert.rejects(
-    () => sharedDagClient.financial({
-      refreshToken: REFRESH_TOKEN,
-      request: overBudgetSharedRequest
-    }),
+    () => sharedDagClient.financial(Buffer.from(ACCESS_TOKEN), overBudgetSharedRequest),
     (error) => errorRecord(error).code === 'IFIND_CONFIG_INVALID' &&
       errorRecord(error).class === 'CONFIG' &&
       errorRecord(error).stage === 'financial' &&
@@ -596,10 +655,12 @@ async function run() {
     marketOperationFixtures.HK.financial
   ])
   const safeSharedClient = createIfindHttpClient({ request: safeSharedTransport.request })
-  const safeSharedResult = await safeSharedClient.financial({
-    refreshToken: REFRESH_TOKEN,
-    request: safeSharedRequest
-  })
+  const safeSharedResult = await executeSharedMarketOperation(
+    safeSharedClient,
+    'financial',
+    REFRESH_TOKEN,
+    safeSharedRequest
+  )
   assert.deepEqual(safeSharedResult, marketOperationFixtures.HK.financial)
   assert.equal(safeSharedTransport.calls.length, 2)
 
@@ -716,10 +777,10 @@ async function run() {
       }
     })
     await assert.rejects(
-      () => hostileClient[hostileCase.operation]({
-        refreshToken: REFRESH_TOKEN,
-        request: hostileCase.request
-      }),
+      () => hostileClient[hostileCase.operation](
+        Buffer.from(ACCESS_TOKEN),
+        hostileCase.request
+      ),
       (error) => errorRecord(error).code === 'IFIND_CONFIG_INVALID' &&
         errorRecord(error).class === 'CONFIG' &&
         errorRecord(error).stage === hostileCase.operation &&
@@ -758,10 +819,7 @@ async function run() {
       request: inheritedCodeAuthTransport.request
     })
     await assert.rejects(
-      () => inheritedCodeAuthClient.quote({
-        refreshToken: REFRESH_TOKEN,
-        request: quoteRequest('HK')
-      }),
+      () => inheritedCodeAuthClient.authenticate(REFRESH_TOKEN),
       (error) => errorRecord(error).code === 'IFIND_RESPONSE_SHAPE' &&
         errorRecord(error).stage === 'auth'
     )
@@ -776,10 +834,12 @@ async function run() {
         request: inheritedCodeOperationTransport.request
       })
       await assert.rejects(
-        () => inheritedCodeOperationClient[operation]({
-          refreshToken: REFRESH_TOKEN,
-          request: operation === 'quote' ? quoteRequest('HK') : financialRequest('HK')
-        }),
+        () => executeSharedMarketOperation(
+          inheritedCodeOperationClient,
+          operation,
+          REFRESH_TOKEN,
+          operation === 'quote' ? quoteRequest('HK') : financialRequest('HK')
+        ),
         (error) => errorRecord(error).code === 'IFIND_RESPONSE_SHAPE' &&
           errorRecord(error).stage === operation
       )
@@ -796,10 +856,7 @@ async function run() {
     const inheritedTokenTransport = createRequestStub([{ errorcode: 0, data: {} }])
     const inheritedTokenClient = createIfindHttpClient({ request: inheritedTokenTransport.request })
     await assert.rejects(
-      () => inheritedTokenClient.financial({
-        refreshToken: REFRESH_TOKEN,
-        request: financialRequest('HK')
-      }),
+      () => inheritedTokenClient.authenticate(REFRESH_TOKEN),
       (error) => errorRecord(error).code === 'IFIND_RESPONSE_SHAPE' &&
         errorRecord(error).stage === 'auth'
     )
@@ -815,10 +872,7 @@ async function run() {
     const inheritedDataTransport = createRequestStub([{ errorcode: 0 }])
     const inheritedDataClient = createIfindHttpClient({ request: inheritedDataTransport.request })
     await assert.rejects(
-      () => inheritedDataClient.quote({
-        refreshToken: REFRESH_TOKEN,
-        request: quoteRequest('HK')
-      }),
+      () => inheritedDataClient.authenticate(REFRESH_TOKEN),
       (error) => errorRecord(error).code === 'IFIND_RESPONSE_SHAPE' &&
         errorRecord(error).stage === 'auth'
     )
@@ -840,10 +894,12 @@ async function run() {
         request: inheritedMetadataTransport.request
       })
       await assert.rejects(
-        () => inheritedMetadataClient[operation]({
-          refreshToken: REFRESH_TOKEN,
-          request: operation === 'quote' ? quoteRequest('HK') : financialRequest('HK')
-        }),
+        () => executeSharedMarketOperation(
+          inheritedMetadataClient,
+          operation,
+          REFRESH_TOKEN,
+          operation === 'quote' ? quoteRequest('HK') : financialRequest('HK')
+        ),
         (error) => errorRecord(error).code === 'IFIND_PERMISSION_REJECTED' &&
           errorRecord(error).stage === operation &&
           !Object.hasOwn(errorRecord(error), 'dataVol')
@@ -856,40 +912,30 @@ async function run() {
     'url', 'endpoint', 'headers', 'host', 'method', 'timeout', 'responseCap', 'route'
   ]
   for (const forbiddenName of forbiddenTransportControls) {
-    for (const location of ['input', 'request']) {
-      const overrideTransport = createRequestStub([])
-      const overrideClient = createIfindHttpClient({ request: overrideTransport.request })
-      const fixedRequest = {
-        vendorCode: 'TEST_ONLY_HK_CODE',
-        fields: ['TEST_ONLY_HK_LATEST_PRICE']
-      }
-      const input = {
-        refreshToken: REFRESH_TOKEN,
-        request: fixedRequest
-      }
-      if (location === 'input') input[forbiddenName] = 'https://attacker.invalid/provider-route'
-      if (location === 'request') fixedRequest[forbiddenName] = 'https://attacker.invalid/provider-route'
-      deepFreezeTestRequest(fixedRequest)
-      await assert.rejects(
-        () => overrideClient.quote(input),
-        (error) => errorRecord(error).code === 'IFIND_CONFIG_INVALID' &&
-          errorRecord(error).class === 'CONFIG' &&
-          errorRecord(error).stage === 'quote' &&
-          errorRecord(error).requestCount === 0
-      )
-      assert.equal(overrideTransport.calls.length, 0)
+    const overrideTransport = createRequestStub([])
+    const overrideClient = createIfindHttpClient({ request: overrideTransport.request })
+    const fixedRequest = {
+      vendorCode: 'TEST_ONLY_HK_CODE',
+      fields: ['TEST_ONLY_HK_LATEST_PRICE'],
+      [forbiddenName]: 'https://attacker.invalid/provider-route'
     }
+    deepFreezeTestRequest(fixedRequest)
+    await assert.rejects(
+      () => overrideClient.quote(Buffer.from(ACCESS_TOKEN), fixedRequest),
+      (error) => errorRecord(error).code === 'IFIND_CONFIG_INVALID' &&
+        errorRecord(error).class === 'CONFIG' &&
+        errorRecord(error).stage === 'quote' &&
+        errorRecord(error).requestCount === 0
+    )
+    assert.equal(overrideTransport.calls.length, 0)
   }
 
   const mutableRequestTransport = createRequestStub([])
   const mutableRequestClient = createIfindHttpClient({ request: mutableRequestTransport.request })
   await assert.rejects(
-    () => mutableRequestClient.quote({
-      refreshToken: REFRESH_TOKEN,
-      request: {
-        vendorCode: 'TEST_ONLY_HK_CODE',
-        fields: ['TEST_ONLY_HK_LATEST_PRICE']
-      }
+    () => mutableRequestClient.quote(Buffer.from(ACCESS_TOKEN), {
+      vendorCode: 'TEST_ONLY_HK_CODE',
+      fields: ['TEST_ONLY_HK_LATEST_PRICE']
     }),
     (error) => errorRecord(error).code === 'IFIND_CONFIG_INVALID' &&
       errorRecord(error).stage === 'quote'
@@ -899,10 +945,7 @@ async function run() {
     fields: ['TEST_ONLY_HK_LATEST_PRICE']
   })
   await assert.rejects(
-    () => mutableRequestClient.quote({
-      refreshToken: REFRESH_TOKEN,
-      request: shallowFrozenRequest
-    }),
+    () => mutableRequestClient.quote(Buffer.from(ACCESS_TOKEN), shallowFrozenRequest),
     (error) => errorRecord(error).code === 'IFIND_CONFIG_INVALID' &&
       errorRecord(error).stage === 'quote'
   )
@@ -953,18 +996,18 @@ async function run() {
       request: failureTransport.request,
       logger: failureLogger.logger
     })
-    const execution = await captureGlobalOutput(() => failureClient[failureCase.operation]({
-      refreshToken: REFRESH_TOKEN,
-      request: failureCase.operation === 'quote'
-        ? quoteRequest('HK')
-        : financialRequest('HK')
-    }))
+    const execution = await captureGlobalOutput(() => executeSharedMarketOperation(
+      failureClient,
+      failureCase.operation,
+      REFRESH_TOKEN,
+      failureCase.operation === 'quote' ? quoteRequest('HK') : financialRequest('HK')
+    ))
     assert.equal(execution.status, 'rejected')
     assert.equal(execution.reason.code, failureCase.code)
     assert.equal(execution.reason.class, failureCase.errorClass)
     assert.equal(execution.reason.stage, failureCase.stage)
     assert.equal(execution.reason.vendorErrorCode, failureCase.response.errorcode)
-    assert.equal(execution.reason.requestCount, 2)
+    assert.equal(execution.reason.requestCount, 1)
     assert.equal('cause' in execution.reason, false)
     assertNoProviderLeak({
       scenario: `${failureCase.operation} provider rejection`,
@@ -978,10 +1021,7 @@ async function run() {
   const operationAuthTransport = createRequestStub([providerErrors.accessToken])
   const operationAuthClient = createIfindHttpClient({ request: operationAuthTransport.request })
   await assert.rejects(
-    () => operationAuthClient.financial({
-      refreshToken: REFRESH_TOKEN,
-      request: financialRequest('US')
-    }),
+    () => operationAuthClient.authenticate(REFRESH_TOKEN),
     (error) => errorRecord(error).code === 'IFIND_AUTH_REJECTED' &&
       errorRecord(error).stage === 'auth' &&
       errorRecord(error).requestCount === 1
@@ -1005,13 +1045,10 @@ async function run() {
     ])
     const rawClient = createIfindHttpClient({ request: rawTransport.request })
     await assert.rejects(
-      () => rawClient.quote({
-        refreshToken: REFRESH_TOKEN,
-        request: quoteRequest('CN')
-      }),
+      () => executeSharedMarketOperation(rawClient, 'quote', REFRESH_TOKEN, quoteRequest('CN')),
       (error) => errorRecord(error).code === malformedScenario.code &&
         errorRecord(error).stage === 'quote' &&
-        errorRecord(error).requestCount === 2,
+        errorRecord(error).requestCount === 1,
       malformedScenario.name
     )
     assert.equal(rawTransport.calls[1].requestDestroyCount, 1)
@@ -1031,14 +1068,16 @@ async function run() {
       timer.cleared = true
     }
   })
-  const timedOperation = operationTimeoutClient.financial({
-    refreshToken: REFRESH_TOKEN,
-    request: financialRequest('CN')
-  })
+  const timedAuthentication = operationTimeoutClient.authenticate(REFRESH_TOKEN)
   operationTimeoutTransport.calls[0].respond({
     chunks: [JSON.stringify(accessTokenSuccess)]
   })
   await new Promise((resolve) => setImmediate(resolve))
+  const timedAuthenticationResult = await timedAuthentication
+  const timedOperation = operationTimeoutClient.financial(
+    timedAuthenticationResult.accessToken,
+    financialRequest('CN')
+  )
   const operationTotalTimer = operationTimeoutTimers
     .filter((timer) => !timer.cleared && timer.milliseconds === 5000)[0]
   assert.ok(operationTotalTimer)
@@ -1055,14 +1094,16 @@ async function run() {
   const operationDuplicateClient = createIfindHttpClient({
     request: operationDuplicateTransport.request
   })
-  const duplicateOperation = operationDuplicateClient.quote({
-    refreshToken: REFRESH_TOKEN,
-    request: quoteRequest('US')
-  })
+  const duplicateAuthentication = operationDuplicateClient.authenticate(REFRESH_TOKEN)
   operationDuplicateTransport.calls[0].respond({
     chunks: [JSON.stringify(accessTokenSuccess)]
   })
   await new Promise((resolve) => setImmediate(resolve))
+  const duplicateAuthenticationResult = await duplicateAuthentication
+  const duplicateOperation = operationDuplicateClient.quote(
+    duplicateAuthenticationResult.accessToken,
+    quoteRequest('US')
+  )
   const firstDuplicateResponse = operationDuplicateTransport.calls[1].respond({ event: null })
   const secondDuplicateResponse = operationDuplicateTransport.calls[1].respond({ event: null })
   await assert.rejects(
@@ -1082,10 +1123,12 @@ async function run() {
     return unknownBaseTransport.request(url, options, callback)
   }
   const unknownFailureClient = createIfindHttpClient({ request: unknownFailureRequest })
-  const unknownExecution = await captureGlobalOutput(() => unknownFailureClient.quote({
-    refreshToken: REFRESH_TOKEN,
-    request: quoteRequest('HK')
-  }))
+  const unknownExecution = await captureGlobalOutput(() => executeSharedMarketOperation(
+    unknownFailureClient,
+    'quote',
+    REFRESH_TOKEN,
+    quoteRequest('HK')
+  ))
   assert.equal(unknownExecution.status, 'rejected')
   assert.equal(unknownExecution.reason.code, 'IFIND_NETWORK_FAILED')
   assert.equal(unknownExecution.reason.class, 'NETWORK')
@@ -1111,7 +1154,7 @@ async function run() {
     logger: successLogger.logger
   })
 
-  assert.deepEqual(Object.keys(client), ['diagnose', 'quote', 'financial'])
+  assert.deepEqual(Object.keys(client), ['diagnose', 'authenticate', 'quote', 'financial'])
   const successExecution = await captureGlobalOutput(
     () => client.diagnose({ refreshToken: REFRESH_TOKEN })
   )
@@ -1576,7 +1619,7 @@ async function run() {
   }
   assert.ok(Buffer.isBuffer(clearedTokenBuffer))
   assert.equal((/** @type {Buffer} */ (clearedTokenBuffer)).every((byte) => byte === 0), true)
-  assert.deepEqual(Object.keys(clearClient), ['diagnose', 'quote', 'financial'])
+  assert.deepEqual(Object.keys(clearClient), ['diagnose', 'authenticate', 'quote', 'financial'])
   assert.equal(Object.getOwnPropertyDescriptor(clearClient, 'clear').enumerable, false)
   await clearClient.diagnose({ refreshToken: REFRESH_TOKEN })
   assert.equal(clearTransport.calls.length, 4)

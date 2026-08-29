@@ -44,6 +44,33 @@ const FINANCIAL_METRIC_KEYS = new Set([
   'revenue', 'grossProfit', 'attributableNetProfit', 'operatingCashFlow',
   'receivables', 'inventory', 'interestBearingDebt'
 ])
+const FINANCIAL_DISCLOSURE_SCOPES = Object.freeze({
+  HK_ALIBABA_9988: 'consolidated',
+  US_APPLE_AAPL: 'issuer_consolidated',
+  CN_MOUTAI_600519: 'consolidated'
+})
+const FINANCIAL_METADATA_IDS = Object.freeze({
+  HK_ALIBABA_9988: Object.freeze([
+    'TEST_ONLY_HK_CURRENCY', 'TEST_ONLY_HK_UNIT', 'TEST_ONLY_HK_REPORT_PERIOD',
+    'TEST_ONLY_HK_REPORT_DATE', 'TEST_ONLY_HK_PERIOD_TYPE',
+    'TEST_ONLY_HK_DISCLOSURE_SCOPE', 'TEST_ONLY_HK_SOURCE_TIME',
+    'TEST_ONLY_HK_FETCH_TIME', 'TEST_ONLY_HK_SOURCE_MODE'
+  ]),
+  US_APPLE_AAPL: Object.freeze([
+    'TEST_ONLY_US_CURRENCY', 'TEST_ONLY_US_UNIT', 'TEST_ONLY_US_REPORT_PERIOD',
+    'TEST_ONLY_US_REPORT_DATE', 'TEST_ONLY_US_PERIOD_TYPE',
+    'TEST_ONLY_US_DISCLOSURE_SCOPE', 'TEST_ONLY_US_SOURCE_TIME',
+    'TEST_ONLY_US_FETCH_TIME', 'TEST_ONLY_US_SOURCE_MODE'
+  ]),
+  CN_MOUTAI_600519: Object.freeze([
+    'TEST_ONLY_CN_CURRENCY', 'TEST_ONLY_CN_UNIT', 'TEST_ONLY_CN_REPORT_PERIOD',
+    'TEST_ONLY_CN_REPORT_DATE', 'TEST_ONLY_CN_PERIOD_TYPE',
+    'TEST_ONLY_CN_DISCLOSURE_SCOPE', 'TEST_ONLY_CN_SOURCE_TIME',
+    'TEST_ONLY_CN_FETCH_TIME', 'TEST_ONLY_CN_SOURCE_MODE'
+  ])
+})
+const LEASE_DURATION_MS = 30_000
+const SNAPSHOT_WORK_LIMIT = 4096
 const DANGEROUS_RECORD_KEYS = new Set(['__proto__', 'constructor', 'prototype'])
 const REPOSITORY_SAFE_CLASSES = new Set([
   'AUTH', 'PERMISSION', 'INDICATOR', 'QUOTA', 'NETWORK', 'API',
@@ -118,7 +145,7 @@ function ownBufferReference(value, key) {
   try {
     if (!isObjectLike(value) || types.isProxy(value)) return null
     const descriptor = Reflect.getOwnPropertyDescriptor(value, key)
-    if (!descriptor || !descriptor.enumerable || !Object.hasOwn(descriptor, 'value') ||
+    if (!descriptor || !Object.hasOwn(descriptor, 'value') ||
       types.isProxy(descriptor.value) || !Buffer.isBuffer(descriptor.value)) return null
     return descriptor.value
   } catch {
@@ -147,7 +174,13 @@ function methodReference(value, name) {
   failConfig()
 }
 
-function snapshotTree(value, state = { depth: 0, work: 0, active: new Set() }) {
+function snapshotTree(value, state = { work: 0, active: new Set() }, depth = 0) {
+  if (state.work >= SNAPSHOT_WORK_LIMIT) {
+    throw new SafeFailure(
+      'IFIND_MARKET_CLIENT_OUTPUT_INVALID', 'RESPONSE_SHAPE', 'client'
+    )
+  }
+  state.work += 1
   if (value === null || typeof value === 'string' || typeof value === 'boolean') return value
   if (typeof value === 'number') {
     if (!Number.isFinite(value)) throw new SafeFailure(
@@ -155,7 +188,7 @@ function snapshotTree(value, state = { depth: 0, work: 0, active: new Set() }) {
     )
     return value
   }
-  if (typeof value !== 'object' || types.isProxy(value) || state.depth > 12 || state.work > 4096) {
+  if (typeof value !== 'object' || types.isProxy(value) || depth > 12) {
     throw new SafeFailure(
       'IFIND_MARKET_CLIENT_OUTPUT_INVALID', 'RESPONSE_SHAPE', 'client'
     )
@@ -166,7 +199,6 @@ function snapshotTree(value, state = { depth: 0, work: 0, active: new Set() }) {
     )
   }
   state.active.add(value)
-  state.work += 1
   try {
     const prototype = Reflect.getPrototypeOf(value)
     const descriptors = Object.getOwnPropertyDescriptors(value)
@@ -182,25 +214,17 @@ function snapshotTree(value, state = { depth: 0, work: 0, active: new Set() }) {
         if (!descriptor || !descriptor.enumerable || !Object.hasOwn(descriptor, 'value')) {
           throw new Error('invalid')
         }
-        result.push(snapshotTree(descriptor.value, {
-          depth: state.depth + 1,
-          work: state.work,
-          active: state.active
-        }))
+        result.push(snapshotTree(descriptor.value, state, depth + 1))
       }
       return Object.freeze(result)
     }
     if (prototype !== Object.prototype && prototype !== null) throw new Error('invalid')
-    const result = {}
+    const result = Object.create(null)
     for (const [key, descriptor] of Object.entries(descriptors)) {
       if (DANGEROUS_RECORD_KEYS.has(key) || !descriptor.enumerable ||
         !Object.hasOwn(descriptor, 'value')) throw new Error('invalid')
       Object.defineProperty(result, key, {
-        value: snapshotTree(descriptor.value, {
-          depth: state.depth + 1,
-          work: state.work,
-          active: state.active
-        }),
+        value: snapshotTree(descriptor.value, state, depth + 1),
         enumerable: true,
         configurable: false,
         writable: false
@@ -224,16 +248,17 @@ function snapshotParserTree(value, failureCode, stage, state = {
   const fail = () => {
     throw new SafeFailure(failureCode, 'RESPONSE_SHAPE', stage)
   }
+  if (state.work >= SNAPSHOT_WORK_LIMIT) fail()
+  state.work += 1
   if (value === null || typeof value === 'string' || typeof value === 'boolean') return value
   if (typeof value === 'number') {
     if (!Number.isFinite(value)) fail()
     return value
   }
   if (typeof value !== 'object' || types.isProxy(value) || depth > 12 ||
-    state.work >= 4096 || state.active.has(value)) fail()
+    state.active.has(value)) fail()
 
   state.active.add(value)
-  state.work += 1
   try {
     const prototype = Reflect.getPrototypeOf(value)
     const descriptors = Object.getOwnPropertyDescriptors(value)
@@ -264,7 +289,7 @@ function snapshotParserTree(value, failureCode, stage, state = {
     if (prototype !== Object.prototype && prototype !== null) fail()
     const keys = Object.keys(descriptors)
     if (keys.length > 1024) fail()
-    const result = {}
+    const result = Object.create(null)
     for (const key of keys) {
       const descriptor = descriptors[key]
       if (DANGEROUS_RECORD_KEYS.has(key) || !descriptor.enumerable ||
@@ -291,6 +316,23 @@ function snapshotParserTree(value, failureCode, stage, state = {
   }
 }
 
+function materializeParserInput(value) {
+  if (value === null || typeof value !== 'object') return value
+  if (Array.isArray(value)) {
+    return Object.freeze(value.map((entry) => materializeParserInput(entry)))
+  }
+  const result = {}
+  for (const [key, descriptor] of Object.entries(Object.getOwnPropertyDescriptors(value))) {
+    Object.defineProperty(result, key, {
+      value: materializeParserInput(descriptor.value),
+      enumerable: true,
+      configurable: false,
+      writable: false
+    })
+  }
+  return Object.freeze(result)
+}
+
 function deepFreeze(value) {
   if (!value || typeof value !== 'object' || Buffer.isBuffer(value) || Object.isFrozen(value)) {
     return value
@@ -301,7 +343,9 @@ function deepFreeze(value) {
 
 function clearBuffer(value) {
   try {
-    if (!types.isProxy(value) && Buffer.isBuffer(value)) value.fill(0)
+    if (!types.isProxy(value) && Buffer.isBuffer(value)) {
+      Buffer.prototype.fill.call(value, 0)
+    }
   } catch {
     // Cleanup failure must not replace the originating safe result.
   }
@@ -518,14 +562,17 @@ function buildFixedRequests(manifest) {
       }),
       financial: deepFreeze({
         vendorCode: manifest.vendorCode,
-        indicatorIds: [...financialTemplate.indicatorIds],
+        indicatorIds: [
+          ...financialTemplate.indicatorIds,
+          ...FINANCIAL_METADATA_IDS[manifest.caseId]
+        ],
         periodParameters: {
-          fullFiscalYears: snapshotTree(
+          fullFiscalYears: materializeParserInput(snapshotTree(
             vendorParameters.fullFiscalYears.requestParameters
-          ),
-          latestDisclosedInterim: snapshotTree(
+          )),
+          latestDisclosedInterim: materializeParserInput(snapshotTree(
             vendorParameters.latestDisclosedInterim.requestParameters
-          )
+          ))
         }
       })
     }
@@ -536,7 +583,23 @@ function buildFixedRequests(manifest) {
   }
 }
 
-function validateReservation(caseId, value) {
+function validQuotaSnapshot(value) {
+  return isCanonicalCalendarDate(value.localDayKey) &&
+    Number.isSafeInteger(value.caseAttemptCount) && value.caseAttemptCount >= 0 &&
+    Number.isSafeInteger(value.globalAttemptCount) && value.globalAttemptCount >= 0 &&
+    Number.isSafeInteger(value.caseRemaining) && value.caseRemaining >= 0 &&
+    Number.isSafeInteger(value.globalRemaining) && value.globalRemaining >= 0 &&
+    (value.cooldownUntil === null ||
+      (Number.isSafeInteger(value.cooldownUntil) && value.cooldownUntil >= 0)) &&
+    typeof value.inFlight === 'boolean' &&
+    (value.inFlightCaseId === null ||
+      (typeof value.inFlightCaseId === 'string' &&
+        CASE_ID_PATTERN.test(value.inFlightCaseId))) &&
+    (value.inFlightExpiresAt === null ||
+      (Number.isSafeInteger(value.inFlightExpiresAt) && value.inFlightExpiresAt >= 0))
+}
+
+function validateReservation(expected, value) {
   const result = exactDataObject(value, [
     'status', 'reservation', 'localDayKey', 'caseAttemptCount',
     'globalAttemptCount'
@@ -545,11 +608,15 @@ function validateReservation(caseId, value) {
     'runId', 'caseId', 'createdAt', 'tokenVersionId', 'leaseExpiresAt'
   ])
   if (!result || result.status !== 'reserved' || !reservation ||
-    reservation.caseId !== caseId || !RUN_ID_PATTERN.test(reservation.runId) ||
-    !VERSION_ID_PATTERN.test(reservation.tokenVersionId) ||
-    !Number.isSafeInteger(reservation.createdAt) ||
-    !Number.isSafeInteger(reservation.leaseExpiresAt) ||
-    reservation.leaseExpiresAt <= reservation.createdAt) throw repositoryFailure()
+    !isCanonicalCalendarDate(result.localDayKey) ||
+    !Number.isSafeInteger(result.caseAttemptCount) || result.caseAttemptCount < 1 ||
+    !Number.isSafeInteger(result.globalAttemptCount) || result.globalAttemptCount < 1 ||
+    reservation.runId !== expected.runId || reservation.caseId !== expected.caseId ||
+    reservation.createdAt !== expected.createdAt ||
+    reservation.tokenVersionId !== expected.tokenVersionId ||
+    reservation.leaseExpiresAt !== expected.createdAt + LEASE_DURATION_MS) {
+    throw repositoryFailure()
+  }
   return { ...reservation }
 }
 
@@ -563,7 +630,8 @@ function reservationRejection(value) {
     'inFlight', 'inFlightCaseId', 'inFlightExpiresAt'
   ]
   const result = exactDataObject(value, fields)
-  if (result && statuses.has(result.status) && Number.isSafeInteger(result.retryAt)) {
+  if (result && statuses.has(result.status) && Number.isSafeInteger(result.retryAt) &&
+    result.retryAt >= 0 && validQuotaSnapshot(result)) {
     if (result.status === 'busy') {
       return new SafeFailure(
         'IFIND_MARKET_LEASE_CONFLICT', 'BUSY', 'reserve', null, 'busy'
@@ -575,6 +643,22 @@ function reservationRejection(value) {
       'global-daily-limit': 'IFIND_MARKET_GLOBAL_DAILY_LIMIT'
     }
     return new SafeFailure(codes[result.status], 'RATE_LIMITED', 'reserve', null, result.status)
+  }
+  const stableResult = exactDataObject(value, [
+    'status', 'localDayKey', 'caseAttemptCount', 'globalAttemptCount',
+    'caseRemaining', 'globalRemaining', 'cooldownUntil', 'inFlight',
+    'inFlightCaseId', 'inFlightExpiresAt'
+  ])
+  if (stableResult && validQuotaSnapshot(stableResult) && stableResult.status === 'duplicate') {
+    return new SafeFailure(
+      'IFIND_MARKET_RESERVATION_DUPLICATE', 'CONFIG', 'reserve', null, 'rejected'
+    )
+  }
+  if (stableResult && validQuotaSnapshot(stableResult) &&
+    stableResult.status === 'clock-rollback') {
+    return new SafeFailure(
+      'IFIND_MARKET_CLOCK_ROLLBACK', 'CONFIG', 'reserve', null, 'clock-rollback'
+    )
   }
   return null
 }
@@ -670,7 +754,11 @@ function parseQuote(quoteParser, caseId, catalogCase, payload, verification) {
   let parsed
   try {
     parsed = snapshotParserTree(
-      quoteParser({ caseId, payload, verification }),
+      quoteParser({
+        caseId,
+        payload: materializeParserInput(payload),
+        verification
+      }),
       'IFIND_MARKET_QUOTE_UNAVAILABLE',
       'quote-parser'
     )
@@ -728,68 +816,128 @@ function parseFinancials(
   catalogCase,
   payload,
   verification,
-  financialReportingCurrencyEvidence
+  financialReportingCurrencyEvidence,
+  manifest
 ) {
-  let parsed
+  let parserOutput
   try {
-    parsed = snapshotParserTree(
-      financialParser({
-        caseId,
-        payload,
-        verification,
-        financialReportingCurrencyEvidence
-      }),
-      'IFIND_MARKET_FINANCIAL_UNAVAILABLE',
-      'financial-parser'
-    )
+    parserOutput = financialParser({
+      caseId,
+      payload: materializeParserInput(payload),
+      verification,
+      financialReportingCurrencyEvidence
+    })
   } catch {
     throw new SafeFailure(
       'IFIND_MARKET_FINANCIAL_UNAVAILABLE', 'RESPONSE_SHAPE', 'financial-parser'
     )
   }
+  const invalidOutput = () => {
+    const failure = new SafeFailure(
+      'IFIND_MARKET_FINANCIAL_UNAVAILABLE', 'RESPONSE_SHAPE', 'financial-parser'
+    )
+    Object.defineProperty(failure, 'invalidParserOutput', { value: true })
+    throw failure
+  }
+  let parsed
+  try {
+    parsed = snapshotParserTree(
+      parserOutput,
+      'IFIND_MARKET_FINANCIAL_UNAVAILABLE',
+      'financial-parser'
+    )
+  } catch {
+    invalidOutput()
+  }
   const result = exactDataObject(parsed, FINANCIAL_RESULT_FIELDS)
   const listingId = ownDataValue(catalogCase, 'listingId').value
   const displayCode = ownDataValue(catalogCase, 'displayCode').value
-  if (result) validateParserVerification(
-    result.verification,
-    'IFIND_MARKET_FINANCIAL_UNAVAILABLE',
-    'financial-parser'
-  )
-  if (!result || result.caseId !== caseId || result.listingId !== listingId ||
-    result.displayCode !== displayCode || result.source !== 'real' ||
-    result.availability !== 'available' || !Array.isArray(result.points) ||
-    result.points.length < 1 || result.points.length > 64 || types.isProxy(result.points)) {
+  if (result && result.caseId === caseId && result.listingId === listingId &&
+    result.displayCode === displayCode && result.source === 'unavailable' &&
+    result.availability === 'unavailable' && Array.isArray(result.points) &&
+    result.points.length === 0) {
     throw new SafeFailure(
       'IFIND_MARKET_FINANCIAL_UNAVAILABLE', 'RESPONSE_SHAPE', 'financial-parser'
     )
   }
-  const points = []
-  for (const point of result.points) {
-    const value = exactDataObject(point, FINANCIAL_POINT_FIELDS)
-    if (value) validateParserVerification(
-      value.verification,
+  try {
+    if (result) validateParserVerification(
+      result.verification,
       'IFIND_MARKET_FINANCIAL_UNAVAILABLE',
       'financial-parser'
     )
+  } catch {
+    invalidOutput()
+  }
+  if (!result || result.caseId !== caseId || result.listingId !== listingId ||
+    result.displayCode !== displayCode || result.source !== 'real' ||
+    result.availability !== 'available' || !Array.isArray(result.points) ||
+    result.points.length !== 21 || types.isProxy(result.points)) invalidOutput()
+  const financialIndicators = manifest && manifest.indicators &&
+    manifest.indicators.financial
+  if (!Array.isArray(financialIndicators) || financialIndicators.length !== 7) invalidOutput()
+  const indicatorByMetric = new Map()
+  for (const indicator of financialIndicators) {
+    const value = exactDataObject(indicator, [
+      'metric', 'vendorIndicatorId', 'evidenceStatus'
+    ])
+    if (!value || !FINANCIAL_METRIC_KEYS.has(value.metric) ||
+      typeof value.vendorIndicatorId !== 'string' ||
+      value.evidenceStatus !== 'verified' || indicatorByMetric.has(value.metric)) invalidOutput()
+    indicatorByMetric.set(value.metric, value.vendorIndicatorId)
+  }
+  if (indicatorByMetric.size !== FINANCIAL_METRIC_KEYS.size) invalidOutput()
+  const expectedCurrency = financialReportingCurrencyEvidence.currency
+  const expectedScope = FINANCIAL_DISCLOSURE_SCOPES[caseId]
+  const points = []
+  const identities = new Set()
+  const periods = new Map()
+  for (const point of result.points) {
+    const value = exactDataObject(point, FINANCIAL_POINT_FIELDS)
+    try {
+      if (value) validateParserVerification(
+        value.verification,
+        'IFIND_MARKET_FINANCIAL_UNAVAILABLE',
+        'financial-parser'
+      )
+    } catch {
+      invalidOutput()
+    }
     const availableValue = value && value.availability === 'available' &&
       typeof value.value === 'number' && Number.isFinite(value.value)
     const missingValue = value && value.availability === 'missing' && value.value === null
     const reportPeriod = value && canonicalReportPeriod(value.reportPeriod)
-    if (!value || typeof value.indicatorId !== 'string' ||
-      !/^[A-Z0-9_]{1,80}$/.test(value.indicatorId) ||
+    if (!value || value.indicatorId !== indicatorByMetric.get(value.metricKey) ||
       !FINANCIAL_METRIC_KEYS.has(value.metricKey) ||
       !reportPeriod ||
       !isCanonicalCalendarDate(value.reportDate) ||
       !['annual', 'interim'].includes(value.periodType) ||
       (!availableValue && !missingValue) ||
-      typeof value.currency !== 'string' || !/^[A-Z]{3}$/.test(value.currency) ||
-      value.unit !== 'million' || typeof value.disclosureScope !== 'string' ||
-      !/^[a-z][a-z_]{0,31}$/.test(value.disclosureScope) ||
+      value.currency !== expectedCurrency || value.unit !== 'million' ||
+      value.disclosureScope !== expectedScope ||
       !isStrictTimestamp(value.sourceTime) || !isStrictTimestamp(value.fetchTime)) {
-      throw new SafeFailure(
-        'IFIND_MARKET_FINANCIAL_UNAVAILABLE', 'RESPONSE_SHAPE', 'financial-parser'
-      )
+      invalidOutput()
     }
+    const identity = `${value.metricKey}\u0000${reportPeriod}`
+    if (identities.has(identity)) invalidOutput()
+    identities.add(identity)
+    const period = periods.get(reportPeriod)
+    if (period && (period.reportDate !== value.reportDate ||
+      period.periodType !== value.periodType ||
+      period.disclosureScope !== value.disclosureScope ||
+      period.sourceTime !== value.sourceTime ||
+      period.fetchTime !== value.fetchTime)) invalidOutput()
+    if (!period) {
+      periods.set(reportPeriod, {
+        reportDate: value.reportDate,
+        periodType: value.periodType,
+        disclosureScope: value.disclosureScope,
+        sourceTime: value.sourceTime,
+        fetchTime: value.fetchTime,
+        metrics: new Set()
+      })
+    }
+    periods.get(reportPeriod).metrics.add(value.metricKey)
     points.push({
       indicatorId: value.indicatorId,
       metricKey: value.metricKey,
@@ -805,18 +953,25 @@ function parseFinancials(
       fetchTime: value.fetchTime
     })
   }
+  const observedPeriods = [...periods.values()]
+  if (periods.size !== 3 || observedPeriods.filter((period) =>
+    period.periodType === 'annual').length !== 2 || observedPeriods.filter((period) =>
+    period.periodType === 'interim').length !== 1 || observedPeriods.some((period) =>
+    period.metrics.size !== FINANCIAL_METRIC_KEYS.size)) invalidOutput()
   return points
 }
 
 function terminalTimestamp(clock, reservation) {
-  try {
-    return Math.min(
-      reservation.leaseExpiresAt,
-      Math.max(reservation.createdAt, readTimestamp(clock))
-    )
-  } catch {
-    return reservation.createdAt
+  const observedAt = readTimestamp(clock)
+  if (observedAt > reservation.leaseExpiresAt) {
+    throw new SafeFailure('IFIND_MARKET_LEASE_EXPIRED', 'API', 'lease')
   }
+  if (observedAt < reservation.createdAt) {
+    throw new SafeFailure(
+      'IFIND_MARKET_CLOCK_ROLLBACK', 'CONFIG', 'lease', null, 'clock-rollback'
+    )
+  }
+  return observedAt
 }
 
 function createTerminalResult(reservation, clock, values) {
@@ -861,19 +1016,28 @@ function createIfindMarketDiagnosticService(options) {
     const persistedFailure = REPOSITORY_SAFE_CLASSES.has(failure.safeErrorClass)
       ? failure
       : new SafeFailure(failure.failureCode, 'API', failure.stage, failure.vendorErrorCode)
-    const result = createTerminalResult(reservation, config.clock, {
-      status: 'failed',
-      quoteStatus: 'not_run',
-      financeStatus: 'not_run',
-      requestCount,
-      dataVol,
-      failure: persistedFailure
-    })
+    if (failure.stage === 'lease') return failure
+    let result
+    try {
+      result = createTerminalResult(reservation, config.clock, {
+        status: 'failed',
+        quoteStatus: 'not_run',
+        financeStatus: 'not_run',
+        requestCount,
+        dataVol,
+        failure: persistedFailure
+      })
+    } catch (error) {
+      return error instanceof SafeFailure
+        ? error
+        : new SafeFailure('IFIND_MARKET_INTERNAL_FAILED', 'API', 'service')
+    }
     try {
       validateSettlement(repositoryFail.call(config.repository, { reservation, result }))
     } catch {
       // Cleanup failure must not replace the originating safe failure.
     }
+    return null
   }
 
   async function run(input) {
@@ -935,20 +1099,24 @@ function createIfindMarketDiagnosticService(options) {
         throw new SafeFailure('IFIND_MARKET_CONFIG_INVALID', 'API', 'configuration')
       }
 
+      const reserveRequest = {
+        runId,
+        caseId,
+        createdAt,
+        tokenVersionId: config.tokenVersionId
+      }
       let reserveResult
       try {
-        reserveResult = config.repository && repositoryReserve.call(config.repository, {
-          runId,
-          caseId,
-          createdAt,
-          tokenVersionId: config.tokenVersionId
-        })
+        reserveResult = config.repository && repositoryReserve.call(
+          config.repository,
+          reserveRequest
+        )
       } catch {
         throw repositoryFailure()
       }
       const rejected = reservationRejection(reserveResult)
       if (rejected) throw rejected
-      reservation = validateReservation(caseId, reserveResult)
+      reservation = validateReservation(reserveRequest, reserveResult)
 
       try {
         refreshToken = readRefreshToken.call(config.secretProvider)
@@ -962,14 +1130,10 @@ function createIfindMarketDiagnosticService(options) {
 
       let authResult
       try {
-        const authInput = Object.freeze({
-          refreshToken,
-          requestBudget: 1
-        })
         grantPermit('auth')
         const authOutput = await clientAuthenticate.call(
           config.client,
-          authInput
+          refreshToken
         )
         accessToken = ownBufferReference(authOutput, 'accessToken')
         authResult = decodeAuthResult(authOutput)
@@ -981,15 +1145,11 @@ function createIfindMarketDiagnosticService(options) {
 
       let quoteResult
       try {
-        const quoteInput = Object.freeze({
-          accessToken,
-          request: fixedRequests.quote,
-          requestBudget: 1
-        })
         grantPermit('quote')
         quoteResult = decodeMarketResult(await clientQuote.call(
           config.client,
-          quoteInput
+          accessToken,
+          fixedRequests.quote
         ), 'quote')
         quotePayload = quoteResult.payload
         if (quoteResult.dataVol !== null) {
@@ -1003,15 +1163,11 @@ function createIfindMarketDiagnosticService(options) {
 
       let financialFailure = null
       try {
-        const financialInput = Object.freeze({
-          accessToken,
-          request: fixedRequests.financial,
-          requestBudget: 1
-        })
         grantPermit('financial')
         const financialResult = decodeMarketResult(await clientFinancial.call(
           config.client,
-          financialInput
+          accessToken,
+          fixedRequests.financial
         ), 'financial')
         financialPayload = financialResult.payload
         if (financialResult.dataVol !== null) {
@@ -1043,9 +1199,11 @@ function createIfindMarketDiagnosticService(options) {
             catalogCase,
             financialPayload,
             manifestBundle.financialVerification,
-            manifestBundle.financialReportingCurrencyEvidence
+            manifestBundle.financialReportingCurrencyEvidence,
+            manifestBundle.manifest
           )
         } catch (error) {
+          if (error instanceof SafeFailure && error.invalidParserOutput === true) throw error
           financialFailure = error instanceof SafeFailure
             ? error
             : new SafeFailure(
@@ -1106,12 +1264,13 @@ function createIfindMarketDiagnosticService(options) {
         ? error
         : new SafeFailure('IFIND_MARKET_INTERNAL_FAILED', 'API', 'service')
       if (reservation) {
-        bestEffortFail(
+        const terminalFailure = bestEffortFail(
           reservation,
           failure,
           requestCount,
           hasDataVol ? dataVol : null
         )
+        if (terminalFailure) return safeResult(terminalFailure)
       }
       return safeResult(failure)
     } finally {

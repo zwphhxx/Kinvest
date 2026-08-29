@@ -602,21 +602,12 @@ function frozenProviderParameters(value, state, depth = 0) {
   }
 }
 
-function readOperationInput(input, operation) {
-  const inputDescriptors = plainDataDescriptors(input, ['refreshToken', 'request'], false)
-  const refreshTokenValue = descriptorValue(inputDescriptors, 'refreshToken')
-  const refreshToken = Buffer.isBuffer(refreshTokenValue)
-    ? new TextDecoder('utf-8', { fatal: true }).decode(refreshTokenValue)
-    : refreshTokenValue
-  if (!isHeaderSafeToken(refreshToken)) throw new Error('invalid request')
-
-  const request = descriptorValue(inputDescriptors, 'request')
+function readOperationRequest(request, operation) {
   if (operation === 'quote') {
     const descriptors = plainDataDescriptors(request, ['vendorCode', 'fields'], true)
     const vendorCode = providerIdentifier(descriptorValue(descriptors, 'vendorCode'))
     const fieldIds = frozenIdentifierArray(descriptorValue(descriptors, 'fields'))
     return Object.freeze({
-      refreshToken,
       vendorCode,
       fieldIds,
       body: Object.freeze({
@@ -656,7 +647,6 @@ function readOperationInput(input, operation) {
   const vendorCode = providerIdentifier(descriptorValue(descriptors, 'vendorCode'))
   const fieldIds = frozenIdentifierArray(descriptorValue(descriptors, 'indicatorIds'))
   return Object.freeze({
-    refreshToken,
     vendorCode,
     fieldIds,
     body: Object.freeze({
@@ -802,7 +792,7 @@ function createIfindHttpClient({
 
   function clear() {
     generation += 1
-    for (const token of activeAccessTokens) token.fill(0)
+    for (const token of activeAccessTokens) Buffer.prototype.fill.call(token, 0)
     activeAccessTokens.clear()
   }
 
@@ -829,7 +819,7 @@ function createIfindHttpClient({
     function discardAccessToken() {
       if (Buffer.isBuffer(accessToken)) {
         activeAccessTokens.delete(accessToken)
-        accessToken.fill(0)
+        Buffer.prototype.fill.call(accessToken, 0)
       }
       accessToken = null
     }
@@ -1004,36 +994,39 @@ function createIfindHttpClient({
     }
   }
 
-  async function executeMarketOperation(operation, input) {
+  async function authenticateMarket(refreshTokenInput) {
     let requestCount = 0
     let accessToken = null
+    let transferred = false
     function discardAccessToken() {
       if (Buffer.isBuffer(accessToken)) {
         activeAccessTokens.delete(accessToken)
-        accessToken.fill(0)
+        Buffer.prototype.fill.call(accessToken, 0)
       }
       accessToken = null
     }
-
     try {
-      let operationInput
+      let refreshToken
       try {
-        operationInput = readOperationInput(input, operation)
+        if (types.isProxy(refreshTokenInput)) throw new Error('invalid request')
+        refreshToken = Buffer.isBuffer(refreshTokenInput)
+          ? new TextDecoder('utf-8', { fatal: true }).decode(refreshTokenInput)
+          : refreshTokenInput
+        if (!isHeaderSafeToken(refreshToken)) throw new Error('invalid request')
       } catch {
         throw withStage(
           safeError('IFIND_CONFIG_INVALID', 'CONFIG', 'iFinD client configuration was invalid'),
-          operation
+          'auth'
         )
       }
       const operationGeneration = generation
-
       try {
         requireCurrentGeneration(operationGeneration)
         requestCount += 1
         const tokenResponse = await requestJson(
           request,
           ENDPOINTS.auth,
-          { refresh_token: operationInput.refreshToken },
+          { refresh_token: refreshToken },
           undefined,
           setTimer,
           clearTimer
@@ -1057,21 +1050,45 @@ function createIfindHttpClient({
         accessToken = Buffer.from(providerAccessToken, 'utf8')
         activeAccessTokens.add(accessToken)
         requireCurrentGeneration(operationGeneration)
+        transferred = true
+        return Object.freeze({ accessToken, requestCount: 1 })
       } catch (error) {
         throw withStage(error, 'auth')
       }
+    } catch (error) {
+      throw withRequestCount(error, requestCount)
+    } finally {
+      if (!transferred) discardAccessToken()
+    }
+  }
 
+  async function executeMarketOperation(operation, accessTokenInput, requestInput) {
+    let requestCount = 0
+    try {
+      let operationInput
+      let accessToken
       try {
-        const tokenForOperation = accessToken
-        if (!Buffer.isBuffer(tokenForOperation)) {
-          throw safeError('IFIND_CONFIG_INVALID', 'CONFIG', 'iFinD client configuration was invalid')
+        if (types.isProxy(accessTokenInput) || !Buffer.isBuffer(accessTokenInput)) {
+          throw new Error('invalid request')
         }
+        accessToken = new TextDecoder('utf-8', { fatal: true }).decode(accessTokenInput)
+        if (!isHeaderSafeToken(accessToken)) throw new Error('invalid request')
+        operationInput = readOperationRequest(requestInput, operation)
+      } catch {
+        throw withStage(
+          safeError('IFIND_CONFIG_INVALID', 'CONFIG', 'iFinD client configuration was invalid'),
+          operation
+        )
+      }
+      const operationGeneration = generation
+      try {
+        requireCurrentGeneration(operationGeneration)
         requestCount += 1
         const response = await requestJson(
           request,
           ENDPOINTS[operation],
           {
-            access_token: tokenForOperation.toString('utf8'),
+            access_token: accessToken,
             ifindlang: 'cn'
           },
           operationInput.body,
@@ -1082,10 +1099,15 @@ function createIfindHttpClient({
         const responseErrorCode = protocolErrorCode(response)
         if (responseErrorCode === 0) {
           try {
-            protocolDataVol(response)
-            return operation === 'quote'
+            const dataVol = protocolDataVol(response)
+            const payload = operation === 'quote'
               ? sanitizeQuoteSuccess(response, operationInput)
               : sanitizeFinancialSuccess(response, operationInput)
+            return Object.freeze({
+              payload,
+              requestCount: 1,
+              dataVol: dataVol.present ? dataVol.value : null
+            })
           } catch {
             throw safeError('IFIND_RESPONSE_SHAPE', 'API', 'iFinD response shape was invalid')
           }
@@ -1135,20 +1157,18 @@ function createIfindHttpClient({
       }
     } catch (error) {
       throw withRequestCount(error, requestCount)
-    } finally {
-      discardAccessToken()
     }
   }
 
-  function quote(input) {
-    return executeMarketOperation('quote', input)
+  function quote(accessToken, fixedRequest) {
+    return executeMarketOperation('quote', accessToken, fixedRequest)
   }
 
-  function financial(input) {
-    return executeMarketOperation('financial', input)
+  function financial(accessToken, fixedRequest) {
+    return executeMarketOperation('financial', accessToken, fixedRequest)
   }
 
-  const client = { diagnose, quote, financial }
+  const client = { diagnose, authenticate: authenticateMarket, quote, financial }
   Object.defineProperty(client, 'clear', { value: clear })
   return client
 }
