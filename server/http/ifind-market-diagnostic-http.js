@@ -410,7 +410,9 @@ function copyFinancialPoint(value, catalogEntry) {
   ])
   if (!safeText(dto.indicatorId, 128, /^[A-Z0-9_]+$/) ||
     !METRIC_KEYS.has(dto.metricKey) ||
+    typeof dto.reportPeriod !== 'string' ||
     !REPORT_PERIOD_PATTERN.test(dto.reportPeriod) ||
+    typeof dto.periodEnd !== 'string' ||
     !CALENDAR_DATE_PATTERN.test(dto.periodEnd) ||
     !PERIOD_TYPES.has(dto.periodType) || !AVAILABILITY.has(dto.availability) ||
     dto.currency !== catalogEntry.presentation.expectedTradingCurrency ||
@@ -446,7 +448,8 @@ function copyRun(value, expectedCaseId) {
   ])
   const catalogEntry = CATALOG_BY_ID.get(expectedCaseId)
   if (!catalogEntry || dto.caseId !== expectedCaseId ||
-    !RUN_ID_PATTERN.test(dto.runId) || !RUN_STATUSES.has(dto.status) ||
+    typeof dto.runId !== 'string' || !RUN_ID_PATTERN.test(dto.runId) ||
+    !RUN_STATUSES.has(dto.status) ||
     !DATA_STATUSES.has(dto.quoteStatus) || !DATA_STATUSES.has(dto.financeStatus) ||
     !isCount(dto.requestCount, 5) ||
     (dto.dataVol !== null && !isCount(dto.dataVol)) || !isCount(dto.elapsedMs) ||
@@ -454,6 +457,7 @@ function copyRun(value, expectedCaseId) {
     (dto.failureCode !== null &&
       (typeof dto.failureCode !== 'string' || !FAILURE_CODE_PATTERN.test(dto.failureCode))) ||
     (dto.vendorErrorCode !== null && !safeText(dto.vendorErrorCode, 128)) ||
+    typeof dto.tokenVersionId !== 'string' ||
     !VERSION_ID_PATTERN.test(dto.tokenVersionId) || !isTimestamp(dto.createdAt) ||
     !isTimestamp(dto.leaseExpiresAt) || !isTimestamp(dto.completedAt) ||
     dto.createdAt > dto.completedAt || dto.completedAt > dto.leaseExpiresAt) {
@@ -513,7 +517,8 @@ function copyQuota(value) {
     'globalRemaining', 'cooldownUntil', 'inFlight', 'inFlightCaseId',
     'inFlightExpiresAt'
   ])
-  if (!CALENDAR_DATE_PATTERN.test(dto.localDayKey) ||
+  if (typeof dto.localDayKey !== 'string' ||
+    !CALENDAR_DATE_PATTERN.test(dto.localDayKey) ||
     !isCount(dto.caseAttemptCount, 5) || !isCount(dto.globalAttemptCount, 12) ||
     !isCount(dto.caseRemaining, 5) || !isCount(dto.globalRemaining, 12) ||
     dto.caseAttemptCount + dto.caseRemaining !== 5 ||
@@ -640,20 +645,22 @@ function createIfindMarketDiagnosticHttpController({
     if (typeof csrf !== 'string' || !TOKEN_PATTERN.test(csrf)) {
       boundaryError('ADMIN_CSRF_INVALID', 403)
     }
-    const authenticate = adminMethod('authenticate')
+    const authenticate = adminMethod('authenticateMutation')
+    let authenticated
     try {
-      authenticate.call(admin, token)
+      authenticated = authenticate.call(admin, token, csrf)
     } catch {
       boundaryError('ADMIN_AUTH_REQUIRED', 401)
     }
-    const verifyCsrf = adminMethod('verifyCsrf')
-    let authenticated
-    try {
-      authenticated = verifyCsrf.call(admin, token, csrf)
-    } catch {
-      boundaryError('ADMIN_CSRF_INVALID', 403)
+    const status = ownDataValue(authenticated, 'status')
+    if (status === 'csrf-invalid') boundaryError('ADMIN_CSRF_INVALID', 403)
+    if (status === 'session-invalid' || status === 'session-expired') {
+      boundaryError('ADMIN_AUTH_REQUIRED', 401)
     }
-    refreshAdminCookie(res, token, authenticated, now)
+    if (status !== 'authenticated') boundaryError('ADMIN_AUTH_REQUIRED', 401)
+    refreshAdminCookie(res, token, exactData(authenticated, [
+      'status', 'sessionId', 'idleExpiresAt', 'absoluteExpiresAt'
+    ]), now)
   }
 
   function requireOrigin(req) {
@@ -691,12 +698,37 @@ function createIfindMarketDiagnosticHttpController({
     }
     const declared = req.headers['content-length']
     if (declared !== undefined &&
-      (!/^\d+$/.test(declared) || Number(declared) > JSON_BODY_LIMIT)) {
+      (typeof declared !== 'string' || !/^\d+$/.test(declared) ||
+        Number(declared) > JSON_BODY_LIMIT)) {
       boundaryError('BODY_TOO_LARGE', 413)
     }
+    let receivedBytes = 0
+    const countBytes = (chunk) => {
+      const size = Buffer.isBuffer(chunk) || ArrayBuffer.isView(chunk)
+        ? chunk.byteLength
+        : typeof chunk === 'string' ? Buffer.byteLength(chunk, 'utf8') : JSON_BODY_LIMIT + 1
+      receivedBytes = Math.min(JSON_BODY_LIMIT + 1, receivedBytes + size)
+    }
+    req.prependListener('data', countBytes)
     try {
       return await parseStrictJsonBody(req, { allowEmpty: false })
     } catch {
+      if (receivedBytes > JSON_BODY_LIMIT) boundaryError('BODY_TOO_LARGE', 413)
+      boundaryError('JSON_INVALID', 400)
+    } finally {
+      req.removeListener('data', countBytes)
+    }
+  }
+
+  function requireExactEmptyObject(value) {
+    try {
+      if (types.isProxy(value) || value === null || typeof value !== 'object' ||
+        Array.isArray(value) || Reflect.getPrototypeOf(value) !== Object.prototype) {
+        boundaryError('JSON_INVALID', 400)
+      }
+      if (Reflect.ownKeys(value).length !== 0) boundaryError('JSON_INVALID', 400)
+    } catch (error) {
+      if (isLocalBoundaryError(error)) throw error
       boundaryError('JSON_INVALID', 400)
     }
   }
@@ -743,7 +775,8 @@ function createIfindMarketDiagnosticHttpController({
       const dto = exactData(value, [
         'status', 'caseId', 'runId', 'quoteStatus', 'financeStatus', 'requestCount'
       ])
-      if (dto.caseId !== expectedCaseId || !RUN_ID_PATTERN.test(dto.runId) ||
+      if (dto.caseId !== expectedCaseId || typeof dto.runId !== 'string' ||
+        !RUN_ID_PATTERN.test(dto.runId) ||
         dto.quoteStatus !== 'available' || dto.financeStatus !== 'available' ||
         !isCount(dto.requestCount, 5) || dto.requestCount < 1) {
         boundaryError('INTERNAL_ERROR', 500)
@@ -755,9 +788,11 @@ function createIfindMarketDiagnosticHttpController({
         'status', 'caseId', 'runId', 'quoteStatus', 'financeStatus', 'requestCount',
         'failureCode', 'safeErrorClass', 'stage', 'vendorErrorCode'
       ])
-      if (dto.caseId !== expectedCaseId || !RUN_ID_PATTERN.test(dto.runId) ||
+      if (dto.caseId !== expectedCaseId || typeof dto.runId !== 'string' ||
+        !RUN_ID_PATTERN.test(dto.runId) ||
         dto.quoteStatus !== 'available' || dto.financeStatus !== 'unavailable' ||
         !isCount(dto.requestCount, 5) || dto.requestCount < 1 ||
+        typeof dto.failureCode !== 'string' ||
         !FAILURE_CODE_PATTERN.test(dto.failureCode) ||
         !SAFE_ERROR_CLASSES.has(dto.safeErrorClass) ||
         !safeText(dto.stage, 32, /^[a-z][a-z-]*$/) ||
@@ -772,7 +807,8 @@ function createIfindMarketDiagnosticHttpController({
     const dto = exactData(value, [
       'status', 'failureCode', 'safeErrorClass', 'stage', 'vendorErrorCode'
     ])
-    if (!FAILURE_CODE_PATTERN.test(dto.failureCode) ||
+    if (typeof dto.failureCode !== 'string' ||
+      !FAILURE_CODE_PATTERN.test(dto.failureCode) ||
       !SAFE_ERROR_CLASSES.has(dto.safeErrorClass) ||
       !safeText(dto.stage, 32, /^[a-z][a-z-]*$/) ||
       (dto.vendorErrorCode !== null && !safeText(dto.vendorErrorCode, 128))) {
@@ -863,7 +899,7 @@ function createIfindMarketDiagnosticHttpController({
       )
       const catalogEntry = requireCase(segments[4])
       const body = await parseLocalStrictJson(req)
-      if (Reflect.ownKeys(body).length !== 0) boundaryError('JSON_INVALID', 400)
+      requireExactEmptyObject(body)
       const access = runtimeAccess(ifindDiagnosticRuntime)
       if (!access.run) {
         const error = access.status === 'disabled'

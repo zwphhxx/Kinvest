@@ -403,16 +403,21 @@ async function testRejectedCsrfDoesNotTouchSession() {
   const beforeAuditCount = countAuthenticatedAudit()
 
   harness.clock.value += 5 * 60 * 1000
-  await expectCode(
-    () => harness.service.verifyCsrf(login.sessionToken, 'wrong-csrf'),
-    'ADMIN_CSRF_INVALID'
+  assert.deepStrictEqual(
+    harness.service.authenticateMutation(login.sessionToken, 'wrong-csrf'),
+    { status: 'csrf-invalid' }
   )
   assert.deepStrictEqual(selectSession.get(login.sessionId), beforeSession)
   assert.strictEqual(countAuthenticatedAudit(), beforeAuditCount)
 
-  assert.equal(
-    harness.service.verifyCsrf(login.sessionToken, login.csrfToken).sessionId,
-    login.sessionId
+  assert.deepStrictEqual(
+    harness.service.authenticateMutation(login.sessionToken, login.csrfToken),
+    {
+      status: 'authenticated',
+      sessionId: login.sessionId,
+      idleExpiresAt: harness.clock.value + ADMIN_IDLE_TTL_MS,
+      absoluteExpiresAt: login.absoluteExpiresAt
+    }
   )
   const afterValidCsrf = selectSession.get(login.sessionId)
   assert.strictEqual(afterValidCsrf.last_used_at, harness.clock.value)

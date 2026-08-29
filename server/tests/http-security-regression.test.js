@@ -172,6 +172,33 @@ async function testDefaultDenyMarketDiagnosticRouteMatrix() {
   }
 }
 
+async function testApprovedFamilyInvestmentRouteMatrixUsesMockData() {
+  const running = await start()
+  const routes = [
+    ['GET', '/api/watchlist', undefined],
+    ['GET', '/api/search?q=ali', undefined],
+    ['GET', '/api/company/9988.HK', undefined],
+    ['POST', '/api/company/9988.HK/refresh', '{}'],
+    ['GET', '/api/research/9988.HK', undefined]
+  ]
+  try {
+    for (const [method, pathname, body] of routes) {
+      const headers = body === undefined
+        ? { cookie: `__Host-kinvest-device=${VALID_DEVICE}` }
+        : validMutationHeaders()
+      const response = await request(running.baseUrl, pathname, {
+        method,
+        headers,
+        body
+      })
+      assert.equal(response.status, 200, `${method} ${pathname}`)
+      assert.equal(response.body.success, true, `${method} ${pathname}`)
+    }
+  } finally {
+    await running.close()
+  }
+}
+
 async function testRefreshUsesInjectedOriginAndDisabledCompatibility() {
   const customOrigin = 'https://family.example.test'
   const enabled = await start(createRuntime(), customOrigin)
@@ -388,6 +415,7 @@ async function testStartupConfigurationDoesNotLeakProcessUmask() {
 async function run() {
   await testDefaultDenyInvestmentRouteMatrix()
   await testDefaultDenyMarketDiagnosticRouteMatrix()
+  await testApprovedFamilyInvestmentRouteMatrixUsesMockData()
   await testRefreshStrictMutationAndExactRoutes()
   await testRefreshUsesInjectedOriginAndDisabledCompatibility()
   await testStrictJsonRejectsMalformedUtf8DuplicatesAndAbort()

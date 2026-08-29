@@ -365,7 +365,10 @@ async function createIfindDiagnosticRuntime(options) {
         repository: marketRepository,
         secretProvider: provider
       })
-      if (!readMethod(marketService, 'run')) {
+      if (!readMethod(marketService, 'run') ||
+          !readMethod(marketService, 'latest') ||
+          !readMethod(marketService, 'history') ||
+          !readMethod(marketService, 'quotaStatus')) {
         fail('IFIND_DIAGNOSTIC_RUNTIME_INVALID')
       }
     } catch (error) {

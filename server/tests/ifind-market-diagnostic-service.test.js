@@ -421,6 +421,18 @@ function createHarness(caseId = 'HK_ALIBABA_9988', overrides = {}) {
       calls.push('fail')
       terminal.fail.push(input)
       return { status: 'completed', cooldownUntil: input.result.completedAt + 300_000 }
+    },
+    latest(input) {
+      calls.push('latest')
+      return { kind: 'latest', input }
+    },
+    history(input) {
+      calls.push('history')
+      return [{ kind: 'history', input }]
+    },
+    quotaStatus(input) {
+      calls.push('quota-status')
+      return { kind: 'quota-status', input }
     }
   }
 
@@ -558,6 +570,24 @@ function assertQuotePreservingPartial(harness, result, expected) {
   assert.equal(harness.terminal.complete[0].result.status, 'partial')
   assert.equal(harness.terminal.complete[0].result.financeStatus, 'unavailable')
   assert.equal(harness.terminal.complete[0].result.failureCode, expected.failureCode)
+}
+
+async function testRepositoryReadersAreExposed() {
+  const harness = createHarness()
+  const latestInput = { caseId: 'HK_ALIBABA_9988' }
+  const historyInput = { caseId: 'HK_ALIBABA_9988', limit: 10 }
+  const quotaInput = { caseId: 'HK_ALIBABA_9988', now: CREATED_AT }
+
+  assert.deepEqual(harness.service.latest(latestInput), {
+    kind: 'latest', input: latestInput
+  })
+  assert.deepEqual(harness.service.history(historyInput), [{
+    kind: 'history', input: historyInput
+  }])
+  assert.deepEqual(harness.service.quotaStatus(quotaInput), {
+    kind: 'quota-status', input: quotaInput
+  })
+  assert.deepEqual(harness.calls, ['latest', 'history', 'quota-status'])
 }
 
 async function testThreeMarketSuccess() {
@@ -1494,6 +1524,7 @@ async function testSharedSnapshotBudgetAndNullPrototype() {
 }
 
 async function run() {
+  await testRepositoryReadersAreExposed()
   await testThreeMarketSuccess()
   await testProductionCatalogFailsClosed()
   await testCallerCannotOverrideFixedRequest()

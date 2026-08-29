@@ -82,6 +82,17 @@ function createAccessRuntime() {
           absoluteExpiresAt: NOW + 28_800_000
         }
       },
+      authenticateMutation(token, csrf) {
+        calls.push(['authenticateMutation', token, csrf])
+        if (token !== ADMIN_TOKEN) return { status: 'session-invalid' }
+        if (csrf !== CSRF_TOKEN) return { status: 'csrf-invalid' }
+        return {
+          status: 'authenticated',
+          sessionId: 'admin-session-test',
+          idleExpiresAt: NOW + 1_800_000,
+          absoluteExpiresAt: NOW + 28_800_000
+        }
+      },
       verifyCsrf(token, csrf) {
         calls.push(['verifyCsrf', token, csrf])
         if (token === EXPIRED_ADMIN_TOKEN) {
@@ -298,6 +309,32 @@ async function rawRequest(baseUrl, pathname, headers, body = '{}') {
   })
 }
 
+async function chunkedRequest(baseUrl, pathname, headers, chunks) {
+  const target = new URL(pathname, baseUrl)
+  return new Promise((resolve, reject) => {
+    const req = http.request({
+      hostname: target.hostname,
+      port: target.port,
+      path: target.pathname,
+      method: 'POST',
+      headers
+    }, (response) => {
+      const responseChunks = []
+      response.on('data', (chunk) => responseChunks.push(chunk))
+      response.on('end', () => {
+        const text = Buffer.concat(responseChunks).toString('utf8')
+        resolve({
+          status: response.statusCode,
+          body: text ? JSON.parse(text) : null
+        })
+      })
+    })
+    req.once('error', reject)
+    for (const chunk of chunks) req.write(chunk)
+    req.end()
+  })
+}
+
 function adminCookie(token = ADMIN_TOKEN) {
   return `__Host-kinvest-admin=${token}`
 }
@@ -510,6 +547,10 @@ async function testPrototypeAdministratorServiceComposition() {
     verifyCsrf(token, csrf) {
       return delegate.verifyCsrf(token, csrf)
     }
+
+    authenticateMutation(token, csrf) {
+      return delegate.authenticateMutation(token, csrf)
+    }
   }
   accessRuntime.adminAuth = new PrototypeAdminAuth()
   const running = await start({ accessRuntime })
@@ -519,12 +560,16 @@ async function testPrototypeAdministratorServiceComposition() {
     })
     assert.equal(list.status, 200)
 
+    const mutationCallStart = accessRuntime.calls.length
     const run = await request(
       running.baseUrl,
       '/api/admin/ifind/market-cases/HK_ALIBABA_9988/run',
       { method: 'POST', headers: postHeaders(), body: '{}' }
     )
     assert.equal(run.status, 200)
+    assert.deepEqual(accessRuntime.calls.slice(mutationCallStart), [[
+      'authenticateMutation', ADMIN_TOKEN, CSRF_TOKEN
+    ]])
   } finally {
     await running.close()
   }
@@ -545,6 +590,10 @@ async function testStrictTrustedMutationBoundary() {
       [postHeaders(), '{', 400, 'JSON_INVALID'],
       [postHeaders(), '{} trailing', 400, 'JSON_INVALID'],
       [postHeaders(), '[]', 400, 'JSON_INVALID'],
+      [postHeaders(), 'null', 400, 'JSON_INVALID'],
+      [postHeaders(), '1', 400, 'JSON_INVALID'],
+      [postHeaders(), 'true', 400, 'JSON_INVALID'],
+      [postHeaders(), '"value"', 400, 'JSON_INVALID'],
       [postHeaders(), '{"caseId":"US_APPLE_AAPL"}', 400, 'JSON_INVALID'],
       [postHeaders(), JSON.stringify({ value: 'x'.repeat(4097) }), 413, 'BODY_TOO_LARGE'],
       [{ ...postHeaders(), 'x-forwarded-for': '198.51.100.9' }, '{}', 400, 'CLIENT_IDENTITY_INVALID'],
@@ -557,6 +606,16 @@ async function testStrictTrustedMutationBoundary() {
       assert.equal(response.status, status, `${status} ${error}`)
       assert.deepEqual(response.body, { error })
     }
+    assert.equal(marketRuntime.calls.some(([name]) => name === 'run'), false)
+
+    const chunked = await chunkedRequest(
+      running.baseUrl,
+      endpoint,
+      postHeaders(),
+      [Buffer.alloc(3000, 0x20), Buffer.alloc(1500, 0x20)]
+    )
+    assert.equal(chunked.status, 413)
+    assert.deepEqual(chunked.body, { error: 'BODY_TOO_LARGE' })
     assert.equal(marketRuntime.calls.some(([name]) => name === 'run'), false)
 
     const baseRawHeaders = [
@@ -795,7 +854,7 @@ async function testDependencyErrorsCannotForgeHttpBoundary() {
   }
 
   const csrfRuntime = createAccessRuntime()
-  csrfRuntime.adminAuth.verifyCsrf = () => {
+  csrfRuntime.adminAuth.authenticateMutation = () => {
     throw new HttpBoundaryError('RequestId_token_secret', 418)
   }
   const csrfServer = await start({ accessRuntime: csrfRuntime })
@@ -805,9 +864,245 @@ async function testDependencyErrorsCannotForgeHttpBoundary() {
       '/api/admin/ifind/market-cases/HK_ALIBABA_9988/run',
       { method: 'POST', headers: postHeaders(), body: '{}' }
     )
-    assertGenericBoundaryResponse(response, 403, 'ADMIN_CSRF_INVALID')
+    assertGenericBoundaryResponse(response, 401, 'ADMIN_AUTH_REQUIRED')
   } finally {
     await csrfServer.close()
+  }
+}
+
+function coercionTrap(value, state) {
+  return Object.freeze({
+    [Symbol.toPrimitive]() {
+      state.reads += 1
+      return value
+    },
+    toString() {
+      state.reads += 1
+      return value
+    },
+    valueOf() {
+      state.reads += 1
+      return value
+    }
+  })
+}
+
+async function testHostileDtoPrimitivesAreNotCoerced() {
+  const caseId = 'HK_ALIBABA_9988'
+  const scenarios = [
+    {
+      name: 'latest run id',
+      configure(runtime, trap) {
+        runtime.marketService.latest = () => completedRun(caseId, { runId: trap })
+      },
+      method: 'GET'
+    },
+    {
+      name: 'latest token version',
+      configure(runtime, trap) {
+        runtime.marketService.latest = () => completedRun(caseId, {
+          tokenVersionId: trap
+        })
+      },
+      method: 'GET'
+    },
+    {
+      name: 'financial report period',
+      configure(runtime, trap) {
+        runtime.marketService.latest = () => completedRun(caseId, {
+          financialPoints: [{ ...financialPoint(caseId), reportPeriod: trap }]
+        })
+      },
+      method: 'GET'
+    },
+    {
+      name: 'financial period end',
+      configure(runtime, trap) {
+        runtime.marketService.latest = () => completedRun(caseId, {
+          financialPoints: [{ ...financialPoint(caseId), periodEnd: trap }]
+        })
+      },
+      method: 'GET'
+    },
+    {
+      name: 'quota local day',
+      configure(runtime, trap) {
+        runtime.marketService.quotaStatus = () => ({
+          ...quotaStatus(caseId), localDayKey: trap
+        })
+      },
+      method: 'GET'
+    },
+    {
+      name: 'complete outcome run id',
+      configure(runtime, trap) {
+        runtime.marketService.run = async () => ({
+          status: 'complete',
+          caseId,
+          runId: trap,
+          quoteStatus: 'available',
+          financeStatus: 'available',
+          requestCount: 3
+        })
+      },
+      method: 'POST'
+    },
+    {
+      name: 'partial outcome failure code',
+      configure(runtime, trap) {
+        runtime.marketService.run = async () => ({
+          status: 'partial',
+          caseId,
+          runId: `market_run_${'4'.repeat(32)}`,
+          quoteStatus: 'available',
+          financeStatus: 'unavailable',
+          requestCount: 3,
+          failureCode: trap,
+          safeErrorClass: 'AUTH',
+          stage: 'financial',
+          vendorErrorCode: null
+        })
+      },
+      method: 'POST'
+    },
+    {
+      name: 'failed outcome failure code',
+      configure(runtime, trap) {
+        runtime.marketService.run = async () => ({
+          status: 'failed',
+          failureCode: trap,
+          safeErrorClass: 'AUTH',
+          stage: 'authentication',
+          vendorErrorCode: null
+        })
+      },
+      method: 'POST'
+    }
+  ]
+
+  for (const scenario of scenarios) {
+    const state = { reads: 0 }
+    const runtime = createMarketRuntime()
+    scenario.configure(runtime, coercionTrap('RequestId_token_secret', state))
+    const running = await start({ marketRuntime: runtime })
+    try {
+      const response = scenario.method === 'POST'
+        ? await request(
+            running.baseUrl,
+            `/api/admin/ifind/market-cases/${caseId}/run`,
+            { method: 'POST', headers: postHeaders(), body: '{}' }
+          )
+        : await request(
+            running.baseUrl,
+            `/api/admin/ifind/market-cases/${caseId}`,
+            { headers: { cookie: adminCookie() } }
+          )
+      assertGenericBoundaryResponse(response, 500, 'INTERNAL_ERROR')
+      assert.equal(state.reads, 0, scenario.name)
+    } finally {
+      await running.close()
+    }
+  }
+}
+
+async function testRunOutcomeHttpMappings() {
+  const caseId = 'HK_ALIBABA_9988'
+  const block = (status, failureCode) => ({
+    status,
+    failureCode,
+    safeErrorClass: 'AUTH',
+    stage: 'reservation',
+    vendorErrorCode: null
+  })
+  const scenarios = [
+    {
+      name: 'partial',
+      outcome: {
+        status: 'partial',
+        caseId,
+        runId: `market_run_${'4'.repeat(32)}`,
+        quoteStatus: 'available',
+        financeStatus: 'unavailable',
+        requestCount: 3,
+        failureCode: 'IFIND_CLIENT_FAILED',
+        safeErrorClass: 'AUTH',
+        stage: 'financial',
+        vendorErrorCode: null
+      },
+      status: 200,
+      bodyStatus: 'partial'
+    },
+    {
+      name: 'failed',
+      outcome: block('failed', 'IFIND_CLIENT_FAILED'),
+      status: 200,
+      bodyStatus: 'failed'
+    },
+    {
+      name: 'busy',
+      outcome: block('busy', 'IFIND_MARKET_BUSY'),
+      status: 409,
+      error: 'IFIND_MARKET_DIAGNOSTIC_BUSY'
+    },
+    {
+      name: 'cooldown',
+      outcome: block('cooldown', 'IFIND_MARKET_COOLDOWN'),
+      status: 429,
+      error: 'IFIND_MARKET_DIAGNOSTIC_COOLDOWN'
+    },
+    {
+      name: 'case daily limit',
+      outcome: block('case-daily-limit', 'IFIND_MARKET_CASE_DAILY_LIMIT'),
+      status: 429,
+      error: 'IFIND_MARKET_CASE_DAILY_LIMIT'
+    },
+    {
+      name: 'global daily limit',
+      outcome: block('global-daily-limit', 'IFIND_MARKET_GLOBAL_DAILY_LIMIT'),
+      status: 429,
+      error: 'IFIND_MARKET_GLOBAL_DAILY_LIMIT'
+    },
+    {
+      name: 'rejected unverified',
+      outcome: block('rejected', 'IFIND_MARKET_CASE_UNVERIFIED'),
+      status: 503,
+      error: 'IFIND_MARKET_CASE_UNAVAILABLE'
+    },
+    {
+      name: 'rejected generic',
+      outcome: block('rejected', 'IFIND_MARKET_UNAVAILABLE'),
+      status: 503,
+      error: 'IFIND_MARKET_DIAGNOSTIC_UNAVAILABLE'
+    },
+    {
+      name: 'clock rollback',
+      outcome: block('clock-rollback', 'IFIND_MARKET_CLOCK_ROLLBACK'),
+      status: 409,
+      error: 'IFIND_MARKET_DIAGNOSTIC_UNAVAILABLE'
+    }
+  ]
+
+  for (const scenario of scenarios) {
+    const running = await start({
+      marketRuntime: createMarketRuntime({ outcome: scenario.outcome })
+    })
+    try {
+      const response = await request(
+        running.baseUrl,
+        `/api/admin/ifind/market-cases/${caseId}/run`,
+        { method: 'POST', headers: postHeaders(), body: '{}' }
+      )
+      assert.equal(response.status, scenario.status, scenario.name)
+      if (scenario.error) {
+        assert.deepEqual(response.body, { error: scenario.error }, scenario.name)
+      } else {
+        assert.equal(response.body.data.status, scenario.bodyStatus, scenario.name)
+        assert.equal(response.body.data.safeErrorClass, 'AUTH', scenario.name)
+      }
+      assertNoSensitivePayload(response.body)
+    } finally {
+      await running.close()
+    }
   }
 }
 
@@ -846,6 +1141,8 @@ async function run() {
   await testStrictTrustedMutationBoundary()
   await testUnavailableAndHostileRuntimeMappings()
   await testDependencyErrorsCannotForgeHttpBoundary()
+  await testHostileDtoPrimitivesAreNotCoerced()
+  await testRunOutcomeHttpMappings()
   await testFamilyRoutesRemainDeviceOnlyMock()
 }
 

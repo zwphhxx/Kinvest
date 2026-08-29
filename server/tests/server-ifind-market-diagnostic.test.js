@@ -395,6 +395,30 @@ async function testEnabledRuntimeComposesProductionMarketService() {
     assert.equal(serviceOptions.financialParser, parseIfindMarketFinancials)
     assert.equal(runtime.marketService, createdMarketService)
     assert.equal(typeof runtime.marketService.run, 'function')
+    assert.equal(typeof runtime.marketService.latest, 'function')
+    assert.equal(typeof runtime.marketService.history, 'function')
+    assert.equal(typeof runtime.marketService.quotaStatus, 'function')
+    assert.equal(runtime.marketService.latest({
+      caseId: 'HK_ALIBABA_9988'
+    }), null)
+    assert.deepEqual(runtime.marketService.history({
+      caseId: 'HK_ALIBABA_9988',
+      limit: 10
+    }), [])
+    assert.deepEqual(runtime.marketService.quotaStatus({
+      caseId: 'HK_ALIBABA_9988',
+      now: 1_787_937_600_000
+    }), {
+      localDayKey: '2026-08-29',
+      caseAttemptCount: 0,
+      caseRemaining: 5,
+      globalAttemptCount: 0,
+      globalRemaining: 12,
+      cooldownUntil: null,
+      inFlight: false,
+      inFlightCaseId: null,
+      inFlightExpiresAt: null
+    })
 
     const result = await runtime.marketService.run({ caseId: 'HK_ALIBABA_9988' })
     assert.equal(result.status, 'rejected')

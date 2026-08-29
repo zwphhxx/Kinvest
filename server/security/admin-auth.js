@@ -287,12 +287,12 @@ class AdminAuthService {
     }
   }
 
-  verifyCsrf(sessionToken, csrfToken) {
+  authenticateMutation(sessionToken, csrfToken) {
     this.assertConfigured()
     const tokenDigest = digestPublicToken(sessionToken)
     const csrfDigest = digestPublicToken(csrfToken)
-    if (!tokenDigest) fail('ADMIN_SESSION_INVALID')
-    if (!csrfDigest) fail('ADMIN_CSRF_INVALID')
+    if (!tokenDigest) return { status: 'session-invalid' }
+    if (!csrfDigest) return { status: 'csrf-invalid' }
     const now = this.now()
     const result = this.repository.verifyAndTouchSession({
       tokenDigest,
@@ -306,13 +306,26 @@ class AdminAuthService {
         {}
       )
     })
-    if (result.status === 'session_expired') fail('ADMIN_SESSION_EXPIRED')
-    if (result.status === 'csrf_invalid') fail('ADMIN_CSRF_INVALID')
-    if (result.status !== 'authenticated') fail('ADMIN_SESSION_INVALID')
+    if (result.status === 'session_expired') return { status: 'session-expired' }
+    if (result.status === 'csrf_invalid') return { status: 'csrf-invalid' }
+    if (result.status !== 'authenticated') return { status: 'session-invalid' }
     return {
+      status: 'authenticated',
       sessionId: result.session.sessionId,
       idleExpiresAt: result.session.idleExpiresAt,
       absoluteExpiresAt: result.session.absoluteExpiresAt
+    }
+  }
+
+  verifyCsrf(sessionToken, csrfToken) {
+    const result = this.authenticateMutation(sessionToken, csrfToken)
+    if (result.status === 'session-expired') fail('ADMIN_SESSION_EXPIRED')
+    if (result.status === 'csrf-invalid') fail('ADMIN_CSRF_INVALID')
+    if (result.status !== 'authenticated') fail('ADMIN_SESSION_INVALID')
+    return {
+      sessionId: result.sessionId,
+      idleExpiresAt: result.idleExpiresAt,
+      absoluteExpiresAt: result.absoluteExpiresAt
     }
   }
 

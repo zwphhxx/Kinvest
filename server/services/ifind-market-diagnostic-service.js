@@ -991,6 +991,9 @@ function createIfindMarketDiagnosticService(options) {
   const repositoryReserve = methodReference(config.repository, 'reserve')
   const repositoryComplete = methodReference(config.repository, 'complete')
   const repositoryFail = methodReference(config.repository, 'fail')
+  const repositoryLatest = methodReference(config.repository, 'latest')
+  const repositoryHistory = methodReference(config.repository, 'history')
+  const repositoryQuotaStatus = methodReference(config.repository, 'quotaStatus')
   const readRefreshToken = methodReference(config.secretProvider, 'readRefreshToken')
 
   function bestEffortFail(reservation, failure, requestCount, dataVol) {
@@ -1272,7 +1275,18 @@ function createIfindMarketDiagnosticService(options) {
     }
   }
 
-  return Object.freeze({ run })
+  return Object.freeze({
+    run,
+    latest(input) {
+      return repositoryLatest.call(config.repository, input)
+    },
+    history(input) {
+      return repositoryHistory.call(config.repository, input)
+    },
+    quotaStatus(input) {
+      return repositoryQuotaStatus.call(config.repository, input)
+    }
+  })
 }
 
 module.exports = {
