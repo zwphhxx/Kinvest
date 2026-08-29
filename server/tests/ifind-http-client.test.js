@@ -477,6 +477,72 @@ async function run() {
     }
   }
 
+  const pollutedSuccessMarkers = [
+    'synthetic successful provider message',
+    'synthetic authorization metadata',
+    'synthetic cookie metadata',
+    'synthetic debug metadata',
+    'synthetic nested provider metadata'
+  ]
+  for (const operation of ['quote', 'financial']) {
+    const cleanFixture = marketOperationFixtures.HK[operation]
+    const pollutedSuccess = JSON.parse(JSON.stringify(cleanFixture))
+    Object.assign(pollutedSuccess, {
+      errmsg: pollutedSuccessMarkers[0],
+      RequestId: SYNTHETIC_REQUEST_ID,
+      token: ACCESS_TOKEN,
+      access_token: ACCESS_TOKEN,
+      refresh_token: REFRESH_TOKEN,
+      authorization: pollutedSuccessMarkers[1],
+      headers: { authorization: pollutedSuccessMarkers[1] },
+      cookie: pollutedSuccessMarkers[2],
+      debug: pollutedSuccessMarkers[3],
+      extra: {
+        providerMetadata: pollutedSuccessMarkers[4],
+        headers: { cookie: pollutedSuccessMarkers[2] }
+      }
+    })
+    Object.assign(pollutedSuccess.tables[0], {
+      errmsg: pollutedSuccessMarkers[0],
+      RequestId: SYNTHETIC_REQUEST_ID,
+      headers: { authorization: pollutedSuccessMarkers[1] },
+      debug: { token: ACCESS_TOKEN }
+    })
+    pollutedSuccess.tables[0].table.TEST_ONLY_UNREQUESTED_METADATA = [{
+      refresh_token: REFRESH_TOKEN,
+      cookie: pollutedSuccessMarkers[2],
+      debug: pollutedSuccessMarkers[3]
+    }]
+
+    const pollutedTransport = createRequestStub([accessTokenSuccess, pollutedSuccess])
+    const pollutedClient = createIfindHttpClient({ request: pollutedTransport.request })
+    const execution = await captureGlobalOutput(() => pollutedClient[operation]({
+      refreshToken: REFRESH_TOKEN,
+      request: operation === 'quote' ? quoteRequest('HK') : financialRequest('HK')
+    }))
+    assert.equal(execution.status, 'fulfilled')
+    assert.deepEqual(execution.value, cleanFixture)
+    assert.notStrictEqual(execution.value, pollutedSuccess)
+    assertPlainFrozenJson(execution.value)
+    assertNoProviderLeak({
+      scenario: `${operation} polluted success`,
+      value: execution.value,
+      logEntries: [],
+      globalOutputEntries: execution.entries,
+      rawProviderMarkers: pollutedSuccessMarkers
+    })
+    for (const forbiddenKey of [
+      'errmsg', 'token', 'access_token', 'refresh_token', 'authorization',
+      'headers', 'cookie', 'debug', 'extra', 'TEST_ONLY_UNREQUESTED_METADATA'
+    ]) {
+      assert.equal(
+        containsSentinel(execution.value, forbiddenKey),
+        false,
+        `${operation} polluted success exposed ${forbiddenKey}`
+      )
+    }
+  }
+
   const forbiddenTransportControls = [
     'url', 'endpoint', 'headers', 'host', 'method', 'timeout', 'responseCap', 'route'
   ]

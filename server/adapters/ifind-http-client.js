@@ -575,11 +575,15 @@ function readOperationInput(input, operation) {
   const request = descriptorValue(inputDescriptors, 'request')
   if (operation === 'quote') {
     const descriptors = plainDataDescriptors(request, ['vendorCode', 'fields'], true)
+    const vendorCode = providerIdentifier(descriptorValue(descriptors, 'vendorCode'))
+    const fieldIds = frozenIdentifierArray(descriptorValue(descriptors, 'fields'))
     return Object.freeze({
       refreshToken,
+      vendorCode,
+      fieldIds,
       body: Object.freeze({
-        codes: providerIdentifier(descriptorValue(descriptors, 'vendorCode')),
-        indicators: frozenIdentifierArray(descriptorValue(descriptors, 'fields')).join(',')
+        codes: vendorCode,
+        indicators: fieldIds.join(',')
       })
     })
   }
@@ -603,14 +607,90 @@ function readOperationInput(input, operation) {
       writable: false
     })
   }
+  const vendorCode = providerIdentifier(descriptorValue(descriptors, 'vendorCode'))
+  const fieldIds = frozenIdentifierArray(descriptorValue(descriptors, 'indicatorIds'))
   return Object.freeze({
     refreshToken,
+    vendorCode,
+    fieldIds,
     body: Object.freeze({
-      codes: providerIdentifier(descriptorValue(descriptors, 'vendorCode')),
-      indicators: frozenIdentifierArray(descriptorValue(descriptors, 'indicatorIds')),
+      codes: vendorCode,
+      indicators: fieldIds,
       parameters: Object.freeze(periodParameters)
     })
   })
+}
+
+function ownDataValue(record, key) {
+  if (!isRecord(record) || Object.getPrototypeOf(record) !== Object.prototype) {
+    throw new Error('invalid response')
+  }
+  const descriptor = Object.getOwnPropertyDescriptor(record, key)
+  if (!descriptor || !Object.hasOwn(descriptor, 'value') || !descriptor.enumerable) {
+    throw new Error('invalid response')
+  }
+  return descriptor.value
+}
+
+function parserDataArray(value) {
+  if (!Array.isArray(value) || Object.getPrototypeOf(value) !== Array.prototype) {
+    throw new Error('invalid response')
+  }
+  const snapshot = []
+  for (let index = 0; index < value.length; index += 1) {
+    const item = value[index]
+    if (item === null || typeof item === 'string' || typeof item === 'boolean') {
+      snapshot.push(item)
+      continue
+    }
+    if (typeof item === 'number' && Number.isFinite(item)) {
+      snapshot.push(item)
+      continue
+    }
+    throw new Error('invalid response')
+  }
+  return Object.freeze(snapshot)
+}
+
+function sanitizeMarketSuccess(response, requestContract) {
+  const tables = ownDataValue(response, 'tables')
+  if (!Array.isArray(tables) || tables.length !== 1) throw new Error('invalid response')
+  const providerTable = tables[0]
+  const providerCode = ownDataValue(providerTable, 'thscode')
+  if (providerCode !== requestContract.vendorCode) throw new Error('invalid response')
+  const providerFields = ownDataValue(providerTable, 'table')
+  const fields = {}
+  for (const fieldId of requestContract.fieldIds) {
+    Object.defineProperty(fields, fieldId, {
+      value: parserDataArray(ownDataValue(providerFields, fieldId)),
+      enumerable: true,
+      configurable: false,
+      writable: false
+    })
+  }
+  const sanitizedTable = Object.freeze({
+    thscode: providerCode,
+    table: Object.freeze(fields)
+  })
+  const sanitized = {
+    errorcode: response.errorcode,
+    tables: Object.freeze([sanitizedTable])
+  }
+  if (Object.hasOwn(response, 'dataVol')) {
+    if (!Number.isSafeInteger(response.dataVol) || response.dataVol < 0) {
+      throw new Error('invalid response')
+    }
+    sanitized.dataVol = response.dataVol
+  }
+  return Object.freeze(sanitized)
+}
+
+function sanitizeQuoteSuccess(response, requestContract) {
+  return sanitizeMarketSuccess(response, requestContract)
+}
+
+function sanitizeFinancialSuccess(response, requestContract) {
+  return sanitizeMarketSuccess(response, requestContract)
 }
 
 /**
@@ -914,7 +994,15 @@ function createIfindHttpClient({
         if (!isRecord(response) || !Number.isSafeInteger(response.errorcode)) {
           throw safeError('IFIND_RESPONSE_SHAPE', 'API', 'iFinD response shape was invalid')
         }
-        if (response.errorcode === 0) return response
+        if (response.errorcode === 0) {
+          try {
+            return operation === 'quote'
+              ? sanitizeQuoteSuccess(response, operationInput)
+              : sanitizeFinancialSuccess(response, operationInput)
+          } catch {
+            throw safeError('IFIND_RESPONSE_SHAPE', 'API', 'iFinD response shape was invalid')
+          }
+        }
 
         const failureClass = classifyProbeFailure(response)
         if (failureClass === 'AUTH') {
