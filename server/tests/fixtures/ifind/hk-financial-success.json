@@ -1,0 +1,14 @@
+{
+  "errorcode": 0,
+  "tables": [
+    {
+      "thscode": "TEST_ONLY_HK_CODE",
+      "table": {
+        "TEST_ONLY_HK_REVENUE": [1001, 1002, 1003],
+        "TEST_ONLY_HK_NET_PROFIT": [101, 102, 103],
+        "TEST_ONLY_HK_OPERATING_CASH_FLOW": [201, 202, 203]
+      }
+    }
+  ],
+  "dataVol": 9
+}

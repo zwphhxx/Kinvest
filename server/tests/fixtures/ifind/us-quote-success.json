@@ -1,0 +1,13 @@
+{
+  "errorcode": 0,
+  "tables": [
+    {
+      "thscode": "TEST_ONLY_US_CODE",
+      "table": {
+        "TEST_ONLY_US_LATEST_PRICE": [202.5],
+        "TEST_ONLY_US_CURRENCY": ["USD"]
+      }
+    }
+  ],
+  "dataVol": 2
+}

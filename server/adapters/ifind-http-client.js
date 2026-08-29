@@ -1,11 +1,18 @@
 const https = require('node:https')
-const { TextDecoder } = require('node:util')
+const { TextDecoder, types } = require('node:util')
 const {
   isClientFailureBase,
   isClientFailureMetadata
 } = require('../contracts/ifind-diagnostic-errors')
 
 const ORIGIN = 'https://quantapi.51ifind.com'
+const ENDPOINTS = Object.freeze({
+  auth: '/api/v1/get_access_token',
+  probe: '/api/v1/get_trade_dates',
+  quote: '/api/v1/real_time_quotation',
+  financial: '/api/v1/basic_data_service'
+})
+const ALLOWED_ENDPOINTS = new Set(Object.values(ENDPOINTS))
 const AUTH_ERROR_CODES = new Set([-401])
 const PERMISSION_ERROR_CODES = new Set([-403])
 const QUOTA_ERROR_CODES = new Set([-429])
@@ -21,7 +28,7 @@ const DIAGNOSTIC_REFERENCE_DATE = '2022-07-05'
  *   vendorErrorCode: number | null,
  *   dataVol?: number,
  *   requestCount?: number,
- *   stage?: 'auth' | 'probe'
+ *   stage?: 'auth' | 'probe' | 'quote' | 'financial'
  * }} IfindClientError
  */
 
@@ -89,7 +96,7 @@ function withStage(error, stage) {
     sanitized = safeError('IFIND_CLIENT_FAILED', 'API', 'iFinD diagnostic failed')
   }
   const existing = Object.getOwnPropertyDescriptor(sanitized, 'stage')
-  if (existing && (existing.value === 'auth' || existing.value === 'probe')) {
+  if (existing && ['auth', 'probe', 'quote', 'financial'].includes(existing.value)) {
     return sanitized
   }
   Object.defineProperty(sanitized, 'stage', {
@@ -101,7 +108,40 @@ function withStage(error, stage) {
   return sanitized
 }
 
+function plainJsonSnapshot(value) {
+  if (value === null || typeof value === 'string' || typeof value === 'boolean') return value
+  if (typeof value === 'number') {
+    if (!Number.isFinite(value)) throw new Error('invalid JSON number')
+    return value
+  }
+  if (Array.isArray(value)) {
+    const snapshot = []
+    for (let index = 0; index < value.length; index += 1) {
+      snapshot.push(plainJsonSnapshot(value[index]))
+    }
+    return Object.freeze(snapshot)
+  }
+  if (!isRecord(value)) throw new Error('invalid JSON value')
+  const snapshot = {}
+  for (const key of Object.keys(value)) {
+    Object.defineProperty(snapshot, key, {
+      value: plainJsonSnapshot(value[key]),
+      enumerable: true,
+      configurable: false,
+      writable: false
+    })
+  }
+  return Object.freeze(snapshot)
+}
+
 function requestJson(request, path, headers, body, setTimer, clearTimer) {
+  if (!ALLOWED_ENDPOINTS.has(path)) {
+    return Promise.reject(safeError(
+      'IFIND_CONFIG_INVALID',
+      'CONFIG',
+      'iFinD client configuration was invalid'
+    ))
+  }
   return new Promise((resolve, reject) => {
     let outgoing = null
     let incoming = null
@@ -273,7 +313,7 @@ function requestJson(request, path, headers, body, setTimer, clearTimer) {
               return
             }
             try {
-              succeed(JSON.parse(text))
+              succeed(plainJsonSnapshot(JSON.parse(text)))
             } catch {
               fail(safeError('IFIND_RESPONSE_JSON', 'API', 'iFinD response JSON was invalid'))
             }
@@ -408,6 +448,169 @@ function isCanonicalCalendarDate(value) {
   }
   const parsed = new Date(`${value}T00:00:00.000Z`)
   return Number.isFinite(parsed.getTime()) && parsed.toISOString().slice(0, 10) === value
+}
+
+function plainDataDescriptors(value, exactKeys, frozen) {
+  if (!value || typeof value !== 'object' || Array.isArray(value) || types.isProxy(value)) {
+    throw new Error('invalid request')
+  }
+  if (Object.getPrototypeOf(value) !== Object.prototype ||
+      Object.getOwnPropertySymbols(value).length !== 0 ||
+      (frozen && !Object.isFrozen(value))) {
+    throw new Error('invalid request')
+  }
+  const descriptors = Object.getOwnPropertyDescriptors(value)
+  const keys = Object.keys(descriptors)
+  if (keys.length !== exactKeys.length ||
+      exactKeys.some((key) => !Object.hasOwn(descriptors, key))) {
+    throw new Error('invalid request')
+  }
+  for (const key of keys) {
+    const descriptor = descriptors[key]
+    if (!Object.hasOwn(descriptor, 'value') || !descriptor.enumerable) {
+      throw new Error('invalid request')
+    }
+  }
+  return descriptors
+}
+
+function descriptorValue(descriptors, key) {
+  const descriptor = descriptors[key]
+  if (!descriptor || !Object.hasOwn(descriptor, 'value')) throw new Error('invalid request')
+  return descriptor.value
+}
+
+function providerIdentifier(value) {
+  if (typeof value !== 'string' || value.length === 0 || value.length > 256 ||
+      value.trim() !== value || /[\u0000-\u001f\u007f]/.test(value)) {
+    throw new Error('invalid request')
+  }
+  return value
+}
+
+function frozenIdentifierArray(value) {
+  if (!Array.isArray(value) || types.isProxy(value) || !Object.isFrozen(value) ||
+      Object.getPrototypeOf(value) !== Array.prototype ||
+      Object.getOwnPropertySymbols(value).length !== 0) {
+    throw new Error('invalid request')
+  }
+  const descriptors = Object.getOwnPropertyDescriptors(value)
+  const lengthDescriptor = descriptors.length
+  const length = lengthDescriptor && lengthDescriptor.value
+  if (!Number.isSafeInteger(length) || length < 1 || length > 64 ||
+      Object.keys(descriptors).length !== length + 1) {
+    throw new Error('invalid request')
+  }
+  const identifiers = []
+  const unique = new Set()
+  for (let index = 0; index < length; index += 1) {
+    const descriptor = descriptors[index]
+    if (!descriptor || !Object.hasOwn(descriptor, 'value') || !descriptor.enumerable) {
+      throw new Error('invalid request')
+    }
+    const identifier = providerIdentifier(descriptor.value)
+    if (unique.has(identifier)) throw new Error('invalid request')
+    unique.add(identifier)
+    identifiers.push(identifier)
+  }
+  return Object.freeze(identifiers)
+}
+
+function frozenProviderParameters(value, depth = 0) {
+  if (typeof value === 'string') return providerIdentifier(value)
+  if (typeof value === 'number') {
+    if (!Number.isFinite(value)) throw new Error('invalid request')
+    return value
+  }
+  if (typeof value === 'boolean') return value
+  if (depth >= 8 || !value || typeof value !== 'object' || types.isProxy(value) ||
+      !Object.isFrozen(value) || Object.getOwnPropertySymbols(value).length !== 0) {
+    throw new Error('invalid request')
+  }
+  if (Array.isArray(value)) {
+    if (Object.getPrototypeOf(value) !== Array.prototype || value.length > 64) {
+      throw new Error('invalid request')
+    }
+    const descriptors = Object.getOwnPropertyDescriptors(value)
+    if (Object.keys(descriptors).length !== value.length + 1) throw new Error('invalid request')
+    const snapshot = []
+    for (let index = 0; index < value.length; index += 1) {
+      const descriptor = descriptors[index]
+      if (!descriptor || !Object.hasOwn(descriptor, 'value') || !descriptor.enumerable) {
+        throw new Error('invalid request')
+      }
+      snapshot.push(frozenProviderParameters(descriptor.value, depth + 1))
+    }
+    return Object.freeze(snapshot)
+  }
+  if (Object.getPrototypeOf(value) !== Object.prototype) throw new Error('invalid request')
+  const descriptors = Object.getOwnPropertyDescriptors(value)
+  const keys = Object.keys(descriptors)
+  if (keys.length < 1 || keys.length > 64) throw new Error('invalid request')
+  const snapshot = {}
+  for (const key of keys) {
+    const descriptor = descriptors[key]
+    if (!/^[A-Za-z][A-Za-z0-9_]{0,63}$/.test(key) ||
+        !Object.hasOwn(descriptor, 'value') || !descriptor.enumerable) {
+      throw new Error('invalid request')
+    }
+    Object.defineProperty(snapshot, key, {
+      value: frozenProviderParameters(descriptor.value, depth + 1),
+      enumerable: true,
+      configurable: false,
+      writable: false
+    })
+  }
+  return Object.freeze(snapshot)
+}
+
+function readOperationInput(input, operation) {
+  const inputDescriptors = plainDataDescriptors(input, ['refreshToken', 'request'], false)
+  const refreshTokenValue = descriptorValue(inputDescriptors, 'refreshToken')
+  const refreshToken = Buffer.isBuffer(refreshTokenValue)
+    ? new TextDecoder('utf-8', { fatal: true }).decode(refreshTokenValue)
+    : refreshTokenValue
+  if (!isHeaderSafeToken(refreshToken)) throw new Error('invalid request')
+
+  const request = descriptorValue(inputDescriptors, 'request')
+  if (operation === 'quote') {
+    const descriptors = plainDataDescriptors(request, ['vendorCode', 'fields'], true)
+    return Object.freeze({
+      refreshToken,
+      body: Object.freeze({
+        codes: providerIdentifier(descriptorValue(descriptors, 'vendorCode')),
+        indicators: frozenIdentifierArray(descriptorValue(descriptors, 'fields')).join(',')
+      })
+    })
+  }
+
+  const descriptors = plainDataDescriptors(
+    request,
+    ['vendorCode', 'indicatorIds', 'periodParameters'],
+    true
+  )
+  const periodDescriptors = plainDataDescriptors(
+    descriptorValue(descriptors, 'periodParameters'),
+    ['fullFiscalYears', 'latestDisclosedInterim'],
+    true
+  )
+  const periodParameters = {}
+  for (const key of ['fullFiscalYears', 'latestDisclosedInterim']) {
+    Object.defineProperty(periodParameters, key, {
+      value: frozenProviderParameters(descriptorValue(periodDescriptors, key)),
+      enumerable: true,
+      configurable: false,
+      writable: false
+    })
+  }
+  return Object.freeze({
+    refreshToken,
+    body: Object.freeze({
+      codes: providerIdentifier(descriptorValue(descriptors, 'vendorCode')),
+      indicators: frozenIdentifierArray(descriptorValue(descriptors, 'indicatorIds')),
+      parameters: Object.freeze(periodParameters)
+    })
+  })
 }
 
 /**
@@ -632,7 +835,143 @@ function createIfindHttpClient({
     }
   }
 
-  const client = { diagnose }
+  async function executeMarketOperation(operation, input) {
+    let requestCount = 0
+    let accessToken = null
+    function discardAccessToken() {
+      if (Buffer.isBuffer(accessToken)) {
+        activeAccessTokens.delete(accessToken)
+        accessToken.fill(0)
+      }
+      accessToken = null
+    }
+
+    try {
+      let operationInput
+      try {
+        operationInput = readOperationInput(input, operation)
+      } catch {
+        throw withStage(
+          safeError('IFIND_CONFIG_INVALID', 'CONFIG', 'iFinD client configuration was invalid'),
+          operation
+        )
+      }
+      const operationGeneration = generation
+
+      try {
+        requireCurrentGeneration(operationGeneration)
+        requestCount += 1
+        const tokenResponse = await requestJson(
+          request,
+          ENDPOINTS.auth,
+          { refresh_token: operationInput.refreshToken },
+          undefined,
+          setTimer,
+          clearTimer
+        )
+        requireCurrentGeneration(operationGeneration)
+        if (!isRecord(tokenResponse) || !Number.isSafeInteger(tokenResponse.errorcode)) {
+          throw safeError('IFIND_RESPONSE_SHAPE', 'API', 'iFinD response shape was invalid')
+        }
+        if (tokenResponse.errorcode !== 0) {
+          throw safeError(
+            'IFIND_AUTH_REJECTED',
+            'AUTH',
+            'iFinD access-token request failed',
+            undefined,
+            tokenResponse.errorcode
+          )
+        }
+        if (!isRecord(tokenResponse.data) ||
+            !isHeaderSafeToken(tokenResponse.data.access_token)) {
+          throw safeError('IFIND_RESPONSE_SHAPE', 'API', 'iFinD response shape was invalid')
+        }
+        accessToken = Buffer.from(tokenResponse.data.access_token, 'utf8')
+        activeAccessTokens.add(accessToken)
+        requireCurrentGeneration(operationGeneration)
+      } catch (error) {
+        throw withStage(error, 'auth')
+      }
+
+      try {
+        const tokenForOperation = accessToken
+        if (!Buffer.isBuffer(tokenForOperation)) {
+          throw safeError('IFIND_CONFIG_INVALID', 'CONFIG', 'iFinD client configuration was invalid')
+        }
+        requestCount += 1
+        const response = await requestJson(
+          request,
+          ENDPOINTS[operation],
+          {
+            access_token: tokenForOperation.toString('utf8'),
+            ifindlang: 'cn'
+          },
+          operationInput.body,
+          setTimer,
+          clearTimer
+        )
+        requireCurrentGeneration(operationGeneration)
+        if (!isRecord(response) || !Number.isSafeInteger(response.errorcode)) {
+          throw safeError('IFIND_RESPONSE_SHAPE', 'API', 'iFinD response shape was invalid')
+        }
+        if (response.errorcode === 0) return response
+
+        const failureClass = classifyProbeFailure(response)
+        if (failureClass === 'AUTH') {
+          throw safeError(
+            'IFIND_AUTH_REJECTED',
+            'AUTH',
+            'iFinD authentication failed',
+            undefined,
+            response.errorcode
+          )
+        }
+        if (failureClass === 'PERMISSION') {
+          throw safeError(
+            'IFIND_PERMISSION_REJECTED',
+            'PERMISSION',
+            'iFinD permission denied',
+            response.dataVol,
+            response.errorcode
+          )
+        }
+        if (failureClass === 'QUOTA') {
+          throw safeError(
+            'IFIND_QUOTA_REJECTED',
+            'QUOTA',
+            'iFinD quota unavailable',
+            response.dataVol,
+            response.errorcode
+          )
+        }
+        throw safeError(
+          operation === 'quote' ? 'IFIND_QUOTE_REJECTED' : 'IFIND_FINANCIAL_REJECTED',
+          'API',
+          operation === 'quote'
+            ? 'iFinD quote request failed'
+            : 'iFinD financial request failed',
+          response.dataVol,
+          response.errorcode
+        )
+      } catch (error) {
+        throw withStage(error, operation)
+      }
+    } catch (error) {
+      throw withRequestCount(error, requestCount)
+    } finally {
+      discardAccessToken()
+    }
+  }
+
+  function quote(input) {
+    return executeMarketOperation('quote', input)
+  }
+
+  function financial(input) {
+    return executeMarketOperation('financial', input)
+  }
+
+  const client = { diagnose, quote, financial }
   Object.defineProperty(client, 'clear', { value: clear })
   return client
 }
