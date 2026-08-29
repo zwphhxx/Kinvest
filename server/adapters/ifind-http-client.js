@@ -115,17 +115,27 @@ function plainJsonSnapshot(value) {
     return value
   }
   if (Array.isArray(value)) {
+    const descriptors = Object.getOwnPropertyDescriptors(value)
     const snapshot = []
     for (let index = 0; index < value.length; index += 1) {
-      snapshot.push(plainJsonSnapshot(value[index]))
+      const descriptor = descriptors[index]
+      if (!descriptor || !Object.hasOwn(descriptor, 'value') || !descriptor.enumerable) {
+        throw new Error('invalid JSON array')
+      }
+      snapshot.push(plainJsonSnapshot(descriptor.value))
     }
     return Object.freeze(snapshot)
   }
   if (!isRecord(value)) throw new Error('invalid JSON value')
+  const descriptors = Object.getOwnPropertyDescriptors(value)
   const snapshot = {}
-  for (const key of Object.keys(value)) {
+  for (const key of Object.keys(descriptors)) {
+    const descriptor = descriptors[key]
+    if (!Object.hasOwn(descriptor, 'value') || !descriptor.enumerable) {
+      throw new Error('invalid JSON object')
+    }
     Object.defineProperty(snapshot, key, {
-      value: plainJsonSnapshot(value[key]),
+      value: plainJsonSnapshot(descriptor.value),
       enumerable: true,
       configurable: false,
       writable: false
@@ -435,10 +445,10 @@ function requestJson(request, path, headers, body, setTimer, clearTimer) {
   })
 }
 
-function classifyProbeFailure(response) {
-  if (PERMISSION_ERROR_CODES.has(response.errorcode)) return 'PERMISSION'
-  if (QUOTA_ERROR_CODES.has(response.errorcode)) return 'QUOTA'
-  if (AUTH_ERROR_CODES.has(response.errorcode)) return 'AUTH'
+function classifyProbeFailure(errorCode) {
+  if (PERMISSION_ERROR_CODES.has(errorCode)) return 'PERMISSION'
+  if (QUOTA_ERROR_CODES.has(errorCode)) return 'QUOTA'
+  if (AUTH_ERROR_CODES.has(errorCode)) return 'AUTH'
   return 'API'
 }
 
@@ -516,37 +526,60 @@ function frozenIdentifierArray(value) {
   return Object.freeze(identifiers)
 }
 
-function frozenProviderParameters(value, depth = 0) {
-  if (typeof value === 'string') return providerIdentifier(value)
+const PARAMETER_VALIDATION_BUDGET = 24
+
+function consumeParameterBudget(state, amount = 1) {
+  state.work += amount
+  if (state.work > PARAMETER_VALIDATION_BUDGET) throw new Error('invalid request')
+}
+
+function frozenProviderParameters(value, state, depth = 0) {
+  if (typeof value === 'string') {
+    consumeParameterBudget(state)
+    return providerIdentifier(value)
+  }
   if (typeof value === 'number') {
     if (!Number.isFinite(value)) throw new Error('invalid request')
+    consumeParameterBudget(state)
     return value
   }
-  if (typeof value === 'boolean') return value
+  if (typeof value === 'boolean') {
+    consumeParameterBudget(state)
+    return value
+  }
   if (depth >= 8 || !value || typeof value !== 'object' || types.isProxy(value) ||
       !Object.isFrozen(value) || Object.getOwnPropertySymbols(value).length !== 0) {
     throw new Error('invalid request')
   }
+  if (state.active.has(value)) throw new Error('invalid request')
+  if (state.snapshots.has(value)) return state.snapshots.get(value)
+  state.active.add(value)
+  consumeParameterBudget(state)
+  try {
   if (Array.isArray(value)) {
     if (Object.getPrototypeOf(value) !== Array.prototype || value.length > 64) {
       throw new Error('invalid request')
     }
     const descriptors = Object.getOwnPropertyDescriptors(value)
     if (Object.keys(descriptors).length !== value.length + 1) throw new Error('invalid request')
+    consumeParameterBudget(state, value.length)
     const snapshot = []
     for (let index = 0; index < value.length; index += 1) {
       const descriptor = descriptors[index]
       if (!descriptor || !Object.hasOwn(descriptor, 'value') || !descriptor.enumerable) {
         throw new Error('invalid request')
       }
-      snapshot.push(frozenProviderParameters(descriptor.value, depth + 1))
+      snapshot.push(frozenProviderParameters(descriptor.value, state, depth + 1))
     }
-    return Object.freeze(snapshot)
+    const frozenSnapshot = Object.freeze(snapshot)
+    state.snapshots.set(value, frozenSnapshot)
+    return frozenSnapshot
   }
   if (Object.getPrototypeOf(value) !== Object.prototype) throw new Error('invalid request')
   const descriptors = Object.getOwnPropertyDescriptors(value)
   const keys = Object.keys(descriptors)
   if (keys.length < 1 || keys.length > 64) throw new Error('invalid request')
+  consumeParameterBudget(state, keys.length)
   const snapshot = {}
   for (const key of keys) {
     const descriptor = descriptors[key]
@@ -555,13 +588,18 @@ function frozenProviderParameters(value, depth = 0) {
       throw new Error('invalid request')
     }
     Object.defineProperty(snapshot, key, {
-      value: frozenProviderParameters(descriptor.value, depth + 1),
+      value: frozenProviderParameters(descriptor.value, state, depth + 1),
       enumerable: true,
       configurable: false,
       writable: false
     })
   }
-  return Object.freeze(snapshot)
+  const frozenSnapshot = Object.freeze(snapshot)
+  state.snapshots.set(value, frozenSnapshot)
+  return frozenSnapshot
+  } finally {
+    state.active.delete(value)
+  }
 }
 
 function readOperationInput(input, operation) {
@@ -599,9 +637,17 @@ function readOperationInput(input, operation) {
     true
   )
   const periodParameters = {}
+  const parameterValidationState = {
+    work: 0,
+    active: new Set(),
+    snapshots: new WeakMap()
+  }
   for (const key of ['fullFiscalYears', 'latestDisclosedInterim']) {
     Object.defineProperty(periodParameters, key, {
-      value: frozenProviderParameters(descriptorValue(periodDescriptors, key)),
+      value: frozenProviderParameters(
+        descriptorValue(periodDescriptors, key),
+        parameterValidationState
+      ),
       enumerable: true,
       configurable: false,
       writable: false
@@ -632,13 +678,60 @@ function ownDataValue(record, key) {
   return descriptor.value
 }
 
+function optionalOwnDataValue(record, key) {
+  if (!isRecord(record) || Object.getPrototypeOf(record) !== Object.prototype) {
+    throw new Error('invalid response')
+  }
+  const descriptor = Object.getOwnPropertyDescriptor(record, key)
+  if (descriptor === undefined) return { present: false, value: undefined }
+  if (!Object.hasOwn(descriptor, 'value') || !descriptor.enumerable) {
+    throw new Error('invalid response')
+  }
+  return { present: true, value: descriptor.value }
+}
+
+function protocolDataValue(record, key) {
+  try {
+    return ownDataValue(record, key)
+  } catch {
+    throw safeError('IFIND_RESPONSE_SHAPE', 'API', 'iFinD response shape was invalid')
+  }
+}
+
+function protocolErrorCode(record) {
+  const errorCode = protocolDataValue(record, 'errorcode')
+  if (!Number.isSafeInteger(errorCode)) {
+    throw safeError('IFIND_RESPONSE_SHAPE', 'API', 'iFinD response shape was invalid')
+  }
+  return errorCode
+}
+
+function protocolDataVol(record) {
+  let field
+  try {
+    field = optionalOwnDataValue(record, 'dataVol')
+  } catch {
+    throw safeError('IFIND_RESPONSE_SHAPE', 'API', 'iFinD response shape was invalid')
+  }
+  if (!field.present) return field
+  if (!Number.isSafeInteger(field.value) || field.value < 0) {
+    throw safeError('IFIND_RESPONSE_SHAPE', 'API', 'iFinD response shape was invalid')
+  }
+  return field
+}
+
 function parserDataArray(value) {
   if (!Array.isArray(value) || Object.getPrototypeOf(value) !== Array.prototype) {
     throw new Error('invalid response')
   }
+  const descriptors = Object.getOwnPropertyDescriptors(value)
   const snapshot = []
   for (let index = 0; index < value.length; index += 1) {
-    const item = value[index]
+    const descriptor = descriptors[index]
+    if (!descriptor || !Object.hasOwn(descriptor, 'value') || !descriptor.enumerable) {
+      throw new Error('invalid response')
+    }
+    const item = descriptor.value
     if (item === null || typeof item === 'string' || typeof item === 'boolean') {
       snapshot.push(item)
       continue
@@ -673,15 +766,11 @@ function sanitizeMarketSuccess(response, requestContract) {
     table: Object.freeze(fields)
   })
   const sanitized = {
-    errorcode: response.errorcode,
+    errorcode: ownDataValue(response, 'errorcode'),
     tables: Object.freeze([sanitizedTable])
   }
-  if (Object.hasOwn(response, 'dataVol')) {
-    if (!Number.isSafeInteger(response.dataVol) || response.dataVol < 0) {
-      throw new Error('invalid response')
-    }
-    sanitized.dataVol = response.dataVol
-  }
+  const dataVol = optionalOwnDataValue(response, 'dataVol')
+  if (dataVol.present) sanitized.dataVol = dataVol.value
   return Object.freeze(sanitized)
 }
 
@@ -778,24 +867,23 @@ function createIfindHttpClient({
           clearTimer
         )
         requireCurrentGeneration(operationGeneration)
-        if (!isRecord(tokenResponse) || !Number.isSafeInteger(tokenResponse.errorcode)) {
-          throw safeError('IFIND_RESPONSE_SHAPE', 'API', 'iFinD response shape was invalid')
-        }
-        if (tokenResponse.errorcode !== 0) {
+        const tokenErrorCode = protocolErrorCode(tokenResponse)
+        if (tokenErrorCode !== 0) {
           throw safeError(
             'IFIND_AUTH_REJECTED',
             'AUTH',
             'iFinD access-token request failed',
             undefined,
-            tokenResponse.errorcode
+            tokenErrorCode
           )
         }
-        if (!isRecord(tokenResponse.data) ||
-            !isHeaderSafeToken(tokenResponse.data.access_token)) {
+        const tokenData = protocolDataValue(tokenResponse, 'data')
+        const providerAccessToken = protocolDataValue(tokenData, 'access_token')
+        if (!isHeaderSafeToken(providerAccessToken)) {
           throw safeError('IFIND_RESPONSE_SHAPE', 'API', 'iFinD response shape was invalid')
         }
         discardAccessToken()
-        accessToken = Buffer.from(tokenResponse.data.access_token, 'utf8')
+        accessToken = Buffer.from(providerAccessToken, 'utf8')
         activeAccessTokens.add(accessToken)
         requireCurrentGeneration(operationGeneration)
       } catch (error) {
@@ -806,6 +894,7 @@ function createIfindHttpClient({
     await authenticate()
 
     let probeResponse
+    let probeDataVol = { present: false, value: undefined }
     try {
       for (let attempt = 0; attempt < 2; attempt += 1) {
         requireCurrentGeneration(operationGeneration)
@@ -836,11 +925,9 @@ function createIfindHttpClient({
           clearTimer
         )
         requireCurrentGeneration(operationGeneration)
-        if (!isRecord(probeResponse) || !Number.isSafeInteger(probeResponse.errorcode)) {
-          throw safeError('IFIND_RESPONSE_SHAPE', 'API', 'iFinD response shape was invalid')
-        }
-        if (probeResponse.errorcode === 0) break
-        const failureClass = classifyProbeFailure(probeResponse)
+        const probeErrorCode = protocolErrorCode(probeResponse)
+        if (probeErrorCode === 0) break
+        const failureClass = classifyProbeFailure(probeErrorCode)
         if (failureClass === 'AUTH' && attempt === 1) {
           discardAccessToken()
           throw safeError(
@@ -848,16 +935,18 @@ function createIfindHttpClient({
             'AUTH',
             'iFinD authentication failed',
             undefined,
-            probeResponse.errorcode
+            probeErrorCode
           )
         }
+        const failureDataVol = protocolDataVol(probeResponse)
+        const safeFailureDataVol = failureDataVol.present ? failureDataVol.value : undefined
         if (failureClass === 'PERMISSION') {
           throw safeError(
             'IFIND_PERMISSION_REJECTED',
             'PERMISSION',
             'iFinD permission denied',
-            probeResponse.dataVol,
-            probeResponse.errorcode
+            safeFailureDataVol,
+            probeErrorCode
           )
         }
         if (failureClass === 'QUOTA') {
@@ -865,8 +954,8 @@ function createIfindHttpClient({
             'IFIND_QUOTA_REJECTED',
             'QUOTA',
             'iFinD quota unavailable',
-            probeResponse.dataVol,
-            probeResponse.errorcode
+            safeFailureDataVol,
+            probeErrorCode
           )
         }
         if (failureClass !== 'AUTH') {
@@ -874,20 +963,20 @@ function createIfindHttpClient({
             'IFIND_PROBE_REJECTED',
             'API',
             'iFinD trade-date probe failed',
-            probeResponse.dataVol,
-            probeResponse.errorcode
+            safeFailureDataVol,
+            probeErrorCode
           )
         }
         discardAccessToken()
         await authenticate()
       }
 
-      if (!isRecord(probeResponse.tables) ||
-          !Array.isArray(probeResponse.tables.time) ||
-          probeResponse.tables.time.length === 0 ||
-          !probeResponse.tables.time.every(isCanonicalCalendarDate) ||
-          (Object.hasOwn(probeResponse, 'dataVol') &&
-            (!Number.isFinite(probeResponse.dataVol) || probeResponse.dataVol < 0))) {
+      const probeTables = protocolDataValue(probeResponse, 'tables')
+      const probeTimes = protocolDataValue(probeTables, 'time')
+      probeDataVol = protocolDataVol(probeResponse)
+      if (!Array.isArray(probeTimes) ||
+          probeTimes.length === 0 ||
+          !probeTimes.every(isCanonicalCalendarDate)) {
         throw safeError('IFIND_RESPONSE_SHAPE', 'API', 'iFinD response shape was invalid')
       }
     } catch (error) {
@@ -896,7 +985,7 @@ function createIfindHttpClient({
 
     const retrievedAt = readNow()
     requireCurrentGeneration(operationGeneration)
-    const hasDataVol = Object.hasOwn(probeResponse, 'dataVol')
+    const hasDataVol = probeDataVol.present
     return {
       route: '/api/v1/get_trade_dates',
       scope: 'market-trade-dates:212001:D:-10',
@@ -904,7 +993,7 @@ function createIfindHttpClient({
       timezone: 'Asia/Shanghai',
       elapsedMs: Math.max(0, retrievedAt.getTime() - startedAt.getTime()),
       requestCount,
-      dataVol: hasDataVol ? probeResponse.dataVol : 'unavailable',
+      dataVol: hasDataVol ? probeDataVol.value : 'unavailable',
       officialQuotaStatus: 'unavailable',
       completeness: hasDataVol ? 'complete' : 'partial'
     }
@@ -950,23 +1039,22 @@ function createIfindHttpClient({
           clearTimer
         )
         requireCurrentGeneration(operationGeneration)
-        if (!isRecord(tokenResponse) || !Number.isSafeInteger(tokenResponse.errorcode)) {
-          throw safeError('IFIND_RESPONSE_SHAPE', 'API', 'iFinD response shape was invalid')
-        }
-        if (tokenResponse.errorcode !== 0) {
+        const tokenErrorCode = protocolErrorCode(tokenResponse)
+        if (tokenErrorCode !== 0) {
           throw safeError(
             'IFIND_AUTH_REJECTED',
             'AUTH',
             'iFinD access-token request failed',
             undefined,
-            tokenResponse.errorcode
+            tokenErrorCode
           )
         }
-        if (!isRecord(tokenResponse.data) ||
-            !isHeaderSafeToken(tokenResponse.data.access_token)) {
+        const tokenData = protocolDataValue(tokenResponse, 'data')
+        const providerAccessToken = protocolDataValue(tokenData, 'access_token')
+        if (!isHeaderSafeToken(providerAccessToken)) {
           throw safeError('IFIND_RESPONSE_SHAPE', 'API', 'iFinD response shape was invalid')
         }
-        accessToken = Buffer.from(tokenResponse.data.access_token, 'utf8')
+        accessToken = Buffer.from(providerAccessToken, 'utf8')
         activeAccessTokens.add(accessToken)
         requireCurrentGeneration(operationGeneration)
       } catch (error) {
@@ -991,11 +1079,10 @@ function createIfindHttpClient({
           clearTimer
         )
         requireCurrentGeneration(operationGeneration)
-        if (!isRecord(response) || !Number.isSafeInteger(response.errorcode)) {
-          throw safeError('IFIND_RESPONSE_SHAPE', 'API', 'iFinD response shape was invalid')
-        }
-        if (response.errorcode === 0) {
+        const responseErrorCode = protocolErrorCode(response)
+        if (responseErrorCode === 0) {
           try {
+            protocolDataVol(response)
             return operation === 'quote'
               ? sanitizeQuoteSuccess(response, operationInput)
               : sanitizeFinancialSuccess(response, operationInput)
@@ -1004,23 +1091,25 @@ function createIfindHttpClient({
           }
         }
 
-        const failureClass = classifyProbeFailure(response)
+        const failureClass = classifyProbeFailure(responseErrorCode)
         if (failureClass === 'AUTH') {
           throw safeError(
             'IFIND_AUTH_REJECTED',
             'AUTH',
             'iFinD authentication failed',
             undefined,
-            response.errorcode
+            responseErrorCode
           )
         }
+        const failureDataVol = protocolDataVol(response)
+        const safeFailureDataVol = failureDataVol.present ? failureDataVol.value : undefined
         if (failureClass === 'PERMISSION') {
           throw safeError(
             'IFIND_PERMISSION_REJECTED',
             'PERMISSION',
             'iFinD permission denied',
-            response.dataVol,
-            response.errorcode
+            safeFailureDataVol,
+            responseErrorCode
           )
         }
         if (failureClass === 'QUOTA') {
@@ -1028,8 +1117,8 @@ function createIfindHttpClient({
             'IFIND_QUOTA_REJECTED',
             'QUOTA',
             'iFinD quota unavailable',
-            response.dataVol,
-            response.errorcode
+            safeFailureDataVol,
+            responseErrorCode
           )
         }
         throw safeError(
@@ -1038,8 +1127,8 @@ function createIfindHttpClient({
           operation === 'quote'
             ? 'iFinD quote request failed'
             : 'iFinD financial request failed',
-          response.dataVol,
-          response.errorcode
+          safeFailureDataVol,
+          responseErrorCode
         )
       } catch (error) {
         throw withStage(error, operation)

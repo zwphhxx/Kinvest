@@ -543,6 +543,315 @@ async function run() {
     }
   }
 
+  let sharedDag = Object.freeze({ leaf: 'TEST_ONLY_SHARED_LEAF' })
+  for (let depth = 0; depth < 6; depth += 1) {
+    const parent = {}
+    for (let branch = 0; branch < 4; branch += 1) {
+      parent[`branch${branch}`] = sharedDag
+    }
+    sharedDag = Object.freeze(parent)
+  }
+  const overBudgetSharedRequest = Object.freeze({
+    vendorCode: 'TEST_ONLY_HK_CODE',
+    indicatorIds: Object.freeze(['TEST_ONLY_HK_REVENUE']),
+    periodParameters: Object.freeze({
+      fullFiscalYears: sharedDag,
+      latestDisclosedInterim: sharedDag
+    })
+  })
+  let sharedDagTransportCalls = 0
+  const sharedDagClient = createIfindHttpClient({
+    request() {
+      sharedDagTransportCalls += 1
+      throw new Error('shared DAG must be rejected before transport')
+    }
+  })
+  await assert.rejects(
+    () => sharedDagClient.financial({
+      refreshToken: REFRESH_TOKEN,
+      request: overBudgetSharedRequest
+    }),
+    (error) => errorRecord(error).code === 'IFIND_CONFIG_INVALID' &&
+      errorRecord(error).class === 'CONFIG' &&
+      errorRecord(error).stage === 'financial' &&
+      errorRecord(error).requestCount === 0
+  )
+  assert.equal(sharedDagTransportCalls, 0)
+
+  const safeSharedParameters = Object.freeze({ reportPeriod: 'TEST_ONLY_SHARED_PERIOD' })
+  const safeSharedRequest = Object.freeze({
+    vendorCode: 'TEST_ONLY_HK_CODE',
+    indicatorIds: Object.freeze([
+      'TEST_ONLY_HK_REVENUE',
+      'TEST_ONLY_HK_NET_PROFIT',
+      'TEST_ONLY_HK_OPERATING_CASH_FLOW'
+    ]),
+    periodParameters: Object.freeze({
+      fullFiscalYears: safeSharedParameters,
+      latestDisclosedInterim: safeSharedParameters
+    })
+  })
+  const safeSharedTransport = createRequestStub([
+    accessTokenSuccess,
+    marketOperationFixtures.HK.financial
+  ])
+  const safeSharedClient = createIfindHttpClient({ request: safeSharedTransport.request })
+  const safeSharedResult = await safeSharedClient.financial({
+    refreshToken: REFRESH_TOKEN,
+    request: safeSharedRequest
+  })
+  assert.deepEqual(safeSharedResult, marketOperationFixtures.HK.financial)
+  assert.equal(safeSharedTransport.calls.length, 2)
+
+  const hostileRequestCases = []
+  let requestAccessorReads = 0
+  const accessorQuoteRequest = {
+    fields: Object.freeze(['TEST_ONLY_HK_LATEST_PRICE'])
+  }
+  Object.defineProperty(accessorQuoteRequest, 'vendorCode', {
+    enumerable: true,
+    get() {
+      requestAccessorReads += 1
+      return 'TEST_ONLY_HK_CODE'
+    }
+  })
+  hostileRequestCases.push({
+    name: 'own accessor',
+    operation: 'quote',
+    request: Object.freeze(accessorQuoteRequest)
+  })
+
+  const liveProxyTarget = quoteRequest('HK')
+  hostileRequestCases.push({
+    name: 'live proxy',
+    operation: 'quote',
+    request: new Proxy(liveProxyTarget, {})
+  })
+
+  const revoked = Proxy.revocable(quoteRequest('HK'), {})
+  revoked.revoke()
+  hostileRequestCases.push({
+    name: 'revoked proxy',
+    operation: 'quote',
+    request: revoked.proxy
+  })
+
+  const customPrototypeRequest = Object.create({ inherited: 'provider field' })
+  Object.defineProperties(customPrototypeRequest, {
+    vendorCode: { value: 'TEST_ONLY_HK_CODE', enumerable: true },
+    fields: {
+      value: Object.freeze(['TEST_ONLY_HK_LATEST_PRICE']),
+      enumerable: true
+    }
+  })
+  hostileRequestCases.push({
+    name: 'custom prototype',
+    operation: 'quote',
+    request: Object.freeze(customPrototypeRequest)
+  })
+
+  let inheritedRequestGetterReads = 0
+  const inheritedRequestPrototype = {}
+  Object.defineProperty(inheritedRequestPrototype, 'vendorCode', {
+    get() {
+      inheritedRequestGetterReads += 1
+      return 'TEST_ONLY_HK_CODE'
+    }
+  })
+  const inheritedFieldRequest = Object.create(inheritedRequestPrototype)
+  Object.defineProperty(inheritedFieldRequest, 'fields', {
+    value: Object.freeze(['TEST_ONLY_HK_LATEST_PRICE']),
+    enumerable: true
+  })
+  hostileRequestCases.push({
+    name: 'inherited provider field',
+    operation: 'quote',
+    request: Object.freeze(inheritedFieldRequest)
+  })
+
+  let nestedParameterAccessorReads = 0
+  const accessorParameters = {}
+  Object.defineProperty(accessorParameters, 'reportPeriod', {
+    enumerable: true,
+    get() {
+      nestedParameterAccessorReads += 1
+      return 'TEST_ONLY_ANNUAL'
+    }
+  })
+  hostileRequestCases.push({
+    name: 'nested parameter accessor',
+    operation: 'financial',
+    request: Object.freeze({
+      vendorCode: 'TEST_ONLY_HK_CODE',
+      indicatorIds: Object.freeze(['TEST_ONLY_HK_REVENUE']),
+      periodParameters: Object.freeze({
+        fullFiscalYears: Object.freeze(accessorParameters),
+        latestDisclosedInterim: Object.freeze({ reportPeriod: 'TEST_ONLY_INTERIM' })
+      })
+    })
+  })
+
+  const cyclicParameters = {}
+  cyclicParameters.self = cyclicParameters
+  Object.freeze(cyclicParameters)
+  hostileRequestCases.push({
+    name: 'cyclic shared graph',
+    operation: 'financial',
+    request: Object.freeze({
+      vendorCode: 'TEST_ONLY_HK_CODE',
+      indicatorIds: Object.freeze(['TEST_ONLY_HK_REVENUE']),
+      periodParameters: Object.freeze({
+        fullFiscalYears: cyclicParameters,
+        latestDisclosedInterim: cyclicParameters
+      })
+    })
+  })
+
+  for (const hostileCase of hostileRequestCases) {
+    let transportCalls = 0
+    const hostileClient = createIfindHttpClient({
+      request() {
+        transportCalls += 1
+        throw new Error('invalid request must not reach transport')
+      }
+    })
+    await assert.rejects(
+      () => hostileClient[hostileCase.operation]({
+        refreshToken: REFRESH_TOKEN,
+        request: hostileCase.request
+      }),
+      (error) => errorRecord(error).code === 'IFIND_CONFIG_INVALID' &&
+        errorRecord(error).class === 'CONFIG' &&
+        errorRecord(error).stage === hostileCase.operation &&
+        errorRecord(error).requestCount === 0,
+      hostileCase.name
+    )
+    assert.equal(transportCalls, 0, hostileCase.name)
+  }
+  assert.equal(requestAccessorReads, 0)
+  assert.equal(inheritedRequestGetterReads, 0)
+  assert.equal(nestedParameterAccessorReads, 0)
+
+  async function withObjectPrototypeGetter(name, getter, action) {
+    const previous = Object.getOwnPropertyDescriptor(Object.prototype, name)
+    Object.defineProperty(Object.prototype, name, {
+      configurable: true,
+      get: getter
+    })
+    try {
+      return await action()
+    } finally {
+      if (previous) Object.defineProperty(Object.prototype, name, previous)
+      else delete Object.prototype[name]
+    }
+  }
+
+  let inheritedErrorCodeReads = 0
+  await withObjectPrototypeGetter('errorcode', () => {
+    inheritedErrorCodeReads += 1
+    return 0
+  }, async () => {
+    const inheritedCodeAuthTransport = createRequestStub([{
+      data: { access_token: ACCESS_TOKEN }
+    }])
+    const inheritedCodeAuthClient = createIfindHttpClient({
+      request: inheritedCodeAuthTransport.request
+    })
+    await assert.rejects(
+      () => inheritedCodeAuthClient.quote({
+        refreshToken: REFRESH_TOKEN,
+        request: quoteRequest('HK')
+      }),
+      (error) => errorRecord(error).code === 'IFIND_RESPONSE_SHAPE' &&
+        errorRecord(error).stage === 'auth'
+    )
+    assert.equal(inheritedCodeAuthTransport.calls.length, 1)
+
+    for (const operation of ['quote', 'financial']) {
+      const inheritedCodeOperationTransport = createRequestStub([
+        accessTokenSuccess,
+        { tables: marketOperationFixtures.HK[operation].tables, dataVol: 1 }
+      ])
+      const inheritedCodeOperationClient = createIfindHttpClient({
+        request: inheritedCodeOperationTransport.request
+      })
+      await assert.rejects(
+        () => inheritedCodeOperationClient[operation]({
+          refreshToken: REFRESH_TOKEN,
+          request: operation === 'quote' ? quoteRequest('HK') : financialRequest('HK')
+        }),
+        (error) => errorRecord(error).code === 'IFIND_RESPONSE_SHAPE' &&
+          errorRecord(error).stage === operation
+      )
+      assert.equal(inheritedCodeOperationTransport.calls.length, 2)
+    }
+  })
+  assert.equal(inheritedErrorCodeReads, 0)
+
+  let inheritedAccessTokenReads = 0
+  await withObjectPrototypeGetter('access_token', () => {
+    inheritedAccessTokenReads += 1
+    return ACCESS_TOKEN
+  }, async () => {
+    const inheritedTokenTransport = createRequestStub([{ errorcode: 0, data: {} }])
+    const inheritedTokenClient = createIfindHttpClient({ request: inheritedTokenTransport.request })
+    await assert.rejects(
+      () => inheritedTokenClient.financial({
+        refreshToken: REFRESH_TOKEN,
+        request: financialRequest('HK')
+      }),
+      (error) => errorRecord(error).code === 'IFIND_RESPONSE_SHAPE' &&
+        errorRecord(error).stage === 'auth'
+    )
+    assert.equal(inheritedTokenTransport.calls.length, 1)
+  })
+  assert.equal(inheritedAccessTokenReads, 0)
+
+  let inheritedDataReads = 0
+  await withObjectPrototypeGetter('data', () => {
+    inheritedDataReads += 1
+    return { access_token: ACCESS_TOKEN }
+  }, async () => {
+    const inheritedDataTransport = createRequestStub([{ errorcode: 0 }])
+    const inheritedDataClient = createIfindHttpClient({ request: inheritedDataTransport.request })
+    await assert.rejects(
+      () => inheritedDataClient.quote({
+        refreshToken: REFRESH_TOKEN,
+        request: quoteRequest('HK')
+      }),
+      (error) => errorRecord(error).code === 'IFIND_RESPONSE_SHAPE' &&
+        errorRecord(error).stage === 'auth'
+    )
+    assert.equal(inheritedDataTransport.calls.length, 1)
+  })
+  assert.equal(inheritedDataReads, 0)
+
+  let inheritedFailureMetadataReads = 0
+  await withObjectPrototypeGetter('dataVol', () => {
+    inheritedFailureMetadataReads += 1
+    return 999999
+  }, async () => {
+    for (const operation of ['quote', 'financial']) {
+      const inheritedMetadataTransport = createRequestStub([
+        accessTokenSuccess,
+        { errorcode: -403, errmsg: 'synthetic inherited metadata rejection' }
+      ])
+      const inheritedMetadataClient = createIfindHttpClient({
+        request: inheritedMetadataTransport.request
+      })
+      await assert.rejects(
+        () => inheritedMetadataClient[operation]({
+          refreshToken: REFRESH_TOKEN,
+          request: operation === 'quote' ? quoteRequest('HK') : financialRequest('HK')
+        }),
+        (error) => errorRecord(error).code === 'IFIND_PERMISSION_REJECTED' &&
+          errorRecord(error).stage === operation &&
+          !Object.hasOwn(errorRecord(error), 'dataVol')
+      )
+    }
+  })
+  assert.equal(inheritedFailureMetadataReads, 0)
+
   const forbiddenTransportControls = [
     'url', 'endpoint', 'headers', 'host', 'method', 'timeout', 'responseCap', 'route'
   ]
