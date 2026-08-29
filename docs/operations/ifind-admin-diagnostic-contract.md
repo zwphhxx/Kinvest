@@ -29,11 +29,13 @@ access_token: <ephemeral access token>
 ifindlang: cn
 ```
 
-The JSON body is fixed except for `startdate`, which is the current calendar date in `Asia/Shanghai` using `YYYY-MM-DD`:
+The JSON body is fully fixed. `startdate` uses the official example reference date `2022-07-05`:
 
 ```json
-{"marketcode":"212001","functionpara":{"dateType":"0","period":"D","offset":"-10","dateFormat":"0","output":"sequencedate"},"startdate":"<Asia/Shanghai YYYY-MM-DD>"}
+{"marketcode":"212001","functionpara":{"dateType":"0","period":"D","offset":"-10","dateFormat":"0","output":"sequencedate"},"startdate":"2022-07-05"}
 ```
+
+This fixed request is a minimal diagnostic baseline. It deliberately removes weekend and current-date variability so repeated diagnostics exercise the same documented provider contract.
 
 ## Diagnostic result and error boundary
 

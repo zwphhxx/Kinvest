@@ -1,5 +1,10 @@
 const crypto = require('node:crypto')
 const { types } = require('node:util')
+const {
+  isClientFailureMetadata,
+  isPersistableFailureMetadata,
+  isSafeErrorClass
+} = require('../contracts/ifind-diagnostic-errors')
 
 const MODE_ADMIN = 'admin-diagnostic'
 const MODE_DISABLED = 'disabled'
@@ -9,10 +14,6 @@ const VERSION_ID_PATTERN = /^v[0-9]{8}-[0-9]{3}$/
 const DIAGNOSTIC_ID_PATTERN = /^diag_[a-f0-9]{24,64}$/
 const DAY_KEY_PATTERN = /^[0-9]{4}-[0-9]{2}-[0-9]{2}$/
 const MAX_DIAGNOSTIC_REQUEST_COUNT = 4
-const SAFE_ERROR_CLASSES = new Set([
-  'AUTH', 'PERMISSION', 'QUOTA', 'NETWORK', 'API', 'CONFIG', 'BUSY',
-  'RATE_LIMITED'
-])
 const AUTH_STATUSES = new Set(['success', 'failed', 'unknown'])
 const PROBE_STATUSES = new Set(['success', 'failed', 'not_run'])
 const COMPLETENESS_VALUES = new Set(['complete', 'partial', 'unavailable'])
@@ -85,7 +86,9 @@ function readErrorFields(error, fallbackRequestCount = 1) {
     errorClass: 'API',
     requestCount: fallbackRequestCount === 0 ? 0 : 1,
     dataVol: null,
-    stage: null
+    stage: null,
+    failureCode: 'IFIND_CLIENT_FAILED',
+    vendorErrorCode: null
   }
   try {
     if (types.isProxy(error) || error === null ||
@@ -97,9 +100,19 @@ function readErrorFields(error, fallbackRequestCount = 1) {
     const candidateClass = readData('class')
     const candidateCount = readData('requestCount')
     const candidateDataVol = readData('dataVol')
-    const candidateStage = readData('stage')
+    const stageDescriptor = Reflect.getOwnPropertyDescriptor(error, 'stage')
+    if (stageDescriptor && !Object.hasOwn(stageDescriptor, 'value')) return fallback
+    const candidateStage = stageDescriptor ? stageDescriptor.value : null
+    const candidateFailureCode = readData('failureCode')
+    const candidateVendorErrorCode = readData('vendorErrorCode')
+    if (!isClientFailureMetadata({
+      failureCode: candidateFailureCode,
+      errorClass: candidateClass,
+      stage: candidateStage,
+      vendorErrorCode: candidateVendorErrorCode
+    })) return fallback
     return {
-      errorClass: SAFE_ERROR_CLASSES.has(candidateClass) ? candidateClass : 'API',
+      errorClass: candidateClass,
       requestCount: isCount(candidateCount, 0, MAX_DIAGNOSTIC_REQUEST_COUNT)
         ? candidateCount
         : 1,
@@ -108,7 +121,9 @@ function readErrorFields(error, fallbackRequestCount = 1) {
         : null,
       stage: candidateStage === 'auth' || candidateStage === 'probe'
         ? candidateStage
-        : null
+        : null,
+      failureCode: candidateFailureCode,
+      vendorErrorCode: candidateVendorErrorCode
     }
   } catch {
     return fallback
@@ -136,7 +151,9 @@ function safeClientResultRequestCount(value) {
 function invalidClientResult(requestCount) {
   return Object.assign(new Error('invalid client result'), {
     class: 'API',
-    requestCount
+    requestCount,
+    failureCode: 'IFIND_CLIENT_FAILED',
+    vendorErrorCode: null
   })
 }
 
@@ -262,14 +279,14 @@ function decodeRun(value) {
   const run = snapshotExactDataObject(value, [
     'diagnosticId', 'startedAt', 'completedAt', 'authStatus', 'probeStatus',
     'safeErrorClass', 'route', 'requestCount', 'dataVol', 'elapsedMs',
-    'completeness', 'tokenVersionId'
+    'completeness', 'tokenVersionId', 'failureCode', 'vendorErrorCode'
   ])
   if (!run || typeof run.diagnosticId !== 'string' ||
       !DIAGNOSTIC_ID_PATTERN.test(run.diagnosticId) ||
       !isTimestamp(run.startedAt) || !isTimestamp(run.completedAt) ||
       run.completedAt < run.startedAt || !AUTH_STATUSES.has(run.authStatus) ||
       !PROBE_STATUSES.has(run.probeStatus) ||
-      (run.safeErrorClass !== null && !SAFE_ERROR_CLASSES.has(run.safeErrorClass)) ||
+      (run.safeErrorClass !== null && !isSafeErrorClass(run.safeErrorClass)) ||
       run.route !== ROUTE || !isCount(run.requestCount, 0, 4) ||
       (run.dataVol !== null && (!Number.isSafeInteger(run.dataVol) || run.dataVol < 0)) ||
       !Number.isSafeInteger(run.elapsedMs) || run.elapsedMs < 0 ||
@@ -277,8 +294,13 @@ function decodeRun(value) {
       typeof run.tokenVersionId !== 'string' ||
       !VERSION_ID_PATTERN.test(run.tokenVersionId)) failConfig()
   if (run.authStatus === 'success' && run.probeStatus === 'success') {
-    if (run.safeErrorClass !== null || run.completeness === 'unavailable') failConfig()
-  } else if (run.safeErrorClass === null) {
+    if (run.safeErrorClass !== null || run.failureCode !== null ||
+        run.vendorErrorCode !== null || run.completeness === 'unavailable') failConfig()
+  } else if (run.safeErrorClass === null || !isPersistableFailureMetadata({
+    failureCode: run.failureCode,
+    errorClass: run.safeErrorClass,
+    vendorErrorCode: run.vendorErrorCode
+  })) {
     failConfig()
   }
   return {
@@ -288,6 +310,8 @@ function decodeRun(value) {
     authStatus: run.authStatus,
     probeStatus: run.probeStatus,
     safeErrorClass: run.safeErrorClass,
+    failureCode: run.failureCode,
+    vendorErrorCode: run.vendorErrorCode,
     route: run.route,
     requestCount: run.requestCount,
     dataVol: run.dataVol,
@@ -479,7 +503,9 @@ function createIfindDiagnosticService(options) {
       if (!Buffer.isBuffer(refreshToken) || refreshToken.length < 1 || refreshToken.length > 4096) {
         throw Object.assign(new Error('invalid secret provider'), {
           class: 'CONFIG',
-          requestCount: 0
+          requestCount: 0,
+          failureCode: 'IFIND_CONFIG_INVALID',
+          vendorErrorCode: null
         })
       }
       activeTokens.add(refreshToken)
@@ -490,7 +516,9 @@ function createIfindDiagnosticService(options) {
       if (invalidated || operationGeneration !== generation) {
         throw Object.assign(new Error('service cleared'), {
           class: 'CONFIG',
-          requestCount: clientResult.requestCount
+          requestCount: clientResult.requestCount,
+          failureCode: 'IFIND_CLIENT_CLEARED',
+          vendorErrorCode: null
         })
       }
       terminal = {
@@ -498,6 +526,8 @@ function createIfindDiagnosticService(options) {
         authStatus: 'success',
         probeStatus: 'success',
         safeErrorClass: null,
+        failureCode: null,
+        vendorErrorCode: null,
         route: ROUTE,
         requestCount: clientResult.requestCount,
         dataVol: clientResult.dataVol === 'unavailable' ? null : clientResult.dataVol,
@@ -520,6 +550,8 @@ function createIfindDiagnosticService(options) {
         authStatus: statuses.authStatus,
         probeStatus: statuses.probeStatus,
         safeErrorClass: fields.errorClass,
+        failureCode: fields.failureCode,
+        vendorErrorCode: fields.vendorErrorCode,
         route: ROUTE,
         requestCount: fields.requestCount,
         dataVol: fields.dataVol,

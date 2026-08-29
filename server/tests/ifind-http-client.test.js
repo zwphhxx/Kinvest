@@ -10,6 +10,7 @@ function readFixture(name) {
 
 const accessTokenSuccess = readFixture('access-token-success.json')
 const tradeDatesSuccess = readFixture('trade-dates-success.json')
+const tradeDatesTimeOnlySuccess = readFixture('trade-dates-time-only-success.json')
 const providerErrors = readFixture('provider-errors.json')
 
 const REFRESH_TOKEN = 'fake-refresh-token-for-contract-tests'
@@ -356,7 +357,7 @@ async function run() {
 
   const successTransport = createRequestStub([
     accessTokenSuccess,
-    tradeDatesSuccess,
+    tradeDatesTimeOnlySuccess,
     accessTokenSuccess,
     tradeDatesSuccess
   ])
@@ -401,7 +402,7 @@ async function run() {
           dateFormat: '0',
           output: 'sequencedate'
         },
-        startdate: '2026-08-26'
+        startdate: '2022-07-05'
       }
     }
   ])
@@ -422,6 +423,29 @@ async function run() {
     logEntries: successLogger.entries,
     globalOutputEntries: successExecution.entries
   })
+
+  for (const invalidTime of [
+    [],
+    null,
+    7,
+    {},
+    ['2022-02-30'],
+    ['2022-7-05'],
+    [20220705]
+  ]) {
+    const invalidTimeTransport = createRequestStub([
+      accessTokenSuccess,
+      { errorcode: 0, tables: { time: invalidTime } }
+    ])
+    const invalidTimeClient = createIfindHttpClient({ request: invalidTimeTransport.request })
+    await assert.rejects(
+      () => invalidTimeClient.diagnose({ refreshToken: REFRESH_TOKEN }),
+      (/** @type {any} */ error) =>
+        errorRecord(error).failureCode === 'IFIND_RESPONSE_SHAPE' &&
+        errorRecord(error).vendorErrorCode === null
+    )
+    assert.equal(invalidTimeTransport.calls.length, 2)
+  }
 
   const secondResult = await client.diagnose({ refreshToken: REFRESH_TOKEN })
   assert.equal(successTransport.calls.length, 4)
@@ -479,6 +503,8 @@ async function run() {
   assert.equal(probeError.message, 'iFinD trade-date probe failed')
   assert.equal(probeError.dataVol, 3)
   assert.equal(probeError.requestCount, 2)
+  assert.equal(probeError.failureCode, 'IFIND_PROBE_REJECTED')
+  assert.equal(probeError.vendorErrorCode, -1)
   assert.equal('cause' in probeError, false)
   assertNoProviderLeak({
     scenario: 'trade-date rejection',
@@ -561,7 +587,9 @@ async function run() {
       assert.equal(errorRecord(error).stage, 'probe')
       assert.equal(errorRecord(error).message, 'iFinD authentication failed')
       assert.equal(errorRecord(error).requestCount, 4)
-      assert.deepEqual(Object.keys(error).sort(), ['class', 'code', 'requestCount', 'stage'])
+      assert.deepEqual(Object.keys(error).sort(), [
+        'class', 'code', 'failureCode', 'requestCount', 'stage', 'vendorErrorCode'
+      ])
       return true
     }
   )
@@ -1238,7 +1266,14 @@ async function run() {
   const unknownCodeClient = createIfindHttpClient({ request: unknownCodeTransport.request })
   await assert.rejects(
     () => unknownCodeClient.diagnose({ refreshToken: REFRESH_TOKEN }),
-    (/**  {any} */ error) => errorRecord(error).class === 'API' && errorRecord(error).code === 'IFIND_PROBE_REJECTED'
+    (/**  {any} */ error) => {
+      assert.equal(errorRecord(error).class, 'API')
+      assert.equal(errorRecord(error).code, 'IFIND_PROBE_REJECTED')
+      assert.equal(errorRecord(error).failureCode, 'IFIND_PROBE_REJECTED')
+      assert.equal(errorRecord(error).vendorErrorCode, -999)
+      assert.equal(JSON.stringify(error).includes('invalid access token expired authentication'), false)
+      return true
+    }
   )
   assert.equal(unknownCodeTransport.calls.length, 2)
 

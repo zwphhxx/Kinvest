@@ -1,6 +1,10 @@
 const { DatabaseSync } = require('node:sqlite')
 const { types } = require('node:util')
 const {
+  isPersistableFailureMetadata,
+  isSafeErrorClass
+} = require('../contracts/ifind-diagnostic-errors')
+const {
   DeviceAuthDatabaseIdentityError,
   KINVEST_SQLITE_APPLICATION_ID,
   readApplicationId,
@@ -16,13 +20,9 @@ const DIAGNOSTIC_ID_PATTERN = /^diag_[a-f0-9]{24,64}$/
 const DAY_KEY_PATTERN = /^[0-9]{4}-[0-9]{2}-[0-9]{2}$/
 const AUTH_STATUSES = new Set(['success', 'failed', 'unknown'])
 const PROBE_STATUSES = new Set(['success', 'failed', 'not_run'])
-const SAFE_ERROR_CLASSES = new Set([
-  'AUTH', 'PERMISSION', 'QUOTA', 'NETWORK', 'API', 'CONFIG', 'BUSY',
-  'RATE_LIMITED'
-])
 const COMPLETENESS_VALUES = new Set(['complete', 'partial', 'unavailable'])
 
-const RUN_COLUMNS = [
+const LEGACY_RUN_COLUMNS = [
   ['diagnostic_id', 'TEXT', 1, 1],
   ['started_at', 'INTEGER', 1, 0],
   ['completed_at', 'INTEGER', 0, 0],
@@ -36,6 +36,11 @@ const RUN_COLUMNS = [
   ['completeness', 'TEXT', 0, 0],
   ['token_version_id', 'TEXT', 1, 0]
 ]
+const RUN_COLUMNS = [
+  ...LEGACY_RUN_COLUMNS,
+  ['failure_code', 'TEXT', 0, 0],
+  ['vendor_error_code', 'INTEGER', 0, 0]
+]
 const CONTROL_COLUMNS = [
   ['singleton_id', 'INTEGER', 1, 1],
   ['day_key', 'TEXT', 1, 0],
@@ -46,6 +51,54 @@ const CONTROL_COLUMNS = [
   ['in_flight_expires_at', 'INTEGER', 0, 0],
   ['in_flight_token_version_id', 'TEXT', 0, 0]
 ]
+const LEGACY_RUN_DDL = `
+  CREATE TABLE ifind_diagnostic_runs (
+    diagnostic_id TEXT PRIMARY KEY NOT NULL,
+    started_at INTEGER NOT NULL CHECK (started_at >= 0),
+    completed_at INTEGER,
+    auth_status TEXT CHECK (auth_status IS NULL OR auth_status IN ('success', 'failed', 'unknown')),
+    probe_status TEXT CHECK (probe_status IS NULL OR probe_status IN ('success', 'failed', 'not_run')),
+    safe_error_class TEXT CHECK (safe_error_class IS NULL OR safe_error_class IN ('AUTH', 'PERMISSION', 'QUOTA', 'NETWORK', 'API', 'CONFIG', 'BUSY', 'RATE_LIMITED')),
+    route TEXT CHECK (route IS NULL OR route = '/api/v1/get_trade_dates'),
+    request_count INTEGER CHECK (request_count IS NULL OR request_count BETWEEN 0 AND 4),
+    data_vol INTEGER CHECK (data_vol IS NULL OR data_vol >= 0),
+    elapsed_ms INTEGER CHECK (elapsed_ms IS NULL OR elapsed_ms >= 0),
+    completeness TEXT CHECK (completeness IS NULL OR completeness IN ('complete', 'partial', 'unavailable')),
+    token_version_id TEXT NOT NULL,
+    CHECK (
+      (completed_at IS NULL AND auth_status IS NULL AND probe_status IS NULL
+        AND safe_error_class IS NULL AND route IS NULL
+        AND request_count IS NULL AND data_vol IS NULL
+        AND elapsed_ms IS NULL AND completeness IS NULL)
+      OR
+      (completed_at IS NOT NULL AND auth_status IS NOT NULL
+        AND probe_status IS NOT NULL AND route IS NOT NULL
+        AND request_count IS NOT NULL AND elapsed_ms IS NOT NULL
+        AND completeness IS NOT NULL)
+    ),
+    CHECK (completed_at IS NULL OR completed_at >= started_at)
+  )
+`
+const LEGACY_CONTROL_DDL = `
+  CREATE TABLE ifind_diagnostic_control (
+    singleton_id INTEGER PRIMARY KEY NOT NULL CHECK (singleton_id = 1),
+    day_key TEXT NOT NULL,
+    daily_attempt_count INTEGER NOT NULL CHECK (daily_attempt_count BETWEEN 0 AND 20),
+    cooldown_until INTEGER CHECK (cooldown_until IS NULL OR cooldown_until >= 0),
+    in_flight_id TEXT,
+    in_flight_started_at INTEGER,
+    in_flight_expires_at INTEGER,
+    in_flight_token_version_id TEXT,
+    CHECK (
+      (in_flight_id IS NULL AND in_flight_started_at IS NULL
+        AND in_flight_expires_at IS NULL AND in_flight_token_version_id IS NULL)
+      OR
+      (in_flight_id IS NOT NULL AND in_flight_started_at IS NOT NULL
+        AND in_flight_expires_at IS NOT NULL AND in_flight_token_version_id IS NOT NULL)
+    ),
+    CHECK (in_flight_expires_at IS NULL OR in_flight_expires_at > in_flight_started_at)
+  )
+`
 
 class IfindDiagnosticRepositoryError extends Error {
   constructor() {
@@ -134,6 +187,8 @@ function mapRun(row) {
     authStatus: row.auth_status,
     probeStatus: row.probe_status,
     safeErrorClass: row.safe_error_class,
+    failureCode: row.failure_code,
+    vendorErrorCode: row.vendor_error_code,
     route: row.route,
     requestCount: row.request_count,
     dataVol: row.data_vol,
@@ -170,12 +225,13 @@ function validateReservation(value) {
 function validateTerminalResult(value) {
   const result = snapshotExactDataObject(value, [
     'completedAt', 'authStatus', 'probeStatus', 'safeErrorClass', 'route',
-    'requestCount', 'dataVol', 'elapsedMs', 'completeness'
+    'requestCount', 'dataVol', 'elapsedMs', 'completeness', 'failureCode',
+    'vendorErrorCode'
   ])
   if (!result || !isTimestamp(result.completedAt) ||
       !AUTH_STATUSES.has(result.authStatus) ||
       !PROBE_STATUSES.has(result.probeStatus) ||
-      (result.safeErrorClass !== null && !SAFE_ERROR_CLASSES.has(result.safeErrorClass)) ||
+      (result.safeErrorClass !== null && !isSafeErrorClass(result.safeErrorClass)) ||
       result.route !== IFIND_DIAGNOSTIC_ROUTE ||
       !Number.isSafeInteger(result.requestCount) || result.requestCount < 0 ||
       result.requestCount > 4 ||
@@ -183,8 +239,13 @@ function validateTerminalResult(value) {
       !isNonNegativeInteger(result.elapsedMs) ||
       !COMPLETENESS_VALUES.has(result.completeness)) failInput()
   if (result.authStatus === 'success' && result.probeStatus === 'success') {
-    if (result.safeErrorClass !== null || result.completeness === 'unavailable') failInput()
-  } else if (result.safeErrorClass === null) {
+    if (result.safeErrorClass !== null || result.failureCode !== null ||
+        result.vendorErrorCode !== null || result.completeness === 'unavailable') failInput()
+  } else if (result.safeErrorClass === null || !isPersistableFailureMetadata({
+    failureCode: result.failureCode,
+    errorClass: result.safeErrorClass,
+    vendorErrorCode: result.vendorErrorCode
+  })) {
     failInput()
   }
   return result
@@ -197,12 +258,63 @@ function normalizedColumns(database, table) {
 }
 
 function normalizeSql(value) {
-  return String(value || '').toLowerCase().replace(/\s+/g, '')
+  const sql = String(value || '')
+  let normalized = ''
+  let inString = false
+  for (let index = 0; index < sql.length; index += 1) {
+    const character = sql[index]
+    if (character === "'") {
+      normalized += character
+      if (inString && sql[index + 1] === "'") {
+        normalized += sql[index + 1]
+        index += 1
+      } else {
+        inString = !inString
+      }
+    } else if (inString) {
+      normalized += character
+    } else if (!/\s/.test(character)) {
+      normalized += character.toLowerCase()
+    }
+  }
+  return !inString && normalized.endsWith(';')
+    ? normalized.slice(0, -1)
+    : normalized
 }
 
-function validateSchema(database) {
+function validateLegacySchemaForMigration(database) {
+  validateSchema(database, LEGACY_RUN_COLUMNS)
+  const rows = database.prepare(`
+    SELECT name, sql FROM sqlite_master
+    WHERE type = 'table' AND name IN (
+      'ifind_diagnostic_runs', 'ifind_diagnostic_control'
+    )
+  `).all()
+  const sqlByName = new Map(rows.map((row) => [row.name, normalizeSql(row.sql)]))
+  if (sqlByName.get('ifind_diagnostic_runs') !== normalizeSql(LEGACY_RUN_DDL) ||
+      sqlByName.get('ifind_diagnostic_control') !== normalizeSql(LEGACY_CONTROL_DDL)) {
+    failSchema()
+  }
+}
+
+function validateNoDiagnosticTriggers(database) {
+  const triggers = database.prepare(`
+    SELECT name FROM sqlite_master
+    WHERE type = 'trigger' AND tbl_name IN (
+      'ifind_diagnostic_runs', 'ifind_diagnostic_control'
+    )
+    UNION ALL
+    SELECT name FROM sqlite_temp_master
+    WHERE type = 'trigger' AND tbl_name IN (
+      'ifind_diagnostic_runs', 'ifind_diagnostic_control'
+    )
+  `).all()
+  if (triggers.length !== 0) failSchema()
+}
+
+function validateSchema(database, expectedRunColumns = RUN_COLUMNS) {
   if (JSON.stringify(normalizedColumns(database, 'ifind_diagnostic_runs')) !==
-      JSON.stringify(RUN_COLUMNS)) failSchema()
+      JSON.stringify(expectedRunColumns)) failSchema()
   if (JSON.stringify(normalizedColumns(database, 'ifind_diagnostic_control')) !==
       JSON.stringify(CONTROL_COLUMNS)) failSchema()
 
@@ -254,6 +366,8 @@ function runsEqual(row, reservation, result) {
     row.auth_status === result.authStatus &&
     row.probe_status === result.probeStatus &&
     row.safe_error_class === result.safeErrorClass &&
+    row.failure_code === result.failureCode &&
+    row.vendor_error_code === result.vendorErrorCode &&
     row.route === result.route &&
     row.request_count === result.requestCount &&
     row.data_vol === result.dataVol &&
@@ -305,11 +419,14 @@ class IfindDiagnosticRepository {
           elapsed_ms INTEGER CHECK (elapsed_ms IS NULL OR elapsed_ms >= 0),
           completeness TEXT CHECK (completeness IS NULL OR completeness IN ('complete', 'partial', 'unavailable')),
           token_version_id TEXT NOT NULL,
+          failure_code TEXT,
+          vendor_error_code INTEGER,
           CHECK (
             (completed_at IS NULL AND auth_status IS NULL AND probe_status IS NULL
               AND safe_error_class IS NULL AND route IS NULL
               AND request_count IS NULL AND data_vol IS NULL
-              AND elapsed_ms IS NULL AND completeness IS NULL)
+              AND elapsed_ms IS NULL AND completeness IS NULL
+              AND failure_code IS NULL AND vendor_error_code IS NULL)
             OR
             (completed_at IS NOT NULL AND auth_status IS NOT NULL
               AND probe_status IS NOT NULL AND route IS NOT NULL
@@ -340,14 +457,30 @@ class IfindDiagnosticRepository {
           CHECK (in_flight_expires_at IS NULL OR in_flight_expires_at > in_flight_started_at)
         );
 
+      `)
+      validateNoDiagnosticTriggers(this.database)
+      const runColumns = normalizedColumns(this.database, 'ifind_diagnostic_runs')
+      if (JSON.stringify(runColumns) === JSON.stringify(LEGACY_RUN_COLUMNS)) {
+        validateLegacySchemaForMigration(this.database)
+        this.database.exec(`
+          ALTER TABLE ifind_diagnostic_runs ADD COLUMN failure_code TEXT;
+          ALTER TABLE ifind_diagnostic_runs ADD COLUMN vendor_error_code INTEGER;
+          UPDATE ifind_diagnostic_runs
+          SET failure_code = 'IFIND_LEGACY_DIAGNOSTIC_FAILURE'
+          WHERE completed_at IS NOT NULL
+            AND NOT (auth_status = 'success' AND probe_status = 'success');
+        `)
+      }
+      validateSchema(this.database)
+      validateNoDiagnosticTriggers(this.database)
+      this.database.prepare(`
         INSERT INTO ifind_diagnostic_control (
           singleton_id, day_key, daily_attempt_count, cooldown_until,
           in_flight_id, in_flight_started_at, in_flight_expires_at,
           in_flight_token_version_id
         ) VALUES (1, '', 0, NULL, NULL, NULL, NULL, NULL)
-        ON CONFLICT(singleton_id) DO NOTHING;
-      `)
-      validateSchema(this.database)
+        ON CONFLICT(singleton_id) DO NOTHING
+      `).run()
       const controls = this.database.prepare(
         'SELECT singleton_id FROM ifind_diagnostic_control'
       ).all()
@@ -368,7 +501,7 @@ class IfindDiagnosticRepository {
     return this.database.prepare(`
       SELECT diagnostic_id, started_at, completed_at, auth_status, probe_status,
              safe_error_class, route, request_count, data_vol, elapsed_ms,
-             completeness, token_version_id
+             completeness, token_version_id, failure_code, vendor_error_code
       FROM ifind_diagnostic_runs WHERE diagnostic_id = ?
     `).get(diagnosticId)
   }
@@ -379,7 +512,9 @@ class IfindDiagnosticRepository {
       UPDATE ifind_diagnostic_runs
       SET completed_at = ?, auth_status = 'unknown', probe_status = 'not_run',
           safe_error_class = 'CONFIG', route = ?, request_count = 0,
-          data_vol = NULL, elapsed_ms = ?, completeness = 'unavailable'
+          data_vol = NULL, elapsed_ms = ?, completeness = 'unavailable',
+          failure_code = 'IFIND_DIAGNOSTIC_STALE_RESERVATION',
+          vendor_error_code = NULL
       WHERE diagnostic_id = ? AND started_at = ? AND token_version_id = ?
         AND completed_at IS NULL
     `).run(
@@ -540,7 +675,8 @@ class IfindDiagnosticRepository {
         UPDATE ifind_diagnostic_runs
         SET completed_at = ?, auth_status = ?, probe_status = ?,
             safe_error_class = ?, route = ?, request_count = ?, data_vol = ?,
-            elapsed_ms = ?, completeness = ?
+            elapsed_ms = ?, completeness = ?, failure_code = ?,
+            vendor_error_code = ?
         WHERE diagnostic_id = ? AND completed_at IS NULL
       `).run(
         result.completedAt,
@@ -552,6 +688,8 @@ class IfindDiagnosticRepository {
         result.dataVol,
         result.elapsedMs,
         result.completeness,
+        result.failureCode,
+        result.vendorErrorCode,
         reservation.diagnosticId
       )
       if (update.changes !== 1) failSchema()
@@ -581,7 +719,7 @@ class IfindDiagnosticRepository {
     return this.database.prepare(`
       SELECT diagnostic_id, started_at, completed_at, auth_status, probe_status,
              safe_error_class, route, request_count, data_vol, elapsed_ms,
-             completeness, token_version_id
+             completeness, token_version_id, failure_code, vendor_error_code
       FROM ifind_diagnostic_runs
       WHERE completed_at IS NOT NULL
       ORDER BY completed_at DESC, diagnostic_id DESC LIMIT ?
@@ -592,7 +730,7 @@ class IfindDiagnosticRepository {
     return mapRun(this.database.prepare(`
       SELECT diagnostic_id, started_at, completed_at, auth_status, probe_status,
              safe_error_class, route, request_count, data_vol, elapsed_ms,
-             completeness, token_version_id
+             completeness, token_version_id, failure_code, vendor_error_code
       FROM ifind_diagnostic_runs
       WHERE completed_at IS NOT NULL
       ORDER BY completed_at DESC, diagnostic_id DESC LIMIT 1
