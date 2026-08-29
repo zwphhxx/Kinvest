@@ -48,6 +48,8 @@ const VERIFICATION_FIELDS = Object.freeze([
   'sourceMode'
 ])
 
+const FETCH_TIME = '2025-12-01T12:00:00.000Z'
+
 function readFixture(name) {
   return JSON.parse(fs.readFileSync(
     path.join(__dirname, 'fixtures', 'ifind', name),
@@ -98,19 +100,19 @@ const PROFILES = Object.freeze([
         reportPeriod: 'FY2025',
         reportDate: '2025-03-31',
         periodType: 'annual',
-        sourceTime: '2025-03-13T17:30:00+08:00'
+        sourceTime: '2025-05-15T17:30:00+08:00'
       }),
       Object.freeze({
         reportPeriod: 'FY2024',
         reportDate: '2024-03-31',
         periodType: 'annual',
-        sourceTime: '2024-03-14T17:30:00+08:00'
+        sourceTime: '2024-05-16T17:30:00+08:00'
       }),
       Object.freeze({
         reportPeriod: 'H1-FY2026',
         reportDate: '2025-09-30',
         periodType: 'interim',
-        sourceTime: '2025-08-29T17:30:00+08:00'
+        sourceTime: '2025-11-14T17:30:00+08:00'
       })
     ])
   }),
@@ -219,7 +221,7 @@ function makePayload(profile, periods = profile.periods) {
   fields[profile.metadataIds.periodType] = periods.map((period) => period.periodType)
   fields[profile.metadataIds.disclosureScope] = periods.map(() => profile.scope)
   fields[profile.metadataIds.sourceTime] = periods.map((period) => period.sourceTime)
-  fields[profile.metadataIds.fetchTime] = periods.map(() => '2025-08-29T12:00:00.000Z')
+  fields[profile.metadataIds.fetchTime] = periods.map(() => FETCH_TIME)
   fields[profile.metadataIds.sourceMode] = periods.map(() => 'real')
   return {
     errorcode: 0,
@@ -309,7 +311,7 @@ async function run() {
         assert.equal(point.periodType, period.periodType, `${profile.label}: period type`)
         assert.equal(point.disclosureScope, profile.scope, `${profile.label}: disclosure scope`)
         assert.equal(point.sourceTime, period.sourceTime, `${profile.label}: source time`)
-        assert.equal(point.fetchTime, '2025-08-29T12:00:00.000Z', `${profile.label}: fetch time`)
+        assert.equal(point.fetchTime, FETCH_TIME, `${profile.label}: fetch time`)
         assert.deepEqual(point.verification, verified(), `${profile.label}: point verification`)
       }
     }
@@ -393,6 +395,58 @@ async function run() {
     parse(PROFILES[0], alibabaCalendarAnnual),
     'Alibaba calendar-year annual is incompatible',
     'reportPeriodStatus'
+  )
+
+  const chronologyCases = [
+    {
+      label: 'future report period is not disclosed by fetch time',
+      failedField: 'reportPeriodStatus',
+      mutate(payload) {
+        payload.tables[0].table[PROFILES[0].metadataIds.reportPeriod][2] = 'H1-FY2027'
+        payload.tables[0].table[PROFILES[0].metadataIds.reportDate][2] = '2026-09-30'
+        payload.tables[0].table[PROFILES[0].metadataIds.sourceTime][2] = '2026-11-13T17:30:00+08:00'
+      }
+    },
+    {
+      label: 'source time before report end',
+      failedField: 'scopeStatus',
+      mutate(payload) {
+        payload.tables[0].table[PROFILES[0].metadataIds.sourceTime][0] = '2025-03-30T17:30:00+08:00'
+      }
+    },
+    {
+      label: 'source time after fetch time',
+      failedField: 'scopeStatus',
+      mutate(payload) {
+        payload.tables[0].table[PROFILES[0].metadataIds.sourceTime][0] = '2025-12-02T17:30:00+08:00'
+      }
+    },
+    {
+      label: 'previous Alibaba H1 fixture was not yet disclosed',
+      failedField: 'reportPeriodStatus',
+      mutate(payload) {
+        payload.tables[0].table[PROFILES[0].metadataIds.sourceTime][2] = '2025-08-29T17:30:00+08:00'
+        payload.tables[0].table[PROFILES[0].metadataIds.fetchTime][2] = '2025-08-29T12:00:00.000Z'
+      }
+    }
+  ]
+
+  for (const testCase of chronologyCases) {
+    const payload = makePayload(PROFILES[0])
+    testCase.mutate(payload)
+    assertUnavailable(parse(PROFILES[0], payload), testCase.label, testCase.failedField)
+  }
+
+  const invalidUnselectedPeriodPayload = makePayload(
+    periodSelectionCases[0].profile,
+    periodSelectionCases[0].periods
+  )
+  invalidUnselectedPeriodPayload.tables[0]
+    .table[PROFILES[0].metadataIds.sourceTime][0] = '2023-03-01T17:30:00+08:00'
+  assertUnavailable(
+    parse(PROFILES[0], invalidUnselectedPeriodPayload),
+    'chronology validation precedes latest-period selection',
+    'scopeStatus'
   )
 
   for (const profile of PROFILES) {

@@ -315,6 +315,17 @@ function validDateTime(value) {
     Number.isFinite(Date.parse(value))
 }
 
+function disclosureChronologyFailure(reportDate, sourceTime, fetchTime) {
+  const reportEndTime = Date.parse(`${reportDate}T00:00:00.000Z`)
+  const sourceMilliseconds = Date.parse(sourceTime)
+  const fetchMilliseconds = Date.parse(fetchTime)
+  if (reportEndTime > fetchMilliseconds) return 'reportPeriodStatus'
+  if (reportEndTime > sourceMilliseconds || sourceMilliseconds > fetchMilliseconds) {
+    return 'scopeStatus'
+  }
+  return null
+}
+
 function validReportPeriod(value) {
   return typeof value === 'string' && value.length > 0 && value.length <= 64 &&
     value.trim() === value && !/[\u0000-\u001f\u007f]/.test(value)
@@ -414,6 +425,12 @@ function parsePayload(profileDefinition, payload, verification, reportingCurrenc
     if (!validDateTime(metadata.sourceTime[index]) || !validDateTime(metadata.fetchTime[index])) {
       return { failedFields: ['scopeStatus'] }
     }
+    const chronologyFailure = disclosureChronologyFailure(
+      metadata.reportDate[index],
+      metadata.sourceTime[index],
+      metadata.fetchTime[index]
+    )
+    if (chronologyFailure) return { failedFields: [chronologyFailure] }
     if (metadata.sourceMode[index] !== 'real') return { failedFields: ['sourceMode'] }
     acceptedPeriods.push(Object.freeze({
       index,
