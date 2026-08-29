@@ -395,7 +395,7 @@ function createHarness(caseId = 'HK_ALIBABA_9988', overrides = {}) {
     async financial(input) {
       calls.push('financial')
       assert.deepEqual(Object.keys(input), ['accessToken', 'request', 'requestBudget'])
-      assert.equal(input.requestBudget, 3)
+      assert.equal(input.requestBudget, 1)
       assert.equal(Object.isFrozen(input), true)
       assert.deepEqual(input.request, {
         vendorCode: CASES[caseId].vendorCode,
@@ -507,6 +507,12 @@ async function testThreeMarketSuccess() {
     assert.equal(stored.quoteSnapshot.listingId, CASES[caseId].listingId)
     assert.equal(stored.quoteSnapshot.displayCode, CASES[caseId].displayCode)
     assert.equal(stored.financialPoints.length, 21)
+    assert.equal(
+      stored.financialPoints.every((point) =>
+        /^20[0-9]{2}(?:Q[1-3]|H1|FY)$/.test(point.reportPeriod)),
+      true,
+      'persisted financial periods must use the repository canonical form'
+    )
     assert.deepEqual(Object.keys(stored.quoteSnapshot), [
       'listingId', 'displayCode', 'latestPrice', 'previousClose', 'open',
       'high', 'low', 'volume', 'turnover', 'quoteTime', 'tradingStatus',
@@ -573,7 +579,7 @@ async function testPartialFinancialAvailability() {
   const harness = createHarness(caseId)
   harness.client.financial = async function financial(input) {
     harness.calls.push('financial')
-    assert.equal(input.requestBudget, 3)
+    assert.equal(input.requestBudget, 1)
     return { payload: { errorcode: 0 }, requestCount: 1, dataVol: 0 }
   }
   harness.service = createIfindMarketDiagnosticService(harness.dependencies)
@@ -818,7 +824,7 @@ async function testRequestBudgetExhaustion() {
   const harness = createHarness()
   harness.client.financial = async function exhaustBudget(input) {
     harness.calls.push('financial')
-    assert.equal(input.requestBudget, 3)
+    assert.equal(input.requestBudget, 1)
     return {
       payload: financialPayload('HK_ALIBABA_9988'),
       requestCount: 4,
@@ -828,12 +834,233 @@ async function testRequestBudgetExhaustion() {
   harness.service = createIfindMarketDiagnosticService(harness.dependencies)
   const result = await harness.service.run({ caseId: 'HK_ALIBABA_9988' })
   assert.equal(result.status, 'partial')
-  assert.equal(result.failureCode, 'IFIND_MARKET_REQUEST_BUDGET_EXHAUSTED')
-  assert.equal(result.requestCount, 5)
+  assert.equal(result.failureCode, 'IFIND_MARKET_CLIENT_CONTRACT_INVALID')
+  assert.equal(result.requestCount, 3)
   assert.equal(harness.terminal.complete.length, 1)
-  assert.equal(harness.terminal.complete[0].result.requestCount, 5)
+  assert.equal(harness.terminal.complete[0].result.requestCount, 3)
+  assert.deepEqual(
+    harness.calls.filter((call) => ['auth', 'quote', 'financial'].includes(call)),
+    ['auth', 'quote', 'financial']
+  )
+  assert.equal(
+    harness.calls.filter((call) => ['auth', 'quote', 'financial'].includes(call)).length < 6,
+    true,
+    'a sixth transport operation must never be invoked'
+  )
   assert.equal(harness.calls.includes('financial-parser'), false)
   assert.equal(harness.calls.at(-1), 'client-clear')
+}
+
+async function testMalformedAuthTokenIsAlwaysZeroed() {
+  const harness = createHarness()
+  const returnedAccessToken = Buffer.from('malformed-auth-access-token')
+  harness.client.authenticate = async function malformedAuth() {
+    harness.calls.push('auth')
+    return { accessToken: returnedAccessToken, requestCount: 2 }
+  }
+  harness.client.clear = function failedClientCleanup() {
+    harness.calls.push('client-clear')
+    throw new Error('client cleanup failed')
+  }
+  harness.service = createIfindMarketDiagnosticService(harness.dependencies)
+
+  const result = await harness.service.run({ caseId: 'HK_ALIBABA_9988' })
+
+  assertSafeFailure(result, {
+    failureCode: 'IFIND_MARKET_CLIENT_CONTRACT_INVALID',
+    safeErrorClass: 'RESPONSE_SHAPE',
+    stage: 'auth'
+  })
+  assert.equal(
+    returnedAccessToken.equals(Buffer.alloc(returnedAccessToken.length)),
+    true,
+    'the original malformed auth token buffer must be zeroed'
+  )
+  assert.equal(harness.terminal.fail[0].result.requestCount, 1)
+  assert.equal(harness.calls.at(-1), 'client-clear')
+}
+
+async function testHostileNestedParserOutputsAreRejectedWithoutObservation() {
+  const quoteHarness = createHarness()
+  quoteHarness.dependencies.quoteParser = function hostileQuoteVerification(input) {
+    quoteHarness.calls.push('quote-parser')
+    const parsed = parseIfindMarketQuote(input)
+    const verification = Object.assign(
+      Object.create({ inheritedEvidence: 'must-not-cross' }),
+      VERIFIED
+    )
+    return { ...parsed, verification }
+  }
+  quoteHarness.service = createIfindMarketDiagnosticService(quoteHarness.dependencies)
+  const quoteResult = await quoteHarness.service.run({ caseId: 'HK_ALIBABA_9988' })
+  assertSafeFailure(quoteResult, {
+    failureCode: 'IFIND_MARKET_QUOTE_UNAVAILABLE',
+    safeErrorClass: 'RESPONSE_SHAPE',
+    stage: 'quote-parser'
+  })
+  assert.equal(quoteHarness.terminal.complete.length, 0)
+  assert.equal(quoteHarness.terminal.fail.length, 1)
+
+  const proxyHarness = createHarness()
+  let proxyTrapCount = 0
+  proxyHarness.dependencies.financialParser = function proxiedPoints(input) {
+    proxyHarness.calls.push('financial-parser')
+    const parsed = parseIfindMarketFinancials(input)
+    return {
+      ...parsed,
+      points: new Proxy([...parsed.points], {
+        get(target, key, receiver) {
+          proxyTrapCount += 1
+          return Reflect.get(target, key, receiver)
+        }
+      })
+    }
+  }
+  proxyHarness.service = createIfindMarketDiagnosticService(proxyHarness.dependencies)
+  const proxyResult = await proxyHarness.service.run({ caseId: 'HK_ALIBABA_9988' })
+  assert.equal(proxyResult.status, 'partial')
+  assert.equal(proxyResult.failureCode, 'IFIND_MARKET_FINANCIAL_UNAVAILABLE')
+  assert.equal(proxyTrapCount, 0, 'parser array proxy traps must not be invoked')
+  assert.deepEqual(proxyHarness.terminal.complete[0].financialPoints, [])
+
+  const iteratorHarness = createHarness()
+  let iteratorCallCount = 0
+  iteratorHarness.dependencies.financialParser = function customIteratorPoints(input) {
+    iteratorHarness.calls.push('financial-parser')
+    const parsed = parseIfindMarketFinancials(input)
+    const points = [...parsed.points]
+    Object.defineProperty(points, Symbol.iterator, {
+      value() {
+        iteratorCallCount += 1
+        return Array.prototype[Symbol.iterator].call(this)
+      }
+    })
+    return { ...parsed, points }
+  }
+  iteratorHarness.service = createIfindMarketDiagnosticService(iteratorHarness.dependencies)
+  const iteratorResult = await iteratorHarness.service.run({ caseId: 'HK_ALIBABA_9988' })
+  assert.equal(iteratorResult.status, 'partial')
+  assert.equal(iteratorResult.failureCode, 'IFIND_MARKET_FINANCIAL_UNAVAILABLE')
+  assert.equal(iteratorCallCount, 0, 'custom parser iterators must not be invoked')
+  assert.deepEqual(iteratorHarness.terminal.complete[0].financialPoints, [])
+
+  const accessorHarness = createHarness()
+  let accessorReadCount = 0
+  accessorHarness.dependencies.financialParser = function accessorPoint(input) {
+    accessorHarness.calls.push('financial-parser')
+    const parsed = parseIfindMarketFinancials(input)
+    const firstPoint = { ...parsed.points[0] }
+    Object.defineProperty(firstPoint, 'value', {
+      enumerable: true,
+      get() {
+        accessorReadCount += 1
+        return 100
+      }
+    })
+    return { ...parsed, points: [firstPoint, ...parsed.points.slice(1)] }
+  }
+  accessorHarness.service = createIfindMarketDiagnosticService(accessorHarness.dependencies)
+  const accessorResult = await accessorHarness.service.run({ caseId: 'HK_ALIBABA_9988' })
+  assert.equal(accessorResult.status, 'partial')
+  assert.equal(accessorResult.failureCode, 'IFIND_MARKET_FINANCIAL_UNAVAILABLE')
+  assert.equal(accessorReadCount, 0, 'nested parser accessors must not be invoked')
+
+  const prototypeHarness = createHarness()
+  prototypeHarness.dependencies.financialParser = function customArrayPrototype(input) {
+    prototypeHarness.calls.push('financial-parser')
+    const parsed = parseIfindMarketFinancials(input)
+    const points = [...parsed.points]
+    Object.setPrototypeOf(points, Object.create(Array.prototype))
+    return { ...parsed, points }
+  }
+  prototypeHarness.service = createIfindMarketDiagnosticService(prototypeHarness.dependencies)
+  const prototypeResult = await prototypeHarness.service.run({ caseId: 'HK_ALIBABA_9988' })
+  assert.equal(prototypeResult.status, 'partial')
+  assert.equal(prototypeResult.failureCode, 'IFIND_MARKET_FINANCIAL_UNAVAILABLE')
+
+  const revokedHarness = createHarness()
+  revokedHarness.dependencies.financialParser = function revokedArrayProxy(input) {
+    revokedHarness.calls.push('financial-parser')
+    const parsed = parseIfindMarketFinancials(input)
+    const revocable = Proxy.revocable([...parsed.points], {})
+    revocable.revoke()
+    return { ...parsed, points: revocable.proxy }
+  }
+  revokedHarness.service = createIfindMarketDiagnosticService(revokedHarness.dependencies)
+  const revokedResult = await revokedHarness.service.run({ caseId: 'HK_ALIBABA_9988' })
+  assert.equal(revokedResult.status, 'partial')
+  assert.equal(revokedResult.failureCode, 'IFIND_MARKET_FINANCIAL_UNAVAILABLE')
+}
+
+async function testOwnProtoKeyNeverReachesParsersOrPersistence() {
+  const harness = createHarness()
+  let parserObservedPayload = false
+  harness.client.quote = async function ownProtoPayload() {
+    harness.calls.push('quote')
+    const payload = quotePayload('HK_ALIBABA_9988')
+    Object.defineProperty(payload, '__proto__', {
+      value: { inheritedProviderData: 'must-not-cross' },
+      enumerable: true,
+      configurable: true
+    })
+    return { payload, requestCount: 1, dataVol: 10 }
+  }
+  harness.dependencies.quoteParser = function observeQuoteParser(input) {
+    parserObservedPayload = true
+    harness.calls.push('quote-parser')
+    return parseIfindMarketQuote(input)
+  }
+  harness.service = createIfindMarketDiagnosticService(harness.dependencies)
+
+  const result = await harness.service.run({ caseId: 'HK_ALIBABA_9988' })
+
+  assertSafeFailure(result, {
+    failureCode: 'IFIND_MARKET_CLIENT_OUTPUT_INVALID',
+    safeErrorClass: 'RESPONSE_SHAPE',
+    stage: 'quote'
+  })
+  assert.equal(parserObservedPayload, false)
+  assert.equal(harness.terminal.complete.length, 0)
+  assert.equal(harness.terminal.fail.length, 1)
+  assert.equal(
+    JSON.stringify(harness.terminal.fail[0]).includes('inheritedProviderData'),
+    false
+  )
+}
+
+async function testInvalidNestedPersistedDatesAreRejected() {
+  const quoteHarness = createHarness()
+  quoteHarness.dependencies.quoteParser = function invalidQuoteDate(input) {
+    quoteHarness.calls.push('quote-parser')
+    return {
+      ...parseIfindMarketQuote(input),
+      quoteTime: '2026-02-30T12:00:00+08:00'
+    }
+  }
+  quoteHarness.service = createIfindMarketDiagnosticService(quoteHarness.dependencies)
+  const quoteResult = await quoteHarness.service.run({ caseId: 'HK_ALIBABA_9988' })
+  assertSafeFailure(quoteResult, {
+    failureCode: 'IFIND_MARKET_QUOTE_UNAVAILABLE',
+    safeErrorClass: 'RESPONSE_SHAPE',
+    stage: 'quote-parser'
+  })
+  assert.equal(quoteHarness.terminal.complete.length, 0)
+
+  const financialHarness = createHarness()
+  financialHarness.dependencies.financialParser = function invalidReportDate(input) {
+    financialHarness.calls.push('financial-parser')
+    const parsed = parseIfindMarketFinancials(input)
+    const points = parsed.points.map((point, index) => ({
+      ...point,
+      reportDate: index === 0 ? '2025-02-30' : point.reportDate
+    }))
+    return { ...parsed, points }
+  }
+  financialHarness.service = createIfindMarketDiagnosticService(financialHarness.dependencies)
+  const financialResult = await financialHarness.service.run({ caseId: 'HK_ALIBABA_9988' })
+  assert.equal(financialResult.status, 'partial')
+  assert.equal(financialResult.failureCode, 'IFIND_MARKET_FINANCIAL_UNAVAILABLE')
+  assert.deepEqual(financialHarness.terminal.complete[0].financialPoints, [])
 }
 
 async function testHostileProviderAndClientValues() {
@@ -888,6 +1115,10 @@ async function run() {
   await testParserMismatchAndUnavailable()
   await testRepositoryFailureAndOriginalFailurePreservation()
   await testRequestBudgetExhaustion()
+  await testMalformedAuthTokenIsAlwaysZeroed()
+  await testHostileNestedParserOutputsAreRejectedWithoutObservation()
+  await testOwnProtoKeyNeverReachesParsersOrPersistence()
+  await testInvalidNestedPersistedDatesAreRejected()
   await testHostileProviderAndClientValues()
 }
 

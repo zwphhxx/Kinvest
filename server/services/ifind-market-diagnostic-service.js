@@ -7,9 +7,6 @@ const {
 const { isClientFailureMetadata } = require('../contracts/ifind-diagnostic-errors')
 
 const MAX_REQUEST_COUNT = 5
-const AUTH_REQUEST_BUDGET = 1
-const QUOTE_REQUEST_BUDGET = 1
-const MAX_FINANCIAL_REQUEST_BUDGET = 3
 const RUN_ID_PATTERN = /^market_run_[a-f0-9]{24,64}$/
 const VERSION_ID_PATTERN = /^v[0-9]{8}-[0-9]{3}$/
 const CASE_ID_PATTERN = /^(?:HK|US|CN)_[A-Z][A-Z0-9]{0,31}_[A-Z0-9]{1,16}$/
@@ -43,6 +40,11 @@ const FINANCIAL_POINT_FIELDS = Object.freeze([
   'reportDate', 'periodType', 'disclosureScope', 'sourceTime', 'fetchTime',
   'verification', 'availability'
 ])
+const FINANCIAL_METRIC_KEYS = new Set([
+  'revenue', 'grossProfit', 'attributableNetProfit', 'operatingCashFlow',
+  'receivables', 'inventory', 'interestBearingDebt'
+])
+const DANGEROUS_RECORD_KEYS = new Set(['__proto__', 'constructor', 'prototype'])
 const REPOSITORY_SAFE_CLASSES = new Set([
   'AUTH', 'PERMISSION', 'INDICATOR', 'QUOTA', 'NETWORK', 'API',
   'RESPONSE_SHAPE', 'IDENTITY_CONFLICT', 'CURRENCY_MISMATCH',
@@ -109,6 +111,18 @@ function ownDataValue(value, key) {
     return { present: true, value: descriptor.value }
   } catch {
     return { present: false }
+  }
+}
+
+function ownBufferReference(value, key) {
+  try {
+    if (!isObjectLike(value) || types.isProxy(value)) return null
+    const descriptor = Reflect.getOwnPropertyDescriptor(value, key)
+    if (!descriptor || !descriptor.enumerable || !Object.hasOwn(descriptor, 'value') ||
+      types.isProxy(descriptor.value) || !Buffer.isBuffer(descriptor.value)) return null
+    return descriptor.value
+  } catch {
+    return null
   }
 }
 
@@ -179,11 +193,17 @@ function snapshotTree(value, state = { depth: 0, work: 0, active: new Set() }) {
     if (prototype !== Object.prototype && prototype !== null) throw new Error('invalid')
     const result = {}
     for (const [key, descriptor] of Object.entries(descriptors)) {
-      if (!descriptor.enumerable || !Object.hasOwn(descriptor, 'value')) throw new Error('invalid')
-      result[key] = snapshotTree(descriptor.value, {
-        depth: state.depth + 1,
-        work: state.work,
-        active: state.active
+      if (DANGEROUS_RECORD_KEYS.has(key) || !descriptor.enumerable ||
+        !Object.hasOwn(descriptor, 'value')) throw new Error('invalid')
+      Object.defineProperty(result, key, {
+        value: snapshotTree(descriptor.value, {
+          depth: state.depth + 1,
+          work: state.work,
+          active: state.active
+        }),
+        enumerable: true,
+        configurable: false,
+        writable: false
       })
     }
     return Object.freeze(result)
@@ -192,6 +212,80 @@ function snapshotTree(value, state = { depth: 0, work: 0, active: new Set() }) {
     throw new SafeFailure(
       'IFIND_MARKET_CLIENT_OUTPUT_INVALID', 'RESPONSE_SHAPE', 'client'
     )
+  } finally {
+    state.active.delete(value)
+  }
+}
+
+function snapshotParserTree(value, failureCode, stage, state = {
+  work: 0,
+  active: new Set()
+}, depth = 0) {
+  const fail = () => {
+    throw new SafeFailure(failureCode, 'RESPONSE_SHAPE', stage)
+  }
+  if (value === null || typeof value === 'string' || typeof value === 'boolean') return value
+  if (typeof value === 'number') {
+    if (!Number.isFinite(value)) fail()
+    return value
+  }
+  if (typeof value !== 'object' || types.isProxy(value) || depth > 12 ||
+    state.work >= 4096 || state.active.has(value)) fail()
+
+  state.active.add(value)
+  state.work += 1
+  try {
+    const prototype = Reflect.getPrototypeOf(value)
+    const descriptors = Object.getOwnPropertyDescriptors(value)
+    if (Object.getOwnPropertySymbols(value).length !== 0) fail()
+
+    if (Array.isArray(value)) {
+      const lengthDescriptor = descriptors.length
+      if (prototype !== Array.prototype || !lengthDescriptor ||
+        !Object.hasOwn(lengthDescriptor, 'value') ||
+        !Number.isSafeInteger(lengthDescriptor.value) ||
+        lengthDescriptor.value < 0 || lengthDescriptor.value > 1024 ||
+        Object.getOwnPropertyNames(value).length !== lengthDescriptor.value + 1) fail()
+      const result = []
+      for (let index = 0; index < lengthDescriptor.value; index += 1) {
+        const descriptor = descriptors[index]
+        if (!descriptor || !descriptor.enumerable || !Object.hasOwn(descriptor, 'value')) fail()
+        result.push(snapshotParserTree(
+          descriptor.value,
+          failureCode,
+          stage,
+          state,
+          depth + 1
+        ))
+      }
+      return Object.freeze(result)
+    }
+
+    if (prototype !== Object.prototype && prototype !== null) fail()
+    const keys = Object.keys(descriptors)
+    if (keys.length > 1024) fail()
+    const result = {}
+    for (const key of keys) {
+      const descriptor = descriptors[key]
+      if (DANGEROUS_RECORD_KEYS.has(key) || !descriptor.enumerable ||
+        !Object.hasOwn(descriptor, 'value')) fail()
+      Object.defineProperty(result, key, {
+        value: snapshotParserTree(
+          descriptor.value,
+          failureCode,
+          stage,
+          state,
+          depth + 1
+        ),
+        enumerable: true,
+        configurable: false,
+        writable: false
+      })
+    }
+    return Object.freeze(result)
+  } catch (error) {
+    if (error instanceof SafeFailure) throw error
+    fail()
   } finally {
     state.active.delete(value)
   }
@@ -263,6 +357,61 @@ function validateVerification(value) {
     }
   }
   return deepFreeze({ ...snapshot })
+}
+
+function validateParserVerification(value, failureCode, stage) {
+  const snapshot = exactDataObject(value, VERIFICATION_FIELDS)
+  if (!snapshot) throw new SafeFailure(failureCode, 'RESPONSE_SHAPE', stage)
+  for (const key of VERIFICATION_FIELDS) {
+    const expected = key === 'sourceMode' ? 'real' : 'verified'
+    if (snapshot[key] !== expected) {
+      throw new SafeFailure(failureCode, 'RESPONSE_SHAPE', stage)
+    }
+  }
+}
+
+function canonicalReportPeriod(value) {
+  if (typeof value !== 'string') return null
+  let match = /^(20[0-9]{2})(Q[1-3]|H1|FY)$/.exec(value)
+  if (match) return value
+  match = /^FY(20[0-9]{2})$/.exec(value)
+  if (match) return `${match[1]}FY`
+  match = /^H1-FY(20[0-9]{2})$/.exec(value)
+  if (match) return `${match[1]}H1`
+  match = /^Q([1-3])-FY(20[0-9]{2})$/.exec(value)
+  if (match) return `${match[2]}Q${match[1]}`
+  match = /^(20[0-9]{2})A$/.exec(value)
+  return match ? `${match[1]}FY` : null
+}
+
+function isCanonicalCalendarDate(value) {
+  if (typeof value !== 'string') return false
+  const match = /^(20[0-9]{2})-([0-9]{2})-([0-9]{2})$/.exec(value)
+  if (!match) return false
+  const year = Number(match[1])
+  const month = Number(match[2])
+  const day = Number(match[3])
+  const date = new Date(Date.UTC(year, month - 1, day))
+  return date.getUTCFullYear() === year &&
+    date.getUTCMonth() === month - 1 &&
+    date.getUTCDate() === day
+}
+
+function isStrictTimestamp(value) {
+  if (typeof value !== 'string') return false
+  const match = /^(20[0-9]{2}-[0-9]{2}-[0-9]{2})T([0-9]{2}):([0-9]{2}):([0-9]{2})(?:\.[0-9]{3})?(Z|([+-])([0-9]{2}):([0-9]{2}))$/.exec(value)
+  if (!match || !isCanonicalCalendarDate(match[1])) return false
+  const hour = Number(match[2])
+  const minute = Number(match[3])
+  const second = Number(match[4])
+  if (hour > 23 || minute > 59 || second > 59) return false
+  if (match[5] !== 'Z') {
+    const offsetHour = Number(match[7])
+    const offsetMinute = Number(match[8])
+    if (offsetHour > 14 || offsetMinute > 59 ||
+      (offsetHour === 14 && offsetMinute !== 0)) return false
+  }
+  return Number.isFinite(Date.parse(value))
 }
 
 function validateCatalogCase(caseId, value) {
@@ -439,20 +588,19 @@ function validateSettlement(value) {
   return Boolean(result && (result.status === 'not-found' || result.status === 'conflict'))
 }
 
-function readClientFailure(error, stage, budget) {
+function readClientFailure(error, stage) {
   const fallback = new SafeFailure('IFIND_CLIENT_FAILED', 'API', stage)
   try {
-    if (!isObjectLike(error) || types.isProxy(error)) return { failure: fallback, requestCount: 1 }
+    if (!isObjectLike(error) || types.isProxy(error)) return fallback
     const read = (key) => {
       const descriptor = Reflect.getOwnPropertyDescriptor(error, key)
       return descriptor && Object.hasOwn(descriptor, 'value') ? descriptor.value : undefined
     }
     const requestCount = read('requestCount')
-    if (!Number.isSafeInteger(requestCount) || requestCount < 0) {
-      return { failure: fallback, requestCount: 1 }
-    }
-    if (requestCount > budget) {
-      return { failure: budgetFailure(stage), requestCount: budget }
+    if (requestCount !== undefined && requestCount !== 1) {
+      return new SafeFailure(
+        'IFIND_MARKET_CLIENT_CONTRACT_INVALID', 'RESPONSE_SHAPE', stage
+      )
     }
     const metadata = {
       failureCode: read('failureCode'),
@@ -461,30 +609,30 @@ function readClientFailure(error, stage, budget) {
       vendorErrorCode: read('vendorErrorCode')
     }
     if (!isClientFailureMetadata(metadata)) {
-      return { failure: fallback, requestCount: Math.max(1, requestCount) }
+      return fallback
     }
-    return {
-      failure: new SafeFailure(
-        metadata.failureCode,
-        metadata.errorClass,
-        metadata.stage || stage,
-        metadata.vendorErrorCode
-      ),
-      requestCount
-    }
+    return new SafeFailure(
+      metadata.failureCode,
+      metadata.errorClass,
+      metadata.stage || stage,
+      metadata.vendorErrorCode
+    )
   } catch {
-    return { failure: fallback, requestCount: 1 }
+    return fallback
   }
 }
 
-function decodeAuthResult(value, budget) {
-  const result = exactDataObject(value, ['accessToken', 'requestCount'])
-  if (!result || !Number.isSafeInteger(result.requestCount) || result.requestCount < 1) {
+function decodeAuthResult(value) {
+  let result = exactDataObject(value, ['accessToken'])
+  if (!result) result = exactDataObject(value, ['accessToken', 'requestCount'])
+  if (!result || (result.requestCount !== undefined && result.requestCount !== 1)) {
     throw new SafeFailure(
-      'IFIND_MARKET_CLIENT_OUTPUT_INVALID', 'RESPONSE_SHAPE', 'auth'
+      result
+        ? 'IFIND_MARKET_CLIENT_CONTRACT_INVALID'
+        : 'IFIND_MARKET_CLIENT_OUTPUT_INVALID',
+      'RESPONSE_SHAPE', 'auth'
     )
   }
-  if (result.requestCount > budget) throw budgetFailure('auth')
   if (types.isProxy(result.accessToken) || !Buffer.isBuffer(result.accessToken) ||
     result.accessToken.length < 1 || result.accessToken.length > 4096) {
     throw new SafeFailure(
@@ -494,19 +642,18 @@ function decodeAuthResult(value, budget) {
   return result
 }
 
-function decodeMarketResult(value, stage, budget) {
-  const result = exactDataObject(value, ['payload', 'requestCount', 'dataVol'])
-  if (!result || !Number.isSafeInteger(result.requestCount) || result.requestCount < 1 ||
+function decodeMarketResult(value, stage) {
+  let result = exactDataObject(value, ['payload', 'dataVol'])
+  if (!result) result = exactDataObject(value, ['payload', 'requestCount', 'dataVol'])
+  if (!result || (result.requestCount !== undefined && result.requestCount !== 1) ||
     (result.dataVol !== null &&
       (!Number.isSafeInteger(result.dataVol) || result.dataVol < 0))) {
     throw new SafeFailure(
-      'IFIND_MARKET_CLIENT_OUTPUT_INVALID', 'RESPONSE_SHAPE', stage
+      result
+        ? 'IFIND_MARKET_CLIENT_CONTRACT_INVALID'
+        : 'IFIND_MARKET_CLIENT_OUTPUT_INVALID',
+      'RESPONSE_SHAPE', stage
     )
-  }
-  if (result.requestCount > budget) {
-    const failure = budgetFailure(stage)
-    failure.observedRequestCount = result.requestCount
-    throw failure
   }
   let payload
   try {
@@ -516,13 +663,17 @@ function decodeMarketResult(value, stage, budget) {
       'IFIND_MARKET_CLIENT_OUTPUT_INVALID', 'RESPONSE_SHAPE', stage
     )
   }
-  return { payload, requestCount: result.requestCount, dataVol: result.dataVol }
+  return { payload, dataVol: result.dataVol }
 }
 
 function parseQuote(quoteParser, caseId, catalogCase, payload, verification) {
   let parsed
   try {
-    parsed = quoteParser({ caseId, payload, verification })
+    parsed = snapshotParserTree(
+      quoteParser({ caseId, payload, verification }),
+      'IFIND_MARKET_QUOTE_UNAVAILABLE',
+      'quote-parser'
+    )
   } catch {
     throw new SafeFailure(
       'IFIND_MARKET_QUOTE_UNAVAILABLE', 'RESPONSE_SHAPE', 'quote-parser'
@@ -532,12 +683,17 @@ function parseQuote(quoteParser, caseId, catalogCase, payload, verification) {
   const listingId = ownDataValue(catalogCase, 'listingId').value
   const displayCode = ownDataValue(catalogCase, 'displayCode').value
   const currency = ownDataValue(catalogCase, 'expectedTradingCurrency').value
+  if (result) validateParserVerification(
+    result.verification,
+    'IFIND_MARKET_QUOTE_UNAVAILABLE',
+    'quote-parser'
+  )
   if (!result || result.caseId !== caseId || result.listingId !== listingId ||
     result.displayCode !== displayCode || result.source !== 'real' ||
     result.currency !== currency || !Array.isArray(result.missingFields) ||
     result.missingFields.length !== 0 ||
     !['trading', 'halted', 'closed'].includes(result.tradingStatus) ||
-    typeof result.quoteTime !== 'string' || !Number.isFinite(Date.parse(result.quoteTime))) {
+    !isStrictTimestamp(result.quoteTime)) {
     throw new SafeFailure(
       'IFIND_MARKET_QUOTE_UNAVAILABLE', 'RESPONSE_SHAPE', 'quote-parser'
     )
@@ -576,12 +732,16 @@ function parseFinancials(
 ) {
   let parsed
   try {
-    parsed = financialParser({
-      caseId,
-      payload,
-      verification,
-      financialReportingCurrencyEvidence
-    })
+    parsed = snapshotParserTree(
+      financialParser({
+        caseId,
+        payload,
+        verification,
+        financialReportingCurrencyEvidence
+      }),
+      'IFIND_MARKET_FINANCIAL_UNAVAILABLE',
+      'financial-parser'
+    )
   } catch {
     throw new SafeFailure(
       'IFIND_MARKET_FINANCIAL_UNAVAILABLE', 'RESPONSE_SHAPE', 'financial-parser'
@@ -590,6 +750,11 @@ function parseFinancials(
   const result = exactDataObject(parsed, FINANCIAL_RESULT_FIELDS)
   const listingId = ownDataValue(catalogCase, 'listingId').value
   const displayCode = ownDataValue(catalogCase, 'displayCode').value
+  if (result) validateParserVerification(
+    result.verification,
+    'IFIND_MARKET_FINANCIAL_UNAVAILABLE',
+    'financial-parser'
+  )
   if (!result || result.caseId !== caseId || result.listingId !== listingId ||
     result.displayCode !== displayCode || result.source !== 'real' ||
     result.availability !== 'available' || !Array.isArray(result.points) ||
@@ -601,13 +766,34 @@ function parseFinancials(
   const points = []
   for (const point of result.points) {
     const value = exactDataObject(point, FINANCIAL_POINT_FIELDS)
-    if (!value || typeof value.reportDate !== 'string') throw new SafeFailure(
-      'IFIND_MARKET_FINANCIAL_UNAVAILABLE', 'RESPONSE_SHAPE', 'financial-parser'
+    if (value) validateParserVerification(
+      value.verification,
+      'IFIND_MARKET_FINANCIAL_UNAVAILABLE',
+      'financial-parser'
     )
+    const availableValue = value && value.availability === 'available' &&
+      typeof value.value === 'number' && Number.isFinite(value.value)
+    const missingValue = value && value.availability === 'missing' && value.value === null
+    const reportPeriod = value && canonicalReportPeriod(value.reportPeriod)
+    if (!value || typeof value.indicatorId !== 'string' ||
+      !/^[A-Z0-9_]{1,80}$/.test(value.indicatorId) ||
+      !FINANCIAL_METRIC_KEYS.has(value.metricKey) ||
+      !reportPeriod ||
+      !isCanonicalCalendarDate(value.reportDate) ||
+      !['annual', 'interim'].includes(value.periodType) ||
+      (!availableValue && !missingValue) ||
+      typeof value.currency !== 'string' || !/^[A-Z]{3}$/.test(value.currency) ||
+      value.unit !== 'million' || typeof value.disclosureScope !== 'string' ||
+      !/^[a-z][a-z_]{0,31}$/.test(value.disclosureScope) ||
+      !isStrictTimestamp(value.sourceTime) || !isStrictTimestamp(value.fetchTime)) {
+      throw new SafeFailure(
+        'IFIND_MARKET_FINANCIAL_UNAVAILABLE', 'RESPONSE_SHAPE', 'financial-parser'
+      )
+    }
     points.push({
       indicatorId: value.indicatorId,
       metricKey: value.metricKey,
-      reportPeriod: value.reportPeriod,
+      reportPeriod,
       periodEnd: value.reportDate,
       periodType: value.periodType,
       value: value.value,
@@ -639,7 +825,7 @@ function createTerminalResult(reservation, clock, values) {
     status: values.status,
     quoteStatus: values.quoteStatus,
     financeStatus: values.financeStatus,
-    requestCount: Math.min(MAX_REQUEST_COUNT, Math.max(0, values.requestCount)),
+    requestCount: values.requestCount,
     dataVol: values.dataVol,
     elapsedMs: Math.max(0, completedAt - reservation.createdAt),
     safeErrorClass: values.failure ? values.failure.safeErrorClass : null,
@@ -699,6 +885,10 @@ function createIfindMarketDiagnosticService(options) {
     let requestCount = 0
     let dataVol = 0
     let hasDataVol = false
+    function grantPermit(stage) {
+      if (requestCount >= MAX_REQUEST_COUNT) throw budgetFailure(stage)
+      requestCount += 1
+    }
     try {
       const request = exactDataObject(input, ['caseId'])
       if (!request || typeof request.caseId !== 'string' ||
@@ -772,69 +962,57 @@ function createIfindMarketDiagnosticService(options) {
 
       let authResult
       try {
-        authResult = decodeAuthResult(await clientAuthenticate.call(
+        const authInput = Object.freeze({
+          refreshToken,
+          requestBudget: 1
+        })
+        grantPermit('auth')
+        const authOutput = await clientAuthenticate.call(
           config.client,
-          Object.freeze({
-            refreshToken,
-            requestBudget: AUTH_REQUEST_BUDGET
-          })
-        ), AUTH_REQUEST_BUDGET)
-        requestCount += authResult.requestCount
+          authInput
+        )
+        accessToken = ownBufferReference(authOutput, 'accessToken')
+        authResult = decodeAuthResult(authOutput)
         accessToken = authResult.accessToken
       } catch (error) {
-        if (error instanceof SafeFailure) {
-          if (error.failureCode === 'IFIND_MARKET_REQUEST_BUDGET_EXHAUSTED') {
-            requestCount = Math.min(MAX_REQUEST_COUNT, requestCount + AUTH_REQUEST_BUDGET)
-          }
-          throw error
-        }
-        const observed = readClientFailure(error, 'auth', AUTH_REQUEST_BUDGET)
-        requestCount += observed.requestCount
-        throw observed.failure
+        if (error instanceof SafeFailure) throw error
+        throw readClientFailure(error, 'auth')
       }
 
       let quoteResult
       try {
+        const quoteInput = Object.freeze({
+          accessToken,
+          request: fixedRequests.quote,
+          requestBudget: 1
+        })
+        grantPermit('quote')
         quoteResult = decodeMarketResult(await clientQuote.call(
           config.client,
-          Object.freeze({
-            accessToken,
-            request: fixedRequests.quote,
-            requestBudget: QUOTE_REQUEST_BUDGET
-          })
-        ), 'quote', QUOTE_REQUEST_BUDGET)
-        requestCount += quoteResult.requestCount
+          quoteInput
+        ), 'quote')
         quotePayload = quoteResult.payload
         if (quoteResult.dataVol !== null) {
           dataVol += quoteResult.dataVol
           hasDataVol = true
         }
       } catch (error) {
-        if (error instanceof SafeFailure) {
-          requestCount = Math.min(MAX_REQUEST_COUNT, requestCount + QUOTE_REQUEST_BUDGET)
-          throw error
-        }
-        const observed = readClientFailure(error, 'quote', QUOTE_REQUEST_BUDGET)
-        requestCount += observed.requestCount
-        throw observed.failure
+        if (error instanceof SafeFailure) throw error
+        throw readClientFailure(error, 'quote')
       }
 
       let financialFailure = null
-      const financialBudget = Math.min(
-        MAX_FINANCIAL_REQUEST_BUDGET,
-        MAX_REQUEST_COUNT - requestCount
-      )
       try {
-        if (financialBudget < 1) throw budgetFailure('financial')
+        const financialInput = Object.freeze({
+          accessToken,
+          request: fixedRequests.financial,
+          requestBudget: 1
+        })
+        grantPermit('financial')
         const financialResult = decodeMarketResult(await clientFinancial.call(
           config.client,
-          Object.freeze({
-            accessToken,
-            request: fixedRequests.financial,
-            requestBudget: financialBudget
-          })
-        ), 'financial', financialBudget)
-        requestCount += financialResult.requestCount
+          financialInput
+        ), 'financial')
         financialPayload = financialResult.payload
         if (financialResult.dataVol !== null) {
           dataVol += financialResult.dataVol
@@ -842,15 +1020,9 @@ function createIfindMarketDiagnosticService(options) {
         }
       } catch (error) {
         if (error instanceof SafeFailure) {
-          const observed = Number.isSafeInteger(error.observedRequestCount)
-            ? error.observedRequestCount
-            : 1
-          requestCount = Math.min(MAX_REQUEST_COUNT, requestCount + observed)
           financialFailure = error
         } else {
-          const observed = readClientFailure(error, 'financial', financialBudget)
-          requestCount = Math.min(MAX_REQUEST_COUNT, requestCount + observed.requestCount)
-          financialFailure = observed.failure
+          financialFailure = readClientFailure(error, 'financial')
         }
       }
 
