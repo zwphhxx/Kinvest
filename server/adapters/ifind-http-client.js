@@ -1,16 +1,24 @@
 const https = require('node:https')
 const { TextDecoder } = require('node:util')
+const {
+  isClientFailureBase,
+  isClientFailureMetadata
+} = require('../contracts/ifind-diagnostic-errors')
 
 const ORIGIN = 'https://quantapi.51ifind.com'
 const AUTH_ERROR_CODES = new Set([-401])
 const PERMISSION_ERROR_CODES = new Set([-403])
 const QUOTA_ERROR_CODES = new Set([-429])
 const SAFE_ERRORS = new WeakSet()
+// Fixed baseline from the official iFinD HTTP example, not a dynamic market date.
+const DIAGNOSTIC_REFERENCE_DATE = '2022-07-05'
 
 /**
  * @typedef {Error & {
  *   code: string,
  *   class: string,
+ *   failureCode: string,
+ *   vendorErrorCode: number | null,
  *   dataVol?: number,
  *   requestCount?: number,
  *   stage?: 'auth' | 'probe'
@@ -29,10 +37,24 @@ function isHeaderSafeToken(value) {
 }
 
 /** @returns {IfindClientError} */
-function safeError(code, errorClass, message, dataVol) {
+function safeError(code, errorClass, message, dataVol, vendorErrorCode = null) {
+  if (!isClientFailureBase({
+    failureCode: code,
+    errorClass,
+    vendorErrorCode
+  })) {
+    code = 'IFIND_CLIENT_FAILED'
+    errorClass = 'API'
+    message = 'iFinD diagnostic failed'
+    vendorErrorCode = null
+  }
   const error = /** @type {IfindClientError} */ (new Error(message))
   error.code = code
   error.class = errorClass
+  error.failureCode = code
+  error.vendorErrorCode = Number.isSafeInteger(vendorErrorCode) && vendorErrorCode !== 0
+    ? vendorErrorCode
+    : null
   if (Number.isSafeInteger(dataVol) && dataVol >= 0) error.dataVol = dataVol
   SAFE_ERRORS.add(error)
   return error
@@ -55,9 +77,17 @@ function withRequestCount(error, requestCount) {
 }
 
 function withStage(error, stage) {
-  const sanitized = SAFE_ERRORS.has(error)
+  let sanitized = SAFE_ERRORS.has(error)
     ? error
     : safeError('IFIND_CLIENT_FAILED', 'API', 'iFinD diagnostic failed')
+  if (!isClientFailureMetadata({
+    failureCode: sanitized.failureCode,
+    errorClass: sanitized.class,
+    stage,
+    vendorErrorCode: sanitized.vendorErrorCode
+  })) {
+    sanitized = safeError('IFIND_CLIENT_FAILED', 'API', 'iFinD diagnostic failed')
+  }
   const existing = Object.getOwnPropertyDescriptor(sanitized, 'stage')
   if (existing && (existing.value === 'auth' || existing.value === 'probe')) {
     return sanitized
@@ -69,17 +99,6 @@ function withStage(error, stage) {
     writable: false
   })
   return sanitized
-}
-
-function shanghaiDate(date) {
-  const parts = new Intl.DateTimeFormat('en-CA', {
-    timeZone: 'Asia/Shanghai',
-    year: 'numeric',
-    month: '2-digit',
-    day: '2-digit'
-  }).formatToParts(date)
-  const values = Object.fromEntries(parts.map(({ type, value }) => [type, value]))
-  return `${values.year}-${values.month}-${values.day}`
 }
 
 function requestJson(request, path, headers, body, setTimer, clearTimer) {
@@ -383,6 +402,14 @@ function classifyProbeFailure(response) {
   return 'API'
 }
 
+function isCanonicalCalendarDate(value) {
+  if (typeof value !== 'string' || !/^[0-9]{4}-[0-9]{2}-[0-9]{2}$/.test(value)) {
+    return false
+  }
+  const parsed = new Date(`${value}T00:00:00.000Z`)
+  return Number.isFinite(parsed.getTime()) && parsed.toISOString().slice(0, 10) === value
+}
+
 /**
  * @param {{
  *   request?: (url: string, options: any, callback: (response: any) => void) => any,
@@ -468,11 +495,17 @@ function createIfindHttpClient({
           clearTimer
         )
         requireCurrentGeneration(operationGeneration)
-        if (!isRecord(tokenResponse) || typeof tokenResponse.errorcode !== 'number') {
+        if (!isRecord(tokenResponse) || !Number.isSafeInteger(tokenResponse.errorcode)) {
           throw safeError('IFIND_RESPONSE_SHAPE', 'API', 'iFinD response shape was invalid')
         }
         if (tokenResponse.errorcode !== 0) {
-          throw safeError('IFIND_AUTH_REJECTED', 'AUTH', 'iFinD access-token request failed')
+          throw safeError(
+            'IFIND_AUTH_REJECTED',
+            'AUTH',
+            'iFinD access-token request failed',
+            undefined,
+            tokenResponse.errorcode
+          )
         }
         if (!isRecord(tokenResponse.data) ||
             !isHeaderSafeToken(tokenResponse.data.access_token)) {
@@ -514,27 +547,34 @@ function createIfindHttpClient({
               dateFormat: '0',
               output: 'sequencedate'
             },
-            startdate: shanghaiDate(startedAt)
+            startdate: DIAGNOSTIC_REFERENCE_DATE
           },
           setTimer,
           clearTimer
         )
         requireCurrentGeneration(operationGeneration)
-        if (!isRecord(probeResponse) || typeof probeResponse.errorcode !== 'number') {
+        if (!isRecord(probeResponse) || !Number.isSafeInteger(probeResponse.errorcode)) {
           throw safeError('IFIND_RESPONSE_SHAPE', 'API', 'iFinD response shape was invalid')
         }
         if (probeResponse.errorcode === 0) break
         const failureClass = classifyProbeFailure(probeResponse)
         if (failureClass === 'AUTH' && attempt === 1) {
           discardAccessToken()
-          throw safeError('IFIND_AUTH_REJECTED', 'AUTH', 'iFinD authentication failed')
+          throw safeError(
+            'IFIND_AUTH_REJECTED',
+            'AUTH',
+            'iFinD authentication failed',
+            undefined,
+            probeResponse.errorcode
+          )
         }
         if (failureClass === 'PERMISSION') {
           throw safeError(
             'IFIND_PERMISSION_REJECTED',
             'PERMISSION',
             'iFinD permission denied',
-            probeResponse.dataVol
+            probeResponse.dataVol,
+            probeResponse.errorcode
           )
         }
         if (failureClass === 'QUOTA') {
@@ -542,7 +582,8 @@ function createIfindHttpClient({
             'IFIND_QUOTA_REJECTED',
             'QUOTA',
             'iFinD quota unavailable',
-            probeResponse.dataVol
+            probeResponse.dataVol,
+            probeResponse.errorcode
           )
         }
         if (failureClass !== 'AUTH') {
@@ -550,7 +591,8 @@ function createIfindHttpClient({
             'IFIND_PROBE_REJECTED',
             'API',
             'iFinD trade-date probe failed',
-            probeResponse.dataVol
+            probeResponse.dataVol,
+            probeResponse.errorcode
           )
         }
         discardAccessToken()
@@ -559,8 +601,8 @@ function createIfindHttpClient({
 
       if (!isRecord(probeResponse.tables) ||
           !Array.isArray(probeResponse.tables.time) ||
-          !isRecord(probeResponse.tables.table) ||
-          !Array.isArray(probeResponse.tables.table.sequencedate) ||
+          probeResponse.tables.time.length === 0 ||
+          !probeResponse.tables.time.every(isCanonicalCalendarDate) ||
           (Object.hasOwn(probeResponse, 'dataVol') &&
             (!Number.isFinite(probeResponse.dataVol) || probeResponse.dataVol < 0))) {
         throw safeError('IFIND_RESPONSE_SHAPE', 'API', 'iFinD response shape was invalid')

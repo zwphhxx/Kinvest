@@ -77,6 +77,21 @@ function clientFailure(errorClass, overrides = {}) {
   )
   error.class = errorClass
   error.code = 'RAW_PROVIDER_CODE'
+  error.failureCode = {
+    AUTH: 'IFIND_AUTH_REJECTED',
+    CONFIG: 'IFIND_CONFIG_INVALID',
+    PERMISSION: 'IFIND_PERMISSION_REJECTED',
+    NETWORK: 'IFIND_NETWORK_FAILED'
+  }[errorClass] || 'RAW_PROVIDER_CODE'
+  error.vendorErrorCode = null
+  error.stage = {
+    AUTH: 'auth',
+    PERMISSION: 'probe',
+    QUOTA: 'probe',
+    NETWORK: null,
+    API: 'probe',
+    CONFIG: null
+  }[errorClass] ?? null
   error.headers = { authorization: 'secret' }
   error.RequestId = 'raw-request-id'
   Object.assign(error, overrides)
@@ -207,6 +222,8 @@ async function run() {
   assert.equal(success.localAttemptCount, 1)
   assert.equal(successful.repository.status(Date.parse('2026-08-26T02:00:00.010Z')).localAttemptCount, 1)
   assert.equal(successful.repository.latest().requestCount, 4)
+  assert.equal(successful.repository.latest().failureCode, null)
+  assert.equal(successful.repository.latest().vendorErrorCode, null)
   assert.equal(Buffer.isBuffer(receivedToken), true)
   assert.equal((/** @type {Buffer} */ (receivedToken)).every((byte) => byte === 0), true)
   assert.equal(successful.tokenBuffers.every((buffer) => buffer.every((byte) => byte === 0)), true)
@@ -227,6 +244,29 @@ async function run() {
     'tokenVersionId'
   ])
   successful.database.close()
+
+  const legacyFailure = createEnabledService()
+  legacyFailure.repository.latest = () => ({
+    diagnosticId: 'diag_000000000000000000000778',
+    startedAt: 1777777777000,
+    completedAt: 1777777777010,
+    authStatus: 'success',
+    probeStatus: 'failed',
+    safeErrorClass: 'API',
+    failureCode: 'IFIND_LEGACY_DIAGNOSTIC_FAILURE',
+    vendorErrorCode: null,
+    route: ROUTE,
+    requestCount: 2,
+    dataVol: null,
+    elapsedMs: 10,
+    completeness: 'unavailable',
+    tokenVersionId: VERSION_ID
+  })
+  const legacyFailureStatus = legacyFailure.service.status()
+  assert.equal(legacyFailureStatus.latest.safeErrorClass, 'API')
+  assert.equal(Object.hasOwn(legacyFailureStatus.latest, 'failureCode'), false)
+  assert.equal(Object.hasOwn(legacyFailureStatus.latest, 'vendorErrorCode'), false)
+  legacyFailure.database.close()
 
   let invalidSecretClientCalls = 0
   const invalidSecret = createEnabledService({
@@ -258,6 +298,8 @@ async function run() {
   )
   throwingSecretError.class = 'CONFIG'
   throwingSecretError.requestCount = 4
+  throwingSecretError.failureCode = 'IFIND_CONFIG_INVALID'
+  throwingSecretError.vendorErrorCode = null
   const throwingSecret = createEnabledService({
     secretProvider: {
       readRefreshToken() { throw throwingSecretError }
@@ -315,7 +357,8 @@ async function run() {
     },
     {
       error: clientFailure('NOT_APPROVED', { requestCount: 1 }),
-      expected: { authStatus: 'unknown', probeStatus: 'failed', safeErrorClass: 'API', requestCount: 1 }
+      expected: { authStatus: 'unknown', probeStatus: 'failed', safeErrorClass: 'API', requestCount: 1 },
+      persisted: { failureCode: 'IFIND_CLIENT_FAILED', vendorErrorCode: null }
     },
     {
       error: clientFailure('NETWORK', { requestCount: Number.MAX_SAFE_INTEGER }),
@@ -338,8 +381,105 @@ async function run() {
       assert.equal(serialized.includes(marker), false)
     }
     assert.equal(state.repository.latest().safeErrorClass, scenario.expected.safeErrorClass)
+    const persisted = state.repository.latest()
+    assert.equal(
+      persisted.failureCode,
+      scenario.persisted?.failureCode || scenario.error.failureCode
+    )
+    assert.equal(
+      persisted.vendorErrorCode,
+      scenario.persisted?.vendorErrorCode || null
+    )
+    assert.equal(Object.hasOwn(outcome.diagnostic, 'failureCode'), false)
+    assert.equal(Object.hasOwn(outcome.diagnostic, 'vendorErrorCode'), false)
     state.database.close()
   }
+
+  const vendorFailure = createEnabledService()
+  vendorFailure.client.diagnose = async () => {
+    throw clientFailure('API', {
+      failureCode: 'IFIND_PROBE_REJECTED',
+      vendorErrorCode: -999,
+      requestCount: 2,
+      errmsg: 'provider errmsg must not escape',
+      rawResponse: 'provider response body must not escape',
+      token: 'provider token must not escape'
+    })
+  }
+  const vendorFailureOutcome = await vendorFailure.service.run()
+  assert.equal(Object.hasOwn(vendorFailureOutcome.diagnostic, 'failureCode'), false)
+  assert.equal(Object.hasOwn(vendorFailureOutcome.diagnostic, 'vendorErrorCode'), false)
+  assert.equal(vendorFailure.repository.latest().failureCode, 'IFIND_PROBE_REJECTED')
+  assert.equal(vendorFailure.repository.latest().vendorErrorCode, -999)
+  for (const marker of [
+    'provider errmsg', 'provider response body', 'provider token', 'raw-request-id'
+  ]) {
+    assert.equal(JSON.stringify(vendorFailureOutcome).includes(marker), false)
+    assert.equal(JSON.stringify(vendorFailure.repository.latest()).includes(marker), false)
+  }
+  assert.equal(Object.hasOwn(vendorFailure.service.status().latest, 'failureCode'), false)
+  assert.equal(Object.hasOwn(vendorFailure.service.status().latest, 'vendorErrorCode'), false)
+  vendorFailure.database.close()
+
+  let accessorReads = 0
+  const accessorFailure = /** @type {Error & Record<string, any>} */ (
+    new Error('hostile accessor error')
+  )
+  accessorFailure.class = 'API'
+  accessorFailure.stage = 'probe'
+  accessorFailure.requestCount = 2
+  accessorFailure.vendorErrorCode = null
+  Object.defineProperty(accessorFailure, 'failureCode', {
+    enumerable: true,
+    get() {
+      accessorReads += 1
+      return 'IFIND_PROBE_REJECTED'
+    }
+  })
+  const hostileClientErrors = [
+    clientFailure('AUTH', {
+      failureCode: 'IFIND_PROBE_REJECTED',
+      vendorErrorCode: -999,
+      stage: 'probe',
+      requestCount: 2
+    }),
+    clientFailure('PERMISSION', {
+      failureCode: 'IFIND_PERMISSION_REJECTED',
+      vendorErrorCode: -403,
+      stage: 'auth',
+      requestCount: 2
+    }),
+    clientFailure('NETWORK', {
+      failureCode: 'IFIND_NETWORK_FAILED',
+      vendorErrorCode: -500,
+      stage: 'probe',
+      requestCount: 2
+    }),
+    clientFailure('CONFIG', {
+      failureCode: 'IFIND_DIAGNOSTIC_STALE_RESERVATION',
+      vendorErrorCode: null,
+      stage: null,
+      requestCount: 0
+    }),
+    clientFailure('API', {
+      failureCode: 'IFIND_LEGACY_DIAGNOSTIC_FAILURE',
+      vendorErrorCode: null,
+      stage: null,
+      requestCount: 1
+    }),
+    accessorFailure
+  ]
+  for (const hostileError of hostileClientErrors) {
+    const hostileClient = createEnabledService()
+    hostileClient.client.diagnose = async () => { throw hostileError }
+    const hostileOutcome = await hostileClient.service.run()
+    assert.equal(hostileOutcome.status, 'failed')
+    assert.equal(hostileOutcome.diagnostic.safeErrorClass, 'API')
+    assert.equal(hostileClient.repository.latest().failureCode, 'IFIND_CLIENT_FAILED')
+    assert.equal(hostileClient.repository.latest().vendorErrorCode, null)
+    hostileClient.database.close()
+  }
+  assert.equal(accessorReads, 0)
 
   const { createIfindHttpClient } = require('../adapters/ifind-http-client')
   const exhaustedTransport = createRequestStub([
@@ -359,6 +499,8 @@ async function run() {
   assert.equal(integratedOutcome.diagnostic.requestCount, 4)
   assert.equal(integratedOutcome.localAttemptCount, 1)
   assert.equal(integrated.repository.latest().requestCount, 4)
+  assert.equal(integrated.repository.latest().failureCode, 'IFIND_AUTH_REJECTED')
+  assert.equal(integrated.repository.latest().vendorErrorCode, -401)
   assert.equal(
     integrated.repository.status(Date.parse('2026-08-26T02:00:00.000Z')).localAttemptCount,
     1

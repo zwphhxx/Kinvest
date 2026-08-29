@@ -11,6 +11,7 @@ const runtimeFiles = [
   'server/adapters/modelAdapter.js',
   'server/ai/model-quota.js',
   'server/ai/research-safety.js',
+  'server/contracts/ifind-diagnostic-errors.js',
   'server/adapters/ifindAdapter.js',
   'server/data/mockData.js',
   'server/db/device-auth-repository.js',

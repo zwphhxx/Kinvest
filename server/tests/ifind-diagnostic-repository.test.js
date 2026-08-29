@@ -24,6 +24,8 @@ function terminalResult(overrides = {}) {
     authStatus: 'success',
     probeStatus: 'success',
     safeErrorClass: null,
+    failureCode: null,
+    vendorErrorCode: null,
     route: ROUTE,
     requestCount: 2,
     dataVol: 11,
@@ -79,7 +81,9 @@ async function run() {
       'data_vol',
       'elapsed_ms',
       'completeness',
-      'token_version_id'
+      'token_version_id',
+      'failure_code',
+      'vendor_error_code'
     ]
   )
   assert.deepEqual(
@@ -111,6 +115,114 @@ async function run() {
   identityRepository.initialize()
   assert.equal(identityDatabase.prepare('SELECT COUNT(*) AS count FROM ifind_diagnostic_control').get().count, 1)
   identityDatabase.close()
+
+  const legacyDatabase = new DatabaseSync(':memory:')
+  legacyDatabase.exec(`
+    CREATE TABLE ifind_diagnostic_runs (
+      diagnostic_id TEXT PRIMARY KEY NOT NULL,
+      started_at INTEGER NOT NULL CHECK (started_at >= 0),
+      completed_at INTEGER,
+      auth_status TEXT CHECK (auth_status IS NULL OR auth_status IN ('success', 'failed', 'unknown')),
+      probe_status TEXT CHECK (probe_status IS NULL OR probe_status IN ('success', 'failed', 'not_run')),
+      safe_error_class TEXT CHECK (safe_error_class IS NULL OR safe_error_class IN ('AUTH', 'PERMISSION', 'QUOTA', 'NETWORK', 'API', 'CONFIG', 'BUSY', 'RATE_LIMITED')),
+      route TEXT CHECK (route IS NULL OR route = '/api/v1/get_trade_dates'),
+      request_count INTEGER CHECK (request_count IS NULL OR request_count BETWEEN 0 AND 4),
+      data_vol INTEGER CHECK (data_vol IS NULL OR data_vol >= 0),
+      elapsed_ms INTEGER CHECK (elapsed_ms IS NULL OR elapsed_ms >= 0),
+      completeness TEXT CHECK (completeness IS NULL OR completeness IN ('complete', 'partial', 'unavailable')),
+      token_version_id TEXT NOT NULL,
+      CHECK (
+        (completed_at IS NULL AND auth_status IS NULL AND probe_status IS NULL
+          AND safe_error_class IS NULL AND route IS NULL
+          AND request_count IS NULL AND data_vol IS NULL
+          AND elapsed_ms IS NULL AND completeness IS NULL)
+        OR
+        (completed_at IS NOT NULL AND auth_status IS NOT NULL
+          AND probe_status IS NOT NULL AND route IS NOT NULL
+          AND request_count IS NOT NULL AND elapsed_ms IS NOT NULL
+          AND completeness IS NOT NULL)
+      ),
+      CHECK (completed_at IS NULL OR completed_at >= started_at)
+    );
+    CREATE TABLE ifind_diagnostic_control (
+      singleton_id INTEGER PRIMARY KEY NOT NULL CHECK (singleton_id = 1),
+      day_key TEXT NOT NULL,
+      daily_attempt_count INTEGER NOT NULL CHECK (daily_attempt_count BETWEEN 0 AND 20),
+      cooldown_until INTEGER CHECK (cooldown_until IS NULL OR cooldown_until >= 0),
+      in_flight_id TEXT,
+      in_flight_started_at INTEGER,
+      in_flight_expires_at INTEGER,
+      in_flight_token_version_id TEXT,
+      CHECK (
+        (in_flight_id IS NULL AND in_flight_started_at IS NULL
+          AND in_flight_expires_at IS NULL AND in_flight_token_version_id IS NULL)
+        OR
+        (in_flight_id IS NOT NULL AND in_flight_started_at IS NOT NULL
+          AND in_flight_expires_at IS NOT NULL AND in_flight_token_version_id IS NOT NULL)
+      ),
+      CHECK (in_flight_expires_at IS NULL OR in_flight_expires_at > in_flight_started_at)
+    );
+    INSERT INTO ifind_diagnostic_runs (
+      diagnostic_id, started_at, token_version_id
+    ) VALUES ('diag_000000000000000000000777', 1777777777000, '${VERSION_ID}');
+    INSERT INTO ifind_diagnostic_runs (
+      diagnostic_id, started_at, completed_at, auth_status, probe_status,
+      safe_error_class, route, request_count, data_vol, elapsed_ms,
+      completeness, token_version_id
+    ) VALUES (
+      'diag_000000000000000000000778', 1777777777000, 1777777777010,
+      'success', 'failed', 'API', '${ROUTE}', 2, NULL, 10,
+      'unavailable', '${VERSION_ID}'
+    );
+    INSERT INTO ifind_diagnostic_runs (
+      diagnostic_id, started_at, completed_at, auth_status, probe_status,
+      safe_error_class, route, request_count, data_vol, elapsed_ms,
+      completeness, token_version_id
+    ) VALUES (
+      'diag_000000000000000000000779', 1777777777000, 1777777777005,
+      'success', 'success', NULL, '${ROUTE}', 2, 11, 5,
+      'complete', '${VERSION_ID}'
+    );
+  `)
+  const legacyRepository = createRepository(legacyDatabase)
+  assert.deepEqual(
+    legacyDatabase.prepare('PRAGMA table_info(ifind_diagnostic_runs)').all().map((row) => row.name),
+    [
+      'diagnostic_id', 'started_at', 'completed_at', 'auth_status',
+      'probe_status', 'safe_error_class', 'route', 'request_count', 'data_vol',
+      'elapsed_ms', 'completeness', 'token_version_id', 'failure_code',
+      'vendor_error_code'
+    ]
+  )
+  const migratedPending = legacyDatabase.prepare(`
+    SELECT failure_code, vendor_error_code FROM ifind_diagnostic_runs
+    WHERE diagnostic_id = 'diag_000000000000000000000777'
+  `).get()
+  assert.equal(migratedPending.failure_code, null)
+  assert.equal(migratedPending.vendor_error_code, null)
+  const migratedSuccess = legacyDatabase.prepare(`
+    SELECT failure_code, vendor_error_code FROM ifind_diagnostic_runs
+    WHERE diagnostic_id = 'diag_000000000000000000000779'
+  `).get()
+  assert.equal(migratedSuccess.failure_code, null)
+  assert.equal(migratedSuccess.vendor_error_code, null)
+  assert.deepEqual(legacyRepository.latest(), {
+    diagnosticId: 'diag_000000000000000000000778',
+    startedAt: 1777777777000,
+    completedAt: 1777777777010,
+    authStatus: 'success',
+    probeStatus: 'failed',
+    safeErrorClass: 'API',
+    failureCode: 'IFIND_LEGACY_DIAGNOSTIC_FAILURE',
+    vendorErrorCode: null,
+    route: ROUTE,
+    requestCount: 2,
+    dataVol: null,
+    elapsedMs: 10,
+    completeness: 'unavailable',
+    tokenVersionId: VERSION_ID
+  })
+  legacyDatabase.close()
 
   const wrongIdentity = new DatabaseSync(':memory:')
   wrongIdentity.exec('PRAGMA application_id = 1234')
@@ -221,7 +333,9 @@ async function run() {
       dataVol: 11,
       elapsedMs: 10,
       completeness: 'complete',
-      tokenVersionId: VERSION_ID
+      tokenVersionId: VERSION_ID,
+      failureCode: null,
+      vendorErrorCode: null
     })
     latest.authStatus = 'failed'
     assert.equal(first.latest().authStatus, 'success')
@@ -267,6 +381,31 @@ async function run() {
         result: { ...terminalResult(), [key]: 'sensitive-marker' }
       }), IfindDiagnosticRepositoryError)
     }
+    for (const invalidFailure of [
+      terminalResult({
+        authStatus: 'success',
+        probeStatus: 'failed',
+        safeErrorClass: 'AUTH',
+        failureCode: 'IFIND_PROBE_REJECTED',
+        vendorErrorCode: -999,
+        dataVol: null,
+        completeness: 'unavailable'
+      }),
+      terminalResult({
+        authStatus: 'unknown',
+        probeStatus: 'failed',
+        safeErrorClass: 'NETWORK',
+        failureCode: 'IFIND_NETWORK_FAILED',
+        vendorErrorCode: -500,
+        dataVol: null,
+        completeness: 'unavailable'
+      })
+    ]) {
+      assert.throws(() => second.complete({
+        reservation: firstReservation.reservation,
+        result: invalidFailure
+      }), IfindDiagnosticRepositoryError)
+    }
   } finally {
     firstDatabase.close()
     secondDatabase.close()
@@ -292,6 +431,7 @@ async function run() {
         authStatus: 'failed',
         probeStatus: 'not_run',
         safeErrorClass: 'AUTH',
+        failureCode: 'IFIND_AUTH_REJECTED',
         requestCount: 1,
         dataVol: null,
         elapsedMs: 1,
@@ -350,6 +490,8 @@ async function run() {
     authStatus: 'unknown',
     probeStatus: 'not_run',
     safeErrorClass: 'CONFIG',
+    failureCode: 'IFIND_DIAGNOSTIC_STALE_RESERVATION',
+    vendorErrorCode: null,
     route: ROUTE,
     requestCount: 0,
     dataVol: null,
@@ -389,6 +531,7 @@ async function run() {
       authStatus: 'failed',
       probeStatus: 'not_run',
       safeErrorClass: 'AUTH',
+      failureCode: 'IFIND_AUTH_REJECTED',
       requestCount: 1,
       dataVol: null,
       elapsedMs: 1,
@@ -445,6 +588,388 @@ async function run() {
   assert.equal(injectionControl.daily_attempt_count, 0)
   assert.equal(injectionControl.in_flight_id, null)
   injectionDatabase.close()
+
+  const approximateLegacyDatabase = new DatabaseSync(':memory:')
+  approximateLegacyDatabase.exec(`
+    CREATE TABLE ifind_diagnostic_runs (
+      diagnostic_id TEXT PRIMARY KEY NOT NULL,
+      started_at INTEGER NOT NULL CHECK (started_at >= 0),
+      completed_at INTEGER,
+      auth_status TEXT CHECK (auth_status IS NULL OR auth_status IN ('success', 'failed', 'unknown')),
+      probe_status TEXT CHECK (probe_status IS NULL OR probe_status IN ('success', 'failed', 'not_run')),
+      safe_error_class TEXT CHECK (safe_error_class IS NULL OR safe_error_class IN ('AUTH', 'PERMISSION', 'QUOTA', 'NETWORK', 'API', 'CONFIG', 'BUSY', 'RATE_LIMITED')),
+      route TEXT CHECK (route IS NULL OR route = '/api/v1/get_trade_dates'),
+      request_count INTEGER CHECK (request_count IS NULL OR request_count BETWEEN 0 AND 4),
+      data_vol INTEGER CHECK (data_vol IS NULL OR data_vol >= 0),
+      elapsed_ms INTEGER CHECK (elapsed_ms IS NULL OR elapsed_ms >= 0),
+      completeness TEXT CHECK (completeness IS NULL OR completeness IN ('complete', 'partial', 'unavailable')),
+      token_version_id TEXT NOT NULL,
+      CHECK (
+        (completed_at IS NULL AND auth_status IS NULL AND probe_status IS NULL
+          AND safe_error_class IS NULL AND route IS NULL
+          AND request_count IS NULL AND data_vol IS NULL
+          AND elapsed_ms IS NULL AND completeness IS NULL)
+        OR
+        (completed_at IS NOT NULL AND auth_status IS NOT NULL
+          AND probe_status IS NOT NULL AND route IS NOT NULL
+          AND request_count IS NOT NULL AND elapsed_ms IS NOT NULL
+          AND completeness IS NOT NULL)
+      )
+    );
+    CREATE TABLE ifind_diagnostic_control (
+      singleton_id INTEGER PRIMARY KEY NOT NULL CHECK (singleton_id = 1),
+      day_key TEXT NOT NULL,
+      daily_attempt_count INTEGER NOT NULL CHECK (daily_attempt_count BETWEEN 0 AND 20),
+      cooldown_until INTEGER CHECK (cooldown_until IS NULL OR cooldown_until >= 0),
+      in_flight_id TEXT,
+      in_flight_started_at INTEGER,
+      in_flight_expires_at INTEGER,
+      in_flight_token_version_id TEXT,
+      CHECK (
+        (in_flight_id IS NULL AND in_flight_started_at IS NULL
+          AND in_flight_expires_at IS NULL AND in_flight_token_version_id IS NULL)
+        OR
+        (in_flight_id IS NOT NULL AND in_flight_started_at IS NOT NULL
+          AND in_flight_expires_at IS NOT NULL AND in_flight_token_version_id IS NOT NULL)
+      ),
+      CHECK (in_flight_expires_at IS NULL OR in_flight_expires_at > in_flight_started_at)
+    );
+    INSERT INTO ifind_diagnostic_runs (
+      diagnostic_id, started_at, completed_at, auth_status, probe_status,
+      safe_error_class, route, request_count, data_vol, elapsed_ms,
+      completeness, token_version_id
+    ) VALUES (
+      'diag_000000000000000000000880', 1777777777000, 1777777777010,
+      'success', 'failed', 'API', '${ROUTE}', 2, NULL, 10,
+      'unavailable', '${VERSION_ID}'
+    );
+  `)
+  const approximateColumnsBefore = approximateLegacyDatabase.prepare(
+    'PRAGMA table_info(ifind_diagnostic_runs)'
+  ).all().map((row) => row.name)
+  const approximateRowBefore = JSON.stringify(approximateLegacyDatabase.prepare(`
+    SELECT * FROM ifind_diagnostic_runs
+    WHERE diagnostic_id = 'diag_000000000000000000000880'
+  `).get())
+  assert.throws(
+    () => new IfindDiagnosticRepository(approximateLegacyDatabase).initialize(),
+    IfindDiagnosticRepositorySchemaError
+  )
+  assert.deepEqual(
+    approximateLegacyDatabase.prepare('PRAGMA table_info(ifind_diagnostic_runs)').all()
+      .map((row) => row.name),
+    approximateColumnsBefore
+  )
+  assert.equal(JSON.stringify(approximateLegacyDatabase.prepare(`
+    SELECT * FROM ifind_diagnostic_runs
+    WHERE diagnostic_id = 'diag_000000000000000000000880'
+  `).get()), approximateRowBefore)
+  approximateLegacyDatabase.close()
+
+  const alteredLiteralDatabase = new DatabaseSync(':memory:')
+  alteredLiteralDatabase.exec(`
+    CREATE TABLE ifind_diagnostic_runs (
+      diagnostic_id TEXT PRIMARY KEY NOT NULL,
+      started_at INTEGER NOT NULL CHECK (started_at >= 0),
+      completed_at INTEGER,
+      auth_status TEXT CHECK (auth_status IS NULL OR auth_status IN ('success', 'failed', 'unknown')),
+      probe_status TEXT CHECK (probe_status IS NULL OR probe_status IN ('success', 'failed', 'not_run')),
+      safe_error_class TEXT CHECK (safe_error_class IS NULL OR safe_error_class IN ('auth', 'PERMISSION', 'QUOTA', 'NETWORK', 'API', 'CONFIG', 'BUSY', 'RATE_LIMITED')),
+      route TEXT CHECK (route IS NULL OR route = '/api/v1/get_trade_dates'),
+      request_count INTEGER CHECK (request_count IS NULL OR request_count BETWEEN 0 AND 4),
+      data_vol INTEGER CHECK (data_vol IS NULL OR data_vol >= 0),
+      elapsed_ms INTEGER CHECK (elapsed_ms IS NULL OR elapsed_ms >= 0),
+      completeness TEXT CHECK (completeness IS NULL OR completeness IN ('complete', 'partial', 'unavailable')),
+      token_version_id TEXT NOT NULL,
+      CHECK (
+        (completed_at IS NULL AND auth_status IS NULL AND probe_status IS NULL
+          AND safe_error_class IS NULL AND route IS NULL
+          AND request_count IS NULL AND data_vol IS NULL
+          AND elapsed_ms IS NULL AND completeness IS NULL)
+        OR
+        (completed_at IS NOT NULL AND auth_status IS NOT NULL
+          AND probe_status IS NOT NULL AND route IS NOT NULL
+          AND request_count IS NOT NULL AND elapsed_ms IS NOT NULL
+          AND completeness IS NOT NULL)
+      ),
+      CHECK (completed_at IS NULL OR completed_at >= started_at)
+    );
+    CREATE TABLE ifind_diagnostic_control (
+      singleton_id INTEGER PRIMARY KEY NOT NULL CHECK (singleton_id = 1),
+      day_key TEXT NOT NULL,
+      daily_attempt_count INTEGER NOT NULL CHECK (daily_attempt_count BETWEEN 0 AND 20),
+      cooldown_until INTEGER CHECK (cooldown_until IS NULL OR cooldown_until >= 0),
+      in_flight_id TEXT,
+      in_flight_started_at INTEGER,
+      in_flight_expires_at INTEGER,
+      in_flight_token_version_id TEXT,
+      CHECK (
+        (in_flight_id IS NULL AND in_flight_started_at IS NULL
+          AND in_flight_expires_at IS NULL AND in_flight_token_version_id IS NULL)
+        OR
+        (in_flight_id IS NOT NULL AND in_flight_started_at IS NOT NULL
+          AND in_flight_expires_at IS NOT NULL AND in_flight_token_version_id IS NOT NULL)
+      ),
+      CHECK (in_flight_expires_at IS NULL OR in_flight_expires_at > in_flight_started_at)
+    );
+    INSERT INTO ifind_diagnostic_runs (
+      diagnostic_id, started_at, completed_at, auth_status, probe_status,
+      safe_error_class, route, request_count, data_vol, elapsed_ms,
+      completeness, token_version_id
+    ) VALUES (
+      'diag_000000000000000000000881', 1777777777000, 1777777777010,
+      'success', 'failed', 'API', '${ROUTE}', 2, NULL, 10,
+      'unavailable', '${VERSION_ID}'
+    );
+  `)
+  const alteredLiteralColumnsBefore = alteredLiteralDatabase.prepare(
+    'PRAGMA table_info(ifind_diagnostic_runs)'
+  ).all().map((row) => row.name)
+  const alteredLiteralRowBefore = JSON.stringify(alteredLiteralDatabase.prepare(`
+    SELECT * FROM ifind_diagnostic_runs
+    WHERE diagnostic_id = 'diag_000000000000000000000881'
+  `).get())
+  assert.throws(
+    () => new IfindDiagnosticRepository(alteredLiteralDatabase).initialize(),
+    IfindDiagnosticRepositorySchemaError
+  )
+  assert.deepEqual(
+    alteredLiteralDatabase.prepare('PRAGMA table_info(ifind_diagnostic_runs)').all()
+      .map((row) => row.name),
+    alteredLiteralColumnsBefore
+  )
+  assert.equal(JSON.stringify(alteredLiteralDatabase.prepare(`
+    SELECT * FROM ifind_diagnostic_runs
+    WHERE diagnostic_id = 'diag_000000000000000000000881'
+  `).get()), alteredLiteralRowBefore)
+  alteredLiteralDatabase.close()
+
+  const triggeredLegacyDatabase = new DatabaseSync(':memory:')
+  triggeredLegacyDatabase.exec(`
+    CREATE TABLE ifind_diagnostic_runs (
+      diagnostic_id TEXT PRIMARY KEY NOT NULL,
+      started_at INTEGER NOT NULL CHECK (started_at >= 0),
+      completed_at INTEGER,
+      auth_status TEXT CHECK (auth_status IS NULL OR auth_status IN ('success', 'failed', 'unknown')),
+      probe_status TEXT CHECK (probe_status IS NULL OR probe_status IN ('success', 'failed', 'not_run')),
+      safe_error_class TEXT CHECK (safe_error_class IS NULL OR safe_error_class IN ('AUTH', 'PERMISSION', 'QUOTA', 'NETWORK', 'API', 'CONFIG', 'BUSY', 'RATE_LIMITED')),
+      route TEXT CHECK (route IS NULL OR route = '/api/v1/get_trade_dates'),
+      request_count INTEGER CHECK (request_count IS NULL OR request_count BETWEEN 0 AND 4),
+      data_vol INTEGER CHECK (data_vol IS NULL OR data_vol >= 0),
+      elapsed_ms INTEGER CHECK (elapsed_ms IS NULL OR elapsed_ms >= 0),
+      completeness TEXT CHECK (completeness IS NULL OR completeness IN ('complete', 'partial', 'unavailable')),
+      token_version_id TEXT NOT NULL,
+      CHECK (
+        (completed_at IS NULL AND auth_status IS NULL AND probe_status IS NULL
+          AND safe_error_class IS NULL AND route IS NULL
+          AND request_count IS NULL AND data_vol IS NULL
+          AND elapsed_ms IS NULL AND completeness IS NULL)
+        OR
+        (completed_at IS NOT NULL AND auth_status IS NOT NULL
+          AND probe_status IS NOT NULL AND route IS NOT NULL
+          AND request_count IS NOT NULL AND elapsed_ms IS NOT NULL
+          AND completeness IS NOT NULL)
+      ),
+      CHECK (completed_at IS NULL OR completed_at >= started_at)
+    );
+    CREATE TABLE ifind_diagnostic_control (
+      singleton_id INTEGER PRIMARY KEY NOT NULL CHECK (singleton_id = 1),
+      day_key TEXT NOT NULL,
+      daily_attempt_count INTEGER NOT NULL CHECK (daily_attempt_count BETWEEN 0 AND 20),
+      cooldown_until INTEGER CHECK (cooldown_until IS NULL OR cooldown_until >= 0),
+      in_flight_id TEXT,
+      in_flight_started_at INTEGER,
+      in_flight_expires_at INTEGER,
+      in_flight_token_version_id TEXT,
+      CHECK (
+        (in_flight_id IS NULL AND in_flight_started_at IS NULL
+          AND in_flight_expires_at IS NULL AND in_flight_token_version_id IS NULL)
+        OR
+        (in_flight_id IS NOT NULL AND in_flight_started_at IS NOT NULL
+          AND in_flight_expires_at IS NOT NULL AND in_flight_token_version_id IS NOT NULL)
+      ),
+      CHECK (in_flight_expires_at IS NULL OR in_flight_expires_at > in_flight_started_at)
+    );
+    CREATE TABLE migration_trigger_marker (count INTEGER NOT NULL);
+    INSERT INTO migration_trigger_marker (count) VALUES (0);
+    INSERT INTO ifind_diagnostic_runs (
+      diagnostic_id, started_at, completed_at, auth_status, probe_status,
+      safe_error_class, route, request_count, data_vol, elapsed_ms,
+      completeness, token_version_id
+    ) VALUES (
+      'diag_000000000000000000000882', 1777777777000, 1777777777010,
+      'success', 'failed', 'API', '${ROUTE}', 2, NULL, 10,
+      'unavailable', '${VERSION_ID}'
+    );
+    CREATE TRIGGER reject_hidden_migration_side_effect
+    AFTER UPDATE ON ifind_diagnostic_runs
+    BEGIN
+      UPDATE migration_trigger_marker SET count = count + 1;
+    END;
+  `)
+  const triggeredColumnsBefore = triggeredLegacyDatabase.prepare(
+    'PRAGMA table_info(ifind_diagnostic_runs)'
+  ).all().map((row) => row.name)
+  const triggeredRowBefore = JSON.stringify(triggeredLegacyDatabase.prepare(`
+    SELECT * FROM ifind_diagnostic_runs
+    WHERE diagnostic_id = 'diag_000000000000000000000882'
+  `).get())
+  assert.throws(
+    () => new IfindDiagnosticRepository(triggeredLegacyDatabase).initialize(),
+    IfindDiagnosticRepositorySchemaError
+  )
+  assert.deepEqual(
+    triggeredLegacyDatabase.prepare('PRAGMA table_info(ifind_diagnostic_runs)').all()
+      .map((row) => row.name),
+    triggeredColumnsBefore
+  )
+  assert.equal(JSON.stringify(triggeredLegacyDatabase.prepare(`
+    SELECT * FROM ifind_diagnostic_runs
+    WHERE diagnostic_id = 'diag_000000000000000000000882'
+  `).get()), triggeredRowBefore)
+  assert.equal(
+    triggeredLegacyDatabase.prepare('SELECT count FROM migration_trigger_marker').get().count,
+    0
+  )
+  triggeredLegacyDatabase.close()
+
+  for (const triggerKind of ['persistent', 'temporary']) {
+    const currentTriggerDatabase = new DatabaseSync(':memory:')
+    const currentTriggerRepository = createRepository(currentTriggerDatabase)
+    const applicationIdBefore = Number(
+      currentTriggerDatabase.prepare('PRAGMA application_id').get().application_id
+    )
+    const columnsBefore = currentTriggerDatabase.prepare(
+      'PRAGMA table_info(ifind_diagnostic_runs)'
+    ).all().map((row) => row.name)
+    const controlBefore = JSON.stringify(currentTriggerDatabase.prepare(
+      'SELECT * FROM ifind_diagnostic_control WHERE singleton_id = 1'
+    ).get())
+    currentTriggerDatabase.exec(`
+      CREATE ${triggerKind === 'temporary' ? 'TEMP ' : ''}TRIGGER current_schema_${triggerKind}_trigger
+      AFTER UPDATE ON ifind_diagnostic_runs
+      BEGIN
+        SELECT 1;
+      END;
+    `)
+    assert.throws(
+      () => currentTriggerRepository.initialize(),
+      IfindDiagnosticRepositorySchemaError
+    )
+    assert.deepEqual(
+      currentTriggerDatabase.prepare('PRAGMA table_info(ifind_diagnostic_runs)').all()
+        .map((row) => row.name),
+      columnsBefore
+    )
+    assert.equal(JSON.stringify(currentTriggerDatabase.prepare(
+      'SELECT * FROM ifind_diagnostic_control WHERE singleton_id = 1'
+    ).get()), controlBefore)
+    assert.equal(
+      Number(currentTriggerDatabase.prepare('PRAGMA application_id').get().application_id),
+      applicationIdBefore
+    )
+    currentTriggerDatabase.close()
+  }
+
+  const controlInsertTriggerDatabase = new DatabaseSync(':memory:')
+  controlInsertTriggerDatabase.exec(`
+    CREATE TABLE ifind_diagnostic_runs (
+      diagnostic_id TEXT PRIMARY KEY NOT NULL,
+      started_at INTEGER NOT NULL CHECK (started_at >= 0),
+      completed_at INTEGER,
+      auth_status TEXT CHECK (auth_status IS NULL OR auth_status IN ('success', 'failed', 'unknown')),
+      probe_status TEXT CHECK (probe_status IS NULL OR probe_status IN ('success', 'failed', 'not_run')),
+      safe_error_class TEXT CHECK (safe_error_class IS NULL OR safe_error_class IN ('AUTH', 'PERMISSION', 'QUOTA', 'NETWORK', 'API', 'CONFIG', 'BUSY', 'RATE_LIMITED')),
+      route TEXT CHECK (route IS NULL OR route = '/api/v1/get_trade_dates'),
+      request_count INTEGER CHECK (request_count IS NULL OR request_count BETWEEN 0 AND 4),
+      data_vol INTEGER CHECK (data_vol IS NULL OR data_vol >= 0),
+      elapsed_ms INTEGER CHECK (elapsed_ms IS NULL OR elapsed_ms >= 0),
+      completeness TEXT CHECK (completeness IS NULL OR completeness IN ('complete', 'partial', 'unavailable')),
+      token_version_id TEXT NOT NULL,
+      CHECK (
+        (completed_at IS NULL AND auth_status IS NULL AND probe_status IS NULL
+          AND safe_error_class IS NULL AND route IS NULL
+          AND request_count IS NULL AND data_vol IS NULL
+          AND elapsed_ms IS NULL AND completeness IS NULL)
+        OR
+        (completed_at IS NOT NULL AND auth_status IS NOT NULL
+          AND probe_status IS NOT NULL AND route IS NOT NULL
+          AND request_count IS NOT NULL AND elapsed_ms IS NOT NULL
+          AND completeness IS NOT NULL)
+      ),
+      CHECK (completed_at IS NULL OR completed_at >= started_at)
+    );
+    CREATE TABLE ifind_diagnostic_control (
+      singleton_id INTEGER PRIMARY KEY NOT NULL CHECK (singleton_id = 1),
+      day_key TEXT NOT NULL,
+      daily_attempt_count INTEGER NOT NULL CHECK (daily_attempt_count BETWEEN 0 AND 20),
+      cooldown_until INTEGER CHECK (cooldown_until IS NULL OR cooldown_until >= 0),
+      in_flight_id TEXT,
+      in_flight_started_at INTEGER,
+      in_flight_expires_at INTEGER,
+      in_flight_token_version_id TEXT,
+      CHECK (
+        (in_flight_id IS NULL AND in_flight_started_at IS NULL
+          AND in_flight_expires_at IS NULL AND in_flight_token_version_id IS NULL)
+        OR
+        (in_flight_id IS NOT NULL AND in_flight_started_at IS NOT NULL
+          AND in_flight_expires_at IS NOT NULL AND in_flight_token_version_id IS NOT NULL)
+      ),
+      CHECK (in_flight_expires_at IS NULL OR in_flight_expires_at > in_flight_started_at)
+    );
+    CREATE TABLE control_insert_trigger_marker (count INTEGER NOT NULL);
+    INSERT INTO control_insert_trigger_marker (count) VALUES (0);
+    INSERT INTO ifind_diagnostic_runs (
+      diagnostic_id, started_at, completed_at, auth_status, probe_status,
+      safe_error_class, route, request_count, data_vol, elapsed_ms,
+      completeness, token_version_id
+    ) VALUES (
+      'diag_000000000000000000000883', 1777777777000, 1777777777010,
+      'success', 'failed', 'API', '${ROUTE}', 2, NULL, 10,
+      'unavailable', '${VERSION_ID}'
+    );
+    CREATE TRIGGER legacy_control_insert_trigger
+    BEFORE INSERT ON ifind_diagnostic_control
+    BEGIN
+      UPDATE control_insert_trigger_marker SET count = count + 1;
+      SELECT RAISE(FAIL, 'control insert trigger executed before schema guard');
+    END;
+  `)
+  const controlInsertColumnsBefore = controlInsertTriggerDatabase.prepare(
+    'PRAGMA table_info(ifind_diagnostic_runs)'
+  ).all().map((row) => row.name)
+  const controlInsertRowBefore = JSON.stringify(controlInsertTriggerDatabase.prepare(`
+    SELECT * FROM ifind_diagnostic_runs
+    WHERE diagnostic_id = 'diag_000000000000000000000883'
+  `).get())
+  assert.throws(
+    () => new IfindDiagnosticRepository(controlInsertTriggerDatabase).initialize(),
+    IfindDiagnosticRepositorySchemaError
+  )
+  assert.deepEqual(
+    controlInsertTriggerDatabase.prepare('PRAGMA table_info(ifind_diagnostic_runs)').all()
+      .map((row) => row.name),
+    controlInsertColumnsBefore
+  )
+  assert.equal(JSON.stringify(controlInsertTriggerDatabase.prepare(`
+    SELECT * FROM ifind_diagnostic_runs
+    WHERE diagnostic_id = 'diag_000000000000000000000883'
+  `).get()), controlInsertRowBefore)
+  assert.equal(
+    controlInsertTriggerDatabase.prepare('SELECT count FROM control_insert_trigger_marker').get().count,
+    0
+  )
+  assert.equal(
+    controlInsertTriggerDatabase.prepare(
+      'SELECT COUNT(*) AS count FROM ifind_diagnostic_control'
+    ).get().count,
+    0
+  )
+  assert.equal(
+    Number(controlInsertTriggerDatabase.prepare('PRAGMA application_id').get().application_id),
+    0
+  )
+  controlInsertTriggerDatabase.close()
 
   const malformedDatabase = new DatabaseSync(':memory:')
   malformedDatabase.exec(`

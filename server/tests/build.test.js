@@ -49,6 +49,7 @@ async function runBuildArtifactsExist() {
     'server/adapters/modelAdapter.js',
     'server/ai/model-quota.js',
     'server/ai/research-safety.js',
+    'server/contracts/ifind-diagnostic-errors.js',
     'server/data/mockData.js',
     'server/db/admin-auth-repository.js',
     'server/db/database-identity.js',
