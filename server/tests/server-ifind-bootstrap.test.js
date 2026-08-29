@@ -48,9 +48,33 @@ function repositoryFixture() {
   }
 }
 
+function marketRepositoryFixture() {
+  return {
+    initialize() {},
+    reserve() {},
+    complete() {},
+    fail() {},
+    latest() { return null },
+    history() { return [] },
+    quotaStatus() {}
+  }
+}
+
 function clientFixture(events = [], transportCalls = { count: 0 }) {
   return {
     async diagnose() {
+      transportCalls.count += 1
+      throw new Error('transport must not run during startup')
+    },
+    async authenticate() {
+      transportCalls.count += 1
+      throw new Error('transport must not run during startup')
+    },
+    async quote() {
+      transportCalls.count += 1
+      throw new Error('transport must not run during startup')
+    },
+    async financial() {
       transportCalls.count += 1
       throw new Error('transport must not run during startup')
     },
@@ -66,6 +90,12 @@ function serviceFactory(events = []) {
       events.push('service')
       options.client.clear()
     }
+  })
+}
+
+function marketServiceFactory() {
+  return () => Object.freeze({
+    async run() { return { status: 'rejected' } }
   })
 }
 
@@ -86,6 +116,8 @@ function runtimeDependencies(events = [], overrides = {}) {
       createRepository: () => repositoryFixture(),
       createClient: () => clientFixture(events, transportCalls),
       createService: serviceFactory(events),
+      createMarketRepository: () => marketRepositoryFixture(),
+      createMarketService: marketServiceFactory(),
       ...overrides
     }
   }
@@ -325,6 +357,8 @@ async function testPreparationPassesFrozenRuntimeAndKeepsHealthUnchanged() {
     },
     createIfindClient: () => clientFixture(events),
     createIfindService: serviceFactory(events),
+    createIfindMarketRepository: () => marketRepositoryFixture(),
+    createIfindMarketService: marketServiceFactory(),
     createHandler(options) {
       receivedRuntime = options.ifindDiagnosticRuntime
       return () => {}
@@ -435,6 +469,8 @@ async function testStartupFailuresPreventListenAndCleanEveryPhase() {
       createIfindRepository: () => repositoryFixture(),
       createIfindClient: () => clientFixture(events),
       createIfindService: serviceFactory(events),
+      createIfindMarketRepository: () => marketRepositoryFixture(),
+      createIfindMarketService: marketServiceFactory(),
       createHttpHandler: () => () => {},
       processRef: new EventEmitter(),
       logger: { log() {} },
@@ -465,6 +501,8 @@ async function testShutdownCleanupOrder() {
       createIfindRepository: () => repositoryFixture(),
       createIfindClient: () => clientFixture(events, transportCalls),
       createIfindService: serviceFactory(events),
+      createIfindMarketRepository: () => marketRepositoryFixture(),
+      createIfindMarketService: marketServiceFactory(),
       createHttpHandler: () => () => {},
       closeApplicationDatabase: () => events.push('database'),
       processRef,
