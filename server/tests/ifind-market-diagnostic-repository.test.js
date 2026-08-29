@@ -12,11 +12,14 @@ const {
   IfindDiagnosticRepository
 } = require('../db/ifind-diagnostic-repository')
 const {
+  IFIND_MARKET_MAX_CREATED_AT,
+  IFIND_MARKET_MAX_DERIVED_TIMESTAMP,
   IfindMarketDiagnosticRepository
 } = require('../db/ifind-market-diagnostic-repository')
 const {
   KINVEST_SQLITE_APPLICATION_ID
 } = require('../db/database-identity')
+const { listIfindMarketCases } = require('../domain/ifind-market-cases')
 
 const CASES = Object.freeze([
   'HK_ALIBABA_9988',
@@ -389,6 +392,50 @@ function testSchemaIdentityAndLegacyCompatibility() {
   foreignDatabase.close()
 }
 
+function testZeroIdentityRejectsUnknownUserSchemaObjects() {
+  const additions = [
+    ['table', 'CREATE TABLE foreign_table (id INTEGER PRIMARY KEY)'],
+    [
+      'index',
+      'CREATE INDEX foreign_index ON device_auth_requests(expires_at)'
+    ],
+    [
+      'view',
+      'CREATE VIEW foreign_view AS SELECT request_id FROM device_auth_requests'
+    ],
+    [
+      'trigger',
+      `CREATE TRIGGER foreign_trigger AFTER INSERT ON device_auth_requests
+       BEGIN SELECT 1; END`
+    ]
+  ]
+  for (const [label, sql] of additions) {
+    const database = openDatabase()
+    new DeviceAuthRepository(database).initialize()
+    database.exec(sql)
+    database.exec('PRAGMA application_id = 0')
+    const before = database.prepare(`
+      SELECT type, name, tbl_name, sql FROM sqlite_schema
+      WHERE name NOT LIKE 'sqlite_%' ORDER BY type, name
+    `).all()
+    expectCode(
+      () => new IfindMarketDiagnosticRepository(database).initialize(),
+      'DEVICE_AUTH_DATABASE_IDENTITY_INVALID'
+    )
+    assert.equal(
+      Number(database.prepare('PRAGMA application_id').get().application_id),
+      0,
+      label
+    )
+    assert.deepEqual(database.prepare(`
+      SELECT type, name, tbl_name, sql FROM sqlite_schema
+      WHERE name NOT LIKE 'sqlite_%' ORDER BY type, name
+    `).all(), before, label)
+    assert.equal(columns(database, 'ifind_market_case_runs').length, 0, label)
+    database.close()
+  }
+}
+
 function testTwoConnectionReservationAndStaleRecovery() {
   const databases = createFileDatabases()
   try {
@@ -491,6 +538,57 @@ async function testTrueTwoConnectionReservationRace() {
   }
 }
 
+function testQuotaStatusUsesOneReadSnapshot() {
+  const databases = createFileDatabases()
+  try {
+    databases.first.exec('PRAGMA journal_mode = WAL')
+    const reader = new IfindMarketDiagnosticRepository(databases.first)
+    const writer = new IfindMarketDiagnosticRepository(databases.second)
+    reader.initialize()
+    writer.initialize()
+
+    const originalPrepare = databases.first.prepare.bind(databases.first)
+    let injected = false
+    let writerResult = null
+    databases.first.prepare = function interceptedPrepare(sql) {
+      const statement = originalPrepare(sql)
+      if (!injected && String(sql).includes(
+        'WHERE case_id = ? AND created_at >= ? AND created_at < ?'
+      )) {
+        return {
+          get(...parameters) {
+            const row = statement.get(...parameters)
+            injected = true
+            writerResult = writer.reserve(reservationInput(
+              16,
+              CASES[0],
+              DAY_START + 3 * MINUTE
+            ))
+            return row
+          }
+        }
+      }
+      return statement
+    }
+    const status = reader.quotaStatus({
+      caseId: CASES[0],
+      now: DAY_START + 3 * MINUTE
+    })
+    databases.first.prepare = originalPrepare
+    assert.equal(injected, true)
+    assert.equal(writerResult.status, 'reserved')
+    const beforeSnapshot = status.caseAttemptCount === 0 &&
+      status.globalAttemptCount === 0 && status.inFlight === false
+    const afterSnapshot = status.caseAttemptCount === 1 &&
+      status.globalAttemptCount === 1 && status.inFlight === true
+    assert.equal(beforeSnapshot || afterSnapshot, true, JSON.stringify(status))
+    assert.equal(status.caseRemaining, 5 - status.caseAttemptCount)
+    assert.equal(status.globalRemaining, 12 - status.globalAttemptCount)
+  } finally {
+    databases.close()
+  }
+}
+
 function testLeaseBoundaryAndExpiredWorker() {
   const database = openDatabase()
   const repository = new IfindMarketDiagnosticRepository(database)
@@ -552,6 +650,56 @@ function testDelayedStaleRecoveryUsesLeaseBoundary() {
     now: delayedRecoveryAt
   }).cooldownUntil, null)
   assert.equal(failReservation(repository, recovered).status, 'completed')
+  database.close()
+}
+
+function testTimestampHeadroomAndOverflowRejection() {
+  assert.equal(Number.isSafeInteger(IFIND_MARKET_MAX_CREATED_AT), true)
+  assert.equal(Number.isSafeInteger(IFIND_MARKET_MAX_DERIVED_TIMESTAMP), true)
+  assert.equal(
+    IFIND_MARKET_MAX_CREATED_AT + 30_000 + 5 * MINUTE <=
+      IFIND_MARKET_MAX_DERIVED_TIMESTAMP,
+    true
+  )
+  const database = openDatabase()
+  const repository = new IfindMarketDiagnosticRepository(database)
+  repository.initialize()
+  const boundary = reserve(
+    repository,
+    17,
+    CASES[0],
+    IFIND_MARKET_MAX_CREATED_AT
+  )
+  assert.equal(boundary.leaseExpiresAt <= IFIND_MARKET_MAX_DERIVED_TIMESTAMP, true)
+  assert.equal(repository.fail({
+    reservation: boundary,
+    result: failedResult(boundary.createdAt, {
+      completedAt: boundary.leaseExpiresAt,
+      elapsedMs: boundary.leaseExpiresAt - boundary.createdAt
+    })
+  }).cooldownUntil <= IFIND_MARKET_MAX_DERIVED_TIMESTAMP, true)
+
+  for (const invalidCreatedAt of [
+    IFIND_MARKET_MAX_CREATED_AT + 1,
+    IFIND_MARKET_MAX_DERIVED_TIMESTAMP,
+    Number.MAX_SAFE_INTEGER
+  ]) {
+    expectCode(
+      () => repository.reserve(reservationInput(
+        18,
+        CASES[1],
+        invalidCreatedAt
+      )),
+      'IFIND_MARKET_DIAGNOSTIC_REPOSITORY_INVALID'
+    )
+  }
+  expectCode(
+    () => repository.quotaStatus({
+      caseId: CASES[0],
+      now: IFIND_MARKET_MAX_CREATED_AT + 1
+    }),
+    'IFIND_MARKET_DIAGNOSTIC_REPOSITORY_INVALID'
+  )
   database.close()
 }
 
@@ -717,7 +865,70 @@ function testTransactionalChildFailureRollsBack() {
     SELECT COUNT(*) AS count FROM ifind_market_financial_points WHERE run_id = ?
   `).get(reservation.runId).count, 0)
   database.exec('DROP TRIGGER reject_market_quote_insert')
+
+  database.exec(`
+    CREATE TEMP TRIGGER reject_market_financial_insert
+    BEFORE INSERT ON ifind_market_financial_points
+    WHEN NEW.indicator_id = 'HK_GROSS_PROFIT'
+    BEGIN
+      SELECT RAISE(ABORT, 'forced financial child failure');
+    END
+  `)
+  assert.throws(() => repository.complete({
+    reservation,
+    result: completeResult(reservation.createdAt),
+    quoteSnapshot: quote(),
+    financialPoints: [
+      point(),
+      point({
+        indicatorId: 'HK_GROSS_PROFIT',
+        metricKey: 'grossProfit',
+        value: null,
+        availability: 'missing'
+      })
+    ]
+  }))
+  assert.deepEqual({ ...database.prepare(`
+    SELECT * FROM ifind_market_case_runs WHERE run_id = ?
+  `).get(reservation.runId) }, { ...before })
+  assert.equal(database.prepare(`
+    SELECT COUNT(*) AS count FROM ifind_market_quote_snapshots WHERE run_id = ?
+  `).get(reservation.runId).count, 0)
+  assert.equal(database.prepare(`
+    SELECT COUNT(*) AS count FROM ifind_market_financial_points WHERE run_id = ?
+  `).get(reservation.runId).count, 0)
+  database.exec('DROP TRIGGER reject_market_financial_insert')
   assert.equal(failReservation(repository, reservation).status, 'completed')
+  database.close()
+}
+
+function testCanonicalCatalogIdentityAndReportingCurrency() {
+  const catalog = listIfindMarketCases()
+  assert.equal(catalog.length, 3)
+  assert.equal(catalog.every((marketCase) => marketCase.liveReady === false), true)
+  const marketCase = catalog.find(({ caseId }) => caseId === CASES[0])
+  const financialMetric = marketCase.indicators.financial[0].metric
+  const database = openDatabase()
+  const repository = new IfindMarketDiagnosticRepository(database)
+  repository.initialize()
+  const reservation = reserve(repository, 81, marketCase.caseId, DAY_START + 95 * MINUTE)
+  assert.equal(repository.complete({
+    reservation,
+    result: completeResult(reservation.createdAt),
+    quoteSnapshot: quote({
+      listingId: marketCase.listingId,
+      displayCode: marketCase.displayCode,
+      currency: marketCase.expectedTradingCurrency
+    }),
+    financialPoints: [point({
+      metricKey: financialMetric,
+      currency: 'CNY'
+    })]
+  }).status, 'completed')
+  assert.equal(
+    repository.latest({ caseId: marketCase.caseId }).financialPoints[0].currency,
+    'CNY'
+  )
   database.close()
 }
 
@@ -961,13 +1172,17 @@ function testTerminalValidationRollbackAndRawRejection() {
 async function run() {
   const tests = [
     ['schema identity and legacy compatibility', testSchemaIdentityAndLegacyCompatibility],
+    ['zero identity rejects unknown schema objects', testZeroIdentityRejectsUnknownUserSchemaObjects],
     ['two-connection reservation and stale recovery', testTwoConnectionReservationAndStaleRecovery],
     ['true two-connection reservation race', testTrueTwoConnectionReservationRace],
+    ['quota status uses one read snapshot', testQuotaStatusUsesOneReadSnapshot],
     ['lease boundary and expired worker', testLeaseBoundaryAndExpiredWorker],
     ['delayed stale recovery uses lease boundary', testDelayedStaleRecoveryUsesLeaseBoundary],
+    ['timestamp headroom and overflow rejection', testTimestampHeadroomAndOverflowRejection],
     ['Shanghai day rollover and quotas', testShanghaiDayRolloverAndQuotas],
     ['terminal snapshots, queries, and replacement', testTerminalSnapshotsQueriesAndReplacement],
     ['transactional child failure rollback', testTransactionalChildFailureRollsBack],
+    ['canonical catalog identity and reporting currency', testCanonicalCatalogIdentityAndReportingCurrency],
     ['terminal validation, rollback, and raw rejection', testTerminalValidationRollbackAndRawRejection]
   ]
   for (const [label, test] of tests) {

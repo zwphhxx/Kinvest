@@ -5,9 +5,11 @@ const { types } = require('node:util')
 const {
   DeviceAuthDatabaseIdentityError,
   KINVEST_SQLITE_APPLICATION_ID,
+  hasStrictLegacyDeviceSchema,
   readApplicationId,
   setKinvestApplicationId
 } = require('./database-identity')
+const { listIfindMarketCases } = require('../domain/ifind-market-cases')
 
 const IFIND_MARKET_CASE_COOLDOWN_MS = 5 * 60_000
 const IFIND_MARKET_CASE_DAILY_LIMIT = 5
@@ -15,25 +17,33 @@ const IFIND_MARKET_GLOBAL_DAILY_LIMIT = 12
 const IFIND_MARKET_DIAGNOSTIC_LEASE_MS = 30_000
 const IFIND_MARKET_HISTORY_LIMIT = 50
 const SHANGHAI_DAY_MS = 24 * 60 * 60_000
+const IFIND_MARKET_MIN_DERIVED_TIMESTAMP = Date.parse('1999-12-31T00:00:00.000Z')
+const IFIND_MARKET_MIN_CREATED_AT = Date.parse('2000-01-01T00:00:00.000Z')
+const IFIND_MARKET_MAX_DERIVED_TIMESTAMP =
+  Date.parse('2100-01-02T00:00:00.000Z') - 1
+const IFIND_MARKET_MAX_CREATED_AT = IFIND_MARKET_MAX_DERIVED_TIMESTAMP -
+  SHANGHAI_DAY_MS - IFIND_MARKET_CASE_COOLDOWN_MS -
+  IFIND_MARKET_DIAGNOSTIC_LEASE_MS
 
-const CASES = Object.freeze({
-  HK_ALIBABA_9988: Object.freeze({
-    listingId: 'listing-hkex-9988',
-    displayCode: '9988.HK',
-    currency: 'HKD'
-  }),
-  US_APPLE_AAPL: Object.freeze({
-    listingId: 'listing-nasdaq-aapl',
-    displayCode: 'AAPL.US',
-    currency: 'USD'
-  }),
-  CN_MOUTAI_600519: Object.freeze({
-    listingId: 'listing-sse-600519',
-    displayCode: '600519.SH',
-    currency: 'CNY'
+const CATALOG_CASES = listIfindMarketCases()
+const CASES = Object.freeze(Object.fromEntries(CATALOG_CASES.map((marketCase) => [
+  marketCase.caseId,
+  Object.freeze({
+    listingId: marketCase.listingId,
+    displayCode: marketCase.displayCode,
+    expectedTradingCurrency: marketCase.expectedTradingCurrency
   })
-})
+])))
 const CASE_IDS = new Set(Object.keys(CASES))
+const METRIC_KEYS = Object.freeze(
+  CATALOG_CASES[0].indicators.financial.map((indicator) => indicator.metric)
+)
+for (const marketCase of CATALOG_CASES) {
+  const metrics = marketCase.indicators.financial.map((indicator) => indicator.metric)
+  if (JSON.stringify(metrics) !== JSON.stringify(METRIC_KEYS)) {
+    throw new Error('Fixed iFinD market cases have inconsistent financial metrics')
+  }
+}
 const SAFE_ERROR_CLASSES = new Set([
   'AUTH',
   'PERMISSION',
@@ -48,15 +58,6 @@ const SAFE_ERROR_CLASSES = new Set([
   'PERIOD_UNVERIFIED'
 ])
 const DATA_STATUSES = new Set(['available', 'unavailable', 'not_run'])
-const METRIC_KEYS = new Set([
-  'revenue',
-  'grossProfit',
-  'attributableNetProfit',
-  'operatingCashFlow',
-  'receivables',
-  'inventory',
-  'interestBearingDebt'
-])
 const TRADING_STATUSES = new Set(['trading', 'halted', 'closed'])
 const PERIOD_TYPES = new Set(['annual', 'interim'])
 const RUN_ID_PATTERN = /^market_run_[a-f0-9]{24,64}$/
@@ -66,7 +67,41 @@ const INDICATOR_ID_PATTERN = /^[A-Z0-9_]{1,80}$/
 const REPORT_PERIOD_PATTERN = /^20[0-9]{2}(?:Q[1-3]|H1|FY)$/
 const CALENDAR_DATE_PATTERN = /^(20[0-9]{2})-([0-9]{2})-([0-9]{2})$/
 const ISO_TIMESTAMP_PATTERN = /^(20[0-9]{2})-([0-9]{2})-([0-9]{2})T([0-9]{2}):([0-9]{2}):([0-9]{2})(?:\.([0-9]{3}))?(Z|([+-])([0-9]{2}):([0-9]{2}))$/
-const MAX_TIMESTAMP = 8_640_000_000_000_000
+
+function sqlList(values) {
+  return values.map((value) => `'${String(value).replaceAll("'", "''")}'`).join(', ')
+}
+
+const CASE_ID_SQL = sqlList(Object.keys(CASES))
+const TRADING_CURRENCY_SQL = sqlList([
+  ...new Set(Object.values(CASES).map((identity) =>
+    identity.expectedTradingCurrency))
+])
+const METRIC_KEY_SQL = sqlList(METRIC_KEYS)
+
+const RECOGNIZED_KINVEST_TABLES = new Set([
+  'admin_sessions',
+  'auth_rate_limits',
+  'admin_auth_audit',
+  'refresh_counters',
+  'manual_refresh_events',
+  'device_auth_requests',
+  'device_credentials',
+  'device_auth_audit',
+  'device_request_rate_limits',
+  'ifind_diagnostic_runs',
+  'ifind_diagnostic_control',
+  'ifind_market_case_runs',
+  'ifind_market_quote_snapshots',
+  'ifind_market_financial_points'
+])
+const RECOGNIZED_KINVEST_INDEXES = new Set([
+  'idx_device_credentials_hmac_version',
+  'idx_device_credentials_device',
+  'ifind_market_case_runs_one_pending',
+  'ifind_market_case_runs_case_created',
+  'ifind_market_case_runs_created'
+])
 
 const RUN_COLUMNS = [
   ['run_id', 'TEXT', 1, 1],
@@ -119,7 +154,7 @@ const FINANCIAL_COLUMNS = [
 const RUN_TABLE_DDL = `
   CREATE TABLE IF NOT EXISTS ifind_market_case_runs (
     run_id TEXT PRIMARY KEY NOT NULL,
-    case_id TEXT NOT NULL CHECK (case_id IN ('HK_ALIBABA_9988', 'US_APPLE_AAPL', 'CN_MOUTAI_600519')),
+    case_id TEXT NOT NULL CHECK (case_id IN (${CASE_ID_SQL})),
     status TEXT NOT NULL CHECK (status IN ('pending', 'complete', 'partial', 'failed')),
     quote_status TEXT NOT NULL CHECK (quote_status IN ('pending', 'available', 'unavailable', 'not_run')),
     finance_status TEXT NOT NULL CHECK (finance_status IN ('pending', 'available', 'unavailable', 'not_run')),
@@ -176,7 +211,7 @@ const QUOTE_TABLE_DDL = `
     turnover REAL NOT NULL CHECK (turnover >= 0),
     quote_time TEXT NOT NULL CHECK (length(quote_time) BETWEEN 20 AND 35),
     trading_status TEXT NOT NULL CHECK (trading_status IN ('trading', 'halted', 'closed')),
-    currency TEXT NOT NULL CHECK (currency IN ('HKD', 'USD', 'CNY')),
+    currency TEXT NOT NULL CHECK (currency IN (${TRADING_CURRENCY_SQL})),
     FOREIGN KEY (run_id) REFERENCES ifind_market_case_runs(run_id) ON DELETE CASCADE
   )
 `
@@ -184,16 +219,13 @@ const FINANCIAL_TABLE_DDL = `
   CREATE TABLE IF NOT EXISTS ifind_market_financial_points (
     run_id TEXT NOT NULL,
     indicator_id TEXT NOT NULL CHECK (length(indicator_id) BETWEEN 1 AND 80),
-    metric_key TEXT NOT NULL CHECK (metric_key IN (
-      'revenue', 'grossProfit', 'attributableNetProfit', 'operatingCashFlow',
-      'receivables', 'inventory', 'interestBearingDebt'
-    )),
+    metric_key TEXT NOT NULL CHECK (metric_key IN (${METRIC_KEY_SQL})),
     report_period TEXT NOT NULL CHECK (length(report_period) BETWEEN 4 AND 8),
     period_end TEXT NOT NULL CHECK (length(period_end) = 10),
     period_type TEXT NOT NULL CHECK (period_type IN ('annual', 'interim')),
     value REAL,
     availability TEXT NOT NULL CHECK (availability IN ('available', 'missing')),
-    currency TEXT NOT NULL CHECK (currency IN ('HKD', 'USD', 'CNY')),
+    currency TEXT NOT NULL CHECK (length(currency) = 3 AND currency NOT GLOB '*[^A-Z]*'),
     unit TEXT NOT NULL CHECK (unit = 'million'),
     disclosure_scope TEXT NOT NULL CHECK (length(disclosure_scope) BETWEEN 1 AND 32),
     source_time TEXT NOT NULL CHECK (length(source_time) BETWEEN 20 AND 35),
@@ -281,8 +313,16 @@ function snapshotExactDataArray(value, maximumLength) {
   }
 }
 
-function isTimestamp(value) {
-  return Number.isSafeInteger(value) && value >= 0 && value <= MAX_TIMESTAMP
+function isDerivedTimestamp(value) {
+  return Number.isSafeInteger(value) &&
+    value >= IFIND_MARKET_MIN_DERIVED_TIMESTAMP &&
+    value <= IFIND_MARKET_MAX_DERIVED_TIMESTAMP
+}
+
+function isRunTimestamp(value) {
+  return Number.isSafeInteger(value) &&
+    value >= IFIND_MARKET_MIN_CREATED_AT &&
+    value <= IFIND_MARKET_MAX_CREATED_AT
 }
 
 function isNonNegativeInteger(value) {
@@ -369,7 +409,7 @@ function validateReservationInput(input) {
   if (!value) failInput()
   validateRunId(value.runId)
   validateCaseId(value.caseId)
-  if (!isTimestamp(value.createdAt)) failInput()
+  if (!isRunTimestamp(value.createdAt)) failInput()
   validateVersionId(value.tokenVersionId)
   return value
 }
@@ -381,7 +421,8 @@ function validateReservation(input) {
   if (!value) failInput()
   validateRunId(value.runId)
   validateCaseId(value.caseId)
-  if (!isTimestamp(value.createdAt) || !isTimestamp(value.leaseExpiresAt) ||
+  if (!isRunTimestamp(value.createdAt) ||
+      !isDerivedTimestamp(value.leaseExpiresAt) ||
       value.leaseExpiresAt !== value.createdAt + IFIND_MARKET_DIAGNOSTIC_LEASE_MS) {
     failInput()
   }
@@ -401,7 +442,8 @@ function validateTerminalResult(input) {
       !Number.isSafeInteger(result.requestCount) || result.requestCount < 0 ||
       result.requestCount > 5 ||
       (result.dataVol !== null && !isNonNegativeInteger(result.dataVol)) ||
-      !isNonNegativeInteger(result.elapsedMs) || !isTimestamp(result.completedAt) ||
+      !isNonNegativeInteger(result.elapsedMs) ||
+      !isDerivedTimestamp(result.completedAt) ||
       (result.vendorErrorCode !== null && !Number.isSafeInteger(result.vendorErrorCode))) {
     failInput()
   }
@@ -433,7 +475,8 @@ function validateQuoteSnapshot(input, caseId) {
   ])
   const identity = CASES[caseId]
   if (!quote || quote.listingId !== identity.listingId ||
-      quote.displayCode !== identity.displayCode || quote.currency !== identity.currency ||
+      quote.displayCode !== identity.displayCode ||
+      quote.currency !== identity.expectedTradingCurrency ||
       !TRADING_STATUSES.has(quote.tradingStatus) || !isIsoTimestamp(quote.quoteTime)) {
     failInput()
   }
@@ -445,7 +488,7 @@ function validateQuoteSnapshot(input, caseId) {
   return quote
 }
 
-function validateFinancialPoint(input, caseId) {
+function validateFinancialPoint(input) {
   const point = snapshotExactDataObject(input, [
     'indicatorId', 'metricKey', 'reportPeriod', 'periodEnd', 'periodType',
     'value', 'availability', 'currency', 'unit', 'disclosureScope',
@@ -453,12 +496,13 @@ function validateFinancialPoint(input, caseId) {
   ])
   if (!point || typeof point.indicatorId !== 'string' ||
       !INDICATOR_ID_PATTERN.test(point.indicatorId) ||
-      !METRIC_KEYS.has(point.metricKey) ||
+      !METRIC_KEYS.includes(point.metricKey) ||
       typeof point.reportPeriod !== 'string' ||
       !REPORT_PERIOD_PATTERN.test(point.reportPeriod) ||
       !isCalendarDate(point.periodEnd) || !PERIOD_TYPES.has(point.periodType) ||
       !['available', 'missing'].includes(point.availability) ||
-      point.currency !== CASES[caseId].currency || point.unit !== 'million' ||
+      typeof point.currency !== 'string' || !/^[A-Z]{3}$/.test(point.currency) ||
+      point.unit !== 'million' ||
       typeof point.disclosureScope !== 'string' ||
       !/^[a-z][a-z_]{0,31}$/.test(point.disclosureScope) ||
       !isIsoTimestamp(point.sourceTime) || !isIsoTimestamp(point.fetchTime)) failInput()
@@ -468,13 +512,13 @@ function validateFinancialPoint(input, caseId) {
   return point
 }
 
-function validateFinancialPoints(input, caseId) {
+function validateFinancialPoints(input) {
   const values = snapshotExactDataArray(input, 64)
   if (!values) failInput()
   const points = []
   const identities = new Set()
   for (const value of values) {
-    const point = validateFinancialPoint(value, caseId)
+    const point = validateFinancialPoint(value)
     const identity = `${point.indicatorId}\u0000${point.periodEnd}\u0000${point.periodType}`
     if (identities.has(identity)) failInput()
     identities.add(identity)
@@ -495,10 +539,7 @@ function validateCompletionInput(input) {
   const quoteSnapshot = result.quoteStatus === 'available'
     ? validateQuoteSnapshot(value.quoteSnapshot, reservation.caseId)
     : value.quoteSnapshot === null ? null : failInput()
-  const financialPoints = validateFinancialPoints(
-    value.financialPoints,
-    reservation.caseId
-  )
+  const financialPoints = validateFinancialPoints(value.financialPoints)
   if ((result.financeStatus === 'available' && financialPoints.length === 0) ||
       (result.financeStatus !== 'available' && financialPoints.length !== 0)) failInput()
   return { reservation, result, quoteSnapshot, financialPoints }
@@ -660,7 +701,7 @@ function validateSchema(database) {
   }
   const sql = rows.map((row) => String(row.sql || '')).join('\n')
   for (const fragment of [
-    "case_id IN ('HK_ALIBABA_9988', 'US_APPLE_AAPL', 'CN_MOUTAI_600519')",
+    `case_id IN (${CASE_ID_SQL})`,
     "status IN ('pending', 'complete', 'partial', 'failed')",
     'request_count BETWEEN 0 AND 5',
     "availability = 'missing' AND value IS NULL",
@@ -695,13 +736,28 @@ const SHANGHAI_FORMATTER = new Intl.DateTimeFormat('en-CA', {
 })
 
 function shanghaiDay(timestamp) {
+  if (!isDerivedTimestamp(timestamp)) failInput()
   const values = Object.create(null)
   for (const part of SHANGHAI_FORMATTER.formatToParts(new Date(timestamp))) {
     values[part.type] = part.value
   }
   const dayKey = `${values.year}-${values.month}-${values.day}`
   const dayStart = Date.parse(`${dayKey}T00:00:00+08:00`)
-  return { dayKey, dayStart, nextDayStart: dayStart + SHANGHAI_DAY_MS }
+  const nextDayStart = dayStart + SHANGHAI_DAY_MS
+  if (!isDerivedTimestamp(dayStart) || !isDerivedTimestamp(nextDayStart)) failInput()
+  return { dayKey, dayStart, nextDayStart }
+}
+
+function canClaimZeroApplicationId(database) {
+  const objects = database.prepare(`
+    SELECT type, name FROM sqlite_schema
+    WHERE name NOT LIKE 'sqlite_%'
+  `).all()
+  if (objects.length === 0) return true
+  if (!hasStrictLegacyDeviceSchema(database)) return false
+  return objects.every((object) =>
+    (object.type === 'table' && RECOGNIZED_KINVEST_TABLES.has(object.name)) ||
+    (object.type === 'index' && RECOGNIZED_KINVEST_INDEXES.has(object.name)))
 }
 
 function mapQuote(row) {
@@ -785,12 +841,31 @@ class IfindMarketDiagnosticRepository {
     }
   }
 
+  #withDeferredReadTransaction(operation) {
+    this.#database.exec('BEGIN DEFERRED')
+    try {
+      const result = operation()
+      this.#database.exec('COMMIT')
+      return result
+    } catch (error) {
+      try {
+        this.#database.exec('ROLLBACK')
+      } catch {
+        // Best-effort cleanup must not replace the stable repository result.
+      }
+      throw error
+    }
+  }
+
   initialize() {
     this.#database.exec('PRAGMA busy_timeout = 5000')
     this.#database.exec('PRAGMA foreign_keys = ON')
     this.#withImmediateTransaction(() => {
       const applicationId = readApplicationId(this.#database)
       if (applicationId === 0) {
+        if (!canClaimZeroApplicationId(this.#database)) {
+          throw new DeviceAuthDatabaseIdentityError()
+        }
         setKinvestApplicationId(this.#database)
       } else if (applicationId !== KINVEST_SQLITE_APPLICATION_ID) {
         throw new DeviceAuthDatabaseIdentityError()
@@ -836,6 +911,7 @@ class IfindMarketDiagnosticRepository {
 
   #recoverStale(row, recoveredAt) {
     const completedAt = row.lease_expires_at
+    if (!isDerivedTimestamp(completedAt)) failSchema()
     const update = this.#database.prepare(`
       UPDATE ifind_market_case_runs
       SET status = 'failed', quote_status = 'not_run',
@@ -870,6 +946,9 @@ class IfindMarketDiagnosticRepository {
     const cooldownCandidate = latestTerminal
       ? latestTerminal.completed_at + IFIND_MARKET_CASE_COOLDOWN_MS
       : null
+    if (cooldownCandidate !== null && !isDerivedTimestamp(cooldownCandidate)) {
+      failSchema()
+    }
     const pending = this.#readPending()
     const activePending = pending && now < pending.lease_expires_at ? pending : null
     return {
@@ -940,6 +1019,7 @@ class IfindMarketDiagnosticRepository {
       }
 
       const leaseExpiresAt = request.createdAt + IFIND_MARKET_DIAGNOSTIC_LEASE_MS
+      if (!isDerivedTimestamp(leaseExpiresAt)) failInput()
       const insert = this.#database.prepare(`
         INSERT INTO ifind_market_case_runs (
           run_id, case_id, status, quote_status, finance_status,
@@ -1055,9 +1135,11 @@ class IfindMarketDiagnosticRepository {
       if (update.changes !== 1) failSchema()
       if (quoteSnapshot) this.#insertQuote(reservation.runId, quoteSnapshot)
       this.#insertFinancialPoints(reservation.runId, financialPoints)
+      const cooldownUntil = result.completedAt + IFIND_MARKET_CASE_COOLDOWN_MS
+      if (!isDerivedTimestamp(cooldownUntil)) failSchema()
       return {
         status: 'completed',
-        cooldownUntil: result.completedAt + IFIND_MARKET_CASE_COOLDOWN_MS
+        cooldownUntil
       }
     })
   }
@@ -1124,8 +1206,9 @@ class IfindMarketDiagnosticRepository {
     const value = snapshotExactDataObject(input, ['caseId', 'now'])
     if (!value) failInput()
     validateCaseId(value.caseId)
-    if (!isTimestamp(value.now)) failInput()
-    return this.#readQuota(value.caseId, value.now)
+    if (!isRunTimestamp(value.now)) failInput()
+    return this.#withDeferredReadTransaction(() =>
+      this.#readQuota(value.caseId, value.now))
   }
 }
 
@@ -1134,6 +1217,8 @@ module.exports = {
   IFIND_MARKET_CASE_DAILY_LIMIT,
   IFIND_MARKET_DIAGNOSTIC_LEASE_MS,
   IFIND_MARKET_GLOBAL_DAILY_LIMIT,
+  IFIND_MARKET_MAX_CREATED_AT,
+  IFIND_MARKET_MAX_DERIVED_TIMESTAMP,
   IfindMarketDiagnosticRepository,
   IfindMarketDiagnosticRepositoryError,
   IfindMarketDiagnosticRepositorySchemaError
