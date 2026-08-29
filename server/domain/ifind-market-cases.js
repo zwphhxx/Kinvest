@@ -1,7 +1,13 @@
 'use strict'
 
+const {
+  validateLiveRequestManifestDefinition
+} = require('./ifind-market-manifest-validator')
+
 const IFIND_MARKET_CASE_UNVERIFIED = 'IFIND_MARKET_CASE_UNVERIFIED'
 const IFIND_MARKET_CASE_UNKNOWN = 'IFIND_MARKET_CASE_UNKNOWN'
+const IFIND_MARKET_CASE_ID_INVALID = 'IFIND_MARKET_CASE_ID_INVALID'
+const CASE_ID_PATTERN = /^(?:HK|US|CN)_[A-Z][A-Z0-9]{0,31}_[A-Z0-9]{1,16}$/
 
 const SUPPORTED_ENDPOINTS = new Set([
   '/api/v1/real_time_quotation',
@@ -143,23 +149,12 @@ const MARKET_CASES = deepFreeze([
   })
 ])
 
-function allIndicatorsVerified(marketCase) {
-  return Object.values(marketCase.indicators)
-    .flat()
-    .every((indicator) => indicator.evidenceStatus === 'verified' &&
-      typeof indicator.vendorIndicatorId === 'string' &&
-      indicator.vendorIndicatorId.length > 0)
-}
-
 function caseHasVerifiedRequestEvidence(marketCase) {
-  return marketCase.vendorCodes.ifind.evidenceStatus === 'verified' &&
-    typeof marketCase.vendorCodes.ifind.code === 'string' &&
-    marketCase.vendorCodes.ifind.code.length > 0 &&
-    Object.values(marketCase.requestTemplates)
-      .every((request) => request.evidenceStatus === 'verified') &&
-    marketCase.periodRules.evidenceStatus === 'verified' &&
-    marketCase.periodRules.vendorParameters !== null &&
-    allIndicatorsVerified(marketCase)
+  try {
+    return validateLiveRequestManifestDefinition(marketCase)
+  } catch {
+    return false
+  }
 }
 
 function validateCatalog(catalog) {
@@ -204,13 +199,24 @@ function listIfindMarketCases() {
   return cloneFrozen(MARKET_CASES)
 }
 
+function requireValidCaseId(caseId) {
+  if (typeof caseId !== 'string' || caseId.length > 64 || !CASE_ID_PATTERN.test(caseId)) {
+    const error = new Error('Invalid fixed iFinD market case ID')
+    error.code = IFIND_MARKET_CASE_ID_INVALID
+    throw error
+  }
+  return caseId
+}
+
 function getIfindMarketCase(caseId) {
-  const marketCase = MARKET_CASES.find((candidate) => candidate.caseId === caseId)
+  const validCaseId = requireValidCaseId(caseId)
+  const marketCase = MARKET_CASES.find((candidate) => candidate.caseId === validCaseId)
   return marketCase ? cloneFrozen(marketCase) : null
 }
 
 function createLiveRequestManifest(caseId) {
-  const marketCase = MARKET_CASES.find((candidate) => candidate.caseId === caseId)
+  const validCaseId = requireValidCaseId(caseId)
+  const marketCase = MARKET_CASES.find((candidate) => candidate.caseId === validCaseId)
   if (!marketCase) {
     const error = new Error('Unknown fixed iFinD market case')
     error.code = IFIND_MARKET_CASE_UNKNOWN

@@ -8,6 +8,32 @@ const {
   getIfindMarketCase,
   listIfindMarketCases
 } = require('../domain/ifind-market-cases')
+const {
+  validateLiveRequestManifestDefinition
+} = require('../domain/ifind-market-manifest-validator')
+
+const REQUIRED_QUOTE_METRICS = [
+  'latestPrice',
+  'previousClose',
+  'open',
+  'high',
+  'low',
+  'volume',
+  'turnover',
+  'quoteTime',
+  'tradingStatus',
+  'currency'
+]
+
+const REQUIRED_FINANCIAL_METRICS = [
+  'revenue',
+  'grossProfit',
+  'attributableNetProfit',
+  'operatingCashFlow',
+  'receivables',
+  'inventory',
+  'interestBearingDebt'
+]
 
 const EXPECTED_CASES = [
   {
@@ -52,7 +78,173 @@ function assertDeepFrozen(value) {
   }
 }
 
+function verifiedIndicator(metric, family) {
+  return {
+    metric,
+    vendorIndicatorId: `FIXTURE_${family}_${metric}`,
+    evidenceStatus: 'verified'
+  }
+}
+
+function completeVerifiedManifestDefinition() {
+  const quote = REQUIRED_QUOTE_METRICS.map((metric) => verifiedIndicator(metric, 'QUOTE'))
+  const financial = REQUIRED_FINANCIAL_METRICS.map((metric) => verifiedIndicator(metric, 'FINANCIAL'))
+  return {
+    vendorCodes: {
+      ifind: {
+        code: 'FIXTURE_VENDOR_CODE',
+        evidenceStatus: 'verified'
+      }
+    },
+    requestTemplates: {
+      quote: {
+        endpoint: '/api/v1/real_time_quotation',
+        fields: quote.map((indicator) => indicator.vendorIndicatorId),
+        evidenceStatus: 'verified'
+      },
+      financial: {
+        endpoint: '/api/v1/basic_data_service',
+        indicatorIds: financial.map((indicator) => indicator.vendorIndicatorId),
+        evidenceStatus: 'verified'
+      }
+    },
+    indicators: { quote, financial },
+    periodRules: {
+      fullFiscalYears: 2,
+      includeLatestDisclosedInterim: true,
+      vendorParameters: {
+        fullFiscalYears: {
+          count: 2,
+          requestParameters: { reportPeriod: 'FIXTURE_ANNUAL' }
+        },
+        latestDisclosedInterim: {
+          enabled: true,
+          requestParameters: { reportPeriod: 'FIXTURE_INTERIM' }
+        }
+      },
+      evidenceStatus: 'verified'
+    }
+  }
+}
+
+function removeMetric(family, metric) {
+  return (manifest) => {
+    manifest.indicators[family] = manifest.indicators[family]
+      .filter((indicator) => indicator.metric !== metric)
+  }
+}
+
+function assertInvalidManifest(candidate, name) {
+  assert.throws(
+    () => validateLiveRequestManifestDefinition(candidate),
+    (error) => error && error.code === 'IFIND_MARKET_MANIFEST_INVALID',
+    name
+  )
+}
+
 async function run() {
+  assert.equal(validateLiveRequestManifestDefinition(completeVerifiedManifestDefinition()), true)
+
+  const corruptions = [
+    ...REQUIRED_QUOTE_METRICS.map((metric) => [
+      `missing quote metric ${metric}`,
+      removeMetric('quote', metric)
+    ]),
+    ...REQUIRED_FINANCIAL_METRICS.map((metric) => [
+      `missing financial metric ${metric}`,
+      removeMetric('financial', metric)
+    ]),
+    ['empty quote evidence', (manifest) => { manifest.indicators.quote = [] }],
+    ['empty financial evidence', (manifest) => { manifest.indicators.financial = [] }],
+    ['empty quote request fields', (manifest) => { manifest.requestTemplates.quote.fields = [] }],
+    ['empty financial request IDs', (manifest) => { manifest.requestTemplates.financial.indicatorIds = [] }],
+    ['mismatched quote request ID', (manifest) => { manifest.requestTemplates.quote.fields[0] = 'FIXTURE_MISMATCH' }],
+    ['mismatched financial request ID', (manifest) => { manifest.requestTemplates.financial.indicatorIds[0] = 'FIXTURE_MISMATCH' }],
+    ['whitespace quote provider ID', (manifest) => {
+      manifest.indicators.quote[0].vendorIndicatorId = '   '
+      manifest.requestTemplates.quote.fields[0] = '   '
+    }],
+    ['whitespace financial provider ID', (manifest) => {
+      manifest.indicators.financial[0].vendorIndicatorId = '\t'
+      manifest.requestTemplates.financial.indicatorIds[0] = '\t'
+    }],
+    ['duplicate quote provider ID', (manifest) => {
+      manifest.indicators.quote[1].vendorIndicatorId = manifest.indicators.quote[0].vendorIndicatorId
+      manifest.requestTemplates.quote.fields[1] = manifest.requestTemplates.quote.fields[0]
+    }],
+    ['extra quote metric', (manifest) => {
+      manifest.indicators.quote.push(verifiedIndicator('unapprovedMetric', 'QUOTE'))
+      manifest.requestTemplates.quote.fields.push('FIXTURE_QUOTE_unapprovedMetric')
+    }],
+    ['missing period parameters', (manifest) => { delete manifest.periodRules.vendorParameters }],
+    ['undefined period parameters', (manifest) => { manifest.periodRules.vendorParameters = undefined }],
+    ['primitive period parameters', (manifest) => { manifest.periodRules.vendorParameters = true }],
+    ['empty annual request parameters', (manifest) => {
+      manifest.periodRules.vendorParameters.fullFiscalYears.requestParameters = {}
+    }],
+    ['missing interim period parameters', (manifest) => {
+      delete manifest.periodRules.vendorParameters.latestDisclosedInterim.requestParameters
+    }],
+    ['undefined provider parameter', (manifest) => {
+      manifest.periodRules.vendorParameters.fullFiscalYears.requestParameters.reportPeriod = undefined
+    }],
+    ['unrelated provider schema field', (manifest) => {
+      manifest.periodRules.vendorParameters.unrelated = 'configured'
+    }],
+    ['non-plain period parameters', (manifest) => {
+      manifest.periodRules.vendorParameters = new Date(0)
+    }],
+    ['proxied period parameters', (manifest) => {
+      manifest.periodRules.vendorParameters = new Proxy(
+        manifest.periodRules.vendorParameters,
+        {}
+      )
+    }],
+    ['proxied request fields', (manifest) => {
+      manifest.requestTemplates.quote.fields = new Proxy(
+        manifest.requestTemplates.quote.fields,
+        {}
+      )
+    }],
+    ['whitespace vendor code', (manifest) => { manifest.vendorCodes.ifind.code = '  ' }],
+    ['missing quote template', (manifest) => { delete manifest.requestTemplates.quote }],
+    ['primitive indicators', (manifest) => { manifest.indicators = 'verified' }]
+  ]
+
+  for (const [name, corrupt] of corruptions) {
+    const manifest = completeVerifiedManifestDefinition()
+    corrupt(manifest)
+    assertInvalidManifest(manifest, name)
+  }
+
+  let accessorRead = false
+  const accessorManifest = completeVerifiedManifestDefinition()
+  Object.defineProperty(accessorManifest.periodRules, 'vendorParameters', {
+    enumerable: true,
+    get() {
+      accessorRead = true
+      return completeVerifiedManifestDefinition().periodRules.vendorParameters
+    }
+  })
+  assertInvalidManifest(accessorManifest, 'accessor-backed period parameters')
+  assert.equal(accessorRead, false)
+
+  let nestedAccessorRead = false
+  const nestedAccessorManifest = completeVerifiedManifestDefinition()
+  Object.defineProperty(
+    nestedAccessorManifest.periodRules.vendorParameters.fullFiscalYears.requestParameters,
+    'reportPeriod',
+    {
+      enumerable: true,
+      get() {
+        nestedAccessorRead = true
+        return 'FIXTURE_ANNUAL'
+      }
+    }
+  )
+  assertInvalidManifest(nestedAccessorManifest, 'nested accessor-backed parameter')
+  assert.equal(nestedAccessorRead, false)
+
   const firstList = listIfindMarketCases()
   const secondList = listIfindMarketCases()
 
@@ -86,8 +278,43 @@ async function run() {
     assertDeepFrozen(marketCase)
   }
 
-  assert.equal(getIfindMarketCase('UNKNOWN_CASE'), null)
-  assert.equal(getIfindMarketCase('09888.HK'), null)
+  assert.equal(getIfindMarketCase('HK_UNKNOWN_0000'), null)
+  const invalidCaseIds = [
+    '09888.HK',
+    '',
+    'x'.repeat(65),
+    9988,
+    null,
+    undefined,
+    { caseId: 'HK_ALIBABA_9988' }
+  ]
+  for (const invalidCaseId of invalidCaseIds) {
+    const unsafeText = typeof invalidCaseId === 'string' && invalidCaseId.length > 0
+      ? invalidCaseId
+      : null
+    for (const lookup of [getIfindMarketCase, createLiveRequestManifest]) {
+      assert.throws(
+        () => lookup(invalidCaseId),
+        (error) => error &&
+          error.code === 'IFIND_MARKET_CASE_ID_INVALID' &&
+          !Object.hasOwn(error, 'caseId') &&
+          (unsafeText === null || !String(error.message).includes(unsafeText))
+      )
+    }
+  }
+
+  let hostileCaseIdRead = false
+  const hostileCaseId = {
+    get toString() {
+      hostileCaseIdRead = true
+      throw new Error('must not read hostile case ID')
+    }
+  }
+  assert.throws(
+    () => getIfindMarketCase(hostileCaseId),
+    (error) => error && error.code === 'IFIND_MARKET_CASE_ID_INVALID'
+  )
+  assert.equal(hostileCaseIdRead, false)
   assert.equal(firstList[0].formatAliases.includes('09988.HK'), true)
   assert.equal(firstList[0].formatAliases.includes('09888.HK'), false)
   assert.equal(
@@ -138,6 +365,19 @@ async function run() {
   assert.match(evidence, /unverified/i)
   assert.doesNotMatch(evidence, /refresh[_ -]?token|access[_ -]?token|requestid/i)
   assert.doesNotMatch(evidence, /TEST_ONLY_FIXTURE_ID/)
+  const confidentialAssignments = [
+    /password\s*[:=]\s*["'`]?\S+/i,
+    /client_secret\s*[:=]\s*["'`]?\S+/i,
+    /authorization\s*[:=]\s*(?:bearer|basic)\s+\S+/i,
+    /cookies?\s*[:=]\s*["'`]?\S+/i,
+    /usernames?\s*[:=]\s*["'`]?\S+/i,
+    /account[_ -]?id(?:entifier)?\s*[:=]\s*["'`]?\S+/i,
+    /(?:request|response|raw)[_ -]?headers?\s*[:=]/i,
+    /(?:raw[_ -]?payload|request[_ -]?body|response[_ -]?body)\s*[:=]/i
+  ]
+  for (const marker of confidentialAssignments) assert.doesNotMatch(evidence, marker)
+  assert.match(evidence, /redacted evidence summary/i)
+  assert.match(evidence, /no credentials, account identifiers, raw provider payloads/i)
 }
 
 module.exports = { run }
