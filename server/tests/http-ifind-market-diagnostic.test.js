@@ -2,6 +2,7 @@ const assert = require('node:assert/strict')
 const http = require('node:http')
 
 const { createRequestHandler } = require('../server')
+const { HttpBoundaryError } = require('../http/auth-http')
 
 const ORIGIN = 'https://dearmina.cn'
 const NOW = Date.UTC(2026, 7, 30, 8, 0, 0)
@@ -583,9 +584,12 @@ async function testStrictTrustedMutationBoundary() {
 }
 
 async function testUnavailableAndHostileRuntimeMappings() {
+  let disabledRunCalls = 0
   const disabledRuntime = {
     status: { mode: 'disabled', configured: false, versionId: null },
-    marketService: null
+    marketService: {
+      async run() { disabledRunCalls += 1 }
+    }
   }
   const disabledServer = await start({ marketRuntime: disabledRuntime })
   try {
@@ -604,23 +608,16 @@ async function testUnavailableAndHostileRuntimeMappings() {
     )
     assert.deepEqual(run.body, { error: 'IFIND_MARKET_DIAGNOSTIC_DISABLED' })
     assert.equal(run.status, 503)
+    assert.equal(disabledRunCalls, 0)
   } finally {
     await disabledServer.close()
   }
 
-  const unverifiedRuntime = createMarketRuntime({
-    outcome: {
-      status: 'rejected',
-      failureCode: 'IFIND_MARKET_CASE_UNVERIFIED',
-      safeErrorClass: 'CONFIG',
-      stage: 'catalog',
-      vendorErrorCode: null
-    }
-  })
-  delete unverifiedRuntime.marketService.latest
-  delete unverifiedRuntime.marketService.history
-  delete unverifiedRuntime.marketService.quotaStatus
-  const unavailableServer = await start({ marketRuntime: unverifiedRuntime })
+  const partialRuntime = createMarketRuntime()
+  delete partialRuntime.marketService.latest
+  delete partialRuntime.marketService.history
+  delete partialRuntime.marketService.quotaStatus
+  const unavailableServer = await start({ marketRuntime: partialRuntime })
   try {
     const list = await request(unavailableServer.baseUrl, '/api/admin/ifind/market-cases', {
       headers: { cookie: adminCookie() }
@@ -632,9 +629,26 @@ async function testUnavailableAndHostileRuntimeMappings() {
       { method: 'POST', headers: postHeaders(), body: '{}' }
     )
     assert.equal(run.status, 503)
-    assert.deepEqual(run.body, { error: 'IFIND_MARKET_CASE_UNAVAILABLE' })
+    assert.deepEqual(run.body, { error: 'IFIND_MARKET_DIAGNOSTIC_UNAVAILABLE' })
+    assert.equal(partialRuntime.calls.some(([name]) => name === 'run'), false)
   } finally {
     await unavailableServer.close()
+  }
+
+  const unverifiedRuntime = createMarketRuntime()
+  unverifiedRuntime.status.versionId = 'unverified'
+  const unverifiedServer = await start({ marketRuntime: unverifiedRuntime })
+  try {
+    const run = await request(
+      unverifiedServer.baseUrl,
+      '/api/admin/ifind/market-cases/HK_ALIBABA_9988/run',
+      { method: 'POST', headers: postHeaders(), body: '{}' }
+    )
+    assert.equal(run.status, 503)
+    assert.deepEqual(run.body, { error: 'IFIND_MARKET_DIAGNOSTIC_UNAVAILABLE' })
+    assert.equal(unverifiedRuntime.calls.some(([name]) => name === 'run'), false)
+  } finally {
+    await unverifiedServer.close()
   }
 
   for (const hostile of ['throw', 'extra', 'proxy', 'getter']) {
@@ -674,6 +688,129 @@ async function testUnavailableAndHostileRuntimeMappings() {
   }
 }
 
+function assertGenericBoundaryResponse(response, status, error) {
+  assert.equal(response.status, status)
+  assert.deepEqual(response.body, { error })
+  const serialized = JSON.stringify(response.body)
+  for (const marker of ['RequestId', 'token', 'secret', '418']) {
+    assert.equal(serialized.includes(marker), false, marker)
+  }
+}
+
+async function testDependencyErrorsCannotForgeHttpBoundary() {
+  const scenarios = [
+    {
+      name: 'same class',
+      create() {
+        return new HttpBoundaryError('RequestId_token_secret', 418)
+      }
+    },
+    {
+      name: 'same prototype with accessors',
+      create(state) {
+        const error = Object.create(HttpBoundaryError.prototype)
+        for (const key of ['code', 'status', 'message', 'name']) {
+          Object.defineProperty(error, key, {
+            get() {
+              state.reads += 1
+              return key === 'status' ? 418 : `RequestId_token_secret_${key}`
+            }
+          })
+        }
+        return error
+      }
+    },
+    {
+      name: 'proxy',
+      create(state) {
+        return new Proxy(Object.create(null), {
+          get() {
+            state.reads += 1
+            return 'RequestId_token_secret'
+          },
+          getPrototypeOf() {
+            state.reads += 1
+            return null
+          }
+        })
+      }
+    },
+    {
+      name: 'known dependency code',
+      create() {
+        return {
+          code: 'ADMIN_SESSION_EXPIRED',
+          message: 'RequestId token secret'
+        }
+      }
+    }
+  ]
+
+  for (const scenario of scenarios) {
+    for (const operation of ['latest', 'run']) {
+      const state = { reads: 0 }
+      const runtime = createMarketRuntime()
+      if (operation === 'latest') {
+        runtime.marketService.latest = () => { throw scenario.create(state) }
+      } else {
+        runtime.marketService.run = async () => { throw scenario.create(state) }
+      }
+      const running = await start({ marketRuntime: runtime })
+      try {
+        const response = operation === 'latest'
+          ? await request(
+              running.baseUrl,
+              '/api/admin/ifind/market-cases/HK_ALIBABA_9988',
+              { headers: { cookie: adminCookie() } }
+            )
+          : await request(
+              running.baseUrl,
+              '/api/admin/ifind/market-cases/HK_ALIBABA_9988/run',
+              { method: 'POST', headers: postHeaders(), body: '{}' }
+            )
+        assertGenericBoundaryResponse(response, 500, 'INTERNAL_ERROR')
+        assert.equal(state.reads, 0, `${scenario.name} ${operation}`)
+      } finally {
+        await running.close()
+      }
+    }
+  }
+
+  const authenticationRuntime = createAccessRuntime()
+  authenticationRuntime.adminAuth.authenticate = () => {
+    throw new HttpBoundaryError('RequestId_token_secret', 418)
+  }
+  const authenticationServer = await start({
+    accessRuntime: authenticationRuntime
+  })
+  try {
+    const response = await request(
+      authenticationServer.baseUrl,
+      '/api/admin/ifind/market-cases',
+      { headers: { cookie: adminCookie() } }
+    )
+    assertGenericBoundaryResponse(response, 401, 'ADMIN_AUTH_REQUIRED')
+  } finally {
+    await authenticationServer.close()
+  }
+
+  const csrfRuntime = createAccessRuntime()
+  csrfRuntime.adminAuth.verifyCsrf = () => {
+    throw new HttpBoundaryError('RequestId_token_secret', 418)
+  }
+  const csrfServer = await start({ accessRuntime: csrfRuntime })
+  try {
+    const response = await request(
+      csrfServer.baseUrl,
+      '/api/admin/ifind/market-cases/HK_ALIBABA_9988/run',
+      { method: 'POST', headers: postHeaders(), body: '{}' }
+    )
+    assertGenericBoundaryResponse(response, 403, 'ADMIN_CSRF_INVALID')
+  } finally {
+    await csrfServer.close()
+  }
+}
+
 async function testFamilyRoutesRemainDeviceOnlyMock() {
   const marketRuntime = createMarketRuntime()
   const running = await start({ marketRuntime })
@@ -708,6 +845,7 @@ async function run() {
   await testPrototypeAdministratorServiceComposition()
   await testStrictTrustedMutationBoundary()
   await testUnavailableAndHostileRuntimeMappings()
+  await testDependencyErrorsCannotForgeHttpBoundary()
   await testFamilyRoutesRemainDeviceOnlyMock()
 }
 

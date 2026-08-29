@@ -14,6 +14,7 @@ const { listIfindMarketCases } = require('../domain/ifind-market-cases')
 
 const ADMIN_COOKIE = '__Host-kinvest-admin'
 const COOKIE_HEADER_LIMIT = 4096
+const JSON_BODY_LIMIT = 4096
 const TOKEN_PATTERN = /^[A-Za-z0-9_-]{43}$/
 const VERSION_ID_PATTERN = /^v[0-9]{8}-[0-9]{3}$/
 const RUN_ID_PATTERN = /^market_run_[a-f0-9]{24,64}$/
@@ -76,9 +77,39 @@ const DUPLICATE_SENSITIVE_HEADERS = Object.freeze([
   'x-real-ip',
   'x-forwarded-for'
 ])
+const LOCAL_BOUNDARY_STATUS = new Map([
+  ['ACCESS_CONTROL_DISABLED', 503],
+  ['ADMIN_AUTH_REQUIRED', 401],
+  ['ADMIN_CSRF_INVALID', 403],
+  ['BODY_TOO_LARGE', 413],
+  ['CLIENT_IDENTITY_INVALID', 400],
+  ['COOKIE_INVALID', 400],
+  ['HEADER_INVALID', 400],
+  ['IFIND_MARKET_CASE_NOT_FOUND', 404],
+  ['INTERNAL_ERROR', 500],
+  ['JSON_INVALID', 400],
+  ['JSON_REQUIRED', 415],
+  ['NOT_FOUND', 404],
+  ['ORIGIN_INVALID', 403],
+  ['TRUSTED_CLIENT_REQUIRED', 403]
+])
+const LOCAL_BOUNDARY_ERRORS = new WeakSet()
+
+function createBoundaryError(code, status) {
+  const allowedStatus = LOCAL_BOUNDARY_STATUS.get(code)
+  const safeCode = allowedStatus === status ? code : 'INTERNAL_ERROR'
+  const safeStatus = allowedStatus === status ? status : 500
+  const error = new HttpBoundaryError(safeCode, safeStatus)
+  LOCAL_BOUNDARY_ERRORS.add(error)
+  return error
+}
+
+function isLocalBoundaryError(value) {
+  return LOCAL_BOUNDARY_ERRORS.has(value)
+}
 
 function boundaryError(code, status) {
-  throw new HttpBoundaryError(code, status)
+  throw createBoundaryError(code, status)
 }
 
 function sendJson(res, body, status = 200) {
@@ -175,7 +206,7 @@ function ownDataValue(value, key) {
       !Object.hasOwn(descriptor, 'value')) boundaryError('INTERNAL_ERROR', 500)
     return descriptor.value
   } catch (error) {
-    if (error instanceof HttpBoundaryError) throw error
+    if (isLocalBoundaryError(error)) throw error
     boundaryError('INTERNAL_ERROR', 500)
   }
 }
@@ -235,7 +266,7 @@ function exactData(value, keys) {
     for (const key of keys) result[key] = ownDataValue(value, key)
     return result
   } catch (error) {
-    if (error instanceof HttpBoundaryError) throw error
+    if (isLocalBoundaryError(error)) throw error
     boundaryError('INTERNAL_ERROR', 500)
   }
 }
@@ -262,7 +293,7 @@ function exactArray(value, maximumLength) {
     }
     return result
   } catch (error) {
-    if (error instanceof HttpBoundaryError) throw error
+    if (isLocalBoundaryError(error)) throw error
     boundaryError('INTERNAL_ERROR', 500)
   }
 }
@@ -517,11 +548,15 @@ function runtimeAccess(runtime) {
   }
   const modeProperty = optionalOwnDataValue(statusProperty.value, 'mode')
   const configuredProperty = optionalOwnDataValue(statusProperty.value, 'configured')
+  const versionProperty = optionalOwnDataValue(statusProperty.value, 'versionId')
   if (!modeProperty.found || modeProperty.value === 'disabled') {
     return { status: 'disabled', service: null, run: null, reader: null }
   }
   if (modeProperty.value !== 'admin-diagnostic' ||
-    !configuredProperty.found || configuredProperty.value !== true) {
+    !configuredProperty.found || configuredProperty.value !== true ||
+    !versionProperty.found ||
+    typeof versionProperty.value !== 'string' ||
+    !VERSION_ID_PATTERN.test(versionProperty.value)) {
     return { status: 'unavailable', service: null, run: null, reader: null }
   }
   const serviceProperty = optionalOwnDataValue(runtime, 'marketService')
@@ -544,8 +579,11 @@ function runtimeAccess(runtime) {
         quotaStatus: quotaProperty.value
       }
     : null
+  if (!run || !reader) {
+    return { status: 'unavailable', service: null, run: null, reader: null }
+  }
   return {
-    status: reader ? 'available' : 'unavailable',
+    status: 'available',
     service: serviceProperty.value,
     run,
     reader
@@ -553,17 +591,9 @@ function runtimeAccess(runtime) {
 }
 
 function safeError(error) {
-  if (error instanceof HttpBoundaryError) return error
-  const code = error && typeof error === 'object' &&
-    typeof error.code === 'string' ? error.code : 'INTERNAL_ERROR'
-  const mapping = {
-    ADMIN_CSRF_INVALID: [403, 'ADMIN_CSRF_INVALID'],
-    ADMIN_SESSION_EXPIRED: [401, 'ADMIN_AUTH_REQUIRED'],
-    ADMIN_SESSION_INVALID: [401, 'ADMIN_AUTH_REQUIRED'],
-    CLIENT_IDENTITY_INVALID: [400, 'CLIENT_IDENTITY_INVALID']
-  }
-  const resolved = mapping[code] || [500, 'INTERNAL_ERROR']
-  return new HttpBoundaryError(resolved[1], resolved[0])
+  return isLocalBoundaryError(error)
+    ? error
+    : createBoundaryError('INTERNAL_ERROR', 500)
 }
 
 function createIfindMarketDiagnosticHttpController({
@@ -593,7 +623,13 @@ function createIfindMarketDiagnosticHttpController({
   function authenticateAdmin(req, res) {
     requireEnabled()
     const token = rawAdminToken(req)
-    const authenticated = adminMethod('authenticate').call(admin, token)
+    const authenticate = adminMethod('authenticate')
+    let authenticated
+    try {
+      authenticated = authenticate.call(admin, token)
+    } catch {
+      boundaryError('ADMIN_AUTH_REQUIRED', 401)
+    }
     refreshAdminCookie(res, token, authenticated, now)
   }
 
@@ -604,7 +640,19 @@ function createIfindMarketDiagnosticHttpController({
     if (typeof csrf !== 'string' || !TOKEN_PATTERN.test(csrf)) {
       boundaryError('ADMIN_CSRF_INVALID', 403)
     }
-    const authenticated = adminMethod('verifyCsrf').call(admin, token, csrf)
+    const authenticate = adminMethod('authenticate')
+    try {
+      authenticate.call(admin, token)
+    } catch {
+      boundaryError('ADMIN_AUTH_REQUIRED', 401)
+    }
+    const verifyCsrf = adminMethod('verifyCsrf')
+    let authenticated
+    try {
+      authenticated = verifyCsrf.call(admin, token, csrf)
+    } catch {
+      boundaryError('ADMIN_CSRF_INVALID', 403)
+    }
     refreshAdminCookie(res, token, authenticated, now)
   }
 
@@ -619,11 +667,38 @@ function createIfindMarketDiagnosticHttpController({
   }
 
   function requireTrustedClient(req) {
-    const directAddress = canonicalIp(req && req.socket && req.socket.remoteAddress)
+    let directAddress
+    try {
+      directAddress = canonicalIp(req && req.socket && req.socket.remoteAddress)
+    } catch {
+      boundaryError('CLIENT_IDENTITY_INVALID', 400)
+    }
     if (!trustedDirectAddresses.has(directAddress)) {
       boundaryError('TRUSTED_CLIENT_REQUIRED', 403)
     }
-    resolveClientIdentity(req, { trustedProxyAddresses })
+    try {
+      resolveClientIdentity(req, { trustedProxyAddresses })
+    } catch {
+      boundaryError('CLIENT_IDENTITY_INVALID', 400)
+    }
+  }
+
+  async function parseLocalStrictJson(req) {
+    const type = req.headers['content-type']
+    if (typeof type !== 'string' ||
+      !/^application\/json(?:\s*;\s*charset=utf-8)?$/i.test(type)) {
+      boundaryError('JSON_REQUIRED', 415)
+    }
+    const declared = req.headers['content-length']
+    if (declared !== undefined &&
+      (!/^\d+$/.test(declared) || Number(declared) > JSON_BODY_LIMIT)) {
+      boundaryError('BODY_TOO_LARGE', 413)
+    }
+    try {
+      return await parseStrictJsonBody(req, { allowEmpty: false })
+    } catch {
+      boundaryError('JSON_INVALID', 400)
+    }
   }
 
   function requireCase(caseId) {
@@ -787,7 +862,7 @@ function createIfindMarketDiagnosticHttpController({
         `/api/admin/ifind/market-cases/${segments[4]}/run`
       )
       const catalogEntry = requireCase(segments[4])
-      const body = await parseStrictJsonBody(req, { allowEmpty: false })
+      const body = await parseLocalStrictJson(req)
       if (Reflect.ownKeys(body).length !== 0) boundaryError('JSON_INVALID', 400)
       const access = runtimeAccess(ifindDiagnosticRuntime)
       if (!access.run) {
