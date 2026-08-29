@@ -37,6 +37,7 @@ const tests = [
   require('./ifind-http-client.test'),
   require('./ifind-market-cases.test'),
   require('./ifind-market-quote-parser.test'),
+  require('./ifind-market-financial-parser.test'),
   require('./ifind-diagnostic-repository.test'),
   require('./ifind-diagnostic-service.test'),
   require('./ssm-material-generator.test'),
