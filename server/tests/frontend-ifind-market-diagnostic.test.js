@@ -123,6 +123,49 @@ function diagnosticDom() {
   }
 }
 
+function deferred() {
+  /** @type {(value: any) => void} */
+  let resolve = () => {}
+  /** @type {(reason: any) => void} */
+  let reject = () => {}
+  const promise = new Promise((resolvePromise, rejectPromise) => {
+    resolve = resolvePromise
+    reject = rejectPromise
+  })
+  return { promise, reject, resolve }
+}
+
+function controlledClock(start) {
+  let now = start
+  let nextId = 1
+  const timers = new Map()
+  const cleared = []
+  return {
+    now: () => now,
+    pending: () => timers.size,
+    cleared,
+    setTimeout(callback, delay) {
+      const id = nextId
+      nextId += 1
+      timers.set(id, { callback, dueAt: now + delay })
+      return id
+    },
+    clearTimeout(id) {
+      if (timers.delete(id)) cleared.push(id)
+    },
+    async advance(milliseconds) {
+      now += milliseconds
+      const due = [...timers.entries()]
+        .filter(([, timer]) => timer.dueAt <= now)
+        .sort((left, right) => left[1].dueAt - right[1].dueAt)
+      for (const [id, timer] of due) {
+        timers.delete(id)
+        await timer.callback()
+      }
+    }
+  }
+}
+
 async function run() {
   assert.equal(typeof adminContract.createIfindMarketDiagnosticView, 'function')
   assert.equal(typeof adminContract.createIfindMarketDiagnosticController, 'function')
@@ -156,6 +199,42 @@ async function run() {
   assert.deepEqual(runningView.cards.map((card) => card.run.label), [
     '等待当前诊断', '正在运行…', '等待当前诊断'
   ])
+
+  /** @type {Array<[number, string, string]>} */
+  const actualApiErrors = [
+    [429, 'IFIND_MARKET_CASE_DAILY_LIMIT', '此案例今日诊断次数已达上限。'],
+    [429, 'IFIND_MARKET_GLOBAL_DAILY_LIMIT', '今日三市场诊断总次数已达上限。'],
+    [409, 'IFIND_MARKET_CASE_UNAVAILABLE', '此固定案例尚未完成指标核验。'],
+    [409, 'IFIND_MARKET_DIAGNOSTIC_BUSY', '另一项市场诊断正在运行。'],
+    [429, 'IFIND_MARKET_DIAGNOSTIC_COOLDOWN', '此案例正在冷却，请稍后重试。']
+  ]
+  for (const [status, code, message] of actualApiErrors) {
+    assert.deepEqual(
+      adminContract.ifindMarketDiagnosticApiFailure(status, { error: code }),
+      { code, message, retryable: status >= 500 || code === 'IFIND_MARKET_DIAGNOSTIC_BUSY' ||
+        code === 'IFIND_MARKET_DIAGNOSTIC_COOLDOWN' }
+    )
+  }
+  assert.equal(
+    adminContract.ifindMarketDiagnosticApiFailure(429, {
+      error: 'IFIND_MARKET_DIAGNOSTIC_DAILY_LIMIT'
+    }).code,
+    'UNKNOWN'
+  )
+
+  const disabledView = adminContract.createIfindMarketDiagnosticView(payload({
+    runtimeStatus: 'disabled'
+  }), { now: NOW, dateText: String })
+  assert.equal(disabledView.statusLabel, '三市场诊断未启用')
+  assert.equal(disabledView.cards[0].run.label, '诊断未启用')
+  assert.match(disabledView.note, /后端未启用/)
+  const unavailableView = adminContract.createIfindMarketDiagnosticView(payload({
+    runtimeStatus: 'unavailable'
+  }), { now: NOW, dateText: String })
+  assert.equal(unavailableView.statusLabel, '三市场诊断状态不可用')
+  assert.equal(unavailableView.cards[0].run.label, '状态不可用')
+  assert.match(unavailableView.note, /无法确认/)
+  assert.notEqual(disabledView.note, unavailableView.note)
 
   const dom = diagnosticDom()
   const calls = []
@@ -204,6 +283,118 @@ async function run() {
     Object.values(dom.elements).every((element) => element.innerHtmlWrites === 0),
     true
   )
+
+  const timerClock = controlledClock(NOW)
+  const timerDom = diagnosticDom()
+  const timerLifecycle = adminContract.createAdminSessionLifecycle()
+  timerLifecycle.activate()
+  let timerReads = 0
+  const coolingPayload = payload()
+  coolingPayload.cases[1].quota.cooldownUntil = NOW + 5_000
+  const readyPayload = payload()
+  const timerController = adminContract.createIfindMarketDiagnosticController({
+    document: timerDom.document,
+    sessionLifecycle: timerLifecycle,
+    dateText: (value) => `date:${value}`,
+    now: timerClock.now,
+    setTimeout: timerClock.setTimeout,
+    clearTimeout: timerClock.clearTimeout,
+    setLive() {},
+    onError: async () => {},
+    async request() {
+      timerReads += 1
+      return { data: readyPayload }
+    }
+  })
+  timerController.render(coolingPayload)
+  assert.equal(timerDom.elements['ifind-market-hk-run'].disabled, true)
+  assert.equal(timerDom.elements['ifind-market-hk-run'].textContent, '冷却中')
+  assert.equal(timerClock.pending(), 1)
+  await timerClock.advance(5_000)
+  assert.equal(timerReads, 1)
+  assert.equal(timerDom.elements['ifind-market-hk-run'].disabled, false)
+  assert.equal(timerDom.elements['ifind-market-hk-run'].textContent, '运行此案例')
+  assert.equal(timerClock.pending(), 0)
+
+  coolingPayload.cases[1].quota.cooldownUntil = NOW + 10_000
+  timerController.render(coolingPayload)
+  assert.equal(timerClock.pending(), 1)
+  timerController.reset()
+  assert.equal(timerClock.pending(), 0)
+  assert.ok(timerClock.cleared.length >= 1)
+
+  const invalidationClock = controlledClock(NOW)
+  const invalidationDom = diagnosticDom()
+  const invalidationLifecycle = adminContract.createAdminSessionLifecycle()
+  invalidationLifecycle.activate()
+  const invalidationController = adminContract.createIfindMarketDiagnosticController({
+    document: invalidationDom.document,
+    sessionLifecycle: invalidationLifecycle,
+    dateText: String,
+    now: invalidationClock.now,
+    setTimeout: invalidationClock.setTimeout,
+    clearTimeout: invalidationClock.clearTimeout,
+    setLive() {},
+    onError: async () => {},
+    request: async () => ({ data: readyPayload })
+  })
+  invalidationController.render(coolingPayload)
+  assert.equal(invalidationClock.pending(), 1)
+  invalidationLifecycle.invalidate()
+  assert.equal(invalidationClock.pending(), 0)
+
+  const staleDom = diagnosticDom()
+  const staleLifecycle = adminContract.createAdminSessionLifecycle()
+  staleLifecycle.activate()
+  const firstRead = deferred()
+  const secondRead = deferred()
+  let staleReads = 0
+  const staleController = adminContract.createIfindMarketDiagnosticController({
+    document: staleDom.document,
+    sessionLifecycle: staleLifecycle,
+    dateText: String,
+    now: () => NOW,
+    setLive() {},
+    onError: async () => {},
+    request() {
+      staleReads += 1
+      return staleReads === 1 ? firstRead.promise : secondRead.promise
+    }
+  })
+  const olderRefresh = staleController.refresh()
+  const newerRefresh = staleController.refresh()
+  const newerPayload = payload()
+  newerPayload.cases[1].quota.caseRemaining = 1
+  secondRead.resolve({ data: newerPayload })
+  await newerRefresh
+  const olderPayload = payload()
+  olderPayload.cases[1].quota.caseRemaining = 4
+  firstRead.resolve({ data: olderPayload })
+  await olderRefresh
+  assert.equal(staleDom.elements['ifind-market-hk-daily'].textContent,
+    '个案 1 / 5 · 全局 8 / 12')
+
+  const expiredDom = diagnosticDom()
+  const expiredLifecycle = adminContract.createAdminSessionLifecycle()
+  expiredLifecycle.activate()
+  let expiredErrors = 0
+  const expiredController = adminContract.createIfindMarketDiagnosticController({
+    document: expiredDom.document,
+    sessionLifecycle: expiredLifecycle,
+    dateText: String,
+    now: () => NOW,
+    setLive() {},
+    onError: async (error) => {
+      assert.equal(error.code, 'ADMIN_AUTH_REQUIRED')
+      expiredErrors += 1
+      expiredLifecycle.invalidate()
+    },
+    request: async () => {
+      throw Object.assign(new Error('expired'), { code: 'ADMIN_AUTH_REQUIRED' })
+    }
+  })
+  await expiredController.refresh()
+  assert.equal(expiredErrors, 1)
 
   const html = fs.readFileSync(path.join(ROOT, 'public', 'admin.html'), 'utf8')
   const script = fs.readFileSync(path.join(ROOT, 'public', 'admin.js'), 'utf8')

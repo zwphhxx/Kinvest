@@ -42,9 +42,9 @@
     'IFIND_MARKET_DIAGNOSTIC_UNAVAILABLE',
     'IFIND_MARKET_DIAGNOSTIC_BUSY',
     'IFIND_MARKET_DIAGNOSTIC_COOLDOWN',
-    'IFIND_MARKET_DIAGNOSTIC_DAILY_LIMIT',
-    'IFIND_MARKET_DIAGNOSTIC_CLOCK_ROLLBACK',
-    'IFIND_MARKET_DIAGNOSTIC_REJECTED',
+    'IFIND_MARKET_CASE_DAILY_LIMIT',
+    'IFIND_MARKET_GLOBAL_DAILY_LIMIT',
+    'IFIND_MARKET_CASE_UNAVAILABLE',
     'ADMIN_AUTH_REQUIRED',
     'ADMIN_CSRF_INVALID'
   ])
@@ -53,9 +53,9 @@
     IFIND_MARKET_DIAGNOSTIC_UNAVAILABLE: '三市场诊断暂不可用。',
     IFIND_MARKET_DIAGNOSTIC_BUSY: '另一项市场诊断正在运行。',
     IFIND_MARKET_DIAGNOSTIC_COOLDOWN: '此案例正在冷却，请稍后重试。',
-    IFIND_MARKET_DIAGNOSTIC_DAILY_LIMIT: '今日本地诊断额度已用完。',
-    IFIND_MARKET_DIAGNOSTIC_CLOCK_ROLLBACK: '服务器时间状态异常，诊断已停止。',
-    IFIND_MARKET_DIAGNOSTIC_REJECTED: '诊断请求未通过固定案例校验。',
+    IFIND_MARKET_CASE_DAILY_LIMIT: '此案例今日诊断次数已达上限。',
+    IFIND_MARKET_GLOBAL_DAILY_LIMIT: '今日三市场诊断总次数已达上限。',
+    IFIND_MARKET_CASE_UNAVAILABLE: '此固定案例尚未完成指标核验。',
     ADMIN_AUTH_REQUIRED: '管理员会话已结束，请重新登录。',
     ADMIN_CSRF_INVALID: '操作凭证已失效，请刷新后重试。'
   })
@@ -368,7 +368,7 @@
     return result
   }
 
-  function marketRunDecision({ entry, runtimeReady, runningCaseId, now }) {
+  function marketRunDecision({ entry, runtimeStatus, runningCaseId, now }) {
     if (runningCaseId) {
       return Object.freeze({
         disabled: true,
@@ -376,8 +376,11 @@
         tone: 'running'
       })
     }
-    if (!runtimeReady) {
+    if (runtimeStatus === 'disabled') {
       return Object.freeze({ disabled: true, label: '诊断未启用', tone: 'disabled' })
+    }
+    if (runtimeStatus !== 'admin-diagnostic') {
+      return Object.freeze({ disabled: true, label: '状态不可用', tone: 'disabled' })
     }
     if (entry.case.liveReady !== true) {
       return Object.freeze({ disabled: true, label: '指标尚未核验', tone: 'disabled' })
@@ -458,7 +461,7 @@
       safeError,
       run: marketRunDecision({
         entry: normalizedEntry,
-        runtimeReady: context.runtimeReady,
+        runtimeStatus: context.runtimeStatus,
         runningCaseId: context.runningCaseId,
         now: context.now
       })
@@ -480,16 +483,24 @@
         byCaseId.set(caseId, entry)
       }
     }
-    const runtimeReady = Boolean(status && status.runtimeStatus === 'admin-diagnostic')
+    const runtimeStatus = status && status.runtimeStatus === 'admin-diagnostic'
+      ? 'admin-diagnostic'
+      : (status && status.runtimeStatus === 'disabled' ? 'disabled' : 'unavailable')
     const runningCaseId = IFIND_MARKET_CASES.some((item) => item.caseId === options.runningCaseId)
       ? options.runningCaseId
       : null
     return Object.freeze({
-      statusLabel: runtimeReady ? '固定案例已就绪' : '固定案例未启用',
-      note: '管理员诊断专用；家庭看板继续使用 Mock 数据。',
+      statusLabel: runtimeStatus === 'admin-diagnostic'
+        ? '固定案例已就绪'
+        : (runtimeStatus === 'disabled' ? '三市场诊断未启用' : '三市场诊断状态不可用'),
+      note: runtimeStatus === 'admin-diagnostic'
+        ? '管理员诊断专用；家庭看板继续使用 Mock 数据。'
+        : (runtimeStatus === 'disabled'
+            ? '管理员诊断后端未启用；家庭看板继续使用 Mock 数据。'
+            : '无法确认三市场诊断状态；家庭看板继续使用 Mock 数据。'),
       cards: Object.freeze(IFIND_MARKET_CASES.map((config) =>
         createIfindMarketCardView(config, byCaseId.get(config.caseId), {
-          dateText, now, runningCaseId, runtimeReady
+          dateText, now, runningCaseId, runtimeStatus
         })
       ))
     })
@@ -503,13 +514,52 @@
     const now = options.now
     const setLive = options.setLive
     const onError = options.onError
+    const scheduleTimeout = typeof options.setTimeout === 'function'
+      ? options.setTimeout
+      : globalThis.setTimeout.bind(globalThis)
+    const cancelTimeout = typeof options.clearTimeout === 'function'
+      ? options.clearTimeout
+      : globalThis.clearTimeout.bind(globalThis)
     let status = null
     let runningCaseId = null
     let bound = false
+    let cooldownTimer = null
+    let refreshGeneration = 0
     const byId = (id) => documentRef.getElementById(id)
 
     function isStale(error) {
       return error && (error.name === 'AbortError' || error.message === 'ADMIN_EPOCH_STALE')
+    }
+
+    function clearCooldownTimer() {
+      if (cooldownTimer === null) return
+      cancelTimeout(cooldownTimer)
+      cooldownTimer = null
+    }
+
+    function scheduleCooldownRefresh() {
+      clearCooldownTimer()
+      if (runningCaseId || !status || status.runtimeStatus !== 'admin-diagnostic' ||
+        !Array.isArray(status.cases)) return
+      const currentTime = now()
+      let nearest = null
+      for (const entry of status.cases) {
+        const cooldownUntil = entry && entry.quota && entry.quota.cooldownUntil
+        if (!Number.isSafeInteger(cooldownUntil) || cooldownUntil <= currentTime) continue
+        if (nearest === null || cooldownUntil < nearest) nearest = cooldownUntil
+      }
+      if (nearest === null) return
+      cooldownTimer = scheduleTimeout(() => {
+        cooldownTimer = null
+        try {
+          return Promise.resolve(refresh()).catch((error) => {
+            if (!isStale(error)) clearCooldownTimer()
+          })
+        } catch {
+          clearCooldownTimer()
+          return undefined
+        }
+      }, nearest - currentTime)
     }
 
     function render(nextStatus = status) {
@@ -543,16 +593,32 @@
         button.dataset.tone = card.run.tone
         button.setAttribute('aria-busy', String(runningCaseId === card.caseId))
       }
+      scheduleCooldownRefresh()
     }
 
     async function refresh() {
-      const ticket = sessionLifecycle.beginRequest()
+      const generation = ++refreshGeneration
+      let ticket
+      try {
+        ticket = sessionLifecycle.beginRequest()
+      } catch (error) {
+        clearCooldownTimer()
+        if (error && error.message === 'ADMIN_EPOCH_INACTIVE') return
+        throw error
+      }
       try {
         const payload = await request('/api/admin/ifind/market-cases', { signal: ticket.signal })
-        sessionLifecycle.commit(ticket, () => render(payload.data))
+        sessionLifecycle.commit(ticket, () => {
+          if (generation === refreshGeneration) render(payload.data)
+        })
       } catch (error) {
-        if (isStale(error)) return
+        if (isStale(error)) {
+          clearCooldownTimer()
+          return
+        }
+        if (generation !== refreshGeneration) return
         if (error.code === 'ADMIN_AUTH_REQUIRED') {
+          clearCooldownTimer()
           await onError(error)
           return
         }
@@ -567,6 +633,7 @@
       if (!config || runningCaseId) return
       const button = byId(`ifind-market-${config.key}-run`)
       if (button.disabled) return
+      const generation = ++refreshGeneration
       const ticket = sessionLifecycle.beginRequest()
       sessionLifecycle.commit(ticket, () => {
         runningCaseId = caseId
@@ -591,6 +658,7 @@
         }
         const payload = await request('/api/admin/ifind/market-cases', { signal: ticket.signal })
         sessionLifecycle.commit(ticket, () => {
+          if (generation !== refreshGeneration) return
           render(payload.data)
           if (outcome) {
             const complete = outcome.data && outcome.data.status === 'complete'
@@ -629,9 +697,15 @@
     }
 
     function reset() {
+      refreshGeneration += 1
+      clearCooldownTimer()
       status = null
       runningCaseId = null
       render()
+    }
+
+    if (typeof sessionLifecycle.onInvalidate === 'function') {
+      sessionLifecycle.onInvalidate(clearCooldownTimer)
     }
 
     return Object.freeze({ bind, refresh, render, reset, run })
@@ -731,12 +805,20 @@
     let active = false
     let currentEpoch = 0
     const controllers = new Set()
+    const invalidationListeners = new Set()
 
     function invalidate() {
       active = false
       currentEpoch += 1
       for (const controller of controllers) controller.abort()
       controllers.clear()
+      for (const listener of invalidationListeners) {
+        try {
+          listener()
+        } catch {
+          // Session invalidation remains fail-closed if a UI listener fails.
+        }
+      }
     }
 
     function activate() {
@@ -776,12 +858,19 @@
       if (ticket && ticket.controller) controllers.delete(ticket.controller)
     }
 
+    function onInvalidate(listener) {
+      if (typeof listener !== 'function') throw new TypeError('ADMIN_INVALIDATION_LISTENER_INVALID')
+      invalidationListeners.add(listener)
+      return () => invalidationListeners.delete(listener)
+    }
+
     return Object.freeze({
       activate,
       beginRequest,
       commit,
       finishRequest,
       invalidate,
+      onInvalidate,
       resume,
       suspend
     })
