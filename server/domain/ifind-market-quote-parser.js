@@ -1,6 +1,7 @@
 'use strict'
 
 const { types } = require('node:util')
+const { getIfindMarketCase } = require('./ifind-market-cases')
 
 const QUOTE_FIELDS = Object.freeze([
   'latestPrice',
@@ -138,23 +139,29 @@ function cnQuoteTime(value) {
   }, '+08:00')
 }
 
-function profile(identity, vendorCode, fields, parseQuoteTime, parseTradingStatus, currency) {
+function catalogIdentity(caseId) {
+  const marketCase = getIfindMarketCase(caseId)
+  if (!marketCase) throw new Error('Fixed iFinD quote profile is missing its catalog case')
+  return Object.freeze({
+    caseId: marketCase.caseId,
+    listingId: marketCase.listingId,
+    displayCode: marketCase.displayCode,
+    currency: marketCase.expectedTradingCurrency
+  })
+}
+
+function profile(identity, vendorCode, fields, parseQuoteTime, parseTradingStatus) {
   return Object.freeze({
     ...identity,
     vendorCode,
     fields: Object.freeze({ ...fields }),
     parseQuoteTime,
-    parseTradingStatus,
-    currency
+    parseTradingStatus
   })
 }
 
 const PROFILES = Object.freeze({
-  HK_ALIBABA_9988: profile({
-    caseId: 'HK_ALIBABA_9988',
-    listingId: 'listing-hkex-9988',
-    displayCode: '9988.HK'
-  }, 'TEST_ONLY_HK_CODE', {
+  HK_ALIBABA_9988: profile(catalogIdentity('HK_ALIBABA_9988'), 'TEST_ONLY_HK_CODE', {
     latestPrice: 'TEST_ONLY_HK_LATEST_PRICE',
     previousClose: 'TEST_ONLY_HK_PREVIOUS_CLOSE',
     open: 'TEST_ONLY_HK_OPEN',
@@ -165,12 +172,8 @@ const PROFILES = Object.freeze({
     quoteTime: 'TEST_ONLY_HK_QUOTE_TIME',
     tradingStatus: 'TEST_ONLY_HK_TRADING_STATUS',
     currency: 'TEST_ONLY_HK_CURRENCY'
-  }, hkQuoteTime, hkTradingStatus, 'HKD'),
-  US_APPLE_AAPL: profile({
-    caseId: 'US_APPLE_AAPL',
-    listingId: 'listing-nasdaq-aapl',
-    displayCode: 'AAPL.US'
-  }, 'TEST_ONLY_US_CODE', {
+  }, hkQuoteTime, hkTradingStatus),
+  US_APPLE_AAPL: profile(catalogIdentity('US_APPLE_AAPL'), 'TEST_ONLY_US_CODE', {
     latestPrice: 'TEST_ONLY_US_LATEST_PRICE',
     previousClose: 'TEST_ONLY_US_PREVIOUS_CLOSE',
     open: 'TEST_ONLY_US_OPEN',
@@ -181,12 +184,8 @@ const PROFILES = Object.freeze({
     quoteTime: 'TEST_ONLY_US_QUOTE_TIME',
     tradingStatus: 'TEST_ONLY_US_TRADING_STATUS',
     currency: 'TEST_ONLY_US_CURRENCY'
-  }, usQuoteTime, usTradingStatus, 'USD'),
-  CN_MOUTAI_600519: profile({
-    caseId: 'CN_MOUTAI_600519',
-    listingId: 'listing-sse-600519',
-    displayCode: '600519.SH'
-  }, 'TEST_ONLY_CN_CODE', {
+  }, usQuoteTime, usTradingStatus),
+  CN_MOUTAI_600519: profile(catalogIdentity('CN_MOUTAI_600519'), 'TEST_ONLY_CN_CODE', {
     latestPrice: 'TEST_ONLY_CN_LATEST_PRICE',
     previousClose: 'TEST_ONLY_CN_PREVIOUS_CLOSE',
     open: 'TEST_ONLY_CN_OPEN',
@@ -197,27 +196,25 @@ const PROFILES = Object.freeze({
     quoteTime: 'TEST_ONLY_CN_QUOTE_TIME',
     tradingStatus: 'TEST_ONLY_CN_TRADING_STATUS',
     currency: 'TEST_ONLY_CN_CURRENCY'
-  }, cnQuoteTime, cnTradingStatus, 'CNY')
+  }, cnQuoteTime, cnTradingStatus)
 })
 
-function ownDataRecord(value, allowedKeys, requiredKeys = allowedKeys) {
-  if (!value || typeof value !== 'object' || Array.isArray(value) || types.isProxy(value)) {
-    return null
-  }
+function ownDataRecord(value, allowedKeys, requiredKeys = allowedKeys, forbiddenKeys = []) {
   try {
-    if (Object.getPrototypeOf(value) !== Object.prototype ||
-      Object.getOwnPropertySymbols(value).length !== 0) {
+    if (!value || typeof value !== 'object' || types.isProxy(value) ||
+      Array.isArray(value) || Object.getPrototypeOf(value) !== Object.prototype) {
       return null
     }
-    const descriptors = Object.getOwnPropertyDescriptors(value)
-    const keys = Object.keys(descriptors)
-    if (keys.some((key) => !allowedKeys.includes(key)) ||
-      requiredKeys.some((key) => !Object.hasOwn(descriptors, key))) {
-      return null
-    }
-    for (const key of keys) {
-      const descriptor = descriptors[key]
+    const descriptors = {}
+    for (const key of allowedKeys) {
+      const descriptor = Object.getOwnPropertyDescriptor(value, key)
+      if (!descriptor) continue
       if (!Object.hasOwn(descriptor, 'value') || !descriptor.enumerable) return null
+      descriptors[key] = descriptor
+    }
+    if (requiredKeys.some((key) => !Object.hasOwn(descriptors, key))) return null
+    for (const key of forbiddenKeys) {
+      if (Object.getOwnPropertyDescriptor(value, key)) return null
     }
     return descriptors
   } catch {
@@ -226,23 +223,20 @@ function ownDataRecord(value, allowedKeys, requiredKeys = allowedKeys) {
 }
 
 function ownDataArray(value, maximumLength = 64) {
-  if (!value || typeof value !== 'object' || types.isProxy(value)) return null
   try {
-    if (!Array.isArray(value) || Object.getPrototypeOf(value) !== Array.prototype ||
-      Object.getOwnPropertySymbols(value).length !== 0) {
+    if (!value || typeof value !== 'object' || types.isProxy(value) ||
+      !Array.isArray(value) || Object.getPrototypeOf(value) !== Array.prototype) {
       return null
     }
-    const descriptors = Object.getOwnPropertyDescriptors(value)
-    const lengthDescriptor = descriptors.length
+    const lengthDescriptor = Object.getOwnPropertyDescriptor(value, 'length')
     if (!lengthDescriptor || !Object.hasOwn(lengthDescriptor, 'value')) return null
     const length = lengthDescriptor.value
-    if (!Number.isSafeInteger(length) || length < 0 || length > maximumLength ||
-      Object.keys(descriptors).length !== length + 1) {
+    if (!Number.isSafeInteger(length) || length < 0 || length > maximumLength) {
       return null
     }
     const values = []
     for (let index = 0; index < length; index += 1) {
-      const descriptor = descriptors[index]
+      const descriptor = Object.getOwnPropertyDescriptor(value, String(index))
       if (!descriptor || !Object.hasOwn(descriptor, 'value') || !descriptor.enumerable) return null
       values.push(descriptor.value)
     }
@@ -353,7 +347,7 @@ function parsePayload(profileDefinition, payload) {
   }
   if (payloadDescriptors.dataVol) {
     const dataVol = descriptorValue(payloadDescriptors, 'dataVol')
-    if (!Number.isSafeInteger(dataVol) || dataVol < 0) {
+    if (!Number.isSafeInteger(dataVol) || dataVol !== QUOTE_FIELDS.length) {
       return { failedFields: ['scopeStatus'], missingFields: QUOTE_FIELDS }
     }
   }
@@ -419,7 +413,12 @@ function parsePayload(profileDefinition, payload) {
 }
 
 function parseIfindMarketQuote(input) {
-  const inputDescriptors = ownDataRecord(input, ['caseId', 'payload', 'verification'])
+  const inputDescriptors = ownDataRecord(
+    input,
+    ['caseId', 'payload', 'verification'],
+    ['caseId', 'payload', 'verification'],
+    ['fieldMapping']
+  )
   if (!inputDescriptors) return unavailable(null, null, [])
 
   const caseId = descriptorValue(inputDescriptors, 'caseId')

@@ -94,6 +94,16 @@ const FIELD_SUFFIXES = Object.freeze({
   currency: 'CURRENCY'
 })
 
+const NUMERIC_TEST_FIELDS = Object.freeze([
+  'latestPrice',
+  'previousClose',
+  'open',
+  'high',
+  'low',
+  'volume',
+  'turnover'
+])
+
 function clone(value) {
   return JSON.parse(JSON.stringify(value))
 }
@@ -143,212 +153,338 @@ function assertDeepFrozen(value) {
   for (const nested of Object.values(value)) assertDeepFrozen(nested)
 }
 
-async function run() {
-  for (const [caseId, definition] of Object.entries(CASES)) {
-    const result = parse(caseId)
-    assert.deepEqual(Object.keys(result), [
-      'caseId',
-      'listingId',
-      'displayCode',
-      'latestPrice',
-      'previousClose',
-      'open',
-      'high',
-      'low',
-      'volume',
-      'turnover',
-      'quoteTime',
-      'tradingStatus',
-      'currency',
-      'source',
-      'verification',
-      'missingFields'
-    ])
-    assert.deepEqual(result, {
-      caseId,
-      listingId: definition.listingId,
-      displayCode: definition.displayCode,
-      latestPrice: definition.values.latestPrice,
-      previousClose: definition.values.previousClose,
-      open: definition.values.open,
-      high: definition.values.high,
-      low: definition.values.low,
-      volume: definition.values.volume,
-      turnover: definition.values.turnover,
-      quoteTime: definition.expectedTime,
-      tradingStatus: definition.expectedStatus,
-      currency: definition.values.currency,
-      source: 'real',
-      verification: VERIFIED,
-      missingFields: []
-    })
-    assertDeepFrozen(result)
+function labeledScenario(label, operation) {
+  try {
+    operation()
+  } catch (error) {
+    const message = error instanceof Error ? error.message : String(error)
+    throw new Error(`[${label}] ${message}`, { cause: error })
   }
+}
 
-  const statusCases = [
-    ['HK_ALIBABA_9988', 'SUSPENDED', 'suspended'],
-    ['HK_ALIBABA_9988', 'CLOSED', 'closed'],
-    ['US_APPLE_AAPL', 'HALTED', 'suspended'],
-    ['US_APPLE_AAPL', 'CLOSED', 'closed'],
-    ['CN_MOUTAI_600519', 'SUSPEND', 'suspended'],
-    ['CN_MOUTAI_600519', 'CLOSE', 'closed']
-  ]
-  for (const [caseId, providerStatus, expectedStatus] of statusCases) {
+function labeledTable(group, rows, operation) {
+  for (const [label, ...values] of rows) {
+    labeledScenario(`${group}: ${label}`, () => operation(...values))
+  }
+}
+
+async function run() {
+  labeledTable(
+    'normalization',
+    Object.entries(CASES).map(([caseId, definition]) => [caseId, caseId, definition]),
+    (caseId, definition) => {
+      const result = parse(caseId)
+      assert.deepEqual(Object.keys(result), [
+        'caseId',
+        'listingId',
+        'displayCode',
+        'latestPrice',
+        'previousClose',
+        'open',
+        'high',
+        'low',
+        'volume',
+        'turnover',
+        'quoteTime',
+        'tradingStatus',
+        'currency',
+        'source',
+        'verification',
+        'missingFields'
+      ])
+      assert.deepEqual(result, {
+        caseId,
+        listingId: definition.listingId,
+        displayCode: definition.displayCode,
+        latestPrice: definition.values.latestPrice,
+        previousClose: definition.values.previousClose,
+        open: definition.values.open,
+        high: definition.values.high,
+        low: definition.values.low,
+        volume: definition.values.volume,
+        turnover: definition.values.turnover,
+        quoteTime: definition.expectedTime,
+        tradingStatus: definition.expectedStatus,
+        currency: definition.values.currency,
+        source: 'real',
+        verification: VERIFIED,
+        missingFields: []
+      })
+      assertDeepFrozen(result)
+    }
+  )
+
+  labeledTable('trading states', [
+    ['HK suspended', 'HK_ALIBABA_9988', 'SUSPENDED', 'suspended'],
+    ['HK closed', 'HK_ALIBABA_9988', 'CLOSED', 'closed'],
+    ['US halted', 'US_APPLE_AAPL', 'HALTED', 'suspended'],
+    ['US closed', 'US_APPLE_AAPL', 'CLOSED', 'closed'],
+    ['CN suspended', 'CN_MOUTAI_600519', 'SUSPEND', 'suspended'],
+    ['CN closed', 'CN_MOUTAI_600519', 'CLOSE', 'closed']
+  ], (caseId, providerStatus, expectedStatus) => {
     const payload = completePayload(caseId)
     payload.tables[0].table[fieldId(caseId, 'tradingStatus')] = [providerStatus]
     assert.equal(parse(caseId, payload).tradingStatus, expectedStatus)
-  }
+  })
 
-  const preMarket = completePayload('US_APPLE_AAPL')
-  preMarket.tables[0].table[fieldId('US_APPLE_AAPL', 'tradingStatus')] = ['PRE_MARKET']
-  assertUnavailable(parse('US_APPLE_AAPL', preMarket))
+  labeledScenario('trading states: US pre-market excluded', () => {
+    const payload = completePayload('US_APPLE_AAPL')
+    payload.tables[0].table[fieldId('US_APPLE_AAPL', 'tradingStatus')] = ['PRE_MARKET']
+    assertUnavailable(parse('US_APPLE_AAPL', payload))
+  })
 
-  for (const caseId of Object.keys(CASES)) {
-    const withoutCurrency = completePayload(caseId)
-    delete withoutCurrency.tables[0].table[fieldId(caseId, 'currency')]
-    const unavailable = parse(caseId, withoutCurrency)
-    assertUnavailable(unavailable)
-    assert.equal(unavailable.currency, null)
-    assert.equal(unavailable.missingFields.includes('currency'), true)
-    assert.equal(unavailable.verification.currencyStatus, 'failed')
-  }
-
-  const zeroPayload = completePayload('HK_ALIBABA_9988')
-  for (const field of ['latestPrice', 'previousClose', 'open', 'high', 'low', 'volume', 'turnover']) {
-    zeroPayload.tables[0].table[fieldId('HK_ALIBABA_9988', field)] = [0]
-  }
-  const zeros = parse('HK_ALIBABA_9988', zeroPayload)
-  assert.equal(zeros.source, 'real')
-  assert.deepEqual(
-    [zeros.latestPrice, zeros.previousClose, zeros.open, zeros.high, zeros.low, zeros.volume, zeros.turnover],
-    [0, 0, 0, 0, 0, 0, 0]
+  labeledTable(
+    'currency absence',
+    Object.keys(CASES).map((caseId) => [caseId, caseId]),
+    (caseId) => {
+      const payload = completePayload(caseId)
+      delete payload.tables[0].table[fieldId(caseId, 'currency')]
+      const result = parse(caseId, payload)
+      assertUnavailable(result)
+      assert.equal(result.missingFields.includes('currency'), true)
+      assert.equal(result.verification.currencyStatus, 'failed')
+    }
   )
 
-  for (const invalidNumber of [NaN, Infinity, -Infinity, '0', '', null]) {
-    const invalidPayload = completePayload('US_APPLE_AAPL')
-    invalidPayload.tables[0].table[fieldId('US_APPLE_AAPL', 'latestPrice')] = [invalidNumber]
-    const unavailable = parse('US_APPLE_AAPL', invalidPayload)
-    assertUnavailable(unavailable)
-    assert.equal(unavailable.missingFields.includes('latestPrice'), true)
-  }
-
-  const missingPrice = completePayload('CN_MOUTAI_600519')
-  delete missingPrice.tables[0].table[fieldId('CN_MOUTAI_600519', 'previousClose')]
-  const missingPriceResult = parse('CN_MOUTAI_600519', missingPrice)
-  assertUnavailable(missingPriceResult)
-  assert.deepEqual(missingPriceResult.missingFields, ['previousClose'])
-
-  const invalidTime = completePayload('HK_ALIBABA_9988')
-  invalidTime.tables[0].table[fieldId('HK_ALIBABA_9988', 'quoteTime')] = ['2026-02-30 15:59:00']
-  assertUnavailable(parse('HK_ALIBABA_9988', invalidTime))
-
-  const duplicateSecurities = completePayload('HK_ALIBABA_9988')
-  duplicateSecurities.tables.push(clone(duplicateSecurities.tables[0]))
-  const duplicateResult = parse('HK_ALIBABA_9988', duplicateSecurities)
-  assertUnavailable(duplicateResult)
-  assert.equal(duplicateResult.verification.scopeStatus, 'failed')
-
-  const wrongCode = completePayload('US_APPLE_AAPL')
-  wrongCode.tables[0].thscode = 'TEST_ONLY_WRONG_CODE'
-  const wrongCodeResult = parse('US_APPLE_AAPL', wrongCode)
-  assertUnavailable(wrongCodeResult)
-  assert.equal(wrongCodeResult.verification.vendorCodeStatus, 'failed')
-
-  const mixedSource = completePayload('CN_MOUTAI_600519')
-  mixedSource.tables[0].table.TEST_ONLY_US_LATEST_PRICE = [999]
-  const mixedResult = parse('CN_MOUTAI_600519', mixedSource)
-  assertUnavailable(mixedResult)
-  assert.equal(mixedResult.verification.scopeStatus, 'failed')
-  assert.equal(JSON.stringify(mixedResult).includes('TEST_ONLY_US_LATEST_PRICE'), false)
-
-  const unverified = parse('HK_ALIBABA_9988', completePayload('HK_ALIBABA_9988'), {
-    ...VERIFIED,
-    entitlementStatus: 'unverified',
-    sourceMode: 'unverified'
-  })
-  assertUnavailable(unverified)
-  assert.equal(unverified.verification.entitlementStatus, 'unverified')
-
-  const failedPayload = completePayload('HK_ALIBABA_9988')
-  failedPayload.errorcode = -403
-  failedPayload.errmsg = 'raw provider entitlement message'
-  const failed = parse('HK_ALIBABA_9988', failedPayload)
-  assertUnavailable(failed)
-  assert.equal(failed.verification.entitlementStatus, 'failed')
-  assert.equal(JSON.stringify(failed).includes('raw provider entitlement message'), false)
-
-  let inheritedRead = false
-  const inheritedPayload = Object.create({
-    get tables() {
-      inheritedRead = true
-      throw new Error('inherited payload getter executed')
+  labeledScenario('numeric validation: zero preserved', () => {
+    const payload = completePayload('HK_ALIBABA_9988')
+    for (const field of NUMERIC_TEST_FIELDS) {
+      payload.tables[0].table[fieldId('HK_ALIBABA_9988', field)] = [0]
     }
+    const result = parse('HK_ALIBABA_9988', payload)
+    assert.equal(result.source, 'real')
+    assert.deepEqual(NUMERIC_TEST_FIELDS.map((field) => result[field]), [0, 0, 0, 0, 0, 0, 0])
   })
-  inheritedPayload.errorcode = 0
-  inheritedPayload.dataVol = 10
-  assertUnavailable(parse('HK_ALIBABA_9988', inheritedPayload))
-  assert.equal(inheritedRead, false)
 
-  let accessorRead = false
-  const accessorPayload = completePayload('US_APPLE_AAPL')
-  Object.defineProperty(accessorPayload.tables[0].table, fieldId('US_APPLE_AAPL', 'latestPrice'), {
-    enumerable: true,
-    get() {
-      accessorRead = true
-      throw new Error('provider accessor executed')
+  labeledTable('numeric validation', [
+    ['NaN', NaN],
+    ['positive infinity', Infinity],
+    ['negative infinity', -Infinity],
+    ['numeric string', '0'],
+    ['empty string', ''],
+    ['null', null]
+  ], (invalidNumber) => {
+    const payload = completePayload('US_APPLE_AAPL')
+    payload.tables[0].table[fieldId('US_APPLE_AAPL', 'latestPrice')] = [invalidNumber]
+    const result = parse('US_APPLE_AAPL', payload)
+    assertUnavailable(result)
+    assert.equal(result.missingFields.includes('latestPrice'), true)
+  })
+
+  labeledScenario('missing fields: previous close', () => {
+    const payload = completePayload('CN_MOUTAI_600519')
+    delete payload.tables[0].table[fieldId('CN_MOUTAI_600519', 'previousClose')]
+    const result = parse('CN_MOUTAI_600519', payload)
+    assertUnavailable(result)
+    assert.deepEqual(result.missingFields, ['previousClose'])
+  })
+
+  labeledScenario('timestamp validation: impossible HK date', () => {
+    const payload = completePayload('HK_ALIBABA_9988')
+    payload.tables[0].table[fieldId('HK_ALIBABA_9988', 'quoteTime')] = ['2026-02-30 15:59:00']
+    assertUnavailable(parse('HK_ALIBABA_9988', payload))
+  })
+
+  labeledTable('dataVol contract', [
+    ['zero', 0],
+    ['under contract', 9],
+    ['over contract', 11]
+  ], (dataVol) => {
+    const payload = completePayload('HK_ALIBABA_9988')
+    payload.dataVol = dataVol
+    const result = parse('HK_ALIBABA_9988', payload)
+    assertUnavailable(result)
+    assert.equal(result.verification.scopeStatus, 'failed')
+  })
+
+  labeledScenario('dataVol contract: absent accepted', () => {
+    const payload = completePayload('HK_ALIBABA_9988')
+    delete payload.dataVol
+    assert.equal(parse('HK_ALIBABA_9988', payload).source, 'real')
+  })
+
+  labeledScenario('source integrity: duplicate securities', () => {
+    const payload = completePayload('HK_ALIBABA_9988')
+    payload.tables.push(clone(payload.tables[0]))
+    const result = parse('HK_ALIBABA_9988', payload)
+    assertUnavailable(result)
+    assert.equal(result.verification.scopeStatus, 'failed')
+  })
+
+  labeledScenario('source integrity: wrong vendor code', () => {
+    const payload = completePayload('US_APPLE_AAPL')
+    payload.tables[0].thscode = 'TEST_ONLY_WRONG_CODE'
+    const result = parse('US_APPLE_AAPL', payload)
+    assertUnavailable(result)
+    assert.equal(result.verification.vendorCodeStatus, 'failed')
+  })
+
+  labeledScenario('source integrity: mixed metadata projected out', () => {
+    const payload = completePayload('CN_MOUTAI_600519')
+    payload.tables[0].table.TEST_ONLY_US_LATEST_PRICE = [999]
+    const result = parse('CN_MOUTAI_600519', payload)
+    assert.equal(result.source, 'real')
+    assert.equal(JSON.stringify(result).includes('TEST_ONLY_US_LATEST_PRICE'), false)
+  })
+
+  labeledScenario('verification gate: unverified entitlement', () => {
+    const result = parse('HK_ALIBABA_9988', completePayload('HK_ALIBABA_9988'), {
+      ...VERIFIED,
+      entitlementStatus: 'unverified',
+      sourceMode: 'unverified'
+    })
+    assertUnavailable(result)
+    assert.equal(result.verification.entitlementStatus, 'unverified')
+  })
+
+  labeledScenario('provider failure: message sanitized', () => {
+    const payload = completePayload('HK_ALIBABA_9988')
+    payload.errorcode = -403
+    payload.errmsg = 'raw provider entitlement message'
+    const result = parse('HK_ALIBABA_9988', payload)
+    assertUnavailable(result)
+    assert.equal(result.verification.entitlementStatus, 'failed')
+    assert.equal(JSON.stringify(result).includes('raw provider entitlement message'), false)
+  })
+
+  labeledScenario('untrusted records: inherited getter', () => {
+    let inheritedRead = false
+    const payload = Object.create({
+      get tables() {
+        inheritedRead = true
+        throw new Error('inherited payload getter executed')
+      }
+    })
+    payload.errorcode = 0
+    payload.dataVol = 10
+    assertUnavailable(parse('HK_ALIBABA_9988', payload))
+    assert.equal(inheritedRead, false)
+  })
+
+  labeledScenario('untrusted records: own accessor', () => {
+    let accessorRead = false
+    const payload = completePayload('US_APPLE_AAPL')
+    Object.defineProperty(payload.tables[0].table, fieldId('US_APPLE_AAPL', 'latestPrice'), {
+      enumerable: true,
+      get() {
+        accessorRead = true
+        throw new Error('provider accessor executed')
+      }
+    })
+    assertUnavailable(parse('US_APPLE_AAPL', payload))
+    assert.equal(accessorRead, false)
+  })
+
+  labeledScenario('untrusted records: active proxy traps', () => {
+    let proxyRead = false
+    const payload = new Proxy(completePayload('CN_MOUTAI_600519'), {
+      get() {
+        proxyRead = true
+        throw new Error('provider proxy executed')
+      },
+      getPrototypeOf() {
+        proxyRead = true
+        throw new Error('provider proxy prototype trap executed')
+      },
+      ownKeys() {
+        proxyRead = true
+        throw new Error('provider proxy ownKeys trap executed')
+      }
+    })
+    assertUnavailable(parse('CN_MOUTAI_600519', payload))
+    assert.equal(proxyRead, false)
+  })
+
+  labeledScenario('untrusted records: revoked object proxy', () => {
+    const revocable = Proxy.revocable(completePayload('HK_ALIBABA_9988'), {})
+    revocable.revoke()
+    assertUnavailable(parse('HK_ALIBABA_9988', revocable.proxy))
+  })
+
+  labeledScenario('untrusted records: revoked array proxy', () => {
+    const payload = completePayload('US_APPLE_AAPL')
+    const revocable = Proxy.revocable(payload.tables, {})
+    payload.tables = revocable.proxy
+    revocable.revoke()
+    assertUnavailable(parse('US_APPLE_AAPL', payload))
+  })
+
+  labeledScenario('untrusted records: arbitrary field mapping rejected', () => {
+    let mappingRead = false
+    const input = {
+      caseId: 'HK_ALIBABA_9988',
+      payload: completePayload('HK_ALIBABA_9988'),
+      verification: VERIFIED
     }
+    Object.defineProperty(input, 'fieldMapping', {
+      enumerable: true,
+      get() {
+        mappingRead = true
+        throw new Error('arbitrary field mapping executed')
+      }
+    })
+    assertUnavailable(parseIfindMarketQuote(input))
+    assert.equal(mappingRead, false)
   })
-  assertUnavailable(parse('US_APPLE_AAPL', accessorPayload))
-  assert.equal(accessorRead, false)
 
-  let proxyRead = false
-  const proxyPayload = new Proxy(completePayload('CN_MOUTAI_600519'), {
-    get() {
-      proxyRead = true
-      throw new Error('provider proxy executed')
-    },
-    getPrototypeOf() {
-      proxyRead = true
-      throw new Error('provider proxy prototype trap executed')
-    },
-    ownKeys() {
-      proxyRead = true
-      throw new Error('provider proxy ownKeys trap executed')
+  labeledScenario('untrusted records: unknown fixed case', () => {
+    const result = parseIfindMarketQuote({
+      caseId: 'HK_UNKNOWN_0000',
+      payload: completePayload('HK_ALIBABA_9988'),
+      verification: VERIFIED
+    })
+    assertUnavailable(result)
+    assert.equal(result.caseId, null)
+  })
+
+  labeledScenario('bounded traversal: oversized metadata projected out', () => {
+    const payload = completePayload('CN_MOUTAI_600519')
+    const providerFields = payload.tables[0].table
+    const marker = 'OVERSIZED_UNTRUSTED_METADATA'
+    for (let index = 0; index < 4096; index += 1) {
+      providerFields[`${marker}_${index}`] = index
     }
-  })
-  assertUnavailable(parse('CN_MOUTAI_600519', proxyPayload))
-  assert.equal(proxyRead, false)
+    let metadataRead = false
+    Object.defineProperty(providerFields, `${marker}_ACCESSOR`, {
+      enumerable: true,
+      get() {
+        metadataRead = true
+        throw new Error('oversized metadata accessor executed')
+      }
+    })
 
-  let mappingRead = false
-  const arbitraryMappingInput = {
-    caseId: 'HK_ALIBABA_9988',
-    payload: completePayload('HK_ALIBABA_9988'),
-    verification: VERIFIED
-  }
-  Object.defineProperty(arbitraryMappingInput, 'fieldMapping', {
-    enumerable: true,
-    get() {
-      mappingRead = true
-      throw new Error('arbitrary field mapping executed')
+    const originalDescriptors = Object.getOwnPropertyDescriptors
+    const originalSymbols = Object.getOwnPropertySymbols
+    let wholeRecordReflectionCalls = 0
+    Object.getOwnPropertyDescriptors = () => {
+      wholeRecordReflectionCalls += 1
+      throw new Error('whole-record descriptor traversal attempted')
     }
+    Object.getOwnPropertySymbols = () => {
+      wholeRecordReflectionCalls += 1
+      throw new Error('whole-record symbol traversal attempted')
+    }
+    let result
+    try {
+      result = parse('CN_MOUTAI_600519', payload)
+    } finally {
+      Object.getOwnPropertyDescriptors = originalDescriptors
+      Object.getOwnPropertySymbols = originalSymbols
+    }
+    assert.equal(result.source, 'real')
+    assert.equal(metadataRead, false)
+    assert.equal(wholeRecordReflectionCalls, 0)
+    assert.equal(JSON.stringify(result).includes(marker), false)
   })
-  assertUnavailable(parseIfindMarketQuote(arbitraryMappingInput))
-  assert.equal(mappingRead, false)
 
-  const unknownCase = parseIfindMarketQuote({
-    caseId: 'HK_UNKNOWN_0000',
-    payload: completePayload('HK_ALIBABA_9988'),
-    verification: VERIFIED
+  labeledScenario('defensive output: deeply frozen and metadata-free', () => {
+    const result = parse('US_APPLE_AAPL')
+    assert.throws(() => { result.latestPrice = 1 }, TypeError)
+    assert.throws(() => { result.verification.scopeStatus = 'failed' }, TypeError)
+    assert.throws(() => { result.missingFields.push('rawProviderMetadata') }, TypeError)
+    assert.deepEqual(Object.keys(result), Object.keys(parse('US_APPLE_AAPL')))
+    assert.doesNotMatch(JSON.stringify(result), /thscode|dataVol|TEST_ONLY|errmsg|RequestId/i)
   })
-  assertUnavailable(unknownCase)
-  assert.equal(unknownCase.caseId, null)
-
-  const frozen = parse('US_APPLE_AAPL')
-  assert.throws(() => { frozen.latestPrice = 1 }, TypeError)
-  assert.throws(() => { frozen.verification.scopeStatus = 'failed' }, TypeError)
-  assert.throws(() => { frozen.missingFields.push('rawProviderMetadata') }, TypeError)
-  assert.deepEqual(Object.keys(frozen), Object.keys(parse('US_APPLE_AAPL')))
-  assert.doesNotMatch(JSON.stringify(frozen), /thscode|dataVol|TEST_ONLY|errmsg|RequestId/i)
 }
 
 module.exports = { run }
