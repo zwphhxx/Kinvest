@@ -475,6 +475,13 @@ async function startServer({
   createIfindRepository,
   createIfindClient,
   createIfindService,
+  createIfindMarketRepository,
+  createIfindMarketService,
+  ifindMarketCatalogLookup,
+  ifindMarketManifestLookup,
+  ifindMarketQuoteParser,
+  ifindMarketFinancialParser,
+  ifindMarketIdGenerator,
   runtimeServer,
   port = PORT,
   processRef = process,
@@ -493,7 +500,21 @@ async function startServer({
     ...(loadIfindSecrets ? { loadIfindSecrets } : {}),
     ...(createIfindRepository ? { createIfindRepository } : {}),
     ...(createIfindClient ? { createIfindClient } : {}),
-    ...(createIfindService ? { createIfindService } : {})
+    ...(createIfindService ? { createIfindService } : {}),
+    ...(createIfindMarketRepository !== undefined
+      ? { createIfindMarketRepository } : {}),
+    ...(createIfindMarketService !== undefined
+      ? { createIfindMarketService } : {}),
+    ...(ifindMarketCatalogLookup !== undefined
+      ? { ifindMarketCatalogLookup } : {}),
+    ...(ifindMarketManifestLookup !== undefined
+      ? { ifindMarketManifestLookup } : {}),
+    ...(ifindMarketQuoteParser !== undefined
+      ? { ifindMarketQuoteParser } : {}),
+    ...(ifindMarketFinancialParser !== undefined
+      ? { ifindMarketFinancialParser } : {}),
+    ...(ifindMarketIdGenerator !== undefined
+      ? { ifindMarketIdGenerator } : {})
   })
   try {
     if (!runtimeServer) runtimeServer = http.createServer(prepared.handler)

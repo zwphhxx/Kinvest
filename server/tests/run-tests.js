@@ -32,6 +32,7 @@ const tests = [
   require('./secret-bootstrap.test'),
   require('./server-secret-bootstrap.test'),
   require('./server-ifind-bootstrap.test'),
+  require('./server-ifind-market-diagnostic.test'),
   require('./secret-preflight.test'),
   require('./access-preflight.test'),
   require('./ifind-http-client.test'),

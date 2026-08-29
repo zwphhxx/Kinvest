@@ -1,8 +1,22 @@
+const crypto = require('node:crypto')
 const { types } = require('node:util')
 const { createIfindHttpClient } = require('./adapters/ifind-http-client')
 const {
   IfindDiagnosticRepository
 } = require('./db/ifind-diagnostic-repository')
+const {
+  IfindMarketDiagnosticRepository
+} = require('./db/ifind-market-diagnostic-repository')
+const {
+  createLiveRequestManifest,
+  getIfindMarketCase
+} = require('./domain/ifind-market-cases')
+const {
+  parseIfindMarketFinancials
+} = require('./domain/ifind-market-financial-parser')
+const {
+  parseIfindMarketQuote
+} = require('./domain/ifind-market-quote-parser')
 const {
   IFIND_BUNDLE_PATH,
   IFIND_DIAGNOSTIC_MODE_ADMIN,
@@ -16,6 +30,9 @@ const {
   createDefaultDiagnosticId,
   createIfindDiagnosticService
 } = require('./services/ifind-diagnostic-service')
+const {
+  createIfindMarketDiagnosticService
+} = require('./services/ifind-market-diagnostic-service')
 
 const SAFE_CODES = new Set([
   'IFIND_DIAGNOSTIC_ACCESS_REQUIRED',
@@ -112,7 +129,10 @@ function readOptions(options) {
     const result = Object.create(null)
     for (const key of [
       'env', 'accessRuntime', 'openDatabase', 'loadSecrets', 'createRepository',
-      'createClient', 'createService', 'clock', 'idSource'
+      'createClient', 'createService', 'clock', 'idSource',
+      'createMarketRepository', 'createMarketService', 'marketCatalogLookup',
+      'marketManifestLookup', 'marketQuoteParser', 'marketFinancialParser',
+      'marketIdGenerator'
     ]) {
       const property = readDataProperty(options, key)
       if (!property) fail('IFIND_DIAGNOSTIC_RUNTIME_INVALID')
@@ -168,6 +188,7 @@ function disabledRuntime() {
       versionId: null
     }),
     service: null,
+    marketService: null,
     clear() {}
   })
 }
@@ -178,6 +199,24 @@ function clearBestEffort(...operations) {
       // Every diagnostic resource must still receive cleanup.
     }
   }
+}
+
+function createDefaultMarketDiagnosticId() {
+  return `market_run_${crypto.randomBytes(16).toString('hex')}`
+}
+
+function clearServiceClient(service, client) {
+  const clearService = service && readMethod(service, 'clear')
+  if (clearService) {
+    try {
+      clearService()
+      return
+    } catch {
+      // Fall through so the client buffer is still cleared directly.
+    }
+  }
+  const clearClient = client && readMethod(client, 'clear')
+  if (clearClient) clearClient()
 }
 
 async function createIfindDiagnosticRuntime(options) {
@@ -192,21 +231,51 @@ async function createIfindDiagnosticRuntime(options) {
     ((database) => new IfindDiagnosticRepository(database))
   const createClient = config.createClient || createIfindHttpClient
   const createService = config.createService || createIfindDiagnosticService
+  const createMarketRepository = Object.hasOwn(config, 'createMarketRepository')
+    ? config.createMarketRepository
+    : (database) => new IfindMarketDiagnosticRepository(database)
+  const createMarketService = Object.hasOwn(config, 'createMarketService')
+    ? config.createMarketService
+    : createIfindMarketDiagnosticService
+  const marketCatalogLookup = Object.hasOwn(config, 'marketCatalogLookup')
+    ? config.marketCatalogLookup
+    : getIfindMarketCase
+  const marketManifestLookup = Object.hasOwn(config, 'marketManifestLookup')
+    ? config.marketManifestLookup
+    : createLiveRequestManifest
+  const marketQuoteParser = Object.hasOwn(config, 'marketQuoteParser')
+    ? config.marketQuoteParser
+    : parseIfindMarketQuote
+  const marketFinancialParser = Object.hasOwn(config, 'marketFinancialParser')
+    ? config.marketFinancialParser
+    : parseIfindMarketFinancials
+  const marketIdGenerator = Object.hasOwn(config, 'marketIdGenerator')
+    ? config.marketIdGenerator
+    : createDefaultMarketDiagnosticId
   const clock = config.clock || Date.now
   const idSource = config.idSource || createDefaultDiagnosticId
   if (typeof openDatabase !== 'function' || typeof loadSecrets !== 'function' ||
     typeof createRepository !== 'function' || typeof createClient !== 'function' ||
     typeof createService !== 'function' || typeof clock !== 'function' ||
-    typeof idSource !== 'function' || types.isProxy(openDatabase) ||
+    typeof idSource !== 'function' || typeof createMarketRepository !== 'function' ||
+    typeof createMarketService !== 'function' || typeof marketCatalogLookup !== 'function' ||
+    typeof marketManifestLookup !== 'function' || typeof marketQuoteParser !== 'function' ||
+    typeof marketFinancialParser !== 'function' || typeof marketIdGenerator !== 'function' ||
+    types.isProxy(openDatabase) ||
     types.isProxy(loadSecrets) || types.isProxy(createRepository) ||
     types.isProxy(createClient) || types.isProxy(createService) ||
-    types.isProxy(clock) || types.isProxy(idSource)) {
+    types.isProxy(createMarketRepository) || types.isProxy(createMarketService) ||
+    types.isProxy(marketCatalogLookup) || types.isProxy(marketManifestLookup) ||
+    types.isProxy(marketQuoteParser) || types.isProxy(marketFinancialParser) ||
+    types.isProxy(marketIdGenerator) || types.isProxy(clock) ||
+    types.isProxy(idSource)) {
     fail('IFIND_DIAGNOSTIC_RUNTIME_INVALID')
   }
 
   let provider
   let client
   let service
+  let marketService
   try {
     try {
       provider = await loadSecrets(Object.freeze({
@@ -223,9 +292,10 @@ async function createIfindDiagnosticRuntime(options) {
       fail('IFIND_DIAGNOSTIC_PROVIDER_INVALID')
     }
 
+    let database
     let repository
     try {
-      const database = openDatabase()
+      database = openDatabase()
       repository = createRepository(database)
       const initialize = readMethod(repository, 'initialize')
       if (!initialize || !readMethod(repository, 'reserve') ||
@@ -243,6 +313,38 @@ async function createIfindDiagnosticRuntime(options) {
       if (!readMethod(client, 'diagnose') || !readMethod(client, 'clear')) {
         fail('IFIND_DIAGNOSTIC_RUNTIME_INVALID')
       }
+      const marketMethods = ['authenticate', 'quote', 'financial']
+        .map((method) => readMethod(client, method))
+      const marketCompatible = marketMethods.every(Boolean)
+      const hasPartialMarketClient = marketMethods.some(Boolean)
+      const marketOverridesPresent = [
+        'createMarketRepository', 'createMarketService', 'marketCatalogLookup',
+        'marketManifestLookup', 'marketQuoteParser', 'marketFinancialParser',
+        'marketIdGenerator'
+      ].some((key) => Object.hasOwn(config, key))
+      if (!marketCompatible && (hasPartialMarketClient || marketOverridesPresent)) {
+        fail('IFIND_DIAGNOSTIC_RUNTIME_INVALID')
+      }
+
+      let marketRepository
+      if (marketCompatible) {
+        try {
+          marketRepository = createMarketRepository(database)
+          const initialize = readMethod(marketRepository, 'initialize')
+          if (!initialize || !readMethod(marketRepository, 'reserve') ||
+            !readMethod(marketRepository, 'complete') ||
+            !readMethod(marketRepository, 'fail') ||
+            !readMethod(marketRepository, 'latest') ||
+            !readMethod(marketRepository, 'history') ||
+            !readMethod(marketRepository, 'quotaStatus')) {
+            fail('IFIND_DIAGNOSTIC_DATABASE_INVALID')
+          }
+          initialize()
+        } catch (error) {
+          throw sanitizedError(error, 'IFIND_DIAGNOSTIC_DATABASE_INVALID')
+        }
+      }
+
       service = createService({
         mode: IFIND_DIAGNOSTIC_MODE_ADMIN,
         tokenVersionId: contract.versionId,
@@ -254,6 +356,23 @@ async function createIfindDiagnosticRuntime(options) {
       })
       if (!readMethod(service, 'status') || !readMethod(service, 'run') ||
         !readMethod(service, 'clear')) fail('IFIND_DIAGNOSTIC_RUNTIME_INVALID')
+      if (marketCompatible) {
+        marketService = createMarketService({
+          tokenVersionId: contract.versionId,
+          clock,
+          idGenerator: marketIdGenerator,
+          catalogLookup: marketCatalogLookup,
+          manifestLookup: marketManifestLookup,
+          client,
+          quoteParser: marketQuoteParser,
+          financialParser: marketFinancialParser,
+          repository: marketRepository,
+          secretProvider: provider
+        })
+        if (!readMethod(marketService, 'run')) {
+          fail('IFIND_DIAGNOSTIC_RUNTIME_INVALID')
+        }
+      }
     } catch (error) {
       throw sanitizedError(error, 'IFIND_DIAGNOSTIC_RUNTIME_INVALID')
     }
@@ -266,23 +385,19 @@ async function createIfindDiagnosticRuntime(options) {
         versionId: contract.versionId
       }),
       service,
+      marketService: marketService || null,
       clear() {
         if (cleared) return
         cleared = true
         clearBestEffort(
-          () => readMethod(service, 'clear')(),
+          () => clearServiceClient(service, client),
           () => readMethod(provider, 'clear')()
         )
       }
     })
   } catch (error) {
     clearBestEffort(
-      () => {
-        const clearService = service && readMethod(service, 'clear')
-        const clearClient = client && readMethod(client, 'clear')
-        if (clearService) clearService()
-        else if (clearClient) clearClient()
-      },
+      () => clearServiceClient(service, client),
       () => { if (provider) readMethod(provider, 'clear')() }
     )
     if (error instanceof IfindDiagnosticRuntimeError) throw error
