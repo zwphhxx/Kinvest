@@ -35,6 +35,18 @@ const REQUIRED_FINANCIAL_METRICS = [
   'interestBearingDebt'
 ]
 
+const REQUIRED_FINANCIAL_METADATA = [
+  'currency',
+  'unit',
+  'reportPeriod',
+  'reportDate',
+  'periodType',
+  'disclosureScope',
+  'sourceTime',
+  'fetchTime',
+  'sourceMode'
+]
+
 const EXPECTED_CASES = [
   {
     caseId: 'HK_ALIBABA_9988',
@@ -86,9 +98,21 @@ function verifiedIndicator(metric, family) {
   }
 }
 
+function verifiedMetadataIndicator(field) {
+  return {
+    vendorIndicatorId: `FIXTURE_FINANCIAL_METADATA_${field}`,
+    evidenceStatus: 'verified',
+    sourceReference: `fixture://ifind-financial-metadata/${field}`
+  }
+}
+
 function completeVerifiedManifestDefinition() {
   const quote = REQUIRED_QUOTE_METRICS.map((metric) => verifiedIndicator(metric, 'QUOTE'))
   const financial = REQUIRED_FINANCIAL_METRICS.map((metric) => verifiedIndicator(metric, 'FINANCIAL'))
+  const financialMetadata = Object.fromEntries(REQUIRED_FINANCIAL_METADATA.map((field) => [
+    field,
+    verifiedMetadataIndicator(field)
+  ]))
   return {
     vendorCodes: {
       ifind: {
@@ -104,11 +128,15 @@ function completeVerifiedManifestDefinition() {
       },
       financial: {
         endpoint: '/api/v1/basic_data_service',
-        indicatorIds: financial.map((indicator) => indicator.vendorIndicatorId),
+        indicatorIds: [
+          ...financial.map((indicator) => indicator.vendorIndicatorId),
+          ...REQUIRED_FINANCIAL_METADATA.map((field) =>
+            financialMetadata[field].vendorIndicatorId)
+        ],
         evidenceStatus: 'verified'
       }
     },
-    indicators: { quote, financial },
+    indicators: { quote, financial, financialMetadata },
     periodRules: {
       fullFiscalYears: 2,
       includeLatestDisclosedInterim: true,
@@ -154,6 +182,10 @@ async function run() {
       `missing financial metric ${metric}`,
       removeMetric('financial', metric)
     ]),
+    ...REQUIRED_FINANCIAL_METADATA.map((field) => [
+      `missing financial metadata ${field}`,
+      (manifest) => { delete manifest.indicators.financialMetadata[field] }
+    ]),
     ['empty quote evidence', (manifest) => { manifest.indicators.quote = [] }],
     ['empty financial evidence', (manifest) => { manifest.indicators.financial = [] }],
     ['empty quote request fields', (manifest) => { manifest.requestTemplates.quote.fields = [] }],
@@ -171,6 +203,39 @@ async function run() {
     ['duplicate quote provider ID', (manifest) => {
       manifest.indicators.quote[1].vendorIndicatorId = manifest.indicators.quote[0].vendorIndicatorId
       manifest.requestTemplates.quote.fields[1] = manifest.requestTemplates.quote.fields[0]
+    }],
+    ['empty financial metadata provider ID', (manifest) => {
+      manifest.indicators.financialMetadata.currency.vendorIndicatorId = ''
+      manifest.requestTemplates.financial.indicatorIds[REQUIRED_FINANCIAL_METRICS.length] = ''
+    }],
+    ['unverified financial metadata evidence', (manifest) => {
+      manifest.indicators.financialMetadata.currency.evidenceStatus = 'unverified'
+    }],
+    ['missing financial metadata source reference', (manifest) => {
+      delete manifest.indicators.financialMetadata.currency.sourceReference
+    }],
+    ['empty financial metadata source reference', (manifest) => {
+      manifest.indicators.financialMetadata.currency.sourceReference = ''
+    }],
+    ['duplicate financial metadata provider ID', (manifest) => {
+      const metadata = manifest.indicators.financialMetadata
+      metadata.unit.vendorIndicatorId = metadata.currency.vendorIndicatorId
+      manifest.requestTemplates.financial.indicatorIds[REQUIRED_FINANCIAL_METRICS.length + 1] =
+        metadata.currency.vendorIndicatorId
+    }],
+    ['financial metadata collides with metric ID', (manifest) => {
+      const metricId = manifest.indicators.financial[0].vendorIndicatorId
+      manifest.indicators.financialMetadata.currency.vendorIndicatorId = metricId
+      manifest.requestTemplates.financial.indicatorIds[REQUIRED_FINANCIAL_METRICS.length] = metricId
+    }],
+    ['extra financial metadata key', (manifest) => {
+      manifest.indicators.financialMetadata.unapproved = verifiedMetadataIndicator('unapproved')
+    }],
+    ['non-plain financial metadata mapping', (manifest) => {
+      manifest.indicators.financialMetadata.currency = Object.assign(
+        Object.create({ inherited: true }),
+        manifest.indicators.financialMetadata.currency
+      )
     }],
     ['extra quote metric', (manifest) => {
       manifest.indicators.quote.push(verifiedIndicator('unapprovedMetric', 'QUOTE'))
@@ -273,6 +338,22 @@ async function run() {
   assertInvalidManifest(inheritedArrayAccessorManifest, 'hostile inherited array accessor')
   assert.equal(inheritedArrayAccessorRead, false)
 
+  let metadataAccessorRead = false
+  const accessorMetadataManifest = completeVerifiedManifestDefinition()
+  Object.defineProperty(
+    accessorMetadataManifest.indicators.financialMetadata.currency,
+    'sourceReference',
+    {
+      enumerable: true,
+      get() {
+        metadataAccessorRead = true
+        return 'fixture://must-not-be-read'
+      }
+    }
+  )
+  assertInvalidManifest(accessorMetadataManifest, 'accessor financial metadata evidence')
+  assert.equal(metadataAccessorRead, false)
+
   const firstList = listIfindMarketCases()
   const secondList = listIfindMarketCases()
 
@@ -317,6 +398,18 @@ async function run() {
     assert.equal(typeof marketCase.vendorCodes, 'object')
     assert.equal(marketCase.vendorCodes.ifind.code, null)
     assert.equal(marketCase.vendorCodes.ifind.evidenceStatus, 'unverified')
+    assert.deepEqual(
+      Object.keys(marketCase.indicators.financialMetadata),
+      REQUIRED_FINANCIAL_METADATA
+    )
+    assert.equal(
+      Object.values(marketCase.indicators.financialMetadata).every((mapping) =>
+        mapping.vendorIndicatorId === null &&
+        mapping.evidenceStatus === 'unverified' &&
+        mapping.sourceReference === null),
+      true
+    )
+    assert.deepEqual(marketCase.requestTemplates.financial.indicatorIds, [])
     assert.equal(marketCase.liveReady, false)
     assertDeepFrozen(marketCase)
   }
@@ -406,6 +499,8 @@ async function run() {
   assert.match(evidence, /https:\/\/quantapi\.51ifind\.com\/gwstatic\/static\/ds_web\/quantapi-web\/help-center\/manual\.html/)
   assert.match(evidence, /https:\/\/quantapi\.51ifind\.com\/gwstatic\/static\/ds_web\/quantapi-web\/example\.html/)
   assert.match(evidence, /unverified/i)
+  assert.match(evidence, /metadata indicator/i)
+  assert.match(evidence, /metadata indicator[^\n]*(?:unavailable|unverified)/i)
   assert.doesNotMatch(evidence, /refresh[_ -]?token|access[_ -]?token|requestid/i)
   assert.doesNotMatch(evidence, /TEST_ONLY_FIXTURE_ID/)
   const confidentialAssignments = [

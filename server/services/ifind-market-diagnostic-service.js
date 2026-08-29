@@ -49,26 +49,6 @@ const FINANCIAL_DISCLOSURE_SCOPES = Object.freeze({
   US_APPLE_AAPL: 'issuer_consolidated',
   CN_MOUTAI_600519: 'consolidated'
 })
-const FINANCIAL_METADATA_IDS = Object.freeze({
-  HK_ALIBABA_9988: Object.freeze([
-    'TEST_ONLY_HK_CURRENCY', 'TEST_ONLY_HK_UNIT', 'TEST_ONLY_HK_REPORT_PERIOD',
-    'TEST_ONLY_HK_REPORT_DATE', 'TEST_ONLY_HK_PERIOD_TYPE',
-    'TEST_ONLY_HK_DISCLOSURE_SCOPE', 'TEST_ONLY_HK_SOURCE_TIME',
-    'TEST_ONLY_HK_FETCH_TIME', 'TEST_ONLY_HK_SOURCE_MODE'
-  ]),
-  US_APPLE_AAPL: Object.freeze([
-    'TEST_ONLY_US_CURRENCY', 'TEST_ONLY_US_UNIT', 'TEST_ONLY_US_REPORT_PERIOD',
-    'TEST_ONLY_US_REPORT_DATE', 'TEST_ONLY_US_PERIOD_TYPE',
-    'TEST_ONLY_US_DISCLOSURE_SCOPE', 'TEST_ONLY_US_SOURCE_TIME',
-    'TEST_ONLY_US_FETCH_TIME', 'TEST_ONLY_US_SOURCE_MODE'
-  ]),
-  CN_MOUTAI_600519: Object.freeze([
-    'TEST_ONLY_CN_CURRENCY', 'TEST_ONLY_CN_UNIT', 'TEST_ONLY_CN_REPORT_PERIOD',
-    'TEST_ONLY_CN_REPORT_DATE', 'TEST_ONLY_CN_PERIOD_TYPE',
-    'TEST_ONLY_CN_DISCLOSURE_SCOPE', 'TEST_ONLY_CN_SOURCE_TIME',
-    'TEST_ONLY_CN_FETCH_TIME', 'TEST_ONLY_CN_SOURCE_MODE'
-  ])
-})
 const LEASE_DURATION_MS = 30_000
 const SNAPSHOT_WORK_LIMIT = 4096
 const DANGEROUS_RECORD_KEYS = new Set(['__proto__', 'constructor', 'prototype'])
@@ -562,10 +542,7 @@ function buildFixedRequests(manifest) {
       }),
       financial: deepFreeze({
         vendorCode: manifest.vendorCode,
-        indicatorIds: [
-          ...financialTemplate.indicatorIds,
-          ...FINANCIAL_METADATA_IDS[manifest.caseId]
-        ],
+        indicatorIds: [...financialTemplate.indicatorIds],
         periodParameters: {
           fullFiscalYears: materializeParserInput(snapshotTree(
             vendorParameters.fullFiscalYears.requestParameters
@@ -833,11 +810,9 @@ function parseFinancials(
     )
   }
   const invalidOutput = () => {
-    const failure = new SafeFailure(
+    throw new SafeFailure(
       'IFIND_MARKET_FINANCIAL_UNAVAILABLE', 'RESPONSE_SHAPE', 'financial-parser'
     )
-    Object.defineProperty(failure, 'invalidParserOutput', { value: true })
-    throw failure
   }
   let parsed
   try {
@@ -852,6 +827,12 @@ function parseFinancials(
   const result = exactDataObject(parsed, FINANCIAL_RESULT_FIELDS)
   const listingId = ownDataValue(catalogCase, 'listingId').value
   const displayCode = ownDataValue(catalogCase, 'displayCode').value
+  if (result && (result.caseId !== caseId || result.listingId !== listingId ||
+    result.displayCode !== displayCode)) {
+    throw new SafeFailure(
+      'IFIND_MARKET_IDENTITY_CONFLICT', 'IDENTITY_CONFLICT', 'financial-parser'
+    )
+  }
   if (result && result.caseId === caseId && result.listingId === listingId &&
     result.displayCode === displayCode && result.source === 'unavailable' &&
     result.availability === 'unavailable' && Array.isArray(result.points) &&
@@ -1190,6 +1171,10 @@ function createIfindMarketDiagnosticService(options) {
         manifestBundle.quoteVerification
       )
 
+      if (financialFailure && financialFailure.safeErrorClass === 'IDENTITY_CONFLICT') {
+        throw financialFailure
+      }
+
       let financialPoints = []
       if (!financialFailure) {
         try {
@@ -1203,7 +1188,8 @@ function createIfindMarketDiagnosticService(options) {
             manifestBundle.manifest
           )
         } catch (error) {
-          if (error instanceof SafeFailure && error.invalidParserOutput === true) throw error
+          if (error instanceof SafeFailure &&
+            error.safeErrorClass === 'IDENTITY_CONFLICT') throw error
           financialFailure = error instanceof SafeFailure
             ? error
             : new SafeFailure(

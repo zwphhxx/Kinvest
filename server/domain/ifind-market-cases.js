@@ -37,6 +37,18 @@ const FINANCIAL_METRICS = Object.freeze([
   'interestBearingDebt'
 ])
 
+const FINANCIAL_METADATA_FIELDS = Object.freeze([
+  'currency',
+  'unit',
+  'reportPeriod',
+  'reportDate',
+  'periodType',
+  'disclosureScope',
+  'sourceTime',
+  'fetchTime',
+  'sourceMode'
+])
+
 function deepFreeze(value) {
   if (!value || typeof value !== 'object' || Object.isFrozen(value)) return value
   for (const nested of Object.values(value)) deepFreeze(nested)
@@ -79,6 +91,14 @@ function unverifiedIndicators(metrics) {
   }))
 }
 
+function unverifiedFinancialMetadata() {
+  return Object.fromEntries(FINANCIAL_METADATA_FIELDS.map((field) => [field, {
+    vendorIndicatorId: null,
+    evidenceStatus: 'unverified',
+    sourceReference: null
+  }]))
+}
+
 function createCase(identity, template) {
   return {
     ...identity,
@@ -105,7 +125,8 @@ function createCase(identity, template) {
     },
     indicators: {
       quote: unverifiedIndicators(QUOTE_METRICS),
-      financial: unverifiedIndicators(FINANCIAL_METRICS)
+      financial: unverifiedIndicators(FINANCIAL_METRICS),
+      financialMetadata: unverifiedFinancialMetadata()
     },
     periodRules: {
       fullFiscalYears: 2,

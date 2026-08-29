@@ -25,6 +25,18 @@ const REQUIRED_FINANCIAL_METRICS = Object.freeze([
   'interestBearingDebt'
 ])
 
+const REQUIRED_FINANCIAL_METADATA_FIELDS = Object.freeze([
+  'currency',
+  'unit',
+  'reportPeriod',
+  'reportDate',
+  'periodType',
+  'disclosureScope',
+  'sourceTime',
+  'fetchTime',
+  'sourceMode'
+])
+
 function invalidManifest() {
   const error = new Error('iFinD live request manifest is invalid')
   error.code = 'IFIND_MARKET_MANIFEST_INVALID'
@@ -115,6 +127,14 @@ function trimmedProviderId(value) {
   return value
 }
 
+function evidenceSourceReference(value) {
+  if (typeof value !== 'string' || value.length === 0 || value.length > 1024 ||
+    value.trim() !== value || /[\u0000-\u001f\u007f]/.test(value)) {
+    invalidManifest()
+  }
+  return value
+}
+
 function verifiedIndicatorIds(value, requiredMetrics) {
   const indicators = arrayValues(value)
   if (indicators.length !== requiredMetrics.length) invalidManifest()
@@ -139,6 +159,28 @@ function verifiedIndicatorIds(value, requiredMetrics) {
     ids.push(vendorIndicatorId)
   }
   if (requiredMetrics.some((metric) => !metricSet.has(metric))) invalidManifest()
+  return ids
+}
+
+function verifiedFinancialMetadataIds(value, metricIds) {
+  const descriptors = plainRecord(value, REQUIRED_FINANCIAL_METADATA_FIELDS)
+  const usedIds = new Set(metricIds)
+  const ids = []
+  for (const field of REQUIRED_FINANCIAL_METADATA_FIELDS) {
+    const mapping = plainRecord(dataValue(descriptors, field), [
+      'vendorIndicatorId',
+      'evidenceStatus',
+      'sourceReference'
+    ])
+    const vendorIndicatorId = trimmedProviderId(
+      dataValue(mapping, 'vendorIndicatorId')
+    )
+    if (dataValue(mapping, 'evidenceStatus') !== 'verified' ||
+      usedIds.has(vendorIndicatorId)) invalidManifest()
+    evidenceSourceReference(dataValue(mapping, 'sourceReference'))
+    usedIds.add(vendorIndicatorId)
+    ids.push(vendorIndicatorId)
+  }
   return ids
 }
 
@@ -225,7 +267,9 @@ function validateLiveRequestManifestDefinition(definition) {
   trimmedProviderId(dataValue(ifindCode, 'code'))
   if (dataValue(ifindCode, 'evidenceStatus') !== 'verified') invalidManifest()
 
-  const indicators = plainRecord(dataValue(root, 'indicators'), ['quote', 'financial'])
+  const indicators = plainRecord(dataValue(root, 'indicators'), [
+    'quote', 'financial', 'financialMetadata'
+  ])
   const quoteIds = verifiedIndicatorIds(
     dataValue(indicators, 'quote'),
     REQUIRED_QUOTE_METRICS
@@ -233,6 +277,10 @@ function validateLiveRequestManifestDefinition(definition) {
   const financialIds = verifiedIndicatorIds(
     dataValue(indicators, 'financial'),
     REQUIRED_FINANCIAL_METRICS
+  )
+  const financialMetadataIds = verifiedFinancialMetadataIds(
+    dataValue(indicators, 'financialMetadata'),
+    financialIds
   )
 
   const templates = plainRecord(dataValue(root, 'requestTemplates'), ['quote', 'financial'])
@@ -246,7 +294,7 @@ function validateLiveRequestManifestDefinition(definition) {
     dataValue(templates, 'financial'),
     '/api/v1/basic_data_service',
     'indicatorIds',
-    financialIds
+    [...financialIds, ...financialMetadataIds]
   )
 
   periodRules(dataValue(root, 'periodRules'))
