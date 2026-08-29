@@ -5,6 +5,7 @@ const fs = require('node:fs')
 const os = require('node:os')
 const path = require('node:path')
 const { DatabaseSync } = require('node:sqlite')
+const { Worker } = require('node:worker_threads')
 
 const { DeviceAuthRepository } = require('../db/device-auth-repository')
 const {
@@ -90,6 +91,7 @@ function createFileDatabases() {
   const first = openDatabase(databasePath)
   const second = openDatabase(databasePath)
   return {
+    databasePath,
     first,
     second,
     close() {
@@ -98,6 +100,60 @@ function createFileDatabases() {
       fs.rmSync(directory, { recursive: true, force: true })
     }
   }
+}
+
+function reserveWorker(databasePath, input, barrier) {
+  const worker = new Worker(`
+    'use strict'
+    const { parentPort, workerData } = require('node:worker_threads')
+    const { DatabaseSync } = require('node:sqlite')
+    const {
+      IfindMarketDiagnosticRepository
+    } = require(workerData.repositoryPath)
+    const database = new DatabaseSync(workerData.databasePath)
+    let outcome
+    try {
+      const repository = new IfindMarketDiagnosticRepository(database)
+      repository.initialize()
+      const gate = new Int32Array(workerData.barrier)
+      Atomics.add(gate, 0, 1)
+      Atomics.notify(gate, 0)
+      Atomics.wait(gate, 1, 0)
+      outcome = { ok: true, result: repository.reserve(workerData.input) }
+    } catch (error) {
+      outcome = { ok: false, code: error && error.code, message: error && error.message }
+    } finally {
+      database.close()
+    }
+    parentPort.postMessage(outcome)
+  `, {
+    eval: true,
+    workerData: {
+      repositoryPath: require.resolve('../db/ifind-market-diagnostic-repository'),
+      databasePath,
+      input,
+      barrier
+    }
+  })
+  const outcome = new Promise((resolve, reject) => {
+    worker.once('message', resolve)
+    worker.once('error', reject)
+    worker.once('exit', (code) => {
+      if (code !== 0) reject(new Error(`reservation worker exited ${code}`))
+    })
+  })
+  return { worker, outcome }
+}
+
+async function releaseWorkers(barrier, expectedReady) {
+  const gate = new Int32Array(barrier)
+  const deadline = Date.now() + 5000
+  while (Atomics.load(gate, 0) < expectedReady) {
+    if (Date.now() >= deadline) throw new Error('reservation workers did not reach barrier')
+    await new Promise((resolve) => setTimeout(resolve, 2))
+  }
+  Atomics.store(gate, 1, 1)
+  Atomics.notify(gate, 1, expectedReady)
 }
 
 function columns(database, table) {
@@ -394,6 +450,111 @@ function testTwoConnectionReservationAndStaleRecovery() {
   }
 }
 
+async function testTrueTwoConnectionReservationRace() {
+  const databases = createFileDatabases()
+  try {
+    new IfindMarketDiagnosticRepository(databases.first).initialize()
+    const barrier = new SharedArrayBuffer(Int32Array.BYTES_PER_ELEMENT * 2)
+    const contenders = [
+      reserveWorker(
+        databases.databasePath,
+        reservationInput(10, CASES[0], DAY_START + MINUTE),
+        barrier
+      ),
+      reserveWorker(
+        databases.databasePath,
+        reservationInput(11, CASES[1], DAY_START + MINUTE),
+        barrier
+      )
+    ]
+    await releaseWorkers(barrier, contenders.length)
+    const outcomes = await Promise.all(contenders.map(({ outcome }) => outcome))
+    assert.equal(outcomes.every((outcome) => outcome.ok), true)
+    assert.deepEqual(
+      outcomes.map((outcome) => outcome.result.status).sort(),
+      ['busy', 'reserved']
+    )
+    assert.equal(databases.first.prepare(`
+      SELECT COUNT(*) AS count FROM ifind_market_case_runs
+    `).get().count, 1)
+    assert.equal(databases.first.prepare(`
+      SELECT COUNT(*) AS count FROM ifind_market_case_runs WHERE status = 'pending'
+    `).get().count, 1)
+    const attemptTotal = CASES.reduce((total, caseId) => total +
+      new IfindMarketDiagnosticRepository(databases.first).quotaStatus({
+        caseId,
+        now: DAY_START + MINUTE
+      }).caseAttemptCount, 0)
+    assert.equal(attemptTotal, 1)
+  } finally {
+    databases.close()
+  }
+}
+
+function testLeaseBoundaryAndExpiredWorker() {
+  const database = openDatabase()
+  const repository = new IfindMarketDiagnosticRepository(database)
+  repository.initialize()
+
+  const boundary = reserve(repository, 12, CASES[0], DAY_START + 10 * MINUTE)
+  assert.equal(repository.complete({
+    reservation: boundary,
+    result: completeResult(boundary.createdAt, {
+      completedAt: boundary.leaseExpiresAt,
+      elapsedMs: boundary.leaseExpiresAt - boundary.createdAt
+    }),
+    quoteSnapshot: quote(),
+    financialPoints: [point()]
+  }).status, 'completed')
+
+  const expired = reserve(repository, 13, CASES[1], boundary.leaseExpiresAt + 1)
+  expectCode(() => repository.complete({
+    reservation: expired,
+    result: completeResult(expired.createdAt, {
+      completedAt: expired.leaseExpiresAt + 1,
+      elapsedMs: expired.leaseExpiresAt - expired.createdAt + 1
+    }),
+    quoteSnapshot: quote({
+      listingId: 'listing-nasdaq-aapl',
+      displayCode: 'AAPL.US',
+      currency: 'USD'
+    }),
+    financialPoints: [point({
+      indicatorId: 'US_REVENUE',
+      currency: 'USD'
+    })]
+  }), 'IFIND_MARKET_DIAGNOSTIC_REPOSITORY_INVALID')
+  assert.equal(database.prepare(`
+    SELECT status FROM ifind_market_case_runs WHERE run_id = ?
+  `).get(expired.runId).status, 'pending')
+  assert.equal(database.prepare(`
+    SELECT COUNT(*) AS count FROM ifind_market_quote_snapshots WHERE run_id = ?
+  `).get(expired.runId).count, 0)
+  assert.equal(database.prepare(`
+    SELECT COUNT(*) AS count FROM ifind_market_financial_points WHERE run_id = ?
+  `).get(expired.runId).count, 0)
+  database.close()
+}
+
+function testDelayedStaleRecoveryUsesLeaseBoundary() {
+  const database = openDatabase()
+  const repository = new IfindMarketDiagnosticRepository(database)
+  repository.initialize()
+  const stale = reserve(repository, 14, CASES[2], DAY_START + MINUTE)
+  const delayedRecoveryAt = stale.leaseExpiresAt + 26 * 60 * MINUTE
+  const recovered = reserve(repository, 15, CASES[2], delayedRecoveryAt)
+  const staleRun = repository.latest({ caseId: CASES[2] })
+  assert.equal(staleRun.runId, stale.runId)
+  assert.equal(staleRun.completedAt, stale.leaseExpiresAt)
+  assert.equal(staleRun.elapsedMs, stale.leaseExpiresAt - stale.createdAt)
+  assert.equal(repository.quotaStatus({
+    caseId: CASES[2],
+    now: delayedRecoveryAt
+  }).cooldownUntil, null)
+  assert.equal(failReservation(repository, recovered).status, 'completed')
+  database.close()
+}
+
 function testShanghaiDayRolloverAndQuotas() {
   const perCaseDatabase = openDatabase()
   const perCase = new IfindMarketDiagnosticRepository(perCaseDatabase)
@@ -525,10 +686,61 @@ function testTerminalSnapshotsQueriesAndReplacement() {
   database.close()
 }
 
+function testTransactionalChildFailureRollsBack() {
+  const database = openDatabase()
+  const repository = new IfindMarketDiagnosticRepository(database)
+  repository.initialize()
+  const reservation = reserve(repository, 80, CASES[0], DAY_START + 90 * MINUTE)
+  const before = database.prepare(`
+    SELECT * FROM ifind_market_case_runs WHERE run_id = ?
+  `).get(reservation.runId)
+  database.exec(`
+    CREATE TEMP TRIGGER reject_market_quote_insert
+    BEFORE INSERT ON ifind_market_quote_snapshots
+    BEGIN
+      SELECT RAISE(ABORT, 'forced child insert failure');
+    END
+  `)
+  assert.throws(() => repository.complete({
+    reservation,
+    result: completeResult(reservation.createdAt),
+    quoteSnapshot: quote(),
+    financialPoints: [point()]
+  }))
+  assert.deepEqual({ ...database.prepare(`
+    SELECT * FROM ifind_market_case_runs WHERE run_id = ?
+  `).get(reservation.runId) }, { ...before })
+  assert.equal(database.prepare(`
+    SELECT COUNT(*) AS count FROM ifind_market_quote_snapshots WHERE run_id = ?
+  `).get(reservation.runId).count, 0)
+  assert.equal(database.prepare(`
+    SELECT COUNT(*) AS count FROM ifind_market_financial_points WHERE run_id = ?
+  `).get(reservation.runId).count, 0)
+  database.exec('DROP TRIGGER reject_market_quote_insert')
+  assert.equal(failReservation(repository, reservation).status, 'completed')
+  database.close()
+}
+
 function testTerminalValidationRollbackAndRawRejection() {
   const database = openDatabase()
   const repository = new IfindMarketDiagnosticRepository(database)
   repository.initialize()
+  assert.deepEqual(
+    Object.getOwnPropertyNames(Object.getPrototypeOf(repository)).sort(),
+    [
+      'complete',
+      'constructor',
+      'fail',
+      'history',
+      'initialize',
+      'latest',
+      'quotaStatus',
+      'reserve'
+    ]
+  )
+  for (const bypass of ['insertQuote', 'insertFinancialPoints', 'settle']) {
+    assert.equal(repository[bypass], undefined)
+  }
   const createdAt = DAY_START + 120 * MINUTE
   const reservation = reserve(repository, 90, CASES[0], createdAt)
   const invalidWrites = [
@@ -576,6 +788,42 @@ function testTerminalValidationRollbackAndRawRejection() {
         quoteSnapshot: quote({ tradingStatus: 'Mock' }),
         financialPoints: [point()]
       }
+    },
+    {
+      label: 'impossible quote date',
+      input: {
+        reservation,
+        result: completeResult(createdAt),
+        quoteSnapshot: quote({ quoteTime: '2026-02-30T12:00:00+08:00' }),
+        financialPoints: [point()]
+      }
+    },
+    {
+      label: 'invalid quote hour',
+      input: {
+        reservation,
+        result: completeResult(createdAt),
+        quoteSnapshot: quote({ quoteTime: '2026-08-29T24:00:00+08:00' }),
+        financialPoints: [point()]
+      }
+    },
+    {
+      label: 'invalid source minute',
+      input: {
+        reservation,
+        result: completeResult(createdAt),
+        quoteSnapshot: quote(),
+        financialPoints: [point({ sourceTime: '2025-08-29T12:60:00+08:00' })]
+      }
+    },
+    {
+      label: 'invalid fetch offset',
+      input: {
+        reservation,
+        result: completeResult(createdAt),
+        quoteSnapshot: quote(),
+        financialPoints: [point({ fetchTime: '2026-08-29T16:00:00+25:00' })]
+      }
     }
   ]
   for (const { label, input } of invalidWrites) {
@@ -622,6 +870,56 @@ function testTerminalValidationRollbackAndRawRejection() {
   )
   assert.equal(proxyInvoked, false)
 
+  let terminalProxyInvoked = false
+  const terminalProxy = new Proxy({
+    reservation,
+    result: completeResult(createdAt),
+    quoteSnapshot: quote(),
+    financialPoints: [point()]
+  }, {
+    get() {
+      terminalProxyInvoked = true
+      throw new Error('terminal proxy trap invoked')
+    }
+  })
+  expectCode(
+    () => repository.complete(terminalProxy),
+    'IFIND_MARKET_DIAGNOSTIC_REPOSITORY_INVALID'
+  )
+  assert.equal(terminalProxyInvoked, false)
+
+  let quoteAccessorInvoked = false
+  const accessorQuote = quote()
+  Object.defineProperty(accessorQuote, 'latestPrice', {
+    enumerable: true,
+    get() {
+      quoteAccessorInvoked = true
+      return 101.25
+    }
+  })
+  expectCode(() => repository.complete({
+    reservation,
+    result: completeResult(createdAt),
+    quoteSnapshot: accessorQuote,
+    financialPoints: [point()]
+  }), 'IFIND_MARKET_DIAGNOSTIC_REPOSITORY_INVALID')
+  assert.equal(quoteAccessorInvoked, false)
+
+  let pointsProxyInvoked = false
+  const pointsProxy = new Proxy([point()], {
+    get() {
+      pointsProxyInvoked = true
+      throw new Error('points proxy trap invoked')
+    }
+  })
+  expectCode(() => repository.complete({
+    reservation,
+    result: completeResult(createdAt),
+    quoteSnapshot: quote(),
+    financialPoints: pointsProxy
+  }), 'IFIND_MARKET_DIAGNOSTIC_REPOSITORY_INVALID')
+  assert.equal(pointsProxyInvoked, false)
+
   const customPrototype = Object.create({ inherited: true })
   Object.assign(customPrototype, reservationInput(93, CASES[1], createdAt))
   expectCode(
@@ -664,8 +962,12 @@ async function run() {
   const tests = [
     ['schema identity and legacy compatibility', testSchemaIdentityAndLegacyCompatibility],
     ['two-connection reservation and stale recovery', testTwoConnectionReservationAndStaleRecovery],
+    ['true two-connection reservation race', testTrueTwoConnectionReservationRace],
+    ['lease boundary and expired worker', testLeaseBoundaryAndExpiredWorker],
+    ['delayed stale recovery uses lease boundary', testDelayedStaleRecoveryUsesLeaseBoundary],
     ['Shanghai day rollover and quotas', testShanghaiDayRolloverAndQuotas],
     ['terminal snapshots, queries, and replacement', testTerminalSnapshotsQueriesAndReplacement],
+    ['transactional child failure rollback', testTransactionalChildFailureRollsBack],
     ['terminal validation, rollback, and raw rejection', testTerminalValidationRollbackAndRawRejection]
   ]
   for (const [label, test] of tests) {

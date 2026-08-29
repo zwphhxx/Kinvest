@@ -65,7 +65,7 @@ const FAILURE_CODE_PATTERN = /^IFIND_[A-Z0-9_]{1,90}$/
 const INDICATOR_ID_PATTERN = /^[A-Z0-9_]{1,80}$/
 const REPORT_PERIOD_PATTERN = /^20[0-9]{2}(?:Q[1-3]|H1|FY)$/
 const CALENDAR_DATE_PATTERN = /^(20[0-9]{2})-([0-9]{2})-([0-9]{2})$/
-const ISO_TIMESTAMP_PATTERN = /^(20[0-9]{2})-([0-9]{2})-([0-9]{2})T([0-9]{2}):([0-9]{2}):([0-9]{2})(?:\.([0-9]{3}))?(?:Z|[+-][0-9]{2}:[0-9]{2})$/
+const ISO_TIMESTAMP_PATTERN = /^(20[0-9]{2})-([0-9]{2})-([0-9]{2})T([0-9]{2}):([0-9]{2}):([0-9]{2})(?:\.([0-9]{3}))?(Z|([+-])([0-9]{2}):([0-9]{2}))$/
 const MAX_TIMESTAMP = 8_640_000_000_000_000
 
 const RUN_COLUMNS = [
@@ -310,8 +310,41 @@ function isCalendarDate(value) {
 }
 
 function isIsoTimestamp(value) {
-  return typeof value === 'string' && value.length <= 35 &&
-    ISO_TIMESTAMP_PATTERN.test(value) && Number.isFinite(Date.parse(value))
+  if (typeof value !== 'string' || value.length > 35) return false
+  const match = ISO_TIMESTAMP_PATTERN.exec(value)
+  if (!match || !isCalendarDate(`${match[1]}-${match[2]}-${match[3]}`)) return false
+  const year = Number(match[1])
+  const month = Number(match[2])
+  const day = Number(match[3])
+  const hour = Number(match[4])
+  const minute = Number(match[5])
+  const second = Number(match[6])
+  const millisecond = match[7] === undefined ? 0 : Number(match[7])
+  if (hour > 23 || minute > 59 || second > 59) return false
+  let offsetMinutes = 0
+  if (match[8] !== 'Z') {
+    const offsetHour = Number(match[10])
+    const offsetMinute = Number(match[11])
+    if (offsetHour > 14 || offsetMinute > 59 ||
+        (offsetHour === 14 && offsetMinute !== 0)) return false
+    offsetMinutes = (offsetHour * 60 + offsetMinute) * (match[9] === '+' ? 1 : -1)
+  }
+  const localMilliseconds = Date.UTC(
+    year,
+    month - 1,
+    day,
+    hour,
+    minute,
+    second,
+    millisecond
+  )
+  const instantMilliseconds = localMilliseconds - offsetMinutes * 60_000
+  const roundTrip = new Date(instantMilliseconds + offsetMinutes * 60_000)
+  return roundTrip.getUTCFullYear() === year &&
+    roundTrip.getUTCMonth() === month - 1 && roundTrip.getUTCDate() === day &&
+    roundTrip.getUTCHours() === hour && roundTrip.getUTCMinutes() === minute &&
+    roundTrip.getUTCSeconds() === second &&
+    roundTrip.getUTCMilliseconds() === millisecond
 }
 
 function validateCaseId(value) {
@@ -457,7 +490,8 @@ function validateCompletionInput(input) {
   if (!value) failInput()
   const reservation = validateReservation(value.reservation)
   const result = validateTerminalResult(value.result)
-  if (result.status === 'failed' || result.completedAt < reservation.createdAt) failInput()
+  if (result.status === 'failed' || result.completedAt < reservation.createdAt ||
+      result.completedAt > reservation.leaseExpiresAt) failInput()
   const quoteSnapshot = result.quoteStatus === 'available'
     ? validateQuoteSnapshot(value.quoteSnapshot, reservation.caseId)
     : value.quoteSnapshot === null ? null : failInput()
@@ -475,7 +509,8 @@ function validateFailureInput(input) {
   if (!value) failInput()
   const reservation = validateReservation(value.reservation)
   const result = validateTerminalResult(value.result)
-  if (result.status !== 'failed' || result.completedAt < reservation.createdAt) failInput()
+  if (result.status !== 'failed' || result.completedAt < reservation.createdAt ||
+      result.completedAt > reservation.leaseExpiresAt) failInput()
   return { reservation, result, quoteSnapshot: null, financialPoints: [] }
 }
 
@@ -727,20 +762,22 @@ function mapRun(row, quoteSnapshot, financialPoints) {
 }
 
 class IfindMarketDiagnosticRepository {
+  #database
+
   constructor(database) {
     if (!(database instanceof DatabaseSync)) failInput()
-    this.database = database
+    this.#database = database
   }
 
-  withImmediateTransaction(operation) {
-    this.database.exec('BEGIN IMMEDIATE')
+  #withImmediateTransaction(operation) {
+    this.#database.exec('BEGIN IMMEDIATE')
     try {
       const result = operation()
-      this.database.exec('COMMIT')
+      this.#database.exec('COMMIT')
       return result
     } catch (error) {
       try {
-        this.database.exec('ROLLBACK')
+        this.#database.exec('ROLLBACK')
       } catch {
         // Best-effort cleanup must not replace the stable repository result.
       }
@@ -749,17 +786,17 @@ class IfindMarketDiagnosticRepository {
   }
 
   initialize() {
-    this.database.exec('PRAGMA busy_timeout = 5000')
-    this.database.exec('PRAGMA foreign_keys = ON')
-    this.withImmediateTransaction(() => {
-      const applicationId = readApplicationId(this.database)
+    this.#database.exec('PRAGMA busy_timeout = 5000')
+    this.#database.exec('PRAGMA foreign_keys = ON')
+    this.#withImmediateTransaction(() => {
+      const applicationId = readApplicationId(this.#database)
       if (applicationId === 0) {
-        setKinvestApplicationId(this.database)
+        setKinvestApplicationId(this.#database)
       } else if (applicationId !== KINVEST_SQLITE_APPLICATION_ID) {
         throw new DeviceAuthDatabaseIdentityError()
       }
       try {
-        this.database.exec(`
+        this.#database.exec(`
           ${RUN_TABLE_DDL};
           ${QUOTE_TABLE_DDL};
           ${FINANCIAL_TABLE_DDL};
@@ -773,12 +810,12 @@ class IfindMarketDiagnosticRepository {
       } catch {
         failSchema()
       }
-      validateSchema(this.database)
+      validateSchema(this.#database)
     })
   }
 
-  readRun(runId) {
-    return this.database.prepare(`
+  #readRun(runId) {
+    return this.#database.prepare(`
       SELECT run_id, case_id, status, quote_status, finance_status,
              request_count, data_vol, elapsed_ms, safe_error_class,
              failure_code, vendor_error_code, token_version_id, created_at,
@@ -787,8 +824,8 @@ class IfindMarketDiagnosticRepository {
     `).get(runId)
   }
 
-  readPending() {
-    return this.database.prepare(`
+  #readPending() {
+    return this.#database.prepare(`
       SELECT run_id, case_id, status, quote_status, finance_status,
              request_count, data_vol, elapsed_ms, safe_error_class,
              failure_code, vendor_error_code, token_version_id, created_at,
@@ -797,8 +834,9 @@ class IfindMarketDiagnosticRepository {
     `).get()
   }
 
-  recoverStale(row, completedAt) {
-    const update = this.database.prepare(`
+  #recoverStale(row, recoveredAt) {
+    const completedAt = row.lease_expires_at
+    const update = this.#database.prepare(`
       UPDATE ifind_market_case_runs
       SET status = 'failed', quote_status = 'not_run',
           finance_status = 'not_run', request_count = 0, data_vol = NULL,
@@ -807,24 +845,24 @@ class IfindMarketDiagnosticRepository {
           vendor_error_code = NULL, completed_at = ?
       WHERE run_id = ? AND status = 'pending' AND lease_expires_at <= ?
     `).run(
-      Math.max(0, completedAt - row.created_at),
+      completedAt - row.created_at,
       completedAt,
       row.run_id,
-      completedAt
+      recoveredAt
     )
     if (update.changes !== 1) failSchema()
   }
 
-  readQuota(caseId, now, day = shanghaiDay(now)) {
-    const caseAttemptCount = Number(this.database.prepare(`
+  #readQuota(caseId, now, day = shanghaiDay(now)) {
+    const caseAttemptCount = Number(this.#database.prepare(`
       SELECT COUNT(*) AS count FROM ifind_market_case_runs
       WHERE case_id = ? AND created_at >= ? AND created_at < ?
     `).get(caseId, day.dayStart, day.nextDayStart).count)
-    const globalAttemptCount = Number(this.database.prepare(`
+    const globalAttemptCount = Number(this.#database.prepare(`
       SELECT COUNT(*) AS count FROM ifind_market_case_runs
       WHERE created_at >= ? AND created_at < ?
     `).get(day.dayStart, day.nextDayStart).count)
-    const latestTerminal = this.database.prepare(`
+    const latestTerminal = this.#database.prepare(`
       SELECT completed_at FROM ifind_market_case_runs
       WHERE case_id = ? AND completed_at IS NOT NULL
       ORDER BY completed_at DESC, run_id DESC LIMIT 1
@@ -832,7 +870,7 @@ class IfindMarketDiagnosticRepository {
     const cooldownCandidate = latestTerminal
       ? latestTerminal.completed_at + IFIND_MARKET_CASE_COOLDOWN_MS
       : null
-    const pending = this.readPending()
+    const pending = this.#readPending()
     const activePending = pending && now < pending.lease_expires_at ? pending : null
     return {
       localDayKey: day.dayKey,
@@ -852,30 +890,30 @@ class IfindMarketDiagnosticRepository {
   reserve(input) {
     const request = validateReservationInput(input)
     const incomingDay = shanghaiDay(request.createdAt)
-    return this.withImmediateTransaction(() => {
-      if (this.readRun(request.runId)) {
-        const quota = this.readQuota(request.caseId, request.createdAt, incomingDay)
+    return this.#withImmediateTransaction(() => {
+      if (this.#readRun(request.runId)) {
+        const quota = this.#readQuota(request.caseId, request.createdAt, incomingDay)
         return { status: 'duplicate', ...quota }
       }
 
-      const latest = this.database.prepare(`
+      const latest = this.#database.prepare(`
         SELECT created_at FROM ifind_market_case_runs
         ORDER BY created_at DESC, run_id DESC LIMIT 1
       `).get()
       if (latest) {
         const latestDay = shanghaiDay(latest.created_at)
         if (incomingDay.dayStart < latestDay.dayStart) {
-          const quota = this.readQuota(request.caseId, latest.created_at, latestDay)
+          const quota = this.#readQuota(request.caseId, latest.created_at, latestDay)
           return { status: 'clock-rollback', ...quota }
         }
       }
 
-      let pending = this.readPending()
+      let pending = this.#readPending()
       if (pending && request.createdAt >= pending.lease_expires_at) {
-        this.recoverStale(pending, request.createdAt)
-        pending = this.readPending()
+        this.#recoverStale(pending, request.createdAt)
+        pending = this.#readPending()
       }
-      const quota = this.readQuota(request.caseId, request.createdAt, incomingDay)
+      const quota = this.#readQuota(request.caseId, request.createdAt, incomingDay)
       if (pending) {
         return {
           status: 'busy',
@@ -902,7 +940,7 @@ class IfindMarketDiagnosticRepository {
       }
 
       const leaseExpiresAt = request.createdAt + IFIND_MARKET_DIAGNOSTIC_LEASE_MS
-      const insert = this.database.prepare(`
+      const insert = this.#database.prepare(`
         INSERT INTO ifind_market_case_runs (
           run_id, case_id, status, quote_status, finance_status,
           token_version_id, created_at, lease_expires_at
@@ -931,8 +969,8 @@ class IfindMarketDiagnosticRepository {
     })
   }
 
-  insertQuote(runId, quote) {
-    this.database.prepare(`
+  #insertQuote(runId, quote) {
+    this.#database.prepare(`
       INSERT INTO ifind_market_quote_snapshots (
         run_id, listing_id, display_code, latest_price, previous_close,
         open_price, high_price, low_price, volume, turnover, quote_time,
@@ -955,8 +993,8 @@ class IfindMarketDiagnosticRepository {
     )
   }
 
-  insertFinancialPoints(runId, points) {
-    const insert = this.database.prepare(`
+  #insertFinancialPoints(runId, points) {
+    const insert = this.#database.prepare(`
       INSERT INTO ifind_market_financial_points (
         run_id, indicator_id, metric_key, report_period, period_end,
         period_type, value, availability, currency, unit, disclosure_scope,
@@ -982,10 +1020,10 @@ class IfindMarketDiagnosticRepository {
     }
   }
 
-  settle(value) {
+  #settle(value) {
     const { reservation, result, quoteSnapshot, financialPoints } = value
-    return this.withImmediateTransaction(() => {
-      const row = this.readRun(reservation.runId)
+    return this.#withImmediateTransaction(() => {
+      const row = this.#readRun(reservation.runId)
       if (!row || row.case_id !== reservation.caseId ||
           row.created_at !== reservation.createdAt ||
           row.lease_expires_at !== reservation.leaseExpiresAt ||
@@ -994,12 +1032,12 @@ class IfindMarketDiagnosticRepository {
       }
       if (row.status !== 'pending') return { status: 'conflict' }
 
-      const update = this.database.prepare(`
+      const update = this.#database.prepare(`
         UPDATE ifind_market_case_runs
         SET status = ?, quote_status = ?, finance_status = ?, request_count = ?,
             data_vol = ?, elapsed_ms = ?, safe_error_class = ?, failure_code = ?,
             vendor_error_code = ?, completed_at = ?
-        WHERE run_id = ? AND status = 'pending'
+        WHERE run_id = ? AND status = 'pending' AND lease_expires_at >= ?
       `).run(
         result.status,
         result.quoteStatus,
@@ -1011,11 +1049,12 @@ class IfindMarketDiagnosticRepository {
         result.failureCode,
         result.vendorErrorCode,
         result.completedAt,
-        reservation.runId
+        reservation.runId,
+        result.completedAt
       )
       if (update.changes !== 1) failSchema()
-      if (quoteSnapshot) this.insertQuote(reservation.runId, quoteSnapshot)
-      this.insertFinancialPoints(reservation.runId, financialPoints)
+      if (quoteSnapshot) this.#insertQuote(reservation.runId, quoteSnapshot)
+      this.#insertFinancialPoints(reservation.runId, financialPoints)
       return {
         status: 'completed',
         cooldownUntil: result.completedAt + IFIND_MARKET_CASE_COOLDOWN_MS
@@ -1024,21 +1063,21 @@ class IfindMarketDiagnosticRepository {
   }
 
   complete(input) {
-    return this.settle(validateCompletionInput(input))
+    return this.#settle(validateCompletionInput(input))
   }
 
   fail(input) {
-    return this.settle(validateFailureInput(input))
+    return this.#settle(validateFailureInput(input))
   }
 
-  hydrateRun(row) {
-    const quoteSnapshot = mapQuote(this.database.prepare(`
+  #hydrateRun(row) {
+    const quoteSnapshot = mapQuote(this.#database.prepare(`
       SELECT listing_id, display_code, latest_price, previous_close,
              open_price, high_price, low_price, volume, turnover, quote_time,
              trading_status, currency
       FROM ifind_market_quote_snapshots WHERE run_id = ?
     `).get(row.run_id))
-    const financialPoints = this.database.prepare(`
+    const financialPoints = this.#database.prepare(`
       SELECT indicator_id, metric_key, report_period, period_end, period_type,
              value, availability, currency, unit, disclosure_scope,
              source_time, fetch_time
@@ -1052,7 +1091,7 @@ class IfindMarketDiagnosticRepository {
     const value = snapshotExactDataObject(input, ['caseId'])
     if (!value) failInput()
     validateCaseId(value.caseId)
-    const row = this.database.prepare(`
+    const row = this.#database.prepare(`
       SELECT run_id, case_id, status, quote_status, finance_status,
              request_count, data_vol, elapsed_ms, safe_error_class,
              failure_code, vendor_error_code, token_version_id, created_at,
@@ -1061,7 +1100,7 @@ class IfindMarketDiagnosticRepository {
       WHERE case_id = ? AND completed_at IS NOT NULL
       ORDER BY completed_at DESC, run_id DESC LIMIT 1
     `).get(value.caseId)
-    return row ? this.hydrateRun(row) : null
+    return row ? this.#hydrateRun(row) : null
   }
 
   history(input) {
@@ -1070,7 +1109,7 @@ class IfindMarketDiagnosticRepository {
     validateCaseId(value.caseId)
     if (!Number.isSafeInteger(value.limit) || value.limit < 1 ||
         value.limit > IFIND_MARKET_HISTORY_LIMIT) failInput()
-    return this.database.prepare(`
+    return this.#database.prepare(`
       SELECT run_id, case_id, status, quote_status, finance_status,
              request_count, data_vol, elapsed_ms, safe_error_class,
              failure_code, vendor_error_code, token_version_id, created_at,
@@ -1078,7 +1117,7 @@ class IfindMarketDiagnosticRepository {
       FROM ifind_market_case_runs
       WHERE case_id = ? AND completed_at IS NOT NULL
       ORDER BY completed_at DESC, run_id DESC LIMIT ?
-    `).all(value.caseId, value.limit).map((row) => this.hydrateRun(row))
+    `).all(value.caseId, value.limit).map((row) => this.#hydrateRun(row))
   }
 
   quotaStatus(input) {
@@ -1086,7 +1125,7 @@ class IfindMarketDiagnosticRepository {
     if (!value) failInput()
     validateCaseId(value.caseId)
     if (!isTimestamp(value.now)) failInput()
-    return this.readQuota(value.caseId, value.now)
+    return this.#readQuota(value.caseId, value.now)
   }
 }
 
