@@ -136,6 +136,42 @@ async function testDefaultDenyInvestmentRouteMatrix() {
   }
 }
 
+async function testDefaultDenyMarketDiagnosticRouteMatrix() {
+  const running = await start()
+  const routes = [
+    ['GET', '/api/admin/ifind/market-cases', undefined],
+    ['GET', '/api/admin/ifind/market-cases/HK_ALIBABA_9988', undefined],
+    ['POST', '/api/admin/ifind/market-cases/HK_ALIBABA_9988/run', '{}']
+  ]
+  try {
+    for (const [method, pathname, body] of routes) {
+      for (const cookie of [
+        null,
+        `__Host-kinvest-device=${VALID_DEVICE}`,
+        `__Host-kinvest-admin=${ADMIN_TOKEN}`
+      ]) {
+        const headers = body === undefined
+          ? (cookie ? { cookie } : {})
+          : {
+              origin: ORIGIN,
+              'content-type': 'application/json',
+              'x-kinvest-csrf': 'C'.repeat(43),
+              ...(cookie ? { cookie } : {})
+            }
+        const response = await request(running.baseUrl, pathname, {
+          method,
+          headers,
+          body
+        })
+        assert.equal(response.status, 401, `${method} ${pathname} ${cookie}`)
+        assert.deepEqual(response.body, { error: 'ADMIN_AUTH_REQUIRED' })
+      }
+    }
+  } finally {
+    await running.close()
+  }
+}
+
 async function testRefreshUsesInjectedOriginAndDisabledCompatibility() {
   const customOrigin = 'https://family.example.test'
   const enabled = await start(createRuntime(), customOrigin)
@@ -351,6 +387,7 @@ async function testStartupConfigurationDoesNotLeakProcessUmask() {
 
 async function run() {
   await testDefaultDenyInvestmentRouteMatrix()
+  await testDefaultDenyMarketDiagnosticRouteMatrix()
   await testRefreshStrictMutationAndExactRoutes()
   await testRefreshUsesInjectedOriginAndDisabledCompatibility()
   await testStrictJsonRejectsMalformedUtf8DuplicatesAndAbort()
