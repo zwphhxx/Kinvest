@@ -88,27 +88,27 @@ const PROFILES = Object.freeze([
     caseId: 'HK_ALIBABA_9988',
     listingId: 'listing-hkex-9988',
     displayCode: '9988.HK',
-    currency: 'HKD',
+    currency: 'CNY',
     scope: 'consolidated',
     fixture: readFixture('hk-financial-success.json'),
     metricIds: metricIds('HK'),
     metadataIds: metadataIds('HK'),
     periods: Object.freeze([
       Object.freeze({
-        reportPeriod: 'FY2024',
-        reportDate: '2024-12-31',
+        reportPeriod: 'FY2025',
+        reportDate: '2025-03-31',
         periodType: 'annual',
         sourceTime: '2025-03-13T17:30:00+08:00'
       }),
       Object.freeze({
-        reportPeriod: 'FY2023',
-        reportDate: '2023-12-31',
+        reportPeriod: 'FY2024',
+        reportDate: '2024-03-31',
         periodType: 'annual',
         sourceTime: '2024-03-14T17:30:00+08:00'
       }),
       Object.freeze({
-        reportPeriod: 'H1-2025',
-        reportDate: '2025-06-30',
+        reportPeriod: 'H1-FY2026',
+        reportDate: '2025-09-30',
         periodType: 'interim',
         sourceTime: '2025-08-29T17:30:00+08:00'
       })
@@ -194,28 +194,33 @@ function verified(overrides = {}) {
   }
 }
 
-function cloneArrays(record) {
+function cloneArrays(record, length) {
   return Object.fromEntries(
-    Object.entries(record).map(([key, value]) => [key, [...value]])
+    Object.entries(record).map(([key, value]) => [
+      key,
+      Array.from({ length }, (_, index) => value[index] === undefined
+        ? value[value.length - 1] + index + 1
+        : value[index])
+    ])
   )
 }
 
-function makePayload(profile) {
+function makePayload(profile, periods = profile.periods) {
   const sourceTable = profile.fixture.tables[0].table
-  const fields = cloneArrays(sourceTable)
+  const fields = cloneArrays(sourceTable, periods.length)
   const offset = profile.market === 'HK' ? 400 : profile.market === 'US' ? 500 : 600
-  fields[profile.metricIds.receivables] = [offset + 1, offset + 2, offset + 3]
-  fields[profile.metricIds.inventory] = [offset + 11, offset + 12, offset + 13]
-  fields[profile.metricIds.interestBearingDebt] = [offset + 21, offset + 22, offset + 23]
-  fields[profile.metadataIds.currency] = profile.periods.map(() => profile.currency)
-  fields[profile.metadataIds.unit] = profile.periods.map(() => 'million')
-  fields[profile.metadataIds.reportPeriod] = profile.periods.map((period) => period.reportPeriod)
-  fields[profile.metadataIds.reportDate] = profile.periods.map((period) => period.reportDate)
-  fields[profile.metadataIds.periodType] = profile.periods.map((period) => period.periodType)
-  fields[profile.metadataIds.disclosureScope] = profile.periods.map(() => profile.scope)
-  fields[profile.metadataIds.sourceTime] = profile.periods.map((period) => period.sourceTime)
-  fields[profile.metadataIds.fetchTime] = profile.periods.map(() => '2025-08-29T12:00:00.000Z')
-  fields[profile.metadataIds.sourceMode] = profile.periods.map(() => 'real')
+  fields[profile.metricIds.receivables] = periods.map((_, index) => offset + index + 1)
+  fields[profile.metricIds.inventory] = periods.map((_, index) => offset + index + 11)
+  fields[profile.metricIds.interestBearingDebt] = periods.map((_, index) => offset + index + 21)
+  fields[profile.metadataIds.currency] = periods.map(() => profile.currency)
+  fields[profile.metadataIds.unit] = periods.map(() => 'million')
+  fields[profile.metadataIds.reportPeriod] = periods.map((period) => period.reportPeriod)
+  fields[profile.metadataIds.reportDate] = periods.map((period) => period.reportDate)
+  fields[profile.metadataIds.periodType] = periods.map((period) => period.periodType)
+  fields[profile.metadataIds.disclosureScope] = periods.map(() => profile.scope)
+  fields[profile.metadataIds.sourceTime] = periods.map((period) => period.sourceTime)
+  fields[profile.metadataIds.fetchTime] = periods.map(() => '2025-08-29T12:00:00.000Z')
+  fields[profile.metadataIds.sourceMode] = periods.map(() => 'real')
   return {
     errorcode: 0,
     tables: [{
@@ -226,11 +231,25 @@ function makePayload(profile) {
   }
 }
 
-function parse(profile, payload = makePayload(profile), verification = verified()) {
+function reportingCurrencyEvidence(profile, overrides = {}) {
+  return {
+    currency: profile.currency,
+    evidenceStatus: 'verified',
+    ...overrides
+  }
+}
+
+function parse(
+  profile,
+  payload = makePayload(profile),
+  verification = verified(),
+  currencyEvidence = reportingCurrencyEvidence(profile)
+) {
   return parseIfindMarketFinancials({
     caseId: profile.caseId,
     payload,
-    verification
+    verification,
+    financialReportingCurrencyEvidence: currencyEvidence
   })
 }
 
@@ -306,6 +325,76 @@ async function run() {
     assertDeepFrozen(result, profile.label)
   }
 
+  const periodSelectionCases = [
+    {
+      label: 'Alibaba March fiscal year and latest issuer interim',
+      profile: PROFILES[0],
+      periods: [
+        { reportPeriod: 'FY2023', reportDate: '2023-03-31', periodType: 'annual', sourceTime: '2023-05-18T17:30:00+08:00' },
+        { reportPeriod: 'H1-FY2025', reportDate: '2024-09-30', periodType: 'interim', sourceTime: '2024-11-15T17:30:00+08:00' },
+        { reportPeriod: 'FY2025', reportDate: '2025-03-31', periodType: 'annual', sourceTime: '2025-05-15T17:30:00+08:00' },
+        { reportPeriod: 'FY2024', reportDate: '2024-03-31', periodType: 'annual', sourceTime: '2024-05-16T17:30:00+08:00' },
+        { reportPeriod: 'H1-FY2026', reportDate: '2025-09-30', periodType: 'interim', sourceTime: '2025-11-14T17:30:00+08:00' }
+      ],
+      expected: ['FY2025', 'FY2024', 'H1-FY2026']
+    },
+    {
+      label: 'Apple 52/53-week fiscal years and latest issuer interim',
+      profile: PROFILES[1],
+      periods: [
+        { reportPeriod: 'Q2-FY2024', reportDate: '2024-03-30', periodType: 'interim', sourceTime: '2024-05-03T06:00:00-04:00' },
+        { reportPeriod: 'FY2023', reportDate: '2023-09-30', periodType: 'annual', sourceTime: '2023-11-03T06:00:00-04:00' },
+        { reportPeriod: 'FY2024', reportDate: '2024-09-28', periodType: 'annual', sourceTime: '2024-11-01T06:00:00-04:00' },
+        { reportPeriod: 'Q3-FY2025', reportDate: '2025-06-28', periodType: 'interim', sourceTime: '2025-08-01T06:00:00-04:00' },
+        { reportPeriod: 'FY2022', reportDate: '2022-09-24', periodType: 'annual', sourceTime: '2022-10-28T06:00:00-04:00' }
+      ],
+      expected: ['FY2024', 'FY2023', 'Q3-FY2025']
+    },
+    {
+      label: 'Moutai calendar annual and latest disclosed interim',
+      profile: PROFILES[2],
+      periods: [
+        { reportPeriod: '2023A', reportDate: '2023-12-31', periodType: 'annual', sourceTime: '2024-04-03T18:00:00+08:00' },
+        { reportPeriod: '2025Q1', reportDate: '2025-03-31', periodType: 'interim', sourceTime: '2025-04-26T18:00:00+08:00' },
+        { reportPeriod: '2022A', reportDate: '2022-12-31', periodType: 'annual', sourceTime: '2023-03-31T18:00:00+08:00' },
+        { reportPeriod: '2024A', reportDate: '2024-12-31', periodType: 'annual', sourceTime: '2025-04-03T18:00:00+08:00' },
+        { reportPeriod: '2025H1', reportDate: '2025-06-30', periodType: 'interim', sourceTime: '2025-08-13T18:00:00+08:00' }
+      ],
+      expected: ['2024A', '2023A', '2025H1']
+    }
+  ]
+
+  for (const testCase of periodSelectionCases) {
+    const payload = makePayload(testCase.profile, testCase.periods)
+    const result = parse(testCase.profile, payload)
+    assert.equal(result.source, 'real', `${testCase.label}: source`)
+    assert.deepEqual(
+      result.points
+        .filter((point) => point.metricKey === 'revenue')
+        .map((point) => point.reportPeriod),
+      testCase.expected,
+      `${testCase.label}: chronological selection`
+    )
+    for (const reportPeriod of testCase.expected) {
+      const providerIndex = testCase.periods.findIndex((period) =>
+        period.reportPeriod === reportPeriod
+      )
+      assert.equal(
+        pointFor(result, 'revenue', reportPeriod).value,
+        payload.tables[0].table[testCase.profile.metricIds.revenue][providerIndex],
+        `${testCase.label}: selected provider value`
+      )
+    }
+  }
+
+  const alibabaCalendarAnnual = makePayload(PROFILES[0])
+  alibabaCalendarAnnual.tables[0].table[PROFILES[0].metadataIds.reportDate][0] = '2024-12-31'
+  assertUnavailable(
+    parse(PROFILES[0], alibabaCalendarAnnual),
+    'Alibaba calendar-year annual is incompatible',
+    'reportPeriodStatus'
+  )
+
   for (const profile of PROFILES) {
     const payload = makePayload(profile)
     payload.tables[0].table[profile.metricIds.revenue][0] = null
@@ -317,6 +406,39 @@ async function run() {
   }
 
   const hk = PROFILES[0]
+  const missingCurrencyEvidenceResult = parseIfindMarketFinancials({
+    caseId: hk.caseId,
+    payload: makePayload(hk),
+    verification: verified()
+  })
+  assertUnavailable(
+    missingCurrencyEvidenceResult,
+    'missing financial reporting currency evidence',
+    'currencyStatus'
+  )
+  assert.equal(JSON.stringify(missingCurrencyEvidenceResult).includes('HKD'), false)
+
+  const unverifiedCurrencyEvidenceResult = parse(
+    hk,
+    makePayload(hk),
+    verified(),
+    reportingCurrencyEvidence(hk, { currency: null, evidenceStatus: 'unverified' })
+  )
+  assertUnavailable(unverifiedCurrencyEvidenceResult, 'unverified reporting currency evidence')
+  assert.equal(unverifiedCurrencyEvidenceResult.verification.currencyStatus, 'unverified')
+
+  const mismatchedCurrencyEvidenceResult = parse(
+    hk,
+    makePayload(hk),
+    verified(),
+    reportingCurrencyEvidence(hk, { currency: 'HKD' })
+  )
+  assertUnavailable(
+    mismatchedCurrencyEvidenceResult,
+    'provider currency differs from verified reporting currency evidence',
+    'currencyStatus'
+  )
+
   const rejectionCases = [
     {
       label: 'mismatched provider code',
@@ -401,17 +523,32 @@ async function run() {
     ['extra payload field', () => {
       const payload = makePayload(hk)
       payload.errmsg = 'raw-provider-sentinel'
-      return { caseId: hk.caseId, payload, verification: verified() }
+      return {
+        caseId: hk.caseId,
+        payload,
+        verification: verified(),
+        financialReportingCurrencyEvidence: reportingCurrencyEvidence(hk)
+      }
     }],
     ['extra provider table field', () => {
       const payload = makePayload(hk)
       payload.tables[0].rawSource = 'raw-provider-sentinel'
-      return { caseId: hk.caseId, payload, verification: verified() }
+      return {
+        caseId: hk.caseId,
+        payload,
+        verification: verified(),
+        financialReportingCurrencyEvidence: reportingCurrencyEvidence(hk)
+      }
     }],
     ['extra provider indicator', () => {
       const payload = makePayload(hk)
       payload.tables[0].table.TEST_ONLY_UNKNOWN = ['raw-provider-sentinel']
-      return { caseId: hk.caseId, payload, verification: verified() }
+      return {
+        caseId: hk.caseId,
+        payload,
+        verification: verified(),
+        financialReportingCurrencyEvidence: reportingCurrencyEvidence(hk)
+      }
     }]
   ]
   for (const [label, createInput] of strictShapeCases) {
@@ -421,7 +558,8 @@ async function run() {
   let accessorInvoked = false
   const accessorInput = {
     payload: makePayload(hk),
-    verification: verified()
+    verification: verified(),
+    financialReportingCurrencyEvidence: reportingCurrencyEvidence(hk)
   }
   Object.defineProperty(accessorInput, 'caseId', {
     enumerable: true,
@@ -447,7 +585,12 @@ async function run() {
 
   const proxyCases = []
   for (const [label, target] of [
-    ['proxied input', { caseId: hk.caseId, payload: makePayload(hk), verification: verified() }],
+    ['proxied input', {
+      caseId: hk.caseId,
+      payload: makePayload(hk),
+      verification: verified(),
+      financialReportingCurrencyEvidence: reportingCurrencyEvidence(hk)
+    }],
     ['proxied payload', makePayload(hk)],
     ['proxied tables array', makePayload(hk).tables]
   ]) {
@@ -468,11 +611,21 @@ async function run() {
     let input
     if (label === 'proxied input') input = proxy
     else if (label === 'proxied payload') {
-      input = { caseId: hk.caseId, payload: proxy, verification: verified() }
+      input = {
+        caseId: hk.caseId,
+        payload: proxy,
+        verification: verified(),
+        financialReportingCurrencyEvidence: reportingCurrencyEvidence(hk)
+      }
     } else {
       const payload = makePayload(hk)
       payload.tables = proxy
-      input = { caseId: hk.caseId, payload, verification: verified() }
+      input = {
+        caseId: hk.caseId,
+        payload,
+        verification: verified(),
+        financialReportingCurrencyEvidence: reportingCurrencyEvidence(hk)
+      }
     }
     assertUnavailable(parseIfindMarketFinancials(input), label)
     assert.equal(wasTrapInvoked(), false, `${label}: proxy traps were not invoked`)
@@ -483,7 +636,8 @@ async function run() {
   assertUnavailable(parseIfindMarketFinancials({
     caseId: hk.caseId,
     payload: revoked.proxy,
-    verification: verified()
+    verification: verified(),
+    financialReportingCurrencyEvidence: reportingCurrencyEvidence(hk)
   }), 'revoked payload')
 
   let inheritedGetterInvoked = false
@@ -497,6 +651,7 @@ async function run() {
   const customPrototypeInput = Object.create(hostilePrototype)
   customPrototypeInput.payload = makePayload(hk)
   customPrototypeInput.verification = verified()
+  customPrototypeInput.financialReportingCurrencyEvidence = reportingCurrencyEvidence(hk)
   assertUnavailable(parseIfindMarketFinancials(customPrototypeInput), 'custom prototype')
   assert.equal(inheritedGetterInvoked, false, 'custom prototype: inherited getter was not invoked')
 

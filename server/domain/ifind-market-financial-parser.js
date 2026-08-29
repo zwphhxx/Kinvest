@@ -48,8 +48,7 @@ function catalogIdentity(caseId) {
   return Object.freeze({
     caseId: marketCase.caseId,
     listingId: marketCase.listingId,
-    displayCode: marketCase.displayCode,
-    currency: marketCase.expectedTradingCurrency
+    displayCode: marketCase.displayCode
   })
 }
 
@@ -79,11 +78,54 @@ function metadataIds(market) {
   })
 }
 
-function period(reportPeriod, reportDate, periodType) {
-  return Object.freeze({ reportPeriod, reportDate, periodType })
+function validDate(value) {
+  if (typeof value !== 'string') return false
+  const match = /^(\d{4})-(\d{2})-(\d{2})$/.exec(value)
+  if (!match) return false
+  const date = new Date(Date.UTC(Number(match[1]), Number(match[2]) - 1, Number(match[3])))
+  return date.getUTCFullYear() === Number(match[1]) &&
+    date.getUTCMonth() === Number(match[2]) - 1 &&
+    date.getUTCDate() === Number(match[3])
 }
 
-function profile(identity, market, vendorCode, scope, periods) {
+function dateParts(value) {
+  if (!validDate(value)) return null
+  return Object.freeze({
+    year: Number(value.slice(0, 4)),
+    month: Number(value.slice(5, 7)),
+    day: Number(value.slice(8, 10))
+  })
+}
+
+function fixedMonthDay(month, day) {
+  return (value) => {
+    const parts = dateParts(value)
+    return Boolean(parts && parts.month === month && parts.day === day)
+  }
+}
+
+function lastSaturdayIn(months) {
+  const allowedMonths = new Set(months)
+  return (value) => {
+    const parts = dateParts(value)
+    if (!parts || !allowedMonths.has(parts.month)) return false
+    const date = new Date(Date.UTC(parts.year, parts.month - 1, parts.day))
+    const daysInMonth = new Date(Date.UTC(parts.year, parts.month, 0)).getUTCDate()
+    return date.getUTCDay() === 6 && parts.day + 7 > daysInMonth
+  }
+}
+
+function oneOfMonthDays(monthDays) {
+  const allowed = new Set(monthDays)
+  return (value) => {
+    const parts = dateParts(value)
+    return Boolean(parts && allowed.has(
+      `${String(parts.month).padStart(2, '0')}-${String(parts.day).padStart(2, '0')}`
+    ))
+  }
+}
+
+function profile(identity, market, vendorCode, scope, annualDate, interimDate) {
   return Object.freeze({
     ...identity,
     market,
@@ -92,7 +134,8 @@ function profile(identity, market, vendorCode, scope, periods) {
     unit: 'million',
     metricIds: metricIds(market),
     metadataIds: metadataIds(market),
-    periods: Object.freeze(periods)
+    annualDate,
+    interimDate
   })
 }
 
@@ -102,33 +145,24 @@ const PROFILES = Object.freeze({
     'HK',
     'TEST_ONLY_HK_CODE',
     'consolidated',
-    [
-      period('FY2024', '2024-12-31', 'annual'),
-      period('FY2023', '2023-12-31', 'annual'),
-      period('H1-2025', '2025-06-30', 'interim')
-    ]
+    fixedMonthDay(3, 31),
+    fixedMonthDay(9, 30)
   ),
   US_APPLE_AAPL: profile(
     catalogIdentity('US_APPLE_AAPL'),
     'US',
     'TEST_ONLY_US_CODE',
     'issuer_consolidated',
-    [
-      period('FY2024', '2024-09-28', 'annual'),
-      period('FY2023', '2023-09-30', 'annual'),
-      period('Q3-FY2025', '2025-06-28', 'interim')
-    ]
+    lastSaturdayIn([9]),
+    lastSaturdayIn([12, 3, 6])
   ),
   CN_MOUTAI_600519: profile(
     catalogIdentity('CN_MOUTAI_600519'),
     'CN',
     'TEST_ONLY_CN_CODE',
     'consolidated',
-    [
-      period('2024A', '2024-12-31', 'annual'),
-      period('2023A', '2023-12-31', 'annual'),
-      period('2025H1', '2025-06-30', 'interim')
-    ]
+    fixedMonthDay(12, 31),
+    oneOfMonthDays(['03-31', '06-30', '09-30'])
   )
 })
 
@@ -159,7 +193,7 @@ function ownDataRecord(value, allowedKeys, requiredKeys = allowedKeys) {
   }
 }
 
-function ownDataArray(value, expectedLength) {
+function ownDataArrayRange(value, minimumLength, maximumLength) {
   try {
     if (!value || typeof value !== 'object' || types.isProxy(value) ||
       !Array.isArray(value) || Object.getPrototypeOf(value) !== Array.prototype) {
@@ -167,15 +201,17 @@ function ownDataArray(value, expectedLength) {
     }
     const lengthDescriptor = Object.getOwnPropertyDescriptor(value, 'length')
     if (!lengthDescriptor || !Object.hasOwn(lengthDescriptor, 'value') ||
-      lengthDescriptor.value !== expectedLength || expectedLength > 32) {
+      !Number.isSafeInteger(lengthDescriptor.value) ||
+      lengthDescriptor.value < minimumLength || lengthDescriptor.value > maximumLength) {
       return null
     }
+    const length = lengthDescriptor.value
     const names = Object.getOwnPropertyNames(value)
-    if (Object.getOwnPropertySymbols(value).length !== 0 || names.length !== expectedLength + 1) {
+    if (Object.getOwnPropertySymbols(value).length !== 0 || names.length !== length + 1) {
       return null
     }
     const values = []
-    for (let index = 0; index < expectedLength; index += 1) {
+    for (let index = 0; index < length; index += 1) {
       const descriptor = Object.getOwnPropertyDescriptor(value, String(index))
       if (!descriptor || !Object.hasOwn(descriptor, 'value') || !descriptor.enumerable) {
         return null
@@ -186,6 +222,10 @@ function ownDataArray(value, expectedLength) {
   } catch {
     return null
   }
+}
+
+function ownDataArray(value, expectedLength) {
+  return ownDataArrayRange(value, expectedLength, expectedLength)
 }
 
 function descriptorValue(descriptors, key) {
@@ -204,6 +244,29 @@ function verificationSnapshot(value) {
       return null
     }
     snapshot[field] = status
+  }
+  return Object.freeze(snapshot)
+}
+
+function reportingCurrencyEvidenceSnapshot(value) {
+  const descriptors = ownDataRecord(value, ['currency', 'evidenceStatus'])
+  if (!descriptors) return null
+  const currency = descriptorValue(descriptors, 'currency')
+  const evidenceStatus = descriptorValue(descriptors, 'evidenceStatus')
+  if (!['verified', 'unverified', 'failed'].includes(evidenceStatus)) return null
+  const hasValidCurrency = typeof currency === 'string' && /^[A-Z]{3}$/.test(currency)
+  if ((evidenceStatus === 'verified' && !hasValidCurrency) ||
+    (evidenceStatus !== 'verified' && currency !== null && !hasValidCurrency)) return null
+  return Object.freeze({ currency, evidenceStatus })
+}
+
+function verificationWithCurrencyEvidence(verification, evidenceStatus) {
+  const snapshot = {
+    ...verification,
+    currencyStatus: evidenceStatus
+  }
+  if (snapshot.sourceMode === 'real' && evidenceStatus !== 'verified') {
+    snapshot.sourceMode = evidenceStatus === 'failed' ? 'failed' : 'unverified'
   }
   return Object.freeze(snapshot)
 }
@@ -246,23 +309,18 @@ function unavailable(profileDefinition, verification, failedFields = []) {
   )
 }
 
-function validDate(value) {
-  if (typeof value !== 'string') return false
-  const match = /^(\d{4})-(\d{2})-(\d{2})$/.exec(value)
-  if (!match) return false
-  const date = new Date(Date.UTC(Number(match[1]), Number(match[2]) - 1, Number(match[3])))
-  return date.getUTCFullYear() === Number(match[1]) &&
-    date.getUTCMonth() === Number(match[2]) - 1 &&
-    date.getUTCDate() === Number(match[3])
-}
-
 function validDateTime(value) {
   return typeof value === 'string' && value.length <= 35 &&
     /^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(?:\.\d{3})?(?:Z|[+-]\d{2}:\d{2})$/.test(value) &&
     Number.isFinite(Date.parse(value))
 }
 
-function parsePayload(profileDefinition, payload, verification) {
+function validReportPeriod(value) {
+  return typeof value === 'string' && value.length > 0 && value.length <= 64 &&
+    value.trim() === value && !/[\u0000-\u001f\u007f]/.test(value)
+}
+
+function parsePayload(profileDefinition, payload, verification, reportingCurrency) {
   const payloadDescriptors = ownDataRecord(
     payload,
     ['errorcode', 'tables', 'dataVol']
@@ -290,11 +348,20 @@ function parsePayload(profileDefinition, payload, verification) {
   )
   if (!fieldDescriptors) return { failedFields: ['scopeStatus'] }
 
-  const periodCount = profileDefinition.periods.length
+  const reportPeriodId = profileDefinition.metadataIds.reportPeriod
+  const reportPeriods = ownDataArrayRange(
+    descriptorValue(fieldDescriptors, reportPeriodId),
+    3,
+    16
+  )
+  if (!reportPeriods) return { failedFields: ['reportPeriodStatus'] }
+  const periodCount = reportPeriods.length
   const metadata = {}
   let expectedDataVol = 0
   for (const [field, indicatorId] of Object.entries(profileDefinition.metadataIds)) {
-    const values = ownDataArray(descriptorValue(fieldDescriptors, indicatorId), periodCount)
+    const values = field === 'reportPeriod'
+      ? reportPeriods
+      : ownDataArray(descriptorValue(fieldDescriptors, indicatorId), periodCount)
     if (!values) return { failedFields: ['scopeStatus'] }
     metadata[field] = values
     expectedDataVol += values.length
@@ -319,24 +386,28 @@ function parsePayload(profileDefinition, payload, verification) {
   }
 
   const seenPeriods = new Set()
+  const seenReportDates = new Set()
+  const acceptedPeriods = []
   for (let index = 0; index < periodCount; index += 1) {
-    const expected = profileDefinition.periods[index]
-    if (metadata.currency[index] !== profileDefinition.currency) {
+    if (metadata.currency[index] !== reportingCurrency) {
       return { failedFields: ['currencyStatus'] }
     }
     if (metadata.unit[index] !== profileDefinition.unit) {
       return { failedFields: ['unitStatus'] }
     }
-    if (metadata.reportPeriod[index] !== expected.reportPeriod ||
-      metadata.reportDate[index] !== expected.reportDate ||
-      metadata.periodType[index] !== expected.periodType ||
-      !validDate(metadata.reportDate[index])) {
+    const periodType = metadata.periodType[index]
+    const validIssuerDate = periodType === 'annual'
+      ? profileDefinition.annualDate(metadata.reportDate[index])
+      : periodType === 'interim' && profileDefinition.interimDate(metadata.reportDate[index])
+    if (!validReportPeriod(metadata.reportPeriod[index]) || !validIssuerDate) {
       return { failedFields: ['reportPeriodStatus'] }
     }
-    if (seenPeriods.has(metadata.reportPeriod[index])) {
+    const reportDateIdentity = `${periodType}\u0000${metadata.reportDate[index]}`
+    if (seenPeriods.has(metadata.reportPeriod[index]) || seenReportDates.has(reportDateIdentity)) {
       return { failedFields: ['reportPeriodStatus'] }
     }
     seenPeriods.add(metadata.reportPeriod[index])
+    seenReportDates.add(reportDateIdentity)
     if (metadata.disclosureScope[index] !== profileDefinition.scope) {
       return { failedFields: ['scopeStatus'] }
     }
@@ -344,12 +415,29 @@ function parsePayload(profileDefinition, payload, verification) {
       return { failedFields: ['scopeStatus'] }
     }
     if (metadata.sourceMode[index] !== 'real') return { failedFields: ['sourceMode'] }
+    acceptedPeriods.push(Object.freeze({
+      index,
+      reportDate: metadata.reportDate[index],
+      periodType
+    }))
   }
+
+  const annualPeriods = acceptedPeriods
+    .filter((candidate) => candidate.periodType === 'annual')
+    .sort((left, right) => right.reportDate.localeCompare(left.reportDate))
+  const interimPeriods = acceptedPeriods
+    .filter((candidate) => candidate.periodType === 'interim')
+    .sort((left, right) => right.reportDate.localeCompare(left.reportDate))
+  if (annualPeriods.length < 2 || interimPeriods.length < 1) {
+    return { failedFields: ['reportPeriodStatus'] }
+  }
+  const selectedPeriods = [annualPeriods[0], annualPeriods[1], interimPeriods[0]]
 
   const points = []
   const seenMetricPeriods = new Set()
   for (const metricKey of METRIC_KEYS) {
-    for (let index = 0; index < periodCount; index += 1) {
+    for (const selectedPeriod of selectedPeriods) {
+      const index = selectedPeriod.index
       const pointIdentity = `${metricKey}\u0000${metadata.reportPeriod[index]}`
       if (seenMetricPeriods.has(pointIdentity)) {
         return { failedFields: ['reportPeriodStatus'] }
@@ -383,6 +471,7 @@ function parsePayload(profileDefinition, payload, verification) {
 function parseIfindMarketFinancials(input) {
   const inputDescriptors = ownDataRecord(
     input,
+    ['caseId', 'payload', 'verification', 'financialReportingCurrencyEvidence'],
     ['caseId', 'payload', 'verification']
   )
   if (!inputDescriptors) return unavailable(null, null)
@@ -397,10 +486,25 @@ function parseIfindMarketFinancials(input) {
   if (!verification) return unavailable(profileDefinition, null)
   if (!hasApprovedVerification(verification)) return unavailable(profileDefinition, verification)
 
+  if (!inputDescriptors.financialReportingCurrencyEvidence) {
+    return unavailable(profileDefinition, verification, ['currencyStatus'])
+  }
+  const currencyEvidence = reportingCurrencyEvidenceSnapshot(
+    descriptorValue(inputDescriptors, 'financialReportingCurrencyEvidence')
+  )
+  if (!currencyEvidence) return unavailable(profileDefinition, verification, ['currencyStatus'])
+  if (currencyEvidence.evidenceStatus !== 'verified') {
+    return unavailable(
+      profileDefinition,
+      verificationWithCurrencyEvidence(verification, currencyEvidence.evidenceStatus)
+    )
+  }
+
   const parsed = parsePayload(
     profileDefinition,
     descriptorValue(inputDescriptors, 'payload'),
-    verification
+    verification,
+    currencyEvidence.currency
   )
   if (!parsed.points) return unavailable(profileDefinition, verification, parsed.failedFields)
   return financialResult(
