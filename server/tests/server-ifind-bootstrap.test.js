@@ -227,7 +227,7 @@ async function testEnabledRuntimeRequiresDeviceApprovalAndSharesDatabase() {
   runtime.clear()
   runtime.clear()
   assert.deepStrictEqual(events, [
-    'database-open', 'service', 'client', 'provider'
+    'database-open', 'service', 'client', 'client', 'provider'
   ])
 }
 
@@ -279,7 +279,7 @@ async function testFailureCleanupAndSanitization() {
         options.createService = () => { throw new Error(sensitive) }
       },
       code: 'IFIND_DIAGNOSTIC_RUNTIME_INVALID',
-      expected: ['database-open', 'client', 'provider']
+      expected: ['database-open', 'client', 'client', 'provider']
     },
     {
       name: 'hostile provider',
@@ -295,7 +295,7 @@ async function testFailureCleanupAndSanitization() {
         options.createService = () => new Proxy({}, {})
       },
       code: 'IFIND_DIAGNOSTIC_RUNTIME_INVALID',
-      expected: ['database-open', 'client', 'provider']
+      expected: ['database-open', 'client', 'client', 'provider']
     }
   ]) {
     const events = []
@@ -372,7 +372,9 @@ async function testPreparationPassesFrozenRuntimeAndKeepsHealthUnchanged() {
   })
   prepared.clear()
   prepared.clear()
-  assert.deepStrictEqual(events, ['service', 'client', 'provider', 'access', 'secret'])
+  assert.deepStrictEqual(events, [
+    'service', 'client', 'client', 'provider', 'access', 'secret'
+  ])
 
   const accessRuntime = disabledAccess()
   const baseline = createRequestHandler({ accessRuntime })
@@ -445,12 +447,12 @@ async function testStartupFailuresPreventListenAndCleanEveryPhase() {
     {
       name: 'service',
       override: { createIfindService: () => { throw new Error('sensitive-service') } },
-      expected: ['client', 'provider', 'access', 'secret']
+      expected: ['client', 'client', 'provider', 'access', 'secret']
     },
     {
       name: 'handler',
       override: { createHttpHandler: () => { throw new Error('sensitive-handler') } },
-      expected: ['service', 'client', 'provider', 'access', 'secret']
+      expected: ['service', 'client', 'client', 'provider', 'access', 'secret']
     }
   ]
   for (const fixture of cases) {
@@ -515,7 +517,7 @@ async function testShutdownCleanupOrder() {
     processRef.emit('SIGINT')
     assert.equal(transportCalls.count, 0)
     assert.deepStrictEqual(events, [
-      'service', 'client', 'provider', 'access', 'secret', 'database'
+      'service', 'client', 'client', 'provider', 'access', 'secret', 'database'
     ], shutdown)
   }
 }

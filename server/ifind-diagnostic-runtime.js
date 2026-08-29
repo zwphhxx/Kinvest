@@ -273,7 +273,8 @@ async function createIfindDiagnosticRuntime(options) {
   }
 
   let provider
-  let client
+  let legacyClient
+  let marketClient
   let service
   let marketService
   try {
@@ -309,13 +310,18 @@ async function createIfindDiagnosticRuntime(options) {
     }
 
     try {
-      client = createClient()
-      if (!readMethod(client, 'diagnose') || !readMethod(client, 'clear')) {
+      legacyClient = createClient()
+      if (!readMethod(legacyClient, 'diagnose') ||
+        !readMethod(legacyClient, 'clear')) {
+        fail('IFIND_DIAGNOSTIC_RUNTIME_INVALID')
+      }
+      marketClient = createClient()
+      if (marketClient === legacyClient) {
         fail('IFIND_DIAGNOSTIC_RUNTIME_INVALID')
       }
       const marketMethods = ['authenticate', 'quote', 'financial']
-        .map((method) => readMethod(client, method))
-      if (!marketMethods.every(Boolean)) {
+        .map((method) => readMethod(marketClient, method))
+      if (!marketMethods.every(Boolean) || !readMethod(marketClient, 'clear')) {
         fail('IFIND_DIAGNOSTIC_RUNTIME_INVALID')
       }
 
@@ -340,7 +346,7 @@ async function createIfindDiagnosticRuntime(options) {
         mode: IFIND_DIAGNOSTIC_MODE_ADMIN,
         tokenVersionId: contract.versionId,
         repository,
-        client,
+        client: legacyClient,
         secretProvider: provider,
         clock,
         idSource
@@ -353,7 +359,7 @@ async function createIfindDiagnosticRuntime(options) {
         idGenerator: marketIdGenerator,
         catalogLookup: marketCatalogLookup,
         manifestLookup: marketManifestLookup,
-        client,
+        client: marketClient,
         quoteParser: marketQuoteParser,
         financialParser: marketFinancialParser,
         repository: marketRepository,
@@ -379,14 +385,20 @@ async function createIfindDiagnosticRuntime(options) {
         if (cleared) return
         cleared = true
         clearBestEffort(
-          () => clearServiceClient(service, client),
+          () => clearServiceClient(service, legacyClient),
+          () => readMethod(marketClient, 'clear')(),
           () => readMethod(provider, 'clear')()
         )
       }
     })
   } catch (error) {
     clearBestEffort(
-      () => clearServiceClient(service, client),
+      () => clearServiceClient(service, legacyClient),
+      () => {
+        if (!marketClient || marketClient === legacyClient) return
+        const clearMarketClient = readMethod(marketClient, 'clear')
+        if (clearMarketClient) clearMarketClient()
+      },
       () => { if (provider) readMethod(provider, 'clear')() }
     )
     if (error instanceof IfindDiagnosticRuntimeError) throw error

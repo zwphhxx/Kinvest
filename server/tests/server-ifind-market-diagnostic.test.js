@@ -24,6 +24,8 @@ const {
 const {
   createIfindMarketDiagnosticService
 } = require('../services/ifind-market-diagnostic-service')
+const accessTokenSuccess = require('./fixtures/ifind/access-token-success.json')
+const tradeDatesSuccess = require('./fixtures/ifind/trade-dates-success.json')
 
 const VERSION_ID = 'v20260830-001'
 
@@ -70,8 +72,53 @@ function noNetworkClient(state) {
   })
 }
 
+function controlledRequestStub(responseBodies) {
+  const pendingBodies = [...responseBodies]
+  const pendingResponses = []
+  const waiters = []
+
+  function wakeWaiters() {
+    while (waiters.length > 0) waiters.shift()()
+  }
+
+  function request(_url, _options, callback) {
+    const outgoing = new EventEmitter()
+    outgoing.write = () => {}
+    outgoing.destroy = () => {}
+    outgoing.end = () => {
+      const body = pendingBodies.shift()
+      pendingResponses.push(() => {
+        const incoming = new EventEmitter()
+        incoming.statusCode = 200
+        incoming.destroy = () => {}
+        callback(incoming)
+        incoming.emit('data', Buffer.from(JSON.stringify(body)))
+        incoming.emit('end')
+      })
+      wakeWaiters()
+    }
+    return outgoing
+  }
+
+  async function waitForCall(count) {
+    while (pendingResponses.length < count) {
+      await new Promise((resolve) => waiters.push(resolve))
+    }
+  }
+
+  function release(index) {
+    const respond = pendingResponses[index]
+    assert.equal(typeof respond, 'function')
+    respond()
+  }
+
+  return { release, request, waitForCall }
+}
+
 function instrumentedProductionClient(state) {
   const client = noNetworkClient(state)
+  const clientIndex = state.clientClearCounts.length
+  state.clientClearCounts.push(0)
   return {
     diagnose: client.diagnose,
     authenticate: client.authenticate,
@@ -79,6 +126,7 @@ function instrumentedProductionClient(state) {
     financial: client.financial,
     clear() {
       state.clientClearCalls += 1
+      state.clientClearCounts[clientIndex] += 1
       client.clear()
     }
   }
@@ -127,6 +175,7 @@ function createServerHarness(overrides = {}) {
   const state = {
     transportCalls: 0,
     clientClearCalls: 0,
+    clientClearCounts: [],
     clientCreates: 0,
     providerLoads: 0,
     databaseCloseCalls: 0,
@@ -218,7 +267,7 @@ async function testDisabledModeDoesNotInitializeMarketRuntime() {
 
 async function testEnabledModeRejectsIncompleteProductionClient() {
   for (const missing of [
-    'authenticate', 'quote', 'financial', 'clear', 'all-market'
+    'diagnose', 'authenticate', 'quote', 'financial', 'clear', 'all-market'
   ]) {
     const harness = createServerHarness({
       createIfindClient: (state) => incompleteProductionClient(state, missing)
@@ -236,12 +285,57 @@ async function testEnabledModeRejectsIncompleteProductionClient() {
       assert.equal(harness.state.databaseCloseCalls, 1, missing)
       assert.equal(
         harness.state.clientClearCalls,
-        missing === 'clear' ? 0 : 1,
+        missing === 'clear' ? 0
+          : missing === 'diagnose' ? 1
+            : 2,
         missing
       )
     } finally {
       harness.dispose()
     }
+  }
+}
+
+async function testClientFactoryFailuresCleanDistinctInstances() {
+  const secondFailure = createServerHarness({
+    createIfindClient(state) {
+      if (state.clientCreates === 2) throw new Error('second client failed')
+      return instrumentedProductionClient(state)
+    }
+  })
+  try {
+    await assert.rejects(
+      secondFailure.start(),
+      hasCode('IFIND_DIAGNOSTIC_RUNTIME_INVALID')
+    )
+    assert.equal(secondFailure.server.listenCalls, 0)
+    assert.equal(secondFailure.state.clientCreates, 2)
+    assert.equal(secondFailure.state.clientClearCalls, 1)
+    assert.equal(secondFailure.providerState.clearCalls, 1)
+    assert.equal(secondFailure.state.databaseCloseCalls, 1)
+  } finally {
+    secondFailure.dispose()
+  }
+
+  let sharedClient
+  const reusedInstance = createServerHarness({
+    createIfindClient(state) {
+      if (!sharedClient) sharedClient = instrumentedProductionClient(state)
+      return sharedClient
+    }
+  })
+  try {
+    await assert.rejects(
+      reusedInstance.start(),
+      hasCode('IFIND_DIAGNOSTIC_RUNTIME_INVALID')
+    )
+    assert.equal(reusedInstance.server.listenCalls, 0)
+    assert.equal(reusedInstance.state.clientCreates, 2)
+    assert.equal(reusedInstance.state.clientClearCalls, 1)
+    assert.equal(reusedInstance.providerState.clearCalls, 1)
+    assert.equal(reusedInstance.state.databaseCloseCalls, 1)
+  } finally {
+    reusedInstance.dispose()
   }
 }
 
@@ -257,6 +351,7 @@ async function testEnabledRuntimeComposesProductionMarketService() {
   let repositoryDatabase
   let serviceOptions
   let createdMarketService
+  const clients = []
 
   try {
     const runtime = await createIfindDiagnosticRuntime({
@@ -267,7 +362,11 @@ async function testEnabledRuntimeComposesProductionMarketService() {
         loadedConfig = config
         return provider
       },
-      createClient: () => noNetworkClient(clientState),
+      createClient() {
+        const client = noNetworkClient(clientState)
+        clients.push(client)
+        return client
+      },
       createMarketRepository(value) {
         repositoryDatabase = value
         return new IfindMarketDiagnosticRepository(value)
@@ -285,8 +384,11 @@ async function testEnabledRuntimeComposesProductionMarketService() {
       bundlePath: '/run/secrets/kinvest-ifind'
     })
     assert.equal(repositoryDatabase, database)
+    assert.equal(clients.length, 2)
+    assert.notEqual(clients[0], clients[1])
     assert.equal(serviceOptions.tokenVersionId, VERSION_ID)
     assert.equal(serviceOptions.secretProvider, provider)
+    assert.equal(serviceOptions.client, clients[1])
     assert.equal(serviceOptions.catalogLookup, getIfindMarketCase)
     assert.equal(serviceOptions.manifestLookup, createLiveRequestManifest)
     assert.equal(serviceOptions.quoteParser, parseIfindMarketQuote)
@@ -308,6 +410,78 @@ async function testEnabledRuntimeComposesProductionMarketService() {
     runtime.clear()
     assert.equal(providerState.clearCalls, 1)
     assert.equal(database.prepare('SELECT 1 AS value').get().value, 1)
+  } finally {
+    database.close()
+  }
+}
+
+async function testLegacyAndMarketClientLifecyclesDoNotInterfere() {
+  const {
+    createIfindDiagnosticRuntime
+  } = require('../ifind-diagnostic-runtime')
+  const database = new DatabaseSync(':memory:')
+  const providerState = { reads: 0, clearCalls: 0, cleared: false }
+  const legacyTransport = controlledRequestStub([
+    accessTokenSuccess,
+    tradeDatesSuccess,
+    accessTokenSuccess,
+    tradeDatesSuccess
+  ])
+  const marketTransport = controlledRequestStub([accessTokenSuccess])
+  const transports = [legacyTransport, marketTransport]
+  const clients = []
+
+  try {
+    const runtime = await createIfindDiagnosticRuntime({
+      env: enabledEnv(),
+      accessRuntime: enabledAccess(),
+      openDatabase: () => database,
+      loadSecrets: async () => secretProvider(providerState),
+      createClient() {
+        const transport = transports[clients.length]
+        const client = createIfindHttpClient({ request: transport.request })
+        clients.push(client)
+        return client
+      }
+    })
+    assert.equal(clients.length, 2)
+    const [legacyClient, marketClient] = clients
+
+    const activeLegacy = legacyClient.diagnose({
+      refreshToken: Buffer.from('fixture-refresh-token')
+    })
+    await legacyTransport.waitForCall(1)
+    const marketResult = await runtime.marketService.run({
+      caseId: 'HK_ALIBABA_9988'
+    })
+    assert.equal(marketResult.failureCode, 'IFIND_MARKET_CASE_UNVERIFIED')
+    legacyTransport.release(0)
+    await legacyTransport.waitForCall(2)
+    legacyTransport.release(1)
+    assert.equal((await activeLegacy).route, '/api/v1/get_trade_dates')
+
+    const subsequentLegacy = legacyClient.diagnose({
+      refreshToken: Buffer.from('fixture-refresh-token')
+    })
+    await legacyTransport.waitForCall(3)
+    legacyTransport.release(2)
+    await legacyTransport.waitForCall(4)
+    legacyTransport.release(3)
+    assert.equal((await subsequentLegacy).route, '/api/v1/get_trade_dates')
+
+    const activeMarket = marketClient.authenticate(
+      Buffer.from('fixture-refresh-token')
+    )
+    await marketTransport.waitForCall(1)
+    legacyClient.clear()
+    marketTransport.release(0)
+    const authResult = await activeMarket
+    assert.equal(Buffer.isBuffer(authResult.accessToken), true)
+    assert.equal(authResult.requestCount, 1)
+
+    runtime.clear()
+    runtime.clear()
+    assert.equal(providerState.clearCalls, 1)
   } finally {
     database.close()
   }
@@ -401,7 +575,7 @@ async function testStartupFailureCleanupMatrix() {
           `)
         }
       },
-      expected: { provider: 1, client: 1 }
+      expected: { provider: 1, client: 2 }
     }
   ]
 
@@ -437,7 +611,8 @@ async function exerciseShutdown(trigger) {
 
   assert.equal(harness.server.closeCalls, 1, trigger)
   assert.equal(harness.providerState.clearCalls, 1, trigger)
-  assert.equal(harness.state.clientClearCalls, 1, trigger)
+  assert.equal(harness.state.clientClearCalls, 2, trigger)
+  assert.deepEqual(harness.state.clientClearCounts, [1, 1], trigger)
   assert.equal(harness.state.databaseCloseCalls, 1, trigger)
   assert.equal(harness.state.fallbackCloseCalls, 1, trigger)
   assert.equal(harness.state.secretClearCalls, 1, trigger)
@@ -449,7 +624,8 @@ async function exerciseShutdown(trigger) {
   harness.processRef.emit('SIGTERM')
   harness.processRef.emit('SIGINT')
   assert.equal(harness.providerState.clearCalls, 1, trigger)
-  assert.equal(harness.state.clientClearCalls, 1, trigger)
+  assert.equal(harness.state.clientClearCalls, 2, trigger)
+  assert.deepEqual(harness.state.clientClearCounts, [1, 1], trigger)
   assert.equal(harness.state.databaseCloseCalls, 1, trigger)
   assert.equal(harness.state.fallbackCloseCalls, 1, trigger)
 }
@@ -471,7 +647,9 @@ async function run() {
   try {
     await testDisabledModeDoesNotInitializeMarketRuntime()
     await testEnabledModeRejectsIncompleteProductionClient()
+    await testClientFactoryFailuresCleanDistinctInstances()
     await testEnabledRuntimeComposesProductionMarketService()
+    await testLegacyAndMarketClientLifecyclesDoNotInterfere()
     await testInvalidCatalogPreventsListenBeforeSecretLoad()
     await testStartupFailureCleanupMatrix()
     await testServerCloseClearsSharedResourcesOnce()
