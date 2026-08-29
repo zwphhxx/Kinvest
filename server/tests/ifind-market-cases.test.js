@@ -206,6 +206,18 @@ async function run() {
         {}
       )
     }],
+    ['array subclass request fields', (manifest) => {
+      class FixtureArray extends Array {}
+      manifest.requestTemplates.quote.fields = new FixtureArray(
+        ...manifest.requestTemplates.quote.fields
+      )
+    }],
+    ['replaced request array prototype', (manifest) => {
+      Object.setPrototypeOf(
+        manifest.requestTemplates.quote.fields,
+        Object.create(Array.prototype)
+      )
+    }],
     ['whitespace vendor code', (manifest) => { manifest.vendorCodes.ifind.code = '  ' }],
     ['missing quote template', (manifest) => { delete manifest.requestTemplates.quote }],
     ['primitive indicators', (manifest) => { manifest.indicators = 'verified' }]
@@ -245,6 +257,22 @@ async function run() {
   assertInvalidManifest(nestedAccessorManifest, 'nested accessor-backed parameter')
   assert.equal(nestedAccessorRead, false)
 
+  let inheritedArrayAccessorRead = false
+  const inheritedArrayAccessorManifest = completeVerifiedManifestDefinition()
+  const hostileArrayPrototype = Object.create(Array.prototype)
+  Object.defineProperty(hostileArrayPrototype, 'map', {
+    get() {
+      inheritedArrayAccessorRead = true
+      throw new Error('must not read inherited array behavior')
+    }
+  })
+  Object.setPrototypeOf(
+    inheritedArrayAccessorManifest.requestTemplates.quote.fields,
+    hostileArrayPrototype
+  )
+  assertInvalidManifest(inheritedArrayAccessorManifest, 'hostile inherited array accessor')
+  assert.equal(inheritedArrayAccessorRead, false)
+
   const firstList = listIfindMarketCases()
   const secondList = listIfindMarketCases()
 
@@ -257,6 +285,21 @@ async function run() {
   assert.notStrictEqual(firstList[0], secondList[0])
   assert.notStrictEqual(firstList[0].formatAliases, secondList[0].formatAliases)
   assert.notStrictEqual(firstList[0].vendorCodes, secondList[0].vendorCodes)
+
+  const originalArrayMap = Array.prototype.map
+  let inheritedMapInvoked = false
+  Array.prototype.map = function hostileInheritedMap() {
+    inheritedMapInvoked = true
+    throw new Error('catalog cloning must not dispatch inherited array methods')
+  }
+  try {
+    const safelyClonedList = listIfindMarketCases()
+    assert.equal(safelyClonedList.length, 3)
+    assert.equal(safelyClonedList[0].caseId, 'HK_ALIBABA_9988')
+  } finally {
+    Array.prototype.map = originalArrayMap
+  }
+  assert.equal(inheritedMapInvoked, false)
 
   for (const expected of EXPECTED_CASES) {
     const marketCase = getIfindMarketCase(expected.caseId)

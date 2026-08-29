@@ -44,7 +44,27 @@ function deepFreeze(value) {
 }
 
 function cloneFrozen(value) {
-  if (Array.isArray(value)) return Object.freeze(value.map(cloneFrozen))
+  if (Array.isArray(value)) {
+    if (Object.getPrototypeOf(value) !== Array.prototype) {
+      throw new Error('Fixed iFinD market catalog contains a non-plain array')
+    }
+    const descriptors = Object.getOwnPropertyDescriptors(value)
+    const length = descriptors.length && descriptors.length.value
+    if (!Number.isSafeInteger(length) || length < 0 ||
+      Object.getOwnPropertyNames(value).length !== length + 1) {
+      throw new Error('Fixed iFinD market catalog contains an invalid array')
+    }
+    const clone = []
+    clone.length = length
+    for (let index = 0; index < length; index += 1) {
+      const descriptor = descriptors[index]
+      if (!descriptor || !Object.hasOwn(descriptor, 'value')) {
+        throw new Error('Fixed iFinD market catalog contains an invalid array index')
+      }
+      clone[index] = cloneFrozen(descriptor.value)
+    }
+    return Object.freeze(clone)
+  }
   if (!value || typeof value !== 'object') return value
   const clone = {}
   for (const [key, nested] of Object.entries(value)) clone[key] = cloneFrozen(nested)

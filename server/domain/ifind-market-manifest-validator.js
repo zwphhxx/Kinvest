@@ -76,12 +76,15 @@ function dataValue(descriptors, key) {
 function arrayValues(value, requireNonEmpty = true) {
   if (!Array.isArray(value) || isProxy(value)) invalidManifest()
 
+  let prototype
   let descriptors
   try {
+    prototype = Object.getPrototypeOf(value)
     descriptors = Object.getOwnPropertyDescriptors(value)
   } catch {
     invalidManifest()
   }
+  if (prototype !== Array.prototype) invalidManifest()
   const lengthDescriptor = descriptors.length
   if (!lengthDescriptor || !Object.hasOwn(lengthDescriptor, 'value')) invalidManifest()
   const length = lengthDescriptor.value
