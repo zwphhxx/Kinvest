@@ -200,19 +200,18 @@ async function run() {
     '等待当前诊断', '正在运行…', '等待当前诊断'
   ])
 
-  /** @type {Array<[number, string, string]>} */
+  /** @type {Array<[number, string, string, boolean]>} */
   const actualApiErrors = [
-    [429, 'IFIND_MARKET_CASE_DAILY_LIMIT', '此案例今日诊断次数已达上限。'],
-    [429, 'IFIND_MARKET_GLOBAL_DAILY_LIMIT', '今日三市场诊断总次数已达上限。'],
-    [409, 'IFIND_MARKET_CASE_UNAVAILABLE', '此固定案例尚未完成指标核验。'],
-    [409, 'IFIND_MARKET_DIAGNOSTIC_BUSY', '另一项市场诊断正在运行。'],
-    [429, 'IFIND_MARKET_DIAGNOSTIC_COOLDOWN', '此案例正在冷却，请稍后重试。']
+    [429, 'IFIND_MARKET_CASE_DAILY_LIMIT', '此案例今日诊断次数已达上限。', false],
+    [429, 'IFIND_MARKET_GLOBAL_DAILY_LIMIT', '今日三市场诊断总次数已达上限。', false],
+    [503, 'IFIND_MARKET_CASE_UNAVAILABLE', '此固定案例尚未完成指标核验。', false],
+    [409, 'IFIND_MARKET_DIAGNOSTIC_BUSY', '另一项市场诊断正在运行。', true],
+    [429, 'IFIND_MARKET_DIAGNOSTIC_COOLDOWN', '此案例正在冷却，请稍后重试。', true]
   ]
-  for (const [status, code, message] of actualApiErrors) {
+  for (const [status, code, message, retryable] of actualApiErrors) {
     assert.deepEqual(
       adminContract.ifindMarketDiagnosticApiFailure(status, { error: code }),
-      { code, message, retryable: status >= 500 || code === 'IFIND_MARKET_DIAGNOSTIC_BUSY' ||
-        code === 'IFIND_MARKET_DIAGNOSTIC_COOLDOWN' }
+      { code, message, retryable }
     )
   }
   assert.equal(

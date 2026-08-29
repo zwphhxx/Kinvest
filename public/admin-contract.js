@@ -320,8 +320,9 @@
     return Object.freeze({
       code,
       message: ifindMarketDiagnosticErrorMessage(code),
-      retryable: status >= 500 || code === 'IFIND_MARKET_DIAGNOSTIC_BUSY' ||
-        code === 'IFIND_MARKET_DIAGNOSTIC_COOLDOWN'
+      retryable: code !== 'IFIND_MARKET_CASE_UNAVAILABLE' &&
+        (status >= 500 || code === 'IFIND_MARKET_DIAGNOSTIC_BUSY' ||
+          code === 'IFIND_MARKET_DIAGNOSTIC_COOLDOWN')
     })
   }
 
