@@ -55,9 +55,15 @@ async function runBuildArtifactsExist() {
     'server/db/database-identity.js',
     'server/db/device-auth-repository.js',
     'server/db/ifind-diagnostic-repository.js',
+    'server/db/ifind-market-diagnostic-repository.js',
     'server/db/refresh-db.js',
+    'server/domain/ifind-market-cases.js',
+    'server/domain/ifind-market-financial-parser.js',
+    'server/domain/ifind-market-manifest-validator.js',
+    'server/domain/ifind-market-quote-parser.js',
     'server/domain/security-identity.js',
     'server/http/auth-http.js',
+    'server/http/ifind-market-diagnostic-http.js',
     'server/http/trusted-client.js',
     'server/ifind-diagnostic-runtime.js',
     'server/ifind-secret-preflight.js',
@@ -77,6 +83,7 @@ async function runBuildArtifactsExist() {
     'server/server.js',
     'server/services/health.js',
     'server/services/ifind-diagnostic-service.js',
+    'server/services/ifind-market-diagnostic-service.js',
     'server/services/refresh-rules.js',
     'server/utils/refresh-policy.js'
   ]

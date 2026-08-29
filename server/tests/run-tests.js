@@ -54,6 +54,7 @@ const tests = [
   require('./build.test'),
   require('./frontend-auth-state.test'),
   require('./frontend-auth-contract.test'),
+  require('./frontend-ifind-market-diagnostic.test'),
   require('./frontend-contract.test'),
   require('./data-source-contract.test'),
   require('./model-security-contract.test'),

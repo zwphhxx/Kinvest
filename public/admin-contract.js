@@ -32,6 +32,33 @@
     RATE_LIMITED: '诊断受到本地频率限制，请稍后重试。',
     BUSY: '已有一项诊断正在运行，请稍后再试。'
   })
+  const IFIND_MARKET_CASES = Object.freeze([
+    Object.freeze({ caseId: 'HK_ALIBABA_9988', key: 'hk', marketLabel: '港股' }),
+    Object.freeze({ caseId: 'US_APPLE_AAPL', key: 'us', marketLabel: '美股' }),
+    Object.freeze({ caseId: 'CN_MOUTAI_600519', key: 'cn', marketLabel: 'A 股' })
+  ])
+  const IFIND_MARKET_API_ERRORS = new Set([
+    'IFIND_MARKET_DIAGNOSTIC_DISABLED',
+    'IFIND_MARKET_DIAGNOSTIC_UNAVAILABLE',
+    'IFIND_MARKET_DIAGNOSTIC_BUSY',
+    'IFIND_MARKET_DIAGNOSTIC_COOLDOWN',
+    'IFIND_MARKET_DIAGNOSTIC_DAILY_LIMIT',
+    'IFIND_MARKET_DIAGNOSTIC_CLOCK_ROLLBACK',
+    'IFIND_MARKET_DIAGNOSTIC_REJECTED',
+    'ADMIN_AUTH_REQUIRED',
+    'ADMIN_CSRF_INVALID'
+  ])
+  const IFIND_MARKET_CONTROL_MESSAGES = Object.freeze({
+    IFIND_MARKET_DIAGNOSTIC_DISABLED: '三市场诊断尚未启用。',
+    IFIND_MARKET_DIAGNOSTIC_UNAVAILABLE: '三市场诊断暂不可用。',
+    IFIND_MARKET_DIAGNOSTIC_BUSY: '另一项市场诊断正在运行。',
+    IFIND_MARKET_DIAGNOSTIC_COOLDOWN: '此案例正在冷却，请稍后重试。',
+    IFIND_MARKET_DIAGNOSTIC_DAILY_LIMIT: '今日本地诊断额度已用完。',
+    IFIND_MARKET_DIAGNOSTIC_CLOCK_ROLLBACK: '服务器时间状态异常，诊断已停止。',
+    IFIND_MARKET_DIAGNOSTIC_REJECTED: '诊断请求未通过固定案例校验。',
+    ADMIN_AUTH_REQUIRED: '管理员会话已结束，请重新登录。',
+    ADMIN_CSRF_INVALID: '操作凭证已失效，请刷新后重试。'
+  })
 
   function ifindDiagnosticErrorMessage(code) {
     if (Object.hasOwn(IFIND_SAFE_ERROR_MESSAGES, code)) return IFIND_SAFE_ERROR_MESSAGES[code]
@@ -278,6 +305,338 @@
     return Object.freeze({ bind, refresh, render, reset, run })
   }
 
+  function ifindMarketDiagnosticErrorMessage(code) {
+    if (Object.hasOwn(IFIND_SAFE_ERROR_MESSAGES, code)) return IFIND_SAFE_ERROR_MESSAGES[code]
+    if (Object.hasOwn(IFIND_MARKET_CONTROL_MESSAGES, code)) {
+      return IFIND_MARKET_CONTROL_MESSAGES[code]
+    }
+    return '市场诊断未完成，请检查安全状态后重试。'
+  }
+
+  function ifindMarketDiagnosticApiFailure(status, payload) {
+    const code = payload && IFIND_MARKET_API_ERRORS.has(payload.error)
+      ? payload.error
+      : 'UNKNOWN'
+    return Object.freeze({
+      code,
+      message: ifindMarketDiagnosticErrorMessage(code),
+      retryable: status >= 500 || code === 'IFIND_MARKET_DIAGNOSTIC_BUSY' ||
+        code === 'IFIND_MARKET_DIAGNOSTIC_COOLDOWN'
+    })
+  }
+
+  function finiteNumber(value) {
+    return typeof value === 'number' && Number.isFinite(value)
+  }
+
+  function safeString(value, fallback = '—') {
+    return typeof value === 'string' && value.length > 0 ? value : fallback
+  }
+
+  function safeTimestamp(value, dateText, fallback = '尚未执行') {
+    return Number.isSafeInteger(value) && value >= 0 ? dateText(value) : fallback
+  }
+
+  function marketStatusLabel(value) {
+    const labels = {
+      available: '已验证',
+      unavailable: '不可用',
+      not_run: '未运行'
+    }
+    return Object.hasOwn(labels, value) ? labels[value] : '尚未验证'
+  }
+
+  function tradingStatusLabel(value) {
+    const labels = {
+      trading: '交易中',
+      closed: '已收市',
+      halted: '停牌',
+      pre_open: '盘前',
+      post_close: '盘后'
+    }
+    return Object.hasOwn(labels, value) ? labels[value] : '状态不可用'
+  }
+
+  function uniqueSafeStrings(values) {
+    const seen = new Set()
+    const result = []
+    for (const value of values) {
+      if (typeof value !== 'string' || value.length === 0 || seen.has(value)) continue
+      seen.add(value)
+      result.push(value)
+    }
+    return result
+  }
+
+  function marketRunDecision({ entry, runtimeReady, runningCaseId, now }) {
+    if (runningCaseId) {
+      return Object.freeze({
+        disabled: true,
+        label: runningCaseId === entry.case.caseId ? '正在运行…' : '等待当前诊断',
+        tone: 'running'
+      })
+    }
+    if (!runtimeReady) {
+      return Object.freeze({ disabled: true, label: '诊断未启用', tone: 'disabled' })
+    }
+    if (entry.case.liveReady !== true) {
+      return Object.freeze({ disabled: true, label: '指标尚未核验', tone: 'disabled' })
+    }
+    const quota = entry.quota
+    if (!quota || quota.localStatus !== 'available') {
+      return Object.freeze({ disabled: true, label: '配额状态不可用', tone: 'disabled' })
+    }
+    if (quota.inFlight === true) {
+      return Object.freeze({ disabled: true, label: '诊断占用中', tone: 'running' })
+    }
+    if (Number.isSafeInteger(quota.cooldownUntil) && quota.cooldownUntil > now) {
+      return Object.freeze({ disabled: true, label: '冷却中', tone: 'cooldown' })
+    }
+    if (quota.caseRemaining === 0 || quota.globalRemaining === 0) {
+      return Object.freeze({ disabled: true, label: '今日已达上限', tone: 'daily-limit' })
+    }
+    return Object.freeze({ disabled: false, label: '运行此案例', tone: 'ready' })
+  }
+
+  function createIfindMarketCardView(config, entry, context) {
+    const emptyCase = {
+      caseId: config.caseId,
+      companyName: '案例不可用',
+      displayCode: '—',
+      expectedTradingCurrency: '—',
+      liveReady: false
+    }
+    const normalizedEntry = entry && entry.case && entry.case.caseId === config.caseId
+      ? entry
+      : { case: emptyCase, latest: null, quota: null }
+    const presentation = normalizedEntry.case
+    const latest = normalizedEntry.latest && typeof normalizedEntry.latest === 'object'
+      ? normalizedEntry.latest
+      : null
+    const quote = latest && latest.quote && typeof latest.quote === 'object'
+      ? latest.quote
+      : null
+    const financial = latest && Array.isArray(latest.financial) ? latest.financial : []
+    const periods = uniqueSafeStrings(financial.map((point) => point && point.reportPeriod))
+    const units = uniqueSafeStrings(financial.map((point) => point && point.unit))
+    const missing = financial
+      .filter((point) => point && point.availability === 'missing')
+      .map((point) => `${safeString(point.metricKey)} / ${safeString(point.reportPeriod)}`)
+    const quota = normalizedEntry.quota
+    const cooldown = quota && Number.isSafeInteger(quota.cooldownUntil) &&
+      quota.cooldownUntil > context.now
+      ? `至 ${context.dateText(quota.cooldownUntil)}`
+      : '可运行'
+    const dailyAllowance = quota && quota.localStatus === 'available' &&
+      Number.isSafeInteger(quota.caseRemaining) && Number.isSafeInteger(quota.globalRemaining)
+      ? `个案 ${quota.caseRemaining} / 5 · 全局 ${quota.globalRemaining} / 12`
+      : '本地额度不可用'
+    const safeError = latest && typeof latest.safeErrorClass === 'string'
+      ? ifindMarketDiagnosticErrorMessage(latest.safeErrorClass)
+      : '无'
+    return Object.freeze({
+      caseId: config.caseId,
+      key: config.key,
+      marketLabel: config.marketLabel,
+      companyName: safeString(presentation.companyName, '案例不可用'),
+      displayCode: safeString(presentation.displayCode),
+      lastRun: latest ? safeTimestamp(latest.completedAt, context.dateText) : '尚未执行',
+      cooldown,
+      dailyAllowance,
+      price: quote && finiteNumber(quote.latestPrice) ? String(quote.latestPrice) : '—',
+      quoteTime: quote ? safeString(quote.quoteTime) : '—',
+      tradingStatus: quote ? tradingStatusLabel(quote.tradingStatus) : '尚无行情',
+      currency: quote ? safeString(quote.currency) : safeString(presentation.expectedTradingCurrency),
+      units: units.length > 0 ? units.join(' · ') : '—',
+      periods: periods.length > 0 ? periods.join(' · ') : '—',
+      validation: latest
+        ? `行情 ${marketStatusLabel(latest.quoteStatus)} · 财务 ${marketStatusLabel(latest.financeStatus)}`
+        : '行情 尚未验证 · 财务 尚未验证',
+      missingFields: missing.length > 0
+        ? missing.join('；')
+        : (latest && latest.financeStatus === 'unavailable' ? '财务数据不可用' : '无'),
+      safeError,
+      run: marketRunDecision({
+        entry: normalizedEntry,
+        runtimeReady: context.runtimeReady,
+        runningCaseId: context.runningCaseId,
+        now: context.now
+      })
+    })
+  }
+
+  function createIfindMarketDiagnosticView(status, options = {}) {
+    const now = Number.isSafeInteger(options.now) ? options.now : Date.now()
+    const dateText = typeof options.dateText === 'function'
+      ? options.dateText
+      : (value) => new Date(value).toLocaleString('zh-CN')
+    const cases = status && Array.isArray(status.cases) ? status.cases : []
+    const byCaseId = new Map()
+    for (const entry of cases) {
+      const caseId = entry && entry.case && typeof entry.case.caseId === 'string'
+        ? entry.case.caseId
+        : null
+      if (IFIND_MARKET_CASES.some((item) => item.caseId === caseId) && !byCaseId.has(caseId)) {
+        byCaseId.set(caseId, entry)
+      }
+    }
+    const runtimeReady = Boolean(status && status.runtimeStatus === 'admin-diagnostic')
+    const runningCaseId = IFIND_MARKET_CASES.some((item) => item.caseId === options.runningCaseId)
+      ? options.runningCaseId
+      : null
+    return Object.freeze({
+      statusLabel: runtimeReady ? '固定案例已就绪' : '固定案例未启用',
+      note: '管理员诊断专用；家庭看板继续使用 Mock 数据。',
+      cards: Object.freeze(IFIND_MARKET_CASES.map((config) =>
+        createIfindMarketCardView(config, byCaseId.get(config.caseId), {
+          dateText, now, runningCaseId, runtimeReady
+        })
+      ))
+    })
+  }
+
+  function createIfindMarketDiagnosticController(options) {
+    const documentRef = options.document
+    const sessionLifecycle = options.sessionLifecycle
+    const request = options.request
+    const dateText = options.dateText
+    const now = options.now
+    const setLive = options.setLive
+    const onError = options.onError
+    let status = null
+    let runningCaseId = null
+    let bound = false
+    const byId = (id) => documentRef.getElementById(id)
+
+    function isStale(error) {
+      return error && (error.name === 'AbortError' || error.message === 'ADMIN_EPOCH_STALE')
+    }
+
+    function render(nextStatus = status) {
+      status = nextStatus
+      const view = createIfindMarketDiagnosticView(status, {
+        dateText,
+        now: now(),
+        runningCaseId
+      })
+      byId('ifind-market-status').textContent = view.statusLabel
+      byId('ifind-market-note').textContent = view.note
+      for (const card of view.cards) {
+        const prefix = `ifind-market-${card.key}`
+        byId(`${prefix}-company`).textContent = card.companyName
+        byId(`${prefix}-code`).textContent = card.displayCode
+        byId(`${prefix}-last-run`).textContent = card.lastRun
+        byId(`${prefix}-cooldown`).textContent = card.cooldown
+        byId(`${prefix}-daily`).textContent = card.dailyAllowance
+        byId(`${prefix}-price`).textContent = card.price
+        byId(`${prefix}-quote-time`).textContent = card.quoteTime
+        byId(`${prefix}-trading-status`).textContent = card.tradingStatus
+        byId(`${prefix}-currency`).textContent = card.currency
+        byId(`${prefix}-units`).textContent = card.units
+        byId(`${prefix}-periods`).textContent = card.periods
+        byId(`${prefix}-validation`).textContent = card.validation
+        byId(`${prefix}-missing`).textContent = card.missingFields
+        byId(`${prefix}-error`).textContent = card.safeError
+        const button = byId(`${prefix}-run`)
+        button.textContent = card.run.label
+        button.disabled = card.run.disabled
+        button.dataset.tone = card.run.tone
+        button.setAttribute('aria-busy', String(runningCaseId === card.caseId))
+      }
+    }
+
+    async function refresh() {
+      const ticket = sessionLifecycle.beginRequest()
+      try {
+        const payload = await request('/api/admin/ifind/market-cases', { signal: ticket.signal })
+        sessionLifecycle.commit(ticket, () => render(payload.data))
+      } catch (error) {
+        if (isStale(error)) return
+        if (error.code === 'ADMIN_AUTH_REQUIRED') {
+          await onError(error)
+          return
+        }
+        sessionLifecycle.commit(ticket, () => render({ runtimeStatus: 'unavailable', cases: [] }))
+      } finally {
+        sessionLifecycle.finishRequest(ticket)
+      }
+    }
+
+    async function run(caseId) {
+      const config = IFIND_MARKET_CASES.find((item) => item.caseId === caseId)
+      if (!config || runningCaseId) return
+      const button = byId(`ifind-market-${config.key}-run`)
+      if (button.disabled) return
+      const ticket = sessionLifecycle.beginRequest()
+      sessionLifecycle.commit(ticket, () => {
+        runningCaseId = caseId
+        render()
+      })
+      let finalizationError = null
+      try {
+        let outcome = null
+        try {
+          outcome = await request(`/api/admin/ifind/market-cases/${caseId}/run`, {
+            method: 'POST', body: {}, csrf: true, signal: ticket.signal
+          })
+        } catch (error) {
+          if (isStale(error)) return
+          if (error.code === 'ADMIN_AUTH_REQUIRED' || error.code === 'ADMIN_CSRF_INVALID') {
+            await onError(error)
+            return
+          }
+          sessionLifecycle.commit(ticket, () => {
+            setLive(ifindMarketDiagnosticErrorMessage(error.code), 'error')
+          })
+        }
+        const payload = await request('/api/admin/ifind/market-cases', { signal: ticket.signal })
+        sessionLifecycle.commit(ticket, () => {
+          render(payload.data)
+          if (outcome) {
+            const complete = outcome.data && outcome.data.status === 'complete'
+            setLive(complete ? '固定市场案例诊断已完成。' : '固定市场案例诊断已记录安全结果。',
+              complete ? 'success' : 'error')
+          }
+        })
+      } catch (error) {
+        if (!isStale(error)) {
+          if (error.code === 'ADMIN_AUTH_REQUIRED') await onError(error)
+          else sessionLifecycle.commit(ticket, () => {
+            setLive(ifindMarketDiagnosticErrorMessage(error.code), 'error')
+          })
+        }
+      } finally {
+        try {
+          sessionLifecycle.commit(ticket, () => {
+            runningCaseId = null
+            render()
+          })
+        } catch (error) {
+          if (!isStale(error)) finalizationError = error
+        } finally {
+          sessionLifecycle.finishRequest(ticket)
+        }
+      }
+      if (finalizationError) throw finalizationError
+    }
+
+    function bind() {
+      if (bound) return
+      bound = true
+      for (const config of IFIND_MARKET_CASES) {
+        byId(`ifind-market-${config.key}-run`).addEventListener('click', () => run(config.caseId))
+      }
+    }
+
+    function reset() {
+      status = null
+      runningCaseId = null
+      render()
+    }
+
+    return Object.freeze({ bind, refresh, render, reset, run })
+  }
+
   function approvedRequestDecision(request) {
     return request && Number.isSafeInteger(request.approvedAt)
       ? Object.freeze({ approvable: false, label: '已批准，等待设备兑换' })
@@ -435,9 +794,13 @@
     createAdminSecurityState,
     createIfindDiagnosticController,
     createIfindDiagnosticView,
+    createIfindMarketDiagnosticController,
+    createIfindMarketDiagnosticView,
     ifindDiagnosticApiFailure,
     ifindDiagnosticErrorMessage,
     ifindDiagnosticSafeErrorClasses,
+    ifindMarketDiagnosticApiFailure,
+    ifindMarketDiagnosticErrorMessage,
     logoutFailureDecision,
     mutationFailureDecision
   })

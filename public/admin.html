@@ -77,6 +77,85 @@
           </div>
         </section>
 
+        <section id="ifind-market-diagnostic" class="admin-panel admin-panel-wide ifind-market-diagnostic" aria-labelledby="ifind-market-title">
+          <div class="ifind-market-head">
+            <div>
+              <p class="ticket-label">iFinD / Fixed market cases</p>
+              <h2 id="ifind-market-title">三市场案例诊断</h2>
+              <p id="ifind-market-note" class="ifind-boundary">管理员诊断专用；家庭看板继续使用 Mock 数据。</p>
+            </div>
+            <p class="ifind-enabled-badge">案例状态 <strong id="ifind-market-status">固定案例未启用</strong></p>
+          </div>
+
+          <div class="ifind-market-rail" aria-label="港股、美股和 A 股固定诊断案例">
+            <article id="ifind-market-hk-card" class="ifind-market-card" data-market="HK">
+              <header class="ifind-market-card-head">
+                <span class="ifind-market-tag">港股 · HKEX</span>
+                <div><h3 id="ifind-market-hk-company">阿里巴巴</h3><p id="ifind-market-hk-code">9988.HK</p></div>
+              </header>
+              <dl class="ifind-market-facts">
+                <div><dt>最近运行</dt><dd id="ifind-market-hk-last-run">尚未执行</dd></div>
+                <div><dt>冷却</dt><dd id="ifind-market-hk-cooldown">—</dd></div>
+                <div class="wide"><dt>每日余量</dt><dd id="ifind-market-hk-daily">本地额度不可用</dd></div>
+                <div><dt>最新价</dt><dd id="ifind-market-hk-price">—</dd></div>
+                <div><dt>行情时间</dt><dd id="ifind-market-hk-quote-time">—</dd></div>
+                <div><dt>交易状态</dt><dd id="ifind-market-hk-trading-status">尚无行情</dd></div>
+                <div><dt>币种</dt><dd id="ifind-market-hk-currency">HKD</dd></div>
+                <div><dt>单位</dt><dd id="ifind-market-hk-units">—</dd></div>
+                <div class="wide"><dt>请求报告期</dt><dd id="ifind-market-hk-periods">—</dd></div>
+                <div class="wide"><dt>验证状态</dt><dd id="ifind-market-hk-validation">行情 尚未验证 · 财务 尚未验证</dd></div>
+                <div class="wide"><dt>缺失字段</dt><dd id="ifind-market-hk-missing">无</dd></div>
+              </dl>
+              <p id="ifind-market-hk-error" class="ifind-market-error">无</p>
+              <button id="ifind-market-hk-run" class="auth-primary" type="button" disabled>诊断未启用</button>
+            </article>
+
+            <article id="ifind-market-us-card" class="ifind-market-card" data-market="US">
+              <header class="ifind-market-card-head">
+                <span class="ifind-market-tag">美股 · NASDAQ</span>
+                <div><h3 id="ifind-market-us-company">Apple</h3><p id="ifind-market-us-code">AAPL.US</p></div>
+              </header>
+              <dl class="ifind-market-facts">
+                <div><dt>最近运行</dt><dd id="ifind-market-us-last-run">尚未执行</dd></div>
+                <div><dt>冷却</dt><dd id="ifind-market-us-cooldown">—</dd></div>
+                <div class="wide"><dt>每日余量</dt><dd id="ifind-market-us-daily">本地额度不可用</dd></div>
+                <div><dt>最新价</dt><dd id="ifind-market-us-price">—</dd></div>
+                <div><dt>行情时间</dt><dd id="ifind-market-us-quote-time">—</dd></div>
+                <div><dt>交易状态</dt><dd id="ifind-market-us-trading-status">尚无行情</dd></div>
+                <div><dt>币种</dt><dd id="ifind-market-us-currency">USD</dd></div>
+                <div><dt>单位</dt><dd id="ifind-market-us-units">—</dd></div>
+                <div class="wide"><dt>请求报告期</dt><dd id="ifind-market-us-periods">—</dd></div>
+                <div class="wide"><dt>验证状态</dt><dd id="ifind-market-us-validation">行情 尚未验证 · 财务 尚未验证</dd></div>
+                <div class="wide"><dt>缺失字段</dt><dd id="ifind-market-us-missing">无</dd></div>
+              </dl>
+              <p id="ifind-market-us-error" class="ifind-market-error">无</p>
+              <button id="ifind-market-us-run" class="auth-primary" type="button" disabled>诊断未启用</button>
+            </article>
+
+            <article id="ifind-market-cn-card" class="ifind-market-card" data-market="CN">
+              <header class="ifind-market-card-head">
+                <span class="ifind-market-tag">A 股 · SSE</span>
+                <div><h3 id="ifind-market-cn-company">贵州茅台</h3><p id="ifind-market-cn-code">600519.SH</p></div>
+              </header>
+              <dl class="ifind-market-facts">
+                <div><dt>最近运行</dt><dd id="ifind-market-cn-last-run">尚未执行</dd></div>
+                <div><dt>冷却</dt><dd id="ifind-market-cn-cooldown">—</dd></div>
+                <div class="wide"><dt>每日余量</dt><dd id="ifind-market-cn-daily">本地额度不可用</dd></div>
+                <div><dt>最新价</dt><dd id="ifind-market-cn-price">—</dd></div>
+                <div><dt>行情时间</dt><dd id="ifind-market-cn-quote-time">—</dd></div>
+                <div><dt>交易状态</dt><dd id="ifind-market-cn-trading-status">尚无行情</dd></div>
+                <div><dt>币种</dt><dd id="ifind-market-cn-currency">CNY</dd></div>
+                <div><dt>单位</dt><dd id="ifind-market-cn-units">—</dd></div>
+                <div class="wide"><dt>请求报告期</dt><dd id="ifind-market-cn-periods">—</dd></div>
+                <div class="wide"><dt>验证状态</dt><dd id="ifind-market-cn-validation">行情 尚未验证 · 财务 尚未验证</dd></div>
+                <div class="wide"><dt>缺失字段</dt><dd id="ifind-market-cn-missing">无</dd></div>
+              </dl>
+              <p id="ifind-market-cn-error" class="ifind-market-error">无</p>
+              <button id="ifind-market-cn-run" class="auth-primary" type="button" disabled>诊断未启用</button>
+            </article>
+          </div>
+        </section>
+
         <section class="admin-panel">
           <p class="ticket-label">Pending</p>
           <h2>待审批申请</h2>
