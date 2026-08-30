@@ -60,6 +60,10 @@ Kweichow Moutai `600519.SH`; it does not turn this baseline client into an
 arbitrary provider proxy. The family dashboard remains Mock.
 
 The current production manifest is unverified and therefore remains fail-closed.
-Authenticated indicator evidence and manifest verification are one gate; a
-separately approved, single-case real invocation is a second gate. Neither
-fixtures nor a successful CI run authorize a live request.
+Authenticated indicator evidence and manifest verification are prerequisites,
+not deployment approval. The first gate is approval of the exact image rollout
+with no live requests. Production health and UI acceptance must finish before
+the second gate: a separately approved, single-case real invocation for a case
+whose evidence and manifest are verified. Neither fixtures, a successful CI run,
+nor image deployment authorize a live request. Rollback requires its own approval
+and the runbook's image, joint-state, schema and unchanged-secret checks.

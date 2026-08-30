@@ -88,6 +88,27 @@ async function run() {
   assert.match(readme, /administrator|管理员/i)
   assert.match(readme, /fixed|固定/i)
 
+  assert.ok(/^## \d+\. .*rollback/im.test(runbook), 'runbook must include a rollback section')
+  for (const field of [
+    'imageDigest', 'runtimeImageId', 'commit', 'schemaVersion', 'imageSchemaMin',
+    'imageSchemaMax', 'current.state', 'previous.state', 'VersionId', 'fingerprint',
+    'ROLLBACK_REQUIRES_DB_RESTORE', 'PRAGMA quick_check'
+  ]) {
+    assert.ok(runbook.includes(field), `rollback contract must document ${field}`)
+  }
+  assert.ok(/回滚[\s\S]{0,160}用户明确批准/.test(runbook), 'rollback requires explicit user approval')
+  assert.ok(/切换镜像[\s\S]{0,80}不等于完整恢复/.test(runbook), 'image switching alone is not complete recovery')
+  assert.ok(/不得改变、恢复或重新启用[\s\S]{0,80}秘密值/.test(runbook), 'rollback cannot change or restore secret material')
+  assert.ok(/数据库恢复[\s\S]{0,120}另行[\s\S]{0,80}批准/.test(runbook), 'database restoration requires a separate approval')
+  assert.ok(/认证指标证据[\s\S]{0,140}前置条件[\s\S]{0,120}不代替[\s\S]{0,80}上线审批/.test(runbook), 'evidence is a prerequisite, not deployment approval')
+  assert.ok(/镜像上线审批门[\s\S]{0,360}不得[\s\S]{0,60}真实请求/.test(runbook), 'image rollout must not invoke the provider')
+  assert.ok(/生产健康与 UI 验收[\s\S]{0,220}单独批准的真实调用/.test(runbook), 'live calls require acceptance followed by per-case approval')
+  assert.ok(runbook.includes('本 Task 文档变更不执行生产操作'), 'scope must describe this documentation task')
+  assert.ok(runbook.includes('R1 实现 PR 包含代码、测试和文档'), 'scope must acknowledge the full implementation PR')
+  assert.ok(!runbook.includes('本 PR 只提交文档'), 'runbook must not describe the entire R1 PR as documentation-only')
+  assert.ok(/evidence[\s\S]{0,140}prerequisite[\s\S]{0,140}deployment approval/i.test(wireContract), 'wire contract must preserve the evidence prerequisite')
+  assert.ok(/image rollout[\s\S]{0,160}no live requests[\s\S]{0,200}health and UI acceptance/i.test(wireContract), 'wire contract must document the deployment gate without live requests')
+
   console.log('ifind-three-market-admin-docs: PASS')
 }
 
