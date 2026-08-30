@@ -7,6 +7,7 @@ const { DatabaseSync } = require('node:sqlite')
 const { createIfindHttpClient } = require('../adapters/ifind-http-client')
 const { createIfindDiagnosticRuntime } = require('../ifind-diagnostic-runtime')
 const { createRequestHandler } = require('../server')
+const { expectedEvidence } = require('./ifind-report-period-evidence.test')
 
 const NOW = Date.UTC(2026, 7, 30, 8)
 const ORIGIN = 'https://dearmina.cn'
@@ -23,6 +24,10 @@ function success(value = 123.45) {
     errorcode: 0,
     errmsg: 'UNTRUSTED_PROVIDER_MESSAGE',
     RequestId: 'UNTRUSTED_REQUEST_ID',
+    periodEvidence: {
+      actualPeriod: { type: 'quarter', start: '2026-01-01', end: '2026-03-31' },
+      decision: 'verified', references: [{ url: 'https://UNTRUSTED.invalid/' }]
+    },
     dataVol: 7,
     tables: [{ thscode: '9988.HK', table: {
       revenue_oas: [value], unrelated: ['UNTRUSTED_PROVIDER_FIELD']
@@ -152,7 +157,7 @@ async function clientContract() {
 async function runtimeAndHttpContract() {
   const database = new DatabaseSync(':memory:')
   const network = transport([
-    { errorcode: 0, data: { access_token: 'fixture-access' } }, success()
+    { errorcode: 0, data: { access_token: 'fixture-access' } }, success(247652000000)
   ])
   let secretReads = 0
   const runtime = await createIfindDiagnosticRuntime({
@@ -180,6 +185,7 @@ async function runtimeAndHttpContract() {
     const initial = await invoke(handler)
     assert.equal(initial.status, 200)
     assert.equal(initial.body.data.status, 'ready')
+    assert.deepEqual(initial.body.data.periodEvidence, expectedEvidence())
     assert.equal(network.calls.length, 0, 'GET must not authenticate or query iFinD')
     const blocked = [
       { options: { headers: { cookie: undefined } }, status: 401 },
@@ -208,25 +214,37 @@ async function runtimeAndHttpContract() {
     })
     assert.equal(complete.status, 200)
     assert.equal(complete.body.data.status, 'observed-unverified')
-    assert.equal(complete.body.data.observation.value, 123.45)
+    assert.equal(complete.body.data.observation.value, 247652000000)
+    assert.deepEqual(complete.body.data.periodEvidence, expectedEvidence(247652000000))
+    assert.equal(complete.body.data.observation.reportPeriod, null)
+    assert.equal(complete.body.data.observation.periodType, null)
+    assert.equal(complete.body.data.observation.currency, null)
     assert.equal(complete.body.data.observation.unit, null)
+    assert.equal(complete.body.data.observation.disclosureScope, null)
     assert.equal(complete.body.data.dataVol, 7)
     assert.equal(complete.body.data.requestCount, 2)
     assert.equal(complete.body.data.businessRequestCount, 1)
+    assert.equal(Object.keys(complete.body.data.verification).length, 7)
     assert.ok(Object.values(complete.body.data.verification)
       .every((value) => value === 'unverified'))
     assert.equal(network.calls.length, 2)
     assert.equal(secretReads, 1)
     assert.deepEqual(JSON.parse(network.calls[1].body), FIXED_BODY)
     assert.doesNotMatch(JSON.stringify(complete), /fixture-access|fixture-refresh|UNTRUSTED/)
+    const described = await invoke(handler)
+    assert.deepEqual(described.body.data.periodEvidence, expectedEvidence(247652000000))
     const runs = database.prepare('SELECT * FROM ifind_market_case_runs').all()
     assert.equal(runs.length, 1)
     assert.equal(runs[0].request_count, 2)
     assert.equal(runs[0].failure_code, 'IFIND_CALIBRATION_OBSERVED_UNVERIFIED')
+    assert.doesNotMatch(JSON.stringify(runs), /247652|hkexnews|alibabagroup|periodEvidence/)
+    assert.equal(database.prepare('SELECT COUNT(*) AS n FROM ifind_market_quote_snapshots')
+      .get().n, 0)
     assert.equal(database.prepare('SELECT COUNT(*) AS n FROM ifind_market_financial_points')
       .get().n, 0)
     const again = await invoke(handler, { method: 'POST', url: `${PATH}/run`, body: '{}' })
     assert.equal(again.body.data.status, 'cooldown')
+    assert.deepEqual(again.body.data.periodEvidence, expectedEvidence())
     assert.equal(network.calls.length, 2)
     const catalog = await invoke(handler, { url: '/api/admin/ifind/market-cases' })
     assert.equal(catalog.status, 200)

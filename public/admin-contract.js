@@ -764,6 +764,71 @@
     '七项证据仍未验证，币种、单位及实际报告期未知；家庭看板继续使用 Mock。\n' +
     '观察值仅暂存于本页，刷新后可能丢失。确认执行本次校准吗？'
 
+  function freezeCalibrationEvidence(value) {
+    if (value && typeof value === 'object') {
+      for (const child of Object.values(value)) freezeCalibrationEvidence(child)
+      Object.freeze(value)
+    }
+    return value
+  }
+
+  const IFIND_PERIOD_REFERENCES = freezeCalibrationEvidence([
+    {
+      id: 'ALIBABA_REVENUE_20250630_QUARTER',
+      url: 'https://www1.hkexnews.hk/listedco/listconews/sehk/2025/0829/2025082901541_c.pdf',
+      publishedAt: '2025-08-29', pdfPages: [5, 6],
+      period: { type: 'quarter', start: '2025-04-01', end: '2025-06-30' },
+      currency: 'CNY', unit: 'million', revenue: 247652
+    },
+    {
+      id: 'ALIBABA_REVENUE_20260331_QUARTER',
+      url: 'https://www.alibabagroup.com/zh-HK/document-1991237455038119936',
+      publishedAt: '2026-05-13', pdfPages: [],
+      period: { type: 'quarter', start: '2026-01-01', end: '2026-03-31' },
+      currency: 'CNY', unit: 'million', revenue: 243380
+    },
+    {
+      id: 'ALIBABA_REVENUE_20260331_YEAR',
+      url: 'https://www.alibabagroup.com/zh-HK/document-1991237455038119936',
+      publishedAt: '2026-05-13', pdfPages: [],
+      period: { type: 'fiscal-year', start: '2025-04-01', end: '2026-03-31' },
+      currency: 'CNY', unit: 'million', revenue: 1023670
+    }
+  ])
+
+  function expectedCalibrationPeriodEvidence(value) {
+    return freezeCalibrationEvidence({
+      requestedSelector: '20260331', actualPeriod: null, decision: 'unverified',
+      reasonCode: 'IFIND_REPORT_PERIOD_UNPROVEN', references: IFIND_PERIOD_REFERENCES,
+      comparisonOnly: IFIND_PERIOD_REFERENCES.filter((item) => value === item.revenue * 1000000)
+        .map((item) => ({ sourceId: item.id, signal: 'numerical-match-only' })),
+      parameterEvidence: {
+        source: 'ifind-supercommand-ui', observedAt: '2026-08-30',
+        statementScope: { raw: '1', meaning: 'consolidated-statements' },
+        currencyBasis: { raw: 'BB', meaning: 'original-currency' },
+        currentMrqSelector: '8', frozenSelectorMapping: 'unproven'
+      }
+    })
+  }
+
+  function sameCalibrationEvidence(actual, expected) {
+    if (expected === null || typeof expected !== 'object') return actual === expected
+    if (!actual || typeof actual !== 'object' || Array.isArray(actual) !== Array.isArray(expected)) return false
+    try {
+      const prototype = Object.getPrototypeOf(actual)
+      if (prototype !== (Array.isArray(actual) ? Array.prototype : Object.prototype) && prototype !== null) return false
+      const keys = Reflect.ownKeys(expected)
+      if (Reflect.ownKeys(actual).length !== keys.length) return false
+      return keys.every((key) => {
+        const descriptor = Object.getOwnPropertyDescriptor(actual, key)
+        return descriptor && Object.hasOwn(descriptor, 'value') &&
+          sameCalibrationEvidence(descriptor.value, expected[key])
+      })
+    } catch {
+      return false
+    }
+  }
+
   function normalizeIfindCalibrationDto(input) {
     if (!input || typeof input !== 'object') return null
     for (const key of ['calibrationId', 'caseId', 'displayCode', 'indicator']) {
@@ -793,11 +858,13 @@
         currency: null, unit: null, reportPeriod: null, periodType: null, disclosureScope: null
       })
     }
+    const periodEvidence = expectedCalibrationPeriodEvidence(observation ? observation.value : null)
+    if (!sameCalibrationEvidence(input.periodEvidence, periodEvidence)) return null
     return Object.freeze({
       ...IFIND_CALIBRATION_CONFIG, status: input.status,
       verification: Object.freeze(Object.fromEntries(Object.keys(IFIND_CALIBRATION_EVIDENCE)
         .map((key) => [key, 'unverified']))),
-      observation, requestCount: input.requestCount, businessRequestCount: input.businessRequestCount,
+      observation, periodEvidence, requestCount: input.requestCount, businessRequestCount: input.businessRequestCount,
       dataVol: input.dataVol, attemptedAt: input.attemptedAt, errorCode: input.errorCode
     })
   }
@@ -809,6 +876,7 @@
       IFIND_CALIBRATION_BUSY: '校准正在占用中，本次不重试。',
       IFIND_CALIBRATION_COOLDOWN: '校准正在冷却，本次不重试。',
       IFIND_CALIBRATION_DAILY_LIMIT: '今日校准次数已达上限，本次不重试。',
+      IFIND_CALIBRATION_PERIOD_MISMATCH: '报告期信息不一致，已拦截；不展示为有效财务数据。',
       IFIND_CALIBRATION_UNAVAILABLE: '校准状态不可用；其他管理员功能不受影响。'
     }
     return Object.hasOwn(messages, code)
@@ -853,6 +921,24 @@
       attemptedAt: data && data.attemptedAt ? dateText(Date.parse(data.attemptedAt)) : '尚未执行',
       currency: '未知 / 未验证', unit: '未知 / 未验证', reportPeriod: '未知 / 未验证',
       periodType: '未知 / 未验证', disclosureScope: '未知 / 未验证',
+      requestSelector: data ? '20260331（请求参数，非已验证报告期）' : '请求证据不可用',
+      periodDecision: data
+        ? '实际报告期未证实；披露数字相同也不能确认为同一期。'
+        : '报告期证据不可用，不能确认或展示比较结果。',
+      parameterMeanings: data ? '1 = 合并报表；BB = 原始币种；均不能证明返回值口径。' : '参数证据不可用',
+      periodComparisons: Object.freeze(data ? data.periodEvidence.references.map((reference) => {
+        const matched = data.periodEvidence.comparisonOnly.some((item) => item.sourceId === reference.id)
+        const basis = reference.period.type === 'quarter' ? '单季度' : '财政年度'
+        return Object.freeze({
+          sourceId: reference.id, url: reference.url,
+          summary: `${reference.period.start} 至 ${reference.period.end} · ${basis} · 公告收入 CNY ${reference.revenue.toLocaleString('zh-CN')} 百万元（公布于 ${reference.publishedAt}）`,
+          signal: matched
+            ? '数值相同，仅供比对；不证明实际期间、币种或单位。'
+            : (observation && observation.availability === 'present'
+                ? '未发现数值相同，不代表接口错误。'
+                : '尚无可比观察值。')
+        })
+      }) : []),
       errorMessage: data && data.errorCode ? ifindCalibrationErrorMessage(data.errorCode)
         : (status === 'unavailable' ? ifindCalibrationErrorMessage('IFIND_CALIBRATION_UNAVAILABLE') : ''),
       run: Object.freeze({
@@ -885,9 +971,23 @@
         value: 'value', availability: 'availability', 'attempted-at': 'attemptedAt',
         'request-count': 'requestCount', 'business-request-count': 'businessRequestCount',
         'data-vol': 'dataVol', currency: 'currency', unit: 'unit', 'report-period': 'reportPeriod',
-        'period-type': 'periodType', 'disclosure-scope': 'disclosureScope', error: 'errorMessage'
+        'period-type': 'periodType', 'disclosure-scope': 'disclosureScope', error: 'errorMessage',
+        'request-selector': 'requestSelector', 'period-decision': 'periodDecision',
+        'parameter-meanings': 'parameterMeanings'
       }
       for (const [suffix, key] of Object.entries(fields)) byId(suffix).textContent = view[key]
+      byId('period-comparisons').replaceChildren(...view.periodComparisons.map((reference) => {
+        const row = documentRef.createElement('li')
+        const description = documentRef.createElement('span')
+        description.textContent = `${reference.summary} ${reference.signal} `
+        const link = documentRef.createElement('a')
+        link.textContent = '公告来源'
+        link.setAttribute('href', reference.url)
+        link.setAttribute('target', '_blank')
+        link.setAttribute('rel', 'noopener noreferrer')
+        row.append(description, link)
+        return row
+      }))
       for (const [key, suffix] of Object.entries(IFIND_CALIBRATION_EVIDENCE)) {
         byId(suffix).textContent = '未验证'
         byId(suffix).dataset.evidenceStatus = view.verification[key]

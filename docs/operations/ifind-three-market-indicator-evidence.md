@@ -46,3 +46,15 @@ evidence requirements. New markets and different report types need their own
 metadata; repeated companies must still pass identity and response checks.
 
 This record contains no credentials, account identifiers, raw provider payloads, or provider request identifiers.
+
+## 2026-08-30 follow-up: calibration does not establish actual period
+
+PR #62 subsequently implemented the separately gated administrator-only
+calibration. The earlier "not implemented" statements above describe the
+historical PR #61 state, not the current endpoint inventory.
+
+The [report-period evidence review](ifind-report-period-evidence.md) records
+official parameter labels and public issuer disclosures. The raw `20260331`
+selector, actual returned period and comparison-disclosure period are different
+facts. No comparison or numeric match promotes a verification dimension or
+changes any of the three production full-case manifests to `liveReady: true`.
