@@ -2,6 +2,9 @@
 
 Verification date: 2026-08-29
 
+This is the initial R1 implementation record. The dated follow-up below adds
+metadata observations without promoting any production manifest to verified.
+
 ## Permitted official sources
 
 | Source | Non-secret location | Redacted evidence summary |
@@ -18,6 +21,28 @@ Verification date: 2026-08-29
 | `US_APPLE_AAPL` | `AAPL` | `AAPL.US` | unverified | unverified | unverified | unverified | unverified | rejected |
 | `CN_MOUTAI_600519` | `600519` | `600519.SH` | unverified | unverified | unverified | unverified | unverified | rejected |
 
-The exchange and display codes above identify Kinvest's fixed cases; they are not asserted to be iFinD vendor codes. Financial metadata indicator evidence is unavailable and unverified for all nine required fields: currency, unit, report period, report date, period type, disclosure scope, source time, fetch time, and source mode. No production metric or metadata indicator ID is recorded as verified, and no test-only fixture ID is accepted as production evidence. The catalog therefore fails closed for every production live request until a separately approved authenticated indicator-query operation records exact official evidence and a non-secret source reference for every mapping.
+The exchange and display codes above identify Kinvest's fixed cases; they are not asserted to be verified iFinD vendor codes. Vendor financial metadata indicator evidence remains unavailable for currency, unit, report period, report date, period type, disclosure scope and source time. After PR #60, `fetchTime` comes from the trusted runtime clock and `sourceMode` comes from the verified adapter boundary; neither requires a vendor indicator ID. No production metric or vendor metadata indicator ID is recorded as verified, and no test-only fixture ID is accepted as production evidence. The catalog therefore fails closed for every production live request until exact official evidence and a non-secret source reference are recorded for every required vendor mapping and verification dimension.
+
+## 2026-08-30 follow-up: reusable metadata, not live readiness
+
+The official web SuperCommand tool displayed `9988.HK` with Alibaba and
+generated the following command after the user selected `2026 / Q1`,
+consolidated statements and original currency:
+
+```python
+THS_BD('9988.HK','revenue_oas','20260331,1,BB')
+```
+
+Only command generation was performed; the result-data panel remained empty.
+This establishes a concrete date parameter and a candidate revenue indicator,
+not the returned accounting definition, currency, unit, annual/YTD scope or
+account entitlement. The production cases in the table above remain rejected.
+
+The [request template and reuse policy](ifind-request-templates/README.md)
+preserve this evidence, the derived but unexecuted HTTP body and a proposed
+single-indicator calibration gate. That gate is not implemented or approved.
+The current R1 run endpoint must not be repurposed to bypass its complete-case
+evidence requirements. New markets and different report types need their own
+metadata; repeated companies must still pass identity and response checks.
 
 This record contains no credentials, account identifiers, raw provider payloads, or provider request identifiers.
