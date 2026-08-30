@@ -1,0 +1,107 @@
+{
+  "schemaVersion": 1,
+  "artifactType": "ifind-request-evidence-template",
+  "templateId": "HK_ALIBABA_REVENUE_OAS_20260331_V1",
+  "runtimeManifest": false,
+  "liveReady": false,
+  "executionApproved": false,
+  "observedOn": "2026-08-30",
+  "identity": {
+    "caseId": "HK_ALIBABA_9988",
+    "companyId": "company-alibaba-group",
+    "listingId": "listing-hkex-9988",
+    "issuerLegalName": "Alibaba Group Holding Limited",
+    "exchange": "HKEX",
+    "displayCode": "9988.HK",
+    "observedVendorCode": "9988.HK"
+  },
+  "metadataObservation": {
+    "provenance": "Previously observed official SuperCommand syntax supplied for preservation; not independently rechecked.",
+    "observedCommand": "THS_BD('9988.HK','revenue_oas','20260331,1,BB')",
+    "metricCandidate": {
+      "indicator": "revenue_oas",
+      "label": "Revenue OAS"
+    },
+    "parameterMeanings": [
+      {
+        "position": 1,
+        "value": "20260331",
+        "observedMeaning": "Report selector 2026 / Q1 yielded 20260331.",
+        "evidenceBoundary": "Selector-to-token observation only; actual response period and annual, quarter or YTD basis are unverified."
+      },
+      {
+        "position": 2,
+        "value": "1",
+        "observedMeaning": "Consolidated statements.",
+        "evidenceBoundary": "Observed parameter meaning only; actual response scope is unverified."
+      },
+      {
+        "position": 3,
+        "value": "BB",
+        "observedMeaning": "Original currency.",
+        "evidenceBoundary": "BB is a selector, not a verified currency code; actual response currency is unverified."
+      }
+    ]
+  },
+  "derivedHttpRequest": {
+    "status": "derived-not-executed",
+    "method": "POST",
+    "url": "https://quantapi.51ifind.com/api/v1/basic_data_service",
+    "body": {
+      "codes": "9988.HK",
+      "indipara": [
+        {
+          "indicator": "revenue_oas",
+          "indiparams": ["20260331", "1", "BB"]
+        }
+      ]
+    }
+  },
+  "verification": {
+    "issuerIdentityStatus": "unverified",
+    "vendorCodeStatus": "unverified",
+    "entitlementStatus": "unverified",
+    "currencyStatus": "unverified",
+    "unitStatus": "unverified",
+    "reportPeriodStatus": "unverified",
+    "scopeStatus": "unverified"
+  },
+  "evidenceBoundaries": {
+    "observedSyntacticEvidence": [
+      "The preserved command uses THS_BD with vendor-code token 9988.HK and indicator token revenue_oas.",
+      "The observed parameter order is 20260331, 1, BB.",
+      "The report selector 2026 / Q1 yielded 20260331; 1 denotes consolidated statements and BB denotes original currency in the observed selector metadata."
+    ],
+    "unverifiedResponseEvidence": [
+      "Metric applicability to this issuer and the definition of revenue_oas (Revenue OAS).",
+      "Actual response structure, values and interpretation; no API response is included as evidence.",
+      "Actual report period and fiscal basis; 20260331 is not assumed to return annual rather than quarter or YTD revenue.",
+      "Actual currency code, unit and scale; BB does not establish any of them.",
+      "Actual consolidated scope, issuer identity, vendor-code resolution and entitlement."
+    ],
+    "usageUncertainty": "One nominal scalar does not guarantee dataVol=1. Actual data volume, charging and account allowance are unknown."
+  },
+  "officialReferences": {
+    "superCommand": "https://quantapi.51ifind.com/gwstatic/static/ds_web/super-command-web/index.html#/BasicData",
+    "manual": "https://quantapi.51ifind.com/gwstatic/static/ds_web/quantapi-web/help-center/manual.html",
+    "faq": "https://quantapi.51ifind.com/gwstatic/static/ds_web/quantapi-web/help-center/faq.html"
+  },
+  "reusePolicy": {
+    "reusableEvidence": "Syntax only; this artifact contains one fixed concrete request, not an arbitrary query template.",
+    "changesRequire": "New issuers, periods and report types require their own evidence and explicit approval before execution.",
+    "productionEffect": "Documentation only; no live case is activated and all production cases remain liveReady=false."
+  },
+  "proposedCalibrationGate": {
+    "status": "proposed-not-implemented-not-approved",
+    "implemented": false,
+    "approved": false,
+    "maxBusinessRequests": 1,
+    "maxAuthenticationRequests": 1,
+    "authenticationCondition": "Only if needed, after separate gate approval.",
+    "maxAutomaticRetries": 0,
+    "concurrency": 1,
+    "outputAccess": "administrator-only",
+    "prerequisite": "A separately implemented and explicitly approved one-indicator calibration gate is required; this proposal authorizes no execution.",
+    "currentR1Boundary": "The current R1 run endpoint accepts an empty object and runs only a complete verified case. No one-indicator calibration endpoint exists. The current R1 endpoint must not be used to bypass its gate."
+  }
+}
