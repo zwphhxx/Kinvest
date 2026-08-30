@@ -184,7 +184,7 @@ function failedRun(caseId) {
     dataVol: null,
     safeErrorClass: 'AUTH',
     failureCode: 'IFIND_CLIENT_FAILED',
-    vendorErrorCode: 'RAW_VENDOR_401',
+    vendorErrorCode: -401,
     quoteSnapshot: null,
     financialPoints: []
   })
@@ -1143,7 +1143,80 @@ async function testFamilyRoutesRemainDeviceOnlyMock() {
   }
 }
 
+async function testNumericProviderCodesStayInternal() {
+  const caseId = CASE_IDS[0]
+  for (const status of ['failed', 'partial']) {
+    const outcome = status === 'partial' ? {
+      status, caseId, runId: `market_run_${'4'.repeat(32)}`,
+      quoteStatus: 'available', financeStatus: 'unavailable', requestCount: 3,
+      failureCode: 'IFIND_CLIENT_FAILED', safeErrorClass: 'AUTH',
+      stage: 'financial', vendorErrorCode: -401
+    } : {
+      status, failureCode: 'IFIND_CLIENT_FAILED', safeErrorClass: 'AUTH',
+      stage: 'authentication', vendorErrorCode: -401
+    }
+    const runtime = createMarketRuntime({ outcome })
+    runtime.marketService.latest = () => failedRun(caseId)
+    runtime.marketService.history = () => [failedRun(caseId)]
+    const running = await start({ marketRuntime: runtime })
+    try {
+      for (const suffix of ['', `/${caseId}`, `/${caseId}/run`]) {
+        // List needs each stored run to retain its own fixed case identity.
+        runtime.marketService.latest = (input) => failedRun(input.caseId)
+        runtime.marketService.history = (input) => [failedRun(input.caseId)]
+        const response = await request(running.baseUrl,
+          `/api/admin/ifind/market-cases${suffix}`,
+          suffix.endsWith('/run')
+            ? { method: 'POST', headers: postHeaders(), body: '{}' }
+            : { headers: { cookie: adminCookie() } })
+        assert.equal(response.status, 200, `${status} ${suffix}`)
+        assertNoSensitivePayload(response.body)
+        assert.equal(JSON.stringify(response.body).includes('vendorErrorCode'), false)
+        assert.equal(JSON.stringify(response.body).includes('-401'), false)
+      }
+    } finally {
+      await running.close()
+    }
+  }
+}
+
+async function testIndependentReportingCurrencyProjection() {
+  const caseId = CASE_IDS[0]
+  const runtime = createMarketRuntime()
+  runtime.marketService.latest = (input) => completedRun(input.caseId, {
+    financialPoints: [{ ...financialPoint(input.caseId), currency: 'CNY' }]
+  })
+  runtime.marketService.history = (input) => [completedRun(input.caseId, {
+    financialPoints: [{ ...financialPoint(input.caseId), currency: 'CNY' }]
+  })]
+  const running = await start({ marketRuntime: runtime })
+  try {
+    const response = await request(running.baseUrl,
+      `/api/admin/ifind/market-cases/${caseId}`,
+      { headers: { cookie: adminCookie() } })
+    assert.equal(response.status, 200)
+    const financial = []
+    const quotes = []
+    function visit(value) {
+      if (!value || typeof value !== 'object') return
+      if (value.metricKey === 'revenue') financial.push(value)
+      if (Object.hasOwn(value, 'latestPrice')) quotes.push(value)
+      for (const child of Object.values(value)) visit(child)
+    }
+    visit(response.body)
+    assert.ok(financial.length > 0)
+    assert.ok(quotes.length > 0)
+    assert.ok(financial.every((point) => point.currency === 'CNY'))
+    assert.ok(quotes.every((quote) => quote.currency === 'HKD'))
+    assertNoSensitivePayload(response.body)
+  } finally {
+    await running.close()
+  }
+}
+
 async function run() {
+  await testNumericProviderCodesStayInternal()
+  await testIndependentReportingCurrencyProjection()
   await testListDetailAndRunSuccessProjection()
   await testAdministratorBoundaryAndExactRoutes()
   await testPrototypeAdministratorServiceComposition()

@@ -8,11 +8,12 @@ const {
 } = require('../services/ifind-market-diagnostic-service')
 const { createIfindHttpClient } = require('../adapters/ifind-http-client')
 const {
-  createLiveRequestManifest,
+  createLiveRequestManifestBundle,
   getIfindMarketCase
 } = require('../domain/ifind-market-cases')
 const { parseIfindMarketQuote } = require('../domain/ifind-market-quote-parser')
 const { parseIfindMarketFinancials } = require('../domain/ifind-market-financial-parser')
+const { createVerifiedMarketEvidenceBundle } = require('../domain/ifind-market-manifest-validator')
 
 const CREATED_AT = Date.parse('2026-08-29T04:00:00.000Z')
 const RUN_ID = 'market_run_0123456789abcdef01234567'
@@ -234,15 +235,7 @@ function strictLiveCatalog(caseId) {
 function strictManifestEvidence(caseId) {
   const catalog = strictLiveCatalog(caseId)
   const definition = CASES[caseId]
-  return {
-    manifest: {
-      caseId,
-      vendorCode: catalog.vendorCodes.ifind.code,
-      requestTemplates: clone(catalog.requestTemplates),
-      indicators: clone(catalog.indicators),
-      periodRules: clone(catalog.periodRules),
-      parserId: catalog.parserId
-    },
+  return createVerifiedMarketEvidenceBundle(catalog, {
     quoteVerification: clone(VERIFIED),
     financialVerification: clone(VERIFIED),
     financialReportingCurrencyEvidence: {
@@ -254,7 +247,7 @@ function strictManifestEvidence(caseId) {
       sourceReference: `fixture://ifind/${definition.market.toLowerCase()}-financial-success`,
       verifiedAt: '2025-11-20T08:00:00.000Z'
     }
-  }
+  })
 }
 
 function quotePayload(caseId) {
@@ -654,14 +647,7 @@ async function testProductionCatalogFailsClosed() {
   const caseId = 'HK_ALIBABA_9988'
   const harness = createHarness(caseId, {
     catalogLookup: getIfindMarketCase,
-    manifestLookup(value) {
-      return {
-        manifest: createLiveRequestManifest(value),
-        quoteVerification: clone(VERIFIED),
-        financialVerification: clone(VERIFIED),
-        financialReportingCurrencyEvidence: {}
-      }
-    }
+    manifestLookup: createLiveRequestManifestBundle
   })
   const result = await harness.service.run({ caseId })
   assertSafeFailure(result, {
@@ -673,7 +659,7 @@ async function testProductionCatalogFailsClosed() {
   assert.equal(harness.calls.includes('reserve'), false)
   assert.equal(harness.calls.includes('provider'), false)
   assert.equal(harness.calls.includes('auth'), false)
-  assert.deepEqual(harness.calls, ['client-clear'])
+  assert.deepEqual(harness.calls, [])
 }
 
 async function testCallerCannotOverrideFixedRequest() {
@@ -691,7 +677,7 @@ async function testCallerCannotOverrideFixedRequest() {
     safeErrorClass: 'CONFIG',
     stage: 'input'
   })
-  assert.deepEqual(harness.calls, ['client-clear'])
+  assert.deepEqual(harness.calls, [])
 }
 
 async function testPartialFinancialAvailability() {
@@ -831,7 +817,7 @@ async function testReservationRejections() {
     })
     assert.equal(harness.calls.includes('provider'), false)
     assert.equal(harness.calls.includes('auth'), false)
-    assert.equal(harness.calls.at(-1), 'client-clear')
+    assert.equal(harness.calls.includes('client-clear'), false)
   }
 }
 
@@ -898,7 +884,7 @@ async function testRepositoryFailureAndOriginalFailurePreservation() {
     stage: 'repository'
   })
   assert.equal(reserveFailure.calls.includes('provider'), false)
-  assert.equal(reserveFailure.calls.at(-1), 'client-clear')
+  assert.equal(reserveFailure.calls.includes('client-clear'), false)
 
   const terminalFailure = createHarness()
   terminalFailure.client.quote = async function timeout() {
@@ -1309,9 +1295,12 @@ async function testFinancialRequestUsesOnlyManifestMetadataIds() {
     ...catalog.indicators.financial.map((indicator) => indicator.vendorIndicatorId),
     ...expectedMetadataIds
   ]
-  const evidence = strictManifestEvidence(caseId)
-  evidence.manifest.requestTemplates = clone(catalog.requestTemplates)
-  evidence.manifest.indicators = clone(catalog.indicators)
+  const originalEvidence = strictManifestEvidence(caseId)
+  const evidence = createVerifiedMarketEvidenceBundle(catalog, {
+    quoteVerification: originalEvidence.quoteVerification,
+    financialVerification: originalEvidence.financialVerification,
+    financialReportingCurrencyEvidence: originalEvidence.financialReportingCurrencyEvidence
+  })
   const harness = createHarness(caseId, {
     catalogLookup: () => catalog,
     manifestLookup: () => evidence

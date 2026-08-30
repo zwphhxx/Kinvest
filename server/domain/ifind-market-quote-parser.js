@@ -2,6 +2,7 @@
 
 const { types } = require('node:util')
 const { getIfindMarketCase } = require('./ifind-market-cases')
+const { getVerifiedMarketManifest } = require('./ifind-market-manifest-validator')
 
 const QUOTE_FIELDS = Object.freeze([
   'latestPrice',
@@ -57,21 +58,21 @@ const FAILED_VERIFICATION = Object.freeze({
 
 function hkTradingStatus(value) {
   if (value === 'TRADING') return 'trading'
-  if (value === 'SUSPENDED') return 'suspended'
+  if (value === 'SUSPENDED') return 'halted'
   if (value === 'CLOSED') return 'closed'
   return null
 }
 
 function usTradingStatus(value) {
   if (value === 'REGULAR') return 'trading'
-  if (value === 'HALTED') return 'suspended'
+  if (value === 'HALTED') return 'halted'
   if (value === 'CLOSED') return 'closed'
   return null
 }
 
 function cnTradingStatus(value) {
   if (value === 'TRADE') return 'trading'
-  if (value === 'SUSPEND') return 'suspended'
+  if (value === 'SUSPEND') return 'halted'
   if (value === 'CLOSE') return 'closed'
   return null
 }
@@ -146,57 +147,23 @@ function catalogIdentity(caseId) {
     caseId: marketCase.caseId,
     listingId: marketCase.listingId,
     displayCode: marketCase.displayCode,
+    parserId: marketCase.parserId,
     currency: marketCase.expectedTradingCurrency
   })
 }
 
-function profile(identity, vendorCode, fields, parseQuoteTime, parseTradingStatus) {
+function profile(identity, parseQuoteTime, parseTradingStatus) {
   return Object.freeze({
     ...identity,
-    vendorCode,
-    fields: Object.freeze({ ...fields }),
     parseQuoteTime,
     parseTradingStatus
   })
 }
 
 const PROFILES = Object.freeze({
-  HK_ALIBABA_9988: profile(catalogIdentity('HK_ALIBABA_9988'), 'TEST_ONLY_HK_CODE', {
-    latestPrice: 'TEST_ONLY_HK_LATEST_PRICE',
-    previousClose: 'TEST_ONLY_HK_PREVIOUS_CLOSE',
-    open: 'TEST_ONLY_HK_OPEN',
-    high: 'TEST_ONLY_HK_HIGH',
-    low: 'TEST_ONLY_HK_LOW',
-    volume: 'TEST_ONLY_HK_VOLUME',
-    turnover: 'TEST_ONLY_HK_TURNOVER',
-    quoteTime: 'TEST_ONLY_HK_QUOTE_TIME',
-    tradingStatus: 'TEST_ONLY_HK_TRADING_STATUS',
-    currency: 'TEST_ONLY_HK_CURRENCY'
-  }, hkQuoteTime, hkTradingStatus),
-  US_APPLE_AAPL: profile(catalogIdentity('US_APPLE_AAPL'), 'TEST_ONLY_US_CODE', {
-    latestPrice: 'TEST_ONLY_US_LATEST_PRICE',
-    previousClose: 'TEST_ONLY_US_PREVIOUS_CLOSE',
-    open: 'TEST_ONLY_US_OPEN',
-    high: 'TEST_ONLY_US_HIGH',
-    low: 'TEST_ONLY_US_LOW',
-    volume: 'TEST_ONLY_US_VOLUME',
-    turnover: 'TEST_ONLY_US_TURNOVER',
-    quoteTime: 'TEST_ONLY_US_QUOTE_TIME',
-    tradingStatus: 'TEST_ONLY_US_TRADING_STATUS',
-    currency: 'TEST_ONLY_US_CURRENCY'
-  }, usQuoteTime, usTradingStatus),
-  CN_MOUTAI_600519: profile(catalogIdentity('CN_MOUTAI_600519'), 'TEST_ONLY_CN_CODE', {
-    latestPrice: 'TEST_ONLY_CN_LATEST_PRICE',
-    previousClose: 'TEST_ONLY_CN_PREVIOUS_CLOSE',
-    open: 'TEST_ONLY_CN_OPEN',
-    high: 'TEST_ONLY_CN_HIGH',
-    low: 'TEST_ONLY_CN_LOW',
-    volume: 'TEST_ONLY_CN_VOLUME',
-    turnover: 'TEST_ONLY_CN_TURNOVER',
-    quoteTime: 'TEST_ONLY_CN_QUOTE_TIME',
-    tradingStatus: 'TEST_ONLY_CN_TRADING_STATUS',
-    currency: 'TEST_ONLY_CN_CURRENCY'
-  }, cnQuoteTime, cnTradingStatus)
+  HK_ALIBABA_9988: profile(catalogIdentity('HK_ALIBABA_9988'), hkQuoteTime, hkTradingStatus),
+  US_APPLE_AAPL: profile(catalogIdentity('US_APPLE_AAPL'), usQuoteTime, usTradingStatus),
+  CN_MOUTAI_600519: profile(catalogIdentity('CN_MOUTAI_600519'), cnQuoteTime, cnTradingStatus)
 })
 
 function ownDataRecord(value, allowedKeys, requiredKeys = allowedKeys, forbiddenKeys = []) {
@@ -415,14 +382,14 @@ function parsePayload(profileDefinition, payload) {
 function parseIfindMarketQuote(input) {
   const inputDescriptors = ownDataRecord(
     input,
-    ['caseId', 'payload', 'verification'],
+    ['caseId', 'payload', 'verification', 'manifestBundle'],
     ['caseId', 'payload', 'verification'],
     ['fieldMapping']
   )
   if (!inputDescriptors) return unavailable(null, null, [])
 
   const caseId = descriptorValue(inputDescriptors, 'caseId')
-  const profileDefinition = typeof caseId === 'string' && Object.hasOwn(PROFILES, caseId)
+  let profileDefinition = typeof caseId === 'string' && Object.hasOwn(PROFILES, caseId)
     ? PROFILES[caseId]
     : null
   if (!profileDefinition) return unavailable(null, null, [])
@@ -431,6 +398,18 @@ function parseIfindMarketQuote(input) {
   if (!verification) return unavailable(profileDefinition, null, [])
   if (!hasApprovedVerification(verification)) {
     return unavailable(profileDefinition, verification, [])
+  }
+
+  const manifest = getVerifiedMarketManifest(inputDescriptors.manifestBundle?.value, caseId)
+  if (!manifest || manifest.parserId !== profileDefinition.parserId) {
+    return unavailable(profileDefinition, verification, ['scopeStatus'])
+  }
+  profileDefinition = {
+    ...profileDefinition,
+    vendorCode: manifest.vendorCode,
+    fields: Object.fromEntries(manifest.indicators.quote.map((entry) => [
+      entry.metric, entry.vendorIndicatorId
+    ]))
   }
 
   const parsed = parsePayload(profileDefinition, descriptorValue(inputDescriptors, 'payload'))

@@ -14,7 +14,7 @@ const {
   KINVEST_SQLITE_APPLICATION_ID
 } = require('../db/database-identity')
 const {
-  createLiveRequestManifest,
+  createLiveRequestManifestBundle,
   getIfindMarketCase
 } = require('../domain/ifind-market-cases')
 const {
@@ -361,7 +361,7 @@ async function testEnabledRuntimeComposesProductionMarketService() {
    * secretProvider: ReturnType<typeof secretProvider>,
    * client: ReturnType<typeof noNetworkClient>,
    * catalogLookup: typeof getIfindMarketCase,
-   * manifestLookup: typeof createLiveRequestManifest,
+   * manifestLookup: typeof createLiveRequestManifestBundle,
    * quoteParser: typeof parseIfindMarketQuote,
    * financialParser: typeof parseIfindMarketFinancials
    * } | undefined} */
@@ -408,7 +408,7 @@ async function testEnabledRuntimeComposesProductionMarketService() {
     assert.equal(serviceOptions.secretProvider, provider)
     assert.equal(serviceOptions.client, clients[1])
     assert.equal(serviceOptions.catalogLookup, getIfindMarketCase)
-    assert.equal(serviceOptions.manifestLookup, createLiveRequestManifest)
+    assert.equal(serviceOptions.manifestLookup, createLiveRequestManifestBundle)
     assert.equal(serviceOptions.quoteParser, parseIfindMarketQuote)
     assert.equal(serviceOptions.financialParser, parseIfindMarketFinancials)
     assert.ok(createdMarketService)

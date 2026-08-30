@@ -27,6 +27,7 @@ const runtimeFiles = [
   'server/db/database-identity.js',
   'server/db/refresh-db.js',
   'server/domain/security-identity.js',
+  'server/domain/ifind-indicator-id.js',
   'server/domain/ifind-market-cases.js',
   'server/domain/ifind-market-financial-parser.js',
   'server/domain/ifind-market-manifest-validator.js',

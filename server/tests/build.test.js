@@ -57,6 +57,7 @@ async function runBuildArtifactsExist() {
     'server/db/ifind-diagnostic-repository.js',
     'server/db/ifind-market-diagnostic-repository.js',
     'server/db/refresh-db.js',
+    'server/domain/ifind-indicator-id.js',
     'server/domain/ifind-market-cases.js',
     'server/domain/ifind-market-financial-parser.js',
     'server/domain/ifind-market-manifest-validator.js',
@@ -92,6 +93,9 @@ async function runBuildArtifactsExist() {
     path.join(repositoryRoot, 'Dockerfile'),
     'utf8'
   )
+  assert.match(dockerfile, /require\('\.[/]server[/]domain[/]ifind-indicator-id'\)/)
+  assert.match(dockerfile, /require\('\.[/]server[/]server'\)/)
+  assert.match(dockerfile, /KINVEST_IMAGE_RUNTIME_LOAD_OK/)
   const linuxSmokePath = path.join(
     repositoryRoot,
     'scripts',
@@ -175,12 +179,18 @@ async function runBuildArtifactsExist() {
     })
     assert.equal(distPackage.scripts['access:preflight'], 'node server/access-preflight.js')
 
-    const distServerPath = path.join(repositoryRoot, 'dist', 'server', 'server.js')
-    delete require.cache[require.resolve(distServerPath)]
-    assert.doesNotThrow(
-      () => require(distServerPath),
-      'Built server runtime must load with every local production dependency present'
-    )
+    const runtimeLoadScript = [
+      "require('./server/domain/ifind-indicator-id')",
+      "require('./server/server')",
+      "console.log('KINVEST_BUILT_RUNTIME_LOAD_OK')"
+    ].join(';')
+    assert.equal(execFileSync(process.execPath, ['-e', runtimeLoadScript], {
+      cwd: path.join(repositoryRoot, 'dist'),
+      env: { ...process.env, NODE_NO_WARNINGS: '1' },
+      encoding: 'utf8',
+      timeout: 10_000
+    }), 'KINVEST_BUILT_RUNTIME_LOAD_OK\n',
+    'Built runtime must load in a fresh process without source-module caches')
 
     for (const artifact of expectedArtifacts.filter((file) => file.endsWith('.html'))) {
       const html = fs.readFileSync(path.join(repositoryRoot, 'dist', artifact), 'utf8')

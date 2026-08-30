@@ -10,6 +10,7 @@ const {
   setKinvestApplicationId
 } = require('./database-identity')
 const { listIfindMarketCases } = require('../domain/ifind-market-cases')
+const { isIfindIndicatorId } = require('../domain/ifind-indicator-id')
 
 const IFIND_MARKET_CASE_COOLDOWN_MS = 5 * 60_000
 const IFIND_MARKET_CASE_DAILY_LIMIT = 5
@@ -63,7 +64,6 @@ const PERIOD_TYPES = new Set(['annual', 'interim'])
 const RUN_ID_PATTERN = /^market_run_[a-f0-9]{24,64}$/
 const VERSION_ID_PATTERN = /^v[0-9]{8}-[0-9]{3}$/
 const FAILURE_CODE_PATTERN = /^IFIND_[A-Z0-9_]{1,90}$/
-const INDICATOR_ID_PATTERN = /^[A-Z0-9_]{1,80}$/
 const REPORT_PERIOD_PATTERN = /^20[0-9]{2}(?:Q[1-3]|H1|FY)$/
 const CALENDAR_DATE_PATTERN = /^(20[0-9]{2})-([0-9]{2})-([0-9]{2})$/
 const ISO_TIMESTAMP_PATTERN = /^(20[0-9]{2})-([0-9]{2})-([0-9]{2})T([0-9]{2}):([0-9]{2}):([0-9]{2})(?:\.([0-9]{3}))?(Z|([+-])([0-9]{2}):([0-9]{2}))$/
@@ -494,8 +494,7 @@ function validateFinancialPoint(input) {
     'value', 'availability', 'currency', 'unit', 'disclosureScope',
     'sourceTime', 'fetchTime'
   ])
-  if (!point || typeof point.indicatorId !== 'string' ||
-      !INDICATOR_ID_PATTERN.test(point.indicatorId) ||
+  if (!point || !isIfindIndicatorId(point.indicatorId) ||
       !METRIC_KEYS.includes(point.metricKey) ||
       typeof point.reportPeriod !== 'string' ||
       !REPORT_PERIOD_PATTERN.test(point.reportPeriod) ||

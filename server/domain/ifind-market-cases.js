@@ -1,6 +1,7 @@
 'use strict'
 
 const {
+  createVerifiedMarketEvidenceBundle,
   validateLiveRequestManifestDefinition
 } = require('./ifind-market-manifest-validator')
 
@@ -135,6 +136,11 @@ function createCase(identity, template) {
       evidenceStatus: 'unverified'
     },
     parserId: template.parserId,
+    diagnosticEvidence: {
+      quoteVerification: null,
+      financialVerification: null,
+      financialReportingCurrencyEvidence: null
+    },
     liveReady: false
   }
 }
@@ -284,8 +290,16 @@ function createLiveRequestManifest(caseId) {
   })
 }
 
+function createLiveRequestManifestBundle(caseId) {
+  // Keep the same fixed-case, verified-request gate as the legacy bare manifest.
+  createLiveRequestManifest(caseId)
+  const marketCase = MARKET_CASES.find((candidate) => candidate.caseId === caseId)
+  return createVerifiedMarketEvidenceBundle(marketCase, marketCase.diagnosticEvidence)
+}
+
 module.exports = {
   createLiveRequestManifest,
+  createLiveRequestManifestBundle,
   getIfindMarketCase,
   listIfindMarketCases
 }

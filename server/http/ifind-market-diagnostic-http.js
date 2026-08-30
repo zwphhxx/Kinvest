@@ -364,6 +364,8 @@ if (CATALOG.length !== FIXED_CASE_IDS.size ||
   new Set(CATALOG.map((entry) => entry.presentation.caseId)).size !== CATALOG.length) {
   boundaryError('INTERNAL_ERROR', 500)
 }
+const { isIfindIndicatorId } = require('../domain/ifind-indicator-id')
+
 const CATALOG_BY_ID = new Map(
   CATALOG.map((entry) => [entry.presentation.caseId, entry])
 )
@@ -402,20 +404,20 @@ function copyQuote(value, catalogEntry) {
   }
 }
 
-function copyFinancialPoint(value, catalogEntry) {
+function copyFinancialPoint(value) {
   const dto = exactData(value, [
     'indicatorId', 'metricKey', 'reportPeriod', 'periodEnd', 'periodType',
     'value', 'availability', 'currency', 'unit', 'disclosureScope',
     'sourceTime', 'fetchTime'
   ])
-  if (!safeText(dto.indicatorId, 128, /^[A-Z0-9_]+$/) ||
+  if (!isIfindIndicatorId(dto.indicatorId) ||
     !METRIC_KEYS.has(dto.metricKey) ||
     typeof dto.reportPeriod !== 'string' ||
     !REPORT_PERIOD_PATTERN.test(dto.reportPeriod) ||
     typeof dto.periodEnd !== 'string' ||
     !CALENDAR_DATE_PATTERN.test(dto.periodEnd) ||
     !PERIOD_TYPES.has(dto.periodType) || !AVAILABILITY.has(dto.availability) ||
-    dto.currency !== catalogEntry.presentation.expectedTradingCurrency ||
+    !safeText(dto.currency, 3, /^[A-Z]{3}$/) ||
     dto.unit !== 'million' ||
     !safeText(dto.disclosureScope, 32, /^[a-z][a-z_]*$/) ||
     !isIsoTimestamp(dto.sourceTime) || !isIsoTimestamp(dto.fetchTime) ||
@@ -456,7 +458,7 @@ function copyRun(value, expectedCaseId) {
     (dto.safeErrorClass !== null && !SAFE_ERROR_CLASSES.has(dto.safeErrorClass)) ||
     (dto.failureCode !== null &&
       (typeof dto.failureCode !== 'string' || !FAILURE_CODE_PATTERN.test(dto.failureCode))) ||
-    (dto.vendorErrorCode !== null && !safeText(dto.vendorErrorCode, 128)) ||
+    (dto.vendorErrorCode !== null && !Number.isSafeInteger(dto.vendorErrorCode)) ||
     typeof dto.tokenVersionId !== 'string' ||
     !VERSION_ID_PATTERN.test(dto.tokenVersionId) || !isTimestamp(dto.createdAt) ||
     !isTimestamp(dto.leaseExpiresAt) || !isTimestamp(dto.completedAt) ||
@@ -476,7 +478,7 @@ function copyRun(value, expectedCaseId) {
 
   const quote = copyQuote(dto.quoteSnapshot, catalogEntry)
   const financial = exactArray(dto.financialPoints, 64)
-    .map((point) => copyFinancialPoint(point, catalogEntry))
+    .map((point) => copyFinancialPoint(point))
   if ((dto.quoteStatus === 'available') !== (quote !== null) ||
     ((dto.financeStatus === 'available') !== (financial.length > 0))) {
     boundaryError('INTERNAL_ERROR', 500)
@@ -796,7 +798,7 @@ function createIfindMarketDiagnosticHttpController({
         !FAILURE_CODE_PATTERN.test(dto.failureCode) ||
         !SAFE_ERROR_CLASSES.has(dto.safeErrorClass) ||
         !safeText(dto.stage, 32, /^[a-z][a-z-]*$/) ||
-        (dto.vendorErrorCode !== null && !safeText(dto.vendorErrorCode, 128))) {
+        (dto.vendorErrorCode !== null && !Number.isSafeInteger(dto.vendorErrorCode))) {
         boundaryError('INTERNAL_ERROR', 500)
       }
       return { status: 'partial', safeErrorClass: dto.safeErrorClass }
@@ -811,7 +813,7 @@ function createIfindMarketDiagnosticHttpController({
       !FAILURE_CODE_PATTERN.test(dto.failureCode) ||
       !SAFE_ERROR_CLASSES.has(dto.safeErrorClass) ||
       !safeText(dto.stage, 32, /^[a-z][a-z-]*$/) ||
-      (dto.vendorErrorCode !== null && !safeText(dto.vendorErrorCode, 128))) {
+      (dto.vendorErrorCode !== null && !Number.isSafeInteger(dto.vendorErrorCode))) {
       boundaryError('INTERNAL_ERROR', 500)
     }
     return {

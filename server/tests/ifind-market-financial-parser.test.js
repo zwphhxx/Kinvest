@@ -4,6 +4,7 @@ const assert = require('node:assert/strict')
 const fs = require('node:fs')
 const path = require('node:path')
 const { parseIfindMarketFinancials } = require('../domain/ifind-market-financial-parser')
+const { fixtureBundle } = require('./helpers/ifind-market-evidence')
 const {
   createLiveRequestManifest,
   getIfindMarketCase
@@ -173,6 +174,10 @@ const ISSUERS = Object.freeze([
   })
 ])
 
+const MANIFEST_BUNDLES = Object.fromEntries(ISSUERS.map((issuer) => [
+  issuer.caseId, fixtureBundle(issuer.caseId)
+]))
+
 function verified(overrides = {}) {
   return {
     issuerIdentityStatus: 'verified',
@@ -250,6 +255,7 @@ function parse(
     caseId: issuer.caseId,
     payload,
     verification,
+    manifestBundle: MANIFEST_BUNDLES[issuer.caseId],
     financialReportingCurrencyEvidence: evidence
   })
 }
@@ -433,6 +439,7 @@ function testCurrencyEvidence() {
   const missing = parseIfindMarketFinancials({
     caseId: hk.caseId,
     payload: makePayload(hk),
+    manifestBundle: MANIFEST_BUNDLES[hk.caseId],
     verification: verified()
   })
   assertUnavailable(missing, 'missing currency evidence', 'currencyStatus')

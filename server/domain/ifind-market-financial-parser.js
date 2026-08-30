@@ -2,6 +2,7 @@
 
 const { types } = require('node:util')
 const { getIfindMarketCase } = require('./ifind-market-cases')
+const { getVerifiedMarketManifest } = require('./ifind-market-manifest-validator')
 
 const METRIC_KEYS = Object.freeze([
   'revenue',
@@ -60,33 +61,8 @@ function catalogIdentity(caseId) {
   return Object.freeze({
     caseId: marketCase.caseId,
     listingId: marketCase.listingId,
-    displayCode: marketCase.displayCode
-  })
-}
-
-function metricIds(market) {
-  return Object.freeze({
-    revenue: 'TEST_ONLY_' + market + '_REVENUE',
-    grossProfit: 'TEST_ONLY_' + market + '_GROSS_PROFIT',
-    attributableNetProfit: 'TEST_ONLY_' + market + '_NET_PROFIT',
-    operatingCashFlow: 'TEST_ONLY_' + market + '_OPERATING_CASH_FLOW',
-    receivables: 'TEST_ONLY_' + market + '_RECEIVABLES',
-    inventory: 'TEST_ONLY_' + market + '_INVENTORY',
-    interestBearingDebt: 'TEST_ONLY_' + market + '_INTEREST_BEARING_DEBT'
-  })
-}
-
-function metadataIds(market) {
-  return Object.freeze({
-    currency: 'TEST_ONLY_' + market + '_CURRENCY',
-    unit: 'TEST_ONLY_' + market + '_UNIT',
-    reportPeriod: 'TEST_ONLY_' + market + '_REPORT_PERIOD',
-    reportDate: 'TEST_ONLY_' + market + '_REPORT_DATE',
-    periodType: 'TEST_ONLY_' + market + '_PERIOD_TYPE',
-    disclosureScope: 'TEST_ONLY_' + market + '_DISCLOSURE_SCOPE',
-    sourceTime: 'TEST_ONLY_' + market + '_SOURCE_TIME',
-    fetchTime: 'TEST_ONLY_' + market + '_FETCH_TIME',
-    sourceMode: 'TEST_ONLY_' + market + '_SOURCE_MODE'
+    displayCode: marketCase.displayCode,
+    parserId: marketCase.parserId
   })
 }
 
@@ -315,16 +291,13 @@ function classifyMoutai(reportPeriod, periodType, reportDate) {
   return reportDate.month === monthDay[0] && reportDate.day === monthDay[1]
 }
 
-function profile(identity, market, vendorCode, scope, timeZone, classifyPeriod) {
+function profile(identity, market, scope, timeZone, classifyPeriod) {
   return Object.freeze({
     ...identity,
     market,
-    vendorCode,
     scope,
     timeZone,
     unit: 'million',
-    metricIds: metricIds(market),
-    metadataIds: metadataIds(market),
     classifyPeriod
   })
 }
@@ -333,7 +306,6 @@ const PROFILES = Object.freeze({
   HK_ALIBABA_9988: profile(
     catalogIdentity('HK_ALIBABA_9988'),
     'HK',
-    'TEST_ONLY_HK_CODE',
     'consolidated',
     'Asia/Shanghai',
     classifyAlibaba
@@ -341,7 +313,6 @@ const PROFILES = Object.freeze({
   US_APPLE_AAPL: profile(
     catalogIdentity('US_APPLE_AAPL'),
     'US',
-    'TEST_ONLY_US_CODE',
     'issuer_consolidated',
     'America/New_York',
     classifyApple
@@ -349,7 +320,6 @@ const PROFILES = Object.freeze({
   CN_MOUTAI_600519: profile(
     catalogIdentity('CN_MOUTAI_600519'),
     'CN',
-    'TEST_ONLY_CN_CODE',
     'consolidated',
     'Asia/Shanghai',
     classifyMoutai
@@ -682,13 +652,13 @@ function parsePayload(profileDefinition, payload, verification, currencyEvidence
 function parseIfindMarketFinancials(input) {
   const inputDescriptors = ownDataRecord(
     input,
-    ['caseId', 'payload', 'verification', 'financialReportingCurrencyEvidence'],
+    ['caseId', 'payload', 'verification', 'financialReportingCurrencyEvidence', 'manifestBundle'],
     ['caseId', 'payload', 'verification']
   )
   if (!inputDescriptors) return unavailable(null, null)
 
   const caseId = descriptorValue(inputDescriptors, 'caseId')
-  const profileDefinition = typeof caseId === 'string' && Object.hasOwn(PROFILES, caseId)
+  let profileDefinition = typeof caseId === 'string' && Object.hasOwn(PROFILES, caseId)
     ? PROFILES[caseId]
     : null
   if (!profileDefinition) return unavailable(null, null)
@@ -696,6 +666,22 @@ function parseIfindMarketFinancials(input) {
   const verification = verificationSnapshot(descriptorValue(inputDescriptors, 'verification'))
   if (!verification) return unavailable(profileDefinition, null)
   if (!hasApprovedVerification(verification)) return unavailable(profileDefinition, verification)
+
+  const manifestBundle = inputDescriptors.manifestBundle?.value
+  const manifest = getVerifiedMarketManifest(manifestBundle, caseId)
+  if (!manifest || manifest.parserId !== profileDefinition.parserId) {
+    return unavailable(profileDefinition, verification, ['scopeStatus'])
+  }
+  profileDefinition = {
+    ...profileDefinition,
+    vendorCode: manifest.vendorCode,
+    metricIds: Object.fromEntries(manifest.indicators.financial.map((entry) => [
+      entry.metric, entry.vendorIndicatorId
+    ])),
+    metadataIds: Object.fromEntries(Object.entries(manifest.indicators.financialMetadata).map(([field, entry]) => [
+      field, entry.vendorIndicatorId
+    ]))
+  }
 
   if (!inputDescriptors.financialReportingCurrencyEvidence) {
     return unavailable(profileDefinition, verification, ['currencyStatus'])
@@ -715,6 +701,9 @@ function parseIfindMarketFinancials(input) {
         evidenceResult.evidence.evidenceStatus
       )
     )
+  }
+  if (evidenceResult.evidence.currency !== manifestBundle.financialReportingCurrencyEvidence.currency) {
+    return unavailable(profileDefinition, verification, ['currencyStatus'])
   }
 
   const parsed = parsePayload(

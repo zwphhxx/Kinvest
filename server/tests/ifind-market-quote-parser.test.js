@@ -5,6 +5,7 @@ const fs = require('node:fs')
 const path = require('node:path')
 
 const { parseIfindMarketQuote } = require('../domain/ifind-market-quote-parser')
+const { fixtureBundle } = require('./helpers/ifind-market-evidence')
 function readFixture(name) {
   return JSON.parse(fs.readFileSync(path.join(__dirname, 'fixtures', 'ifind', name), 'utf8'))
 }
@@ -108,6 +109,9 @@ const NUMERIC_TEST_FIELDS = Object.freeze([
   'volume',
   'turnover'
 ])
+const MANIFEST_BUNDLES = Object.fromEntries(Object.keys(CASES).map((caseId) => [
+  caseId, fixtureBundle(caseId)
+]))
 
 function clone(value) {
   return JSON.parse(JSON.stringify(value))
@@ -130,7 +134,7 @@ function completePayload(caseId) {
  * @param {{[K in keyof typeof VERIFIED]: 'verified' | 'unverified' | 'failed' | 'not_applicable' | 'real' | 'mock'}} [verification]
  */
 function parse(caseId, payload = completePayload(caseId), verification = VERIFIED) {
-  return parseIfindMarketQuote({ caseId, payload, verification })
+  return parseIfindMarketQuote({ caseId, payload, verification, manifestBundle: MANIFEST_BUNDLES[caseId] })
 }
 
 function fieldId(caseId, field) {
@@ -225,11 +229,11 @@ async function run() {
   )
 
   labeledTable('trading states', [
-    ['HK suspended', 'HK_ALIBABA_9988', 'SUSPENDED', 'suspended'],
+    ['HK halted', 'HK_ALIBABA_9988', 'SUSPENDED', 'halted'],
     ['HK closed', 'HK_ALIBABA_9988', 'CLOSED', 'closed'],
-    ['US halted', 'US_APPLE_AAPL', 'HALTED', 'suspended'],
+    ['US halted', 'US_APPLE_AAPL', 'HALTED', 'halted'],
     ['US closed', 'US_APPLE_AAPL', 'CLOSED', 'closed'],
-    ['CN suspended', 'CN_MOUTAI_600519', 'SUSPEND', 'suspended'],
+    ['CN halted', 'CN_MOUTAI_600519', 'SUSPEND', 'halted'],
     ['CN closed', 'CN_MOUTAI_600519', 'CLOSE', 'closed']
   ], (caseId, providerStatus, expectedStatus) => {
     const payload = completePayload(caseId)

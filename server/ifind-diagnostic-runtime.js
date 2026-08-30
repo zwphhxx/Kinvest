@@ -8,7 +8,7 @@ const {
   IfindMarketDiagnosticRepository
 } = require('./db/ifind-market-diagnostic-repository')
 const {
-  createLiveRequestManifest,
+  createLiveRequestManifestBundle,
   getIfindMarketCase
 } = require('./domain/ifind-market-cases')
 const {
@@ -242,7 +242,7 @@ async function createIfindDiagnosticRuntime(options) {
     : getIfindMarketCase
   const marketManifestLookup = Object.hasOwn(config, 'marketManifestLookup')
     ? config.marketManifestLookup
-    : createLiveRequestManifest
+    : createLiveRequestManifestBundle
   const marketQuoteParser = Object.hasOwn(config, 'marketQuoteParser')
     ? config.marketQuoteParser
     : parseIfindMarketQuote

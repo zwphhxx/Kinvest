@@ -1,6 +1,12 @@
 'use strict'
 
 const { types } = require('node:util')
+const { isIfindIndicatorId } = require('./ifind-indicator-id')
+const VERIFIED_BUNDLES = new WeakSet()
+const VERIFICATION_FIELDS = Object.freeze([
+  'issuerIdentityStatus', 'vendorCodeStatus', 'entitlementStatus', 'currencyStatus',
+  'unitStatus', 'reportPeriodStatus', 'scopeStatus', 'sourceMode'
+])
 
 const REQUIRED_QUOTE_METRICS = Object.freeze([
   'latestPrice',
@@ -134,6 +140,11 @@ function trimmedProviderId(value) {
   return value
 }
 
+function supportedIndicatorId(value) {
+  if (!isIfindIndicatorId(value)) invalidManifest()
+  return value
+}
+
 function evidenceSourceReference(value) {
   if (typeof value !== 'string' || value.length === 0 || value.length > 1024 ||
     value.trim() !== value || containsControlCharacter(value)) {
@@ -156,7 +167,7 @@ function verifiedIndicatorIds(value, requiredMetrics) {
       'evidenceStatus'
     ])
     const metric = dataValue(descriptors, 'metric')
-    const vendorIndicatorId = trimmedProviderId(dataValue(descriptors, 'vendorIndicatorId'))
+    const vendorIndicatorId = supportedIndicatorId(dataValue(descriptors, 'vendorIndicatorId'))
     if (typeof metric !== 'string' || !requiredMetrics.includes(metric) || metricSet.has(metric) ||
       dataValue(descriptors, 'evidenceStatus') !== 'verified' || idSet.has(vendorIndicatorId)) {
       invalidManifest()
@@ -179,7 +190,7 @@ function verifiedFinancialMetadataIds(value, metricIds) {
       'evidenceStatus',
       'sourceReference'
     ])
-    const vendorIndicatorId = trimmedProviderId(
+    const vendorIndicatorId = supportedIndicatorId(
       dataValue(mapping, 'vendorIndicatorId')
     )
     if (dataValue(mapping, 'evidenceStatus') !== 'verified' ||
@@ -197,7 +208,7 @@ function requestTemplate(value, endpoint, idKey, evidenceIds) {
     dataValue(descriptors, 'evidenceStatus') !== 'verified') {
     invalidManifest()
   }
-  const requestIds = arrayValues(dataValue(descriptors, idKey)).map(trimmedProviderId)
+  const requestIds = arrayValues(dataValue(descriptors, idKey)).map(supportedIndicatorId)
   if (requestIds.length !== evidenceIds.length ||
     requestIds.some((id, index) => id !== evidenceIds[index])) {
     invalidManifest()
@@ -308,4 +319,82 @@ function validateLiveRequestManifestDefinition(definition) {
   return true
 }
 
-module.exports = { validateLiveRequestManifestDefinition }
+function cloneVerifiedData(value) {
+  if (value === null || typeof value !== 'object') return value
+  if (Array.isArray(value)) return Object.freeze(value.map(cloneVerifiedData))
+  return Object.freeze(Object.fromEntries(Object.entries(value).map(([key, entry]) => [
+    key, cloneVerifiedData(entry)
+  ])))
+}
+
+function requireVerifiedDimensions(value) {
+  const descriptors = plainRecord(value, VERIFICATION_FIELDS)
+  for (const field of VERIFICATION_FIELDS) {
+    if (dataValue(descriptors, field) !== (field === 'sourceMode' ? 'real' : 'verified')) {
+      invalidManifest()
+    }
+  }
+}
+
+// Internal composition boundary only. Neither a provider response nor HTTP input
+// may supply evidence. No verification status is synthesized by this factory.
+function createVerifiedMarketEvidenceBundle(definition, evidence) {
+  validateLiveRequestManifestDefinition(definition)
+  const root = plainRecord(definition)
+  const caseId = trimmedProviderId(dataValue(root, 'caseId'))
+  const listingId = trimmedProviderId(dataValue(root, 'listingId'))
+  const parserId = trimmedProviderId(dataValue(root, 'parserId'))
+  if (dataValue(root, 'liveReady') !== true) invalidManifest()
+  const evidenceDescriptors = plainRecord(evidence, [
+    'quoteVerification', 'financialVerification', 'financialReportingCurrencyEvidence'
+  ])
+  const quoteVerification = dataValue(evidenceDescriptors, 'quoteVerification')
+  const financialVerification = dataValue(evidenceDescriptors, 'financialVerification')
+  requireVerifiedDimensions(quoteVerification)
+  requireVerifiedDimensions(financialVerification)
+  const currencyEvidence = dataValue(evidenceDescriptors, 'financialReportingCurrencyEvidence')
+  const currency = plainRecord(currencyEvidence, [
+    'caseId', 'listingId', 'currency', 'evidenceStatus', 'sourceIdentity',
+    'sourceReference', 'verifiedAt'
+  ])
+  const currencyCode = dataValue(currency, 'currency')
+  const verifiedAt = dataValue(currency, 'verifiedAt')
+  if (dataValue(currency, 'caseId') !== caseId ||
+    dataValue(currency, 'listingId') !== listingId ||
+    dataValue(currency, 'evidenceStatus') !== 'verified' ||
+    typeof currencyCode !== 'string' || !/^[A-Z]{3}$/.test(currencyCode) ||
+    typeof verifiedAt !== 'string' || !Number.isFinite(Date.parse(verifiedAt))) invalidManifest()
+  const sourceIdentity = evidenceSourceReference(dataValue(currency, 'sourceIdentity'))
+  const sourceReference = evidenceSourceReference(dataValue(currency, 'sourceReference'))
+  if (/token|secret|password|authorization|cookie|requestid/i.test(sourceIdentity + sourceReference)) {
+    invalidManifest()
+  }
+  const vendorCodes = plainRecord(dataValue(root, 'vendorCodes'), ['ifind'])
+  const ifind = plainRecord(dataValue(vendorCodes, 'ifind'), ['code', 'evidenceStatus'])
+  const bundle = cloneVerifiedData({
+    manifest: {
+      caseId,
+      vendorCode: dataValue(ifind, 'code'),
+      requestTemplates: dataValue(root, 'requestTemplates'),
+      indicators: dataValue(root, 'indicators'),
+      periodRules: dataValue(root, 'periodRules'),
+      parserId
+    },
+    quoteVerification,
+    financialVerification,
+    financialReportingCurrencyEvidence: currencyEvidence
+  })
+  VERIFIED_BUNDLES.add(bundle)
+  return bundle
+}
+
+function getVerifiedMarketManifest(bundle, caseId) {
+  if (!VERIFIED_BUNDLES.has(bundle)) return null
+  return bundle.manifest.caseId === caseId ? bundle.manifest : null
+}
+
+module.exports = {
+  createVerifiedMarketEvidenceBundle,
+  getVerifiedMarketManifest,
+  validateLiveRequestManifestDefinition
+}

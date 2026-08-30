@@ -1,5 +1,6 @@
 const https = require('node:https')
 const { TextDecoder, types } = require('node:util')
+const { isIfindIndicatorId } = require('../domain/ifind-indicator-id')
 const {
   isClientFailureBase,
   isClientFailureMetadata
@@ -608,6 +609,7 @@ function readOperationRequest(request, operation) {
     const descriptors = plainDataDescriptors(request, ['vendorCode', 'fields'], true)
     const vendorCode = providerIdentifier(descriptorValue(descriptors, 'vendorCode'))
     const fieldIds = frozenIdentifierArray(descriptorValue(descriptors, 'fields'))
+    if (!fieldIds.every(isIfindIndicatorId)) throw new Error('invalid request')
     return Object.freeze({
       vendorCode,
       fieldIds,
@@ -647,6 +649,7 @@ function readOperationRequest(request, operation) {
   }
   const vendorCode = providerIdentifier(descriptorValue(descriptors, 'vendorCode'))
   const fieldIds = frozenIdentifierArray(descriptorValue(descriptors, 'indicatorIds'))
+  if (!fieldIds.every(isIfindIndicatorId)) throw new Error('invalid request')
   return Object.freeze({
     vendorCode,
     fieldIds,

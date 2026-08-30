@@ -2,11 +2,13 @@
 
 const { types, isDeepStrictEqual } = require('node:util')
 const {
+  getVerifiedMarketManifest,
   validateLiveRequestManifestDefinition
 } = require('../domain/ifind-market-manifest-validator')
 const { isClientFailureMetadata } = require('../contracts/ifind-diagnostic-errors')
 
 const MAX_REQUEST_COUNT = 5
+const CLIENT_OWNERS = new WeakMap()
 const RUN_ID_PATTERN = /^market_run_[a-f0-9]{24,64}$/
 const VERSION_ID_PATTERN = /^v[0-9]{8}-[0-9]{3}$/
 const CASE_ID_PATTERN = /^(?:HK|US|CN)_[A-Z][A-Z0-9]{0,31}_[A-Z0-9]{1,16}$/
@@ -494,7 +496,7 @@ function validateManifestBundle(caseId, catalogCase, value) {
     'caseId', 'vendorCode', 'requestTemplates', 'indicators', 'periodRules',
     'parserId'
   ])
-  if (!bundle || !manifest) throw new SafeFailure(
+  if (!bundle || !manifest || !getVerifiedMarketManifest(value, caseId)) throw new SafeFailure(
     'IFIND_MARKET_CASE_UNVERIFIED', 'CONFIG', 'catalog', null, 'rejected'
   )
   try {
@@ -509,18 +511,11 @@ function validateManifestBundle(caseId, catalogCase, value) {
       !isDeepStrictEqual(manifest.requestTemplates, requestTemplates) ||
       !isDeepStrictEqual(manifest.indicators, indicators) ||
       !isDeepStrictEqual(manifest.periodRules, periodRules)) throw new Error('invalid')
-    const manifestSnapshot = snapshotTree({ ...manifest })
     const listingId = ownDataValue(catalogCase, 'listingId').value
-    return {
-      manifest: manifestSnapshot,
-      quoteVerification: validateVerification(bundle.quoteVerification),
-      financialVerification: validateVerification(bundle.financialVerification),
-      financialReportingCurrencyEvidence: validateCurrencyEvidence(
-        bundle.financialReportingCurrencyEvidence,
-        caseId,
-        listingId
-      )
-    }
+    validateVerification(bundle.quoteVerification)
+    validateVerification(bundle.financialVerification)
+    validateCurrencyEvidence(bundle.financialReportingCurrencyEvidence, caseId, listingId)
+    return value
   } catch (error) {
     if (error instanceof SafeFailure && error.stage === 'catalog') throw error
     throw new SafeFailure(
@@ -726,14 +721,15 @@ function decodeMarketResult(value, stage) {
   return { payload, dataVol: result.dataVol }
 }
 
-function parseQuote(quoteParser, caseId, catalogCase, payload, verification) {
+function parseQuote(quoteParser, caseId, catalogCase, payload, manifestBundle) {
   let parsed
   try {
     parsed = snapshotParserTree(
       quoteParser({
         caseId,
         payload: materializeParserInput(payload),
-        verification
+        verification: manifestBundle.quoteVerification,
+        manifestBundle
       }),
       'IFIND_MARKET_QUOTE_UNAVAILABLE',
       'quote-parser'
@@ -793,15 +789,17 @@ function parseFinancials(
   payload,
   verification,
   financialReportingCurrencyEvidence,
-  manifest
+  manifestBundle
 ) {
+  const manifest = manifestBundle.manifest
   let parserOutput
   try {
     parserOutput = financialParser({
       caseId,
       payload: materializeParserInput(payload),
       verification,
-      financialReportingCurrencyEvidence
+      financialReportingCurrencyEvidence,
+      manifestBundle
     })
   } catch {
     throw new SafeFailure(
@@ -1024,6 +1022,7 @@ function createIfindMarketDiagnosticService(options) {
   }
 
   async function run(input) {
+    const owner = {}
     let refreshToken = null
     let accessToken = null
     let quotePayload
@@ -1071,6 +1070,9 @@ function createIfindMarketDiagnosticService(options) {
         )
       }
       const fixedRequests = buildFixedRequests(manifestBundle.manifest)
+      if (CLIENT_OWNERS.has(config.client)) {
+        throw new SafeFailure('IFIND_MARKET_LEASE_CONFLICT', 'BUSY', 'reserve', null, 'busy')
+      }
 
       let createdAt
       let runId
@@ -1100,6 +1102,7 @@ function createIfindMarketDiagnosticService(options) {
       const rejected = reservationRejection(reserveResult)
       if (rejected) throw rejected
       reservation = validateReservation(reserveRequest, reserveResult)
+      CLIENT_OWNERS.set(config.client, owner)
 
       try {
         refreshToken = readRefreshToken.call(config.secretProvider)
@@ -1170,7 +1173,7 @@ function createIfindMarketDiagnosticService(options) {
         caseId,
         catalogCase,
         quotePayload,
-        manifestBundle.quoteVerification
+        manifestBundle
       )
 
       if (financialFailure && financialFailure.safeErrorClass === 'IDENTITY_CONFLICT') {
@@ -1187,7 +1190,7 @@ function createIfindMarketDiagnosticService(options) {
             financialPayload,
             manifestBundle.financialVerification,
             manifestBundle.financialReportingCurrencyEvidence,
-            manifestBundle.manifest
+            manifestBundle
           )
         } catch (error) {
           if (error instanceof SafeFailure &&
@@ -1268,10 +1271,14 @@ function createIfindMarketDiagnosticService(options) {
       quotePayload = null
       // eslint-disable-next-line no-useless-assignment -- Keep explicit cleanup on every terminal path.
       financialPayload = null
-      try {
-        clientClear.call(config.client)
-      } catch {
-        // Cleanup failure must not replace the originating safe result.
+      if (CLIENT_OWNERS.get(config.client) === owner) {
+        try {
+          clientClear.call(config.client)
+        } catch {
+          // Cleanup failure must not replace the originating safe result.
+        } finally {
+          CLIENT_OWNERS.delete(config.client)
+        }
       }
     }
   }
