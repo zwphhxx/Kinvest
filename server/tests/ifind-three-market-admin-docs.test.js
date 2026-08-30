@@ -46,6 +46,9 @@ async function run() {
 
   assert.match(runbook, /最近两个年度[\s\S]{0,120}最新已披露中期/)
   assert.match(runbook, /reporting currency evidence|报告币种证据/i)
+  assert.match(runbook, /已披露且时间校验通过[\s\S]{0,100}按报告期末[\s\S]{0,60}最新/)
+  assert.match(runbook, /reportDate[\s\S]{0,60}报告期末/)
+  assert.doesNotMatch(runbook, /以已验证的披露时间顺序判断/)
   assert.match(runbook, /不得推断|no inference/i)
   assert.match(runbook, /缺失字段[\s\S]{0,80}保持缺失/)
   assert.match(runbook, /real[\s\S]{0,100}Mock[\s\S]{0,100}(?:不得混合|cannot mix)|Mock[\s\S]{0,100}real[\s\S]{0,100}(?:不得混合|cannot mix)/i)
