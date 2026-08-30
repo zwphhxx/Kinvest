@@ -1,6 +1,7 @@
 'use strict'
 
 const {
+  LOCAL_FINANCIAL_METADATA_SOURCES,
   createVerifiedMarketEvidenceBundle,
   validateLiveRequestManifestDefinition
 } = require('./ifind-market-manifest-validator')
@@ -93,11 +94,16 @@ function unverifiedIndicators(metrics) {
 }
 
 function unverifiedFinancialMetadata() {
-  return Object.fromEntries(FINANCIAL_METADATA_FIELDS.map((field) => [field, {
-    vendorIndicatorId: null,
-    evidenceStatus: 'unverified',
-    sourceReference: null
-  }]))
+  return Object.fromEntries(FINANCIAL_METADATA_FIELDS.map((field) => [
+    field,
+    Object.hasOwn(LOCAL_FINANCIAL_METADATA_SOURCES, field)
+      ? { source: LOCAL_FINANCIAL_METADATA_SOURCES[field] }
+      : {
+        vendorIndicatorId: null,
+        evidenceStatus: 'unverified',
+        sourceReference: null
+      }
+  ]))
 }
 
 function createCase(identity, template) {

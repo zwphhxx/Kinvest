@@ -66,9 +66,7 @@ function metadataIds(market) {
     reportDate: `TEST_ONLY_${market}_REPORT_DATE`,
     periodType: `TEST_ONLY_${market}_PERIOD_TYPE`,
     disclosureScope: `TEST_ONLY_${market}_DISCLOSURE_SCOPE`,
-    sourceTime: `TEST_ONLY_${market}_SOURCE_TIME`,
-    fetchTime: `TEST_ONLY_${market}_FETCH_TIME`,
-    sourceMode: `TEST_ONLY_${market}_SOURCE_MODE`
+    sourceTime: `TEST_ONLY_${market}_SOURCE_TIME`
   })
 }
 
@@ -215,7 +213,9 @@ function resizeFixtureArrays(record, length) {
 }
 
 function makePayload(issuer, periods = issuer.periods) {
-  const fields = resizeFixtureArrays(issuer.fixture.tables[0].table, periods.length)
+  const fixtureMetrics = Object.fromEntries(Object.entries(issuer.fixture.tables[0].table)
+    .filter(([id]) => Object.values(issuer.metricIds).includes(id)))
+  const fields = resizeFixtureArrays(fixtureMetrics, periods.length)
   const offset = issuer.market === 'HK' ? 400 : issuer.market === 'US' ? 500 : 600
   fields[issuer.metricIds.receivables] = periods.map((_, index) => offset + index + 1)
   fields[issuer.metricIds.inventory] = periods.map((_, index) => offset + index + 11)
@@ -227,8 +227,6 @@ function makePayload(issuer, periods = issuer.periods) {
   fields[issuer.metadataIds.periodType] = periods.map((period) => period.periodType)
   fields[issuer.metadataIds.disclosureScope] = periods.map(() => issuer.scope)
   fields[issuer.metadataIds.sourceTime] = periods.map((period) => period.sourceTime)
-  fields[issuer.metadataIds.fetchTime] = periods.map(() => FETCH_TIME)
-  fields[issuer.metadataIds.sourceMode] = periods.map(() => 'real')
   return {
     errorcode: 0,
     tables: [{
@@ -249,10 +247,12 @@ function parse(
   issuer,
   payload = makePayload(issuer),
   verification = verified(),
-  evidence = currencyEvidence(issuer)
+  evidence = currencyEvidence(issuer),
+  fetchTime = FETCH_TIME
 ) {
   return parseIfindMarketFinancials({
     caseId: issuer.caseId,
+    fetchTime,
     payload,
     verification,
     manifestBundle: MANIFEST_BUNDLES[issuer.caseId],
@@ -276,6 +276,7 @@ function assertUnavailable(result, label, failedField) {
   assert.equal(result.source, 'unavailable', `${label}: source`)
   assert.equal(result.availability, 'unavailable', `${label}: availability`)
   assert.deepEqual(result.points, [], `${label}: sanitized points`)
+  assert.notEqual(result.verification.sourceMode, 'real', `${label}: no real provenance on rejection`)
   if (failedField) {
     assert.equal(result.verification[failedField], 'failed', `${label}: failed dimension`)
   }
@@ -402,10 +403,6 @@ function testSelectionAndChronology() {
     ['source after fetch', 'scopeStatus', (payload) => {
       payload.tables[0].table[hk.metadataIds.sourceTime][0] = '2025-12-02T17:30:00+08:00'
     }],
-    ['old Alibaba H1 fixture was undisclosed', 'reportPeriodStatus', (payload) => {
-      payload.tables[0].table[hk.metadataIds.sourceTime][2] = '2025-08-29T17:30:00+08:00'
-      payload.tables[0].table[hk.metadataIds.fetchTime][2] = '2025-08-29T12:00:00.000Z'
-    }],
     ['same issuer-local report date', 'scopeStatus', (payload) => {
       payload.tables[0].table[hk.metadataIds.sourceTime][0] = '2025-03-31T15:59:59.000Z'
     }]
@@ -416,6 +413,18 @@ function testSelectionAndChronology() {
     mutate(payload)
     assertUnavailable(parse(hk, payload), label, failedField)
   }
+
+  const undisclosedPayload = makePayload(hk)
+  undisclosedPayload.tables[0].table[hk.metadataIds.sourceTime][2] = '2025-08-29T17:30:00+08:00'
+  assertUnavailable(
+    parse(hk, undisclosedPayload, verified(), currencyEvidence(hk), '2025-08-29T12:00:00.000Z'),
+    'old Alibaba H1 fixture was undisclosed at trusted fetch time',
+    'reportPeriodStatus'
+  )
+
+  const sourceAtFetch = makePayload(hk)
+  sourceAtFetch.tables[0].table[hk.metadataIds.sourceTime][0] = FETCH_TIME
+  assert.equal(parse(hk, sourceAtFetch).source, 'real', 'source time may equal trusted fetch time')
 
   const nextLocalDayPayload = makePayload(hk)
   nextLocalDayPayload.tables[0].table[hk.metadataIds.sourceTime][0] =
@@ -438,6 +447,7 @@ function testCurrencyEvidence() {
   const apple = ISSUERS[1]
   const missing = parseIfindMarketFinancials({
     caseId: hk.caseId,
+    fetchTime: FETCH_TIME,
     payload: makePayload(hk),
     manifestBundle: MANIFEST_BUNDLES[hk.caseId],
     verification: verified()
@@ -507,10 +517,8 @@ function testMalformedPayloads() {
     ['short periodType', 'periodType', 'short', 'reportPeriodStatus'],
     ['missing disclosureScope', 'disclosureScope', 'delete', 'scopeStatus'],
     ['short disclosureScope', 'disclosureScope', 'short', 'scopeStatus'],
-    ['missing sourceMode', 'sourceMode', 'delete', 'scopeStatus'],
-    ['short sourceMode', 'sourceMode', 'short', 'scopeStatus'],
     ['missing sourceTime', 'sourceTime', 'delete', 'scopeStatus'],
-    ['short fetchTime', 'fetchTime', 'short', 'scopeStatus']
+    ['short sourceTime', 'sourceTime', 'short', 'scopeStatus']
   ]
   for (const [label, field, mutation, failedField] of metadataCases) {
     const payload = makePayload(hk)
@@ -554,18 +562,12 @@ function testMalformedPayloads() {
     ['wrong scope', 'scopeStatus', (payload) => {
       payload.tables[0].table[hk.metadataIds.disclosureScope][0] = 'issuer_only'
     }],
-    ['mixed source', 'scopeStatus', (payload) => {
-      payload.tables[0].table[hk.metadataIds.sourceMode][0] = 'Mock'
-    }],
     ['duplicate period', 'reportPeriodStatus', (payload) => {
       payload.tables[0].table[hk.metadataIds.reportPeriod][1] =
         payload.tables[0].table[hk.metadataIds.reportPeriod][0]
     }],
     ['normalized invalid source date', 'scopeStatus', (payload) => {
       payload.tables[0].table[hk.metadataIds.sourceTime][0] = '2025-02-30T17:30:00+08:00'
-    }],
-    ['normalized invalid fetch hour', 'scopeStatus', (payload) => {
-      payload.tables[0].table[hk.metadataIds.fetchTime][0] = '2025-12-01T24:00:00.000Z'
     }],
     ['invalid timestamp offset', 'scopeStatus', (payload) => {
       payload.tables[0].table[hk.metadataIds.sourceTime][0] = '2025-05-15T17:30:00+15:00'
@@ -607,6 +609,10 @@ function testMalformedPayloads() {
 
 function hostileProxy(target, state) {
   return new Proxy(target, {
+    get() {
+      state.invoked = true
+      throw new Error('proxy trap must not run')
+    },
     getPrototypeOf() {
       state.invoked = true
       throw new Error('proxy trap must not run')
@@ -622,6 +628,125 @@ function hostileProxy(target, state) {
   })
 }
 
+function testLocalProvenanceContext() {
+  for (const issuer of ISSUERS) {
+    const fetchTime = '2025-12-01T12:34:56.789Z'
+    const payload = makePayload(issuer)
+    const fields = payload.tables[0].table
+    const remoteFieldIds = Object.keys(fields)
+    /** @type {string[]} */
+    const allowedRemoteFieldIds = [
+      ...Object.values(issuer.metricIds), ...Object.values(issuer.metadataIds)
+    ]
+    for (const id of remoteFieldIds) {
+      assert.ok(allowedRemoteFieldIds.includes(id), `${issuer.label}: only vendor fields`)
+      assert.equal(fields[id].length, issuer.periods.length, `${issuer.label}: remote row count`)
+    }
+    assert.doesNotMatch(JSON.stringify(remoteFieldIds), /FETCH_TIME|SOURCE_MODE|fetchTime|sourceMode/,
+      `${issuer.label}: local provenance is not a remote field`)
+    assert.equal(payload.dataVol, remoteFieldIds.length * issuer.periods.length,
+      `${issuer.label}: only actual remote values count, including missing-metric fixtures`)
+    const result = parse(issuer, payload, verified(), currencyEvidence(issuer), fetchTime)
+    assert.equal(result.source, 'real')
+    assert.equal(result.points.length, 21)
+    for (const point of result.points) {
+      assert.equal(point.fetchTime, fetchTime, `${issuer.label}: trusted timestamp copied exactly`)
+      assert.equal(point.verification.sourceMode, 'real')
+      assert.equal(point.sourceTime, issuer.periods.find((period) =>
+        period.reportPeriod === point.reportPeriod).sourceTime)
+    }
+  }
+
+  const hk = ISSUERS[0]
+  const input = () => ({
+    caseId: hk.caseId, fetchTime: FETCH_TIME, payload: makePayload(hk),
+    verification: verified(), manifestBundle: MANIFEST_BUNDLES[hk.caseId],
+    financialReportingCurrencyEvidence: currencyEvidence(hk)
+  })
+  const missing = input()
+  delete missing.fetchTime
+  assertUnavailable(parseIfindMarketFinancials(missing), 'missing trusted fetch time', 'scopeStatus')
+  for (const fetchTime of [
+    undefined, null, '', false, Date.parse(FETCH_TIME), new Date(FETCH_TIME),
+    [FETCH_TIME], { value: FETCH_TIME },
+    'not-a-timestamp', '2025-12-01', '2025-12-01T12:00:00',
+    '2025-02-30T12:00:00.000Z', '2025-12-01T24:00:00.000Z',
+    '2025-12-01T12:00:00+15:00', ` ${FETCH_TIME}`, `${FETCH_TIME} `
+  ]) {
+    assertUnavailable(parseIfindMarketFinancials({ ...input(), fetchTime }),
+      'malformed trusted fetch time', 'scopeStatus')
+  }
+
+  let accessorRead = false
+  const accessor = input()
+  Object.defineProperty(accessor, 'fetchTime', {
+    enumerable: true,
+    get() { accessorRead = true; throw new Error('trusted context getter must not run') }
+  })
+  assertUnavailable(parseIfindMarketFinancials(accessor), 'accessor trusted fetch time')
+  assert.equal(accessorRead, false)
+  const state = { invoked: false }
+  assertUnavailable(parseIfindMarketFinancials({
+    ...input(), fetchTime: hostileProxy({ value: FETCH_TIME }, state)
+  }), 'proxied trusted fetch time')
+  assert.equal(state.invoked, false)
+  const revoked = Proxy.revocable({ value: FETCH_TIME }, {})
+  revoked.revoke()
+  assertUnavailable(parseIfindMarketFinancials({ ...input(), fetchTime: revoked.proxy }),
+    'revoked trusted fetch time')
+
+  const dimensions = [
+    'issuerIdentityStatus', 'vendorCodeStatus', 'entitlementStatus',
+    'currencyStatus', 'unitStatus', 'reportPeriodStatus', 'scopeStatus'
+  ]
+  for (const field of dimensions) {
+    for (const status of ['unverified', 'failed']) {
+      assertUnavailable(parse(hk, makePayload(hk), verified({ [field]: status })),
+        `${field}: local descriptors do not replace vendor evidence`)
+    }
+  }
+  for (const sourceMode of ['Mock', 'mixed', 'unverified', undefined]) {
+    assertUnavailable(parse(hk, makePayload(hk), verified({ sourceMode })),
+      'untrusted verification source mode')
+  }
+}
+
+function testProviderLocalProvenanceRejected() {
+  for (const issuer of ISSUERS) {
+    for (const field of [
+      'fetchTime', 'sourceMode',
+      `TEST_ONLY_${issuer.market}_FETCH_TIME`, `TEST_ONLY_${issuer.market}_SOURCE_MODE`
+    ]) {
+      const isMode = field === 'sourceMode' || field.endsWith('SOURCE_MODE')
+      for (const length of [issuer.periods.length, issuer.periods.length - 1]) {
+        for (const value of isMode ? ['real', 'Mock'] : [FETCH_TIME, '2026-08-30T04:00:00.000Z']) {
+          const payload = makePayload(issuer)
+          payload.tables[0].table[field] = Array.from({ length }, () => value)
+          recalculateDataVol(payload)
+          assertUnavailable(parse(issuer, payload), `${field}: provider injection`, 'scopeStatus')
+        }
+      }
+
+      let getterRead = false
+      const accessorPayload = makePayload(issuer)
+      Object.defineProperty(accessorPayload.tables[0].table, field, {
+        enumerable: true,
+        get() { getterRead = true; throw new Error('provider local getter must not run') }
+      })
+      accessorPayload.dataVol += issuer.periods.length
+      assertUnavailable(parse(issuer, accessorPayload), `${field}: provider accessor`)
+      assert.equal(getterRead, false)
+
+      const state = { invoked: false }
+      const proxyPayload = makePayload(issuer)
+      proxyPayload.tables[0].table[field] = hostileProxy([isMode ? 'real' : FETCH_TIME], state)
+      proxyPayload.dataVol += 1
+      assertUnavailable(parse(issuer, proxyPayload), `${field}: provider proxy`)
+      assert.equal(state.invoked, false)
+    }
+  }
+}
+
 function testHostileObjects() {
   const hk = ISSUERS[0]
   const proxyCases = [
@@ -634,6 +759,8 @@ function testHostileObjects() {
     const target = kind === 'input'
       ? {
           caseId: hk.caseId,
+          fetchTime: FETCH_TIME,
+          manifestBundle: MANIFEST_BUNDLES[hk.caseId],
           payload: makePayload(hk),
           verification: verified(),
           financialReportingCurrencyEvidence: currencyEvidence(hk)
@@ -644,6 +771,8 @@ function testHostileObjects() {
       ? proxy
       : {
           caseId: hk.caseId,
+          fetchTime: FETCH_TIME,
+          manifestBundle: MANIFEST_BUNDLES[hk.caseId],
           payload: kind === 'payload' ? proxy : makePayload(hk),
           verification: verified(),
           financialReportingCurrencyEvidence: kind === 'evidence'
@@ -656,6 +785,8 @@ function testHostileObjects() {
 
   let inputAccessorInvoked = false
   const accessorInput = {
+    fetchTime: FETCH_TIME,
+    manifestBundle: MANIFEST_BUNDLES[hk.caseId],
     payload: makePayload(hk),
     verification: verified(),
     financialReportingCurrencyEvidence: currencyEvidence(hk)
@@ -690,6 +821,8 @@ function testHostileObjects() {
   revoked.revoke()
   assertUnavailable(parseIfindMarketFinancials({
     caseId: hk.caseId,
+    fetchTime: FETCH_TIME,
+    manifestBundle: MANIFEST_BUNDLES[hk.caseId],
     payload: revoked.proxy,
     verification: verified(),
     financialReportingCurrencyEvidence: currencyEvidence(hk)
@@ -730,6 +863,7 @@ function testOutputPurity() {
       assert.equal(point.indicatorId, issuer.metricIds[point.metricKey])
       assert.equal(point.currency, issuer.currency)
       assert.equal(point.unit, 'million')
+      assert.equal(point.fetchTime, FETCH_TIME)
       assert.deepEqual(point.verification, verified())
     }
     for (const period of issuer.periods) {
@@ -757,6 +891,7 @@ function testOutputPurity() {
     'sourceReference',
     'verifiedAt',
     'raw-provider-sentinel',
+    'Mock',
     'access_token',
     'refresh_token'
   ]) {
@@ -771,6 +906,8 @@ async function run() {
     ['selection and chronology', testSelectionAndChronology],
     ['currency evidence', testCurrencyEvidence],
     ['malformed payloads', testMalformedPayloads],
+    ['trusted local provenance context', testLocalProvenanceContext],
+    ['provider local provenance rejection', testProviderLocalProvenanceRejected],
     ['hostile objects', testHostileObjects],
     ['output purity', testOutputPurity]
   ]

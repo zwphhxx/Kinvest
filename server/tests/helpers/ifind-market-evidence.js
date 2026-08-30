@@ -19,9 +19,9 @@ const FINANCIAL_SUFFIXES = Object.freeze({
 const METADATA_SUFFIXES = Object.freeze({
   currency: 'CURRENCY', unit: 'UNIT', reportPeriod: 'REPORT_PERIOD',
   reportDate: 'REPORT_DATE', periodType: 'PERIOD_TYPE',
-  disclosureScope: 'DISCLOSURE_SCOPE', sourceTime: 'SOURCE_TIME',
-  fetchTime: 'FETCH_TIME', sourceMode: 'SOURCE_MODE'
+  disclosureScope: 'DISCLOSURE_SCOPE', sourceTime: 'SOURCE_TIME'
 })
+const REMOTE_FINANCIAL_METADATA_FIELDS = Object.freeze(Object.keys(METADATA_SUFFIXES))
 
 function fixtureEvidence(caseId) {
   const catalog = getIfindMarketCase(caseId)
@@ -58,11 +58,14 @@ function fixtureCatalog(caseId, prefix = 'TEST_ONLY_') {
       sourceReference: 'fixture://ifind/metadata/' + field
     }])
   )
+  catalog.indicators.financialMetadata.fetchTime = { source: 'runtime-clock' }
+  catalog.indicators.financialMetadata.sourceMode = { source: 'verified-adapter' }
   catalog.requestTemplates.quote.fields = catalog.indicators.quote.map((entry) => entry.vendorIndicatorId)
   catalog.requestTemplates.quote.evidenceStatus = 'verified'
   catalog.requestTemplates.financial.indicatorIds = [
     ...catalog.indicators.financial.map((entry) => entry.vendorIndicatorId),
-    ...Object.values(catalog.indicators.financialMetadata).map((entry) => entry.vendorIndicatorId)
+    ...REMOTE_FINANCIAL_METADATA_FIELDS.map((field) =>
+      catalog.indicators.financialMetadata[field].vendorIndicatorId)
   ]
   catalog.requestTemplates.financial.evidenceStatus = 'verified'
   catalog.periodRules = {
@@ -80,4 +83,6 @@ function fixtureBundle(caseId) {
   return createVerifiedMarketEvidenceBundle(fixtureCatalog(caseId), fixtureEvidence(caseId))
 }
 
-module.exports = { fixtureBundle, fixtureCatalog, fixtureEvidence }
+module.exports = {
+  fixtureBundle, fixtureCatalog, fixtureEvidence, REMOTE_FINANCIAL_METADATA_FIELDS
+}

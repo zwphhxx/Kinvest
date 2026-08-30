@@ -46,6 +46,12 @@ const REQUIRED_FINANCIAL_METADATA = [
   'fetchTime',
   'sourceMode'
 ]
+const REMOTE_FINANCIAL_METADATA = REQUIRED_FINANCIAL_METADATA.filter((field) =>
+  field !== 'fetchTime' && field !== 'sourceMode'
+)
+const LOCAL_PROVENANCE_SOURCES = Object.freeze({
+  fetchTime: 'runtime-clock', sourceMode: 'verified-adapter'
+})
 
 const EXPECTED_CASES = [
   {
@@ -99,6 +105,9 @@ function verifiedIndicator(metric, family) {
 }
 
 function verifiedMetadataIndicator(field) {
+  if (Object.hasOwn(LOCAL_PROVENANCE_SOURCES, field)) {
+    return { source: LOCAL_PROVENANCE_SOURCES[field] }
+  }
   return {
     vendorIndicatorId: `FIXTURE_FINANCIAL_METADATA_${field}`,
     evidenceStatus: 'verified',
@@ -130,7 +139,7 @@ function completeVerifiedManifestDefinition() {
         endpoint: '/api/v1/basic_data_service',
         indicatorIds: [
           ...financial.map((indicator) => indicator.vendorIndicatorId),
-          ...REQUIRED_FINANCIAL_METADATA.map((field) =>
+          ...REMOTE_FINANCIAL_METADATA.map((field) =>
             financialMetadata[field].vendorIndicatorId)
         ],
         evidenceStatus: 'verified'
@@ -171,8 +180,101 @@ function assertInvalidManifest(candidate, name) {
   )
 }
 
+function runProvenanceChecks() {
+  const definition = completeVerifiedManifestDefinition()
+  const metadata = definition.indicators.financialMetadata
+  assert.deepEqual(Object.keys(metadata), REQUIRED_FINANCIAL_METADATA)
+  assert.deepEqual(metadata.fetchTime, { source: 'runtime-clock' })
+  assert.deepEqual(metadata.sourceMode, { source: 'verified-adapter' })
+  assert.equal(definition.requestTemplates.financial.indicatorIds.length, 14)
+  assert.deepEqual(definition.requestTemplates.financial.indicatorIds, [
+    ...definition.indicators.financial.map((entry) => entry.vendorIndicatorId),
+    ...REMOTE_FINANCIAL_METADATA.map((field) => metadata[field].vendorIndicatorId)
+  ])
+  assert.doesNotMatch(
+    JSON.stringify(definition.requestTemplates.financial.indicatorIds),
+    /fetchTime|sourceMode|FETCH_TIME|SOURCE_MODE/
+  )
+  assert.equal(validateLiveRequestManifestDefinition(definition), true,
+    'seven verified remote metadata mappings plus two exact local descriptors are valid')
+
+  const legacy = completeVerifiedManifestDefinition()
+  for (const field of Object.keys(LOCAL_PROVENANCE_SOURCES)) {
+    const vendorIndicatorId = `FIXTURE_FINANCIAL_METADATA_${field}`
+    legacy.indicators.financialMetadata[field] = {
+      vendorIndicatorId, evidenceStatus: 'verified',
+      sourceReference: `fixture://ifind-financial-metadata/${field}`
+    }
+    legacy.requestTemplates.financial.indicatorIds.push(vendorIndicatorId)
+  }
+  assertInvalidManifest(legacy, 'old all-vendor local provenance mapping')
+
+  for (const [field, source] of Object.entries(LOCAL_PROVENANCE_SOURCES)) {
+    for (const replacement of [
+      {}, { source: 'real' }, { source: 'vendor' },
+      { source: field === 'fetchTime' ? 'verified-adapter' : 'runtime-clock' },
+      { source, vendorIndicatorId: `TEST_ONLY_HK_${field === 'fetchTime' ? 'FETCH_TIME' : 'SOURCE_MODE'}` },
+      { source, evidenceStatus: 'verified' }, { source, sourceReference: 'fixture://local' },
+      { source, responsePath: ['data', field] }, { source, context: field },
+      Object.assign(Object.create({ inherited: true }), { source })
+    ]) {
+      const candidate = completeVerifiedManifestDefinition()
+      candidate.indicators.financialMetadata[field] = replacement
+      assertInvalidManifest(candidate, `${field}: exact local descriptor required`)
+    }
+
+    const extraRequest = completeVerifiedManifestDefinition()
+    extraRequest.requestTemplates.financial.indicatorIds.push(
+      `TEST_ONLY_HK_${field === 'fetchTime' ? 'FETCH_TIME' : 'SOURCE_MODE'}`
+    )
+    assertInvalidManifest(extraRequest, `${field}: local ID cannot enter the request`)
+
+    for (const extraKey of ['vendorIndicatorId', Symbol('extra-local-key')]) {
+      const candidate = completeVerifiedManifestDefinition()
+      Object.defineProperty(candidate.indicators.financialMetadata[field], extraKey, {
+        value: 'must-not-be-accepted', enumerable: false
+      })
+      assertInvalidManifest(candidate, `${field}: hidden extra descriptor key`)
+    }
+
+    for (const target of ['mapping', 'source', 'extra']) {
+      const candidate = completeVerifiedManifestDefinition()
+      let observed = false
+      const container = target === 'mapping'
+        ? candidate.indicators.financialMetadata
+        : candidate.indicators.financialMetadata[field]
+      Object.defineProperty(container, target === 'mapping' ? field : target === 'source' ? 'source' : 'vendorIndicatorId', {
+        enumerable: true,
+        get() { observed = true; throw new Error('local descriptor getter must not run') }
+      })
+      assertInvalidManifest(candidate, `${field}: accessor ${target}`)
+      assert.equal(observed, false, `${field}: no getter side effects`)
+    }
+
+    for (const target of ['mapping', 'source']) {
+      const candidate = completeVerifiedManifestDefinition()
+      let observed = false
+      const trap = () => { observed = true; throw new Error('local proxy trap must not run') }
+      const proxy = new Proxy({ source }, {
+        get: trap, has: trap, ownKeys: trap,
+        getPrototypeOf: trap, getOwnPropertyDescriptor: trap
+      })
+      if (target === 'mapping') candidate.indicators.financialMetadata[field] = proxy
+      else candidate.indicators.financialMetadata[field].source = proxy
+      assertInvalidManifest(candidate, `${field}: proxied ${target}`)
+      assert.equal(observed, false, `${field}: no proxy side effects`)
+    }
+
+    const revoked = Proxy.revocable({ source }, {})
+    revoked.revoke()
+    const candidate = completeVerifiedManifestDefinition()
+    candidate.indicators.financialMetadata[field] = revoked.proxy
+    assertInvalidManifest(candidate, `${field}: revoked descriptor proxy`)
+  }
+}
+
 async function run() {
-  assert.equal(validateLiveRequestManifestDefinition(completeVerifiedManifestDefinition()), true)
+  runProvenanceChecks()
 
   const corruptions = [
     ...REQUIRED_QUOTE_METRICS.map((metric) => [
@@ -217,6 +319,9 @@ async function run() {
     }],
     ['empty financial metadata source reference', (manifest) => {
       manifest.indicators.financialMetadata.currency.sourceReference = ''
+    }],
+    ['extra remote financial metadata descriptor key', (manifest) => {
+      manifest.indicators.financialMetadata.currency.source = 'vendor'
     }],
     ['duplicate financial metadata provider ID', (manifest) => {
       const metadata = manifest.indicators.financialMetadata
@@ -404,13 +509,19 @@ async function run() {
       Object.keys(marketCase.indicators.financialMetadata),
       REQUIRED_FINANCIAL_METADATA
     )
-    assert.equal(
-      Object.values(marketCase.indicators.financialMetadata).every((mapping) =>
-        mapping.vendorIndicatorId === null &&
-        mapping.evidenceStatus === 'unverified' &&
-        mapping.sourceReference === null),
-      true
-    )
+    for (const field of REMOTE_FINANCIAL_METADATA) {
+      assert.deepEqual(marketCase.indicators.financialMetadata[field], {
+        vendorIndicatorId: null, evidenceStatus: 'unverified', sourceReference: null
+      })
+    }
+    assert.deepEqual(marketCase.indicators.financialMetadata.fetchTime, { source: 'runtime-clock' })
+    assert.deepEqual(marketCase.indicators.financialMetadata.sourceMode, { source: 'verified-adapter' })
+    for (const family of ['quote', 'financial']) {
+      assert.equal(marketCase.indicators[family].every((entry) =>
+        entry.vendorIndicatorId === null && entry.evidenceStatus === 'unverified'), true)
+      assert.equal(marketCase.requestTemplates[family].evidenceStatus, 'unverified')
+    }
+    assert.equal(marketCase.periodRules.evidenceStatus, 'unverified')
     assert.deepEqual(marketCase.requestTemplates.financial.indicatorIds, [])
     assert.equal(marketCase.liveReady, false)
     assertDeepFrozen(marketCase)
@@ -526,4 +637,4 @@ async function run() {
   assert.match(evidence, /no credentials, account identifiers, raw provider payloads/i)
 }
 
-module.exports = { run }
+module.exports = { run, runProvenanceChecks }
