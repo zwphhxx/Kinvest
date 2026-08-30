@@ -58,6 +58,7 @@ async function runBuildArtifactsExist() {
     'server/db/ifind-market-diagnostic-repository.js',
     'server/db/refresh-db.js',
     'server/domain/ifind-indicator-id.js',
+    'server/domain/ifind-calibration.js',
     'server/domain/ifind-market-cases.js',
     'server/domain/ifind-market-financial-parser.js',
     'server/domain/ifind-market-manifest-validator.js',
@@ -83,6 +84,7 @@ async function runBuildArtifactsExist() {
     'server/security/tencent-ssm-client.js',
     'server/server.js',
     'server/services/health.js',
+    'server/services/ifind-calibration-service.js',
     'server/services/ifind-diagnostic-service.js',
     'server/services/ifind-market-diagnostic-service.js',
     'server/services/refresh-rules.js',
@@ -162,7 +164,7 @@ async function runBuildArtifactsExist() {
     )
     assert.deepStrictEqual(
       listRelativeFiles(path.join(repositoryRoot, 'dist')),
-      expectedArtifacts
+      expectedArtifacts.sort((left, right) => left.localeCompare(right))
     )
     const sourcePackage = JSON.parse(fs.readFileSync(
       path.join(repositoryRoot, 'package.json'),

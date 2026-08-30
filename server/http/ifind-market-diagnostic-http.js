@@ -603,6 +603,8 @@ function safeError(error) {
     : createBoundaryError('INTERNAL_ERROR', 500)
 }
 
+const { copyCalibrationResult } = require('../domain/ifind-calibration')
+
 function createIfindMarketDiagnosticHttpController({
   accessRuntime,
   ifindDiagnosticRuntime,
@@ -852,7 +854,44 @@ function createIfindMarketDiagnosticHttpController({
     })
   }
 
+  async function routeCalibration(req, res, segments) {
+    assertNoDuplicateHeaders(req)
+    const isRead = segments.length === 4 && req.method === 'GET'
+    const isRun = segments.length === 5 && segments[4] === 'run' &&
+      req.method === 'POST'
+    if (!isRead && !isRun) {
+      sendJson(res, { error: 'NOT_FOUND' }, 404)
+      return true
+    }
+    if (isRun) {
+      requireOrigin(req)
+      authenticateMutation(req, res)
+      requireTrustedClient(req)
+      requireExactTarget(req, '/api/admin/ifind/calibration/run')
+      requireExactEmptyObject(await parseLocalStrictJson(req))
+    } else {
+      if (req.headers.origin !== undefined) requireOrigin(req)
+      authenticateAdmin(req, res)
+      requireExactTarget(req, '/api/admin/ifind/calibration')
+    }
+    const access = runtimeAccess(ifindDiagnosticRuntime)
+    const property = optionalOwnDataValue(ifindDiagnosticRuntime, 'calibrationService')
+    const method = property.found
+      ? optionalOwnDataValue(property.value, isRun ? 'run' : 'describe')
+      : { found: false, value: null }
+    if (access.status !== 'available' || !method.found ||
+      typeof method.value !== 'function' || types.isProxy(method.value)) {
+      sendJson(res, { error: 'IFIND_CALIBRATION_UNAVAILABLE' }, 503)
+      return true
+    }
+    const result = await method.value.call(property.value)
+    sendJson(res, { data: copyCalibrationResult(result) })
+    return true
+  }
+
   async function route(req, res, segments) {
+    if (segments[1] === 'admin' && segments[2] === 'ifind' &&
+      segments[3] === 'calibration') return routeCalibration(req, res, segments)
     if (segments[1] !== 'admin' || segments[2] !== 'ifind' ||
       segments[3] !== 'market-cases') return false
 

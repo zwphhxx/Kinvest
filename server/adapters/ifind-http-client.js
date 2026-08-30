@@ -1,6 +1,7 @@
 const https = require('node:https')
 const { TextDecoder, types } = require('node:util')
 const { isIfindIndicatorId } = require('../domain/ifind-indicator-id')
+const { CALIBRATION_REQUEST } = require('../domain/ifind-calibration')
 const {
   isClientFailureBase,
   isClientFailureMetadata
@@ -1066,7 +1067,7 @@ function createIfindHttpClient({
     }
   }
 
-  async function executeMarketOperation(operation, accessTokenInput, requestInput) {
+  async function executeMarketOperation(operation, accessTokenInput, requestInput, calibration = false) {
     let requestCount = 0
     try {
       let operationInput
@@ -1077,7 +1078,13 @@ function createIfindHttpClient({
         }
         accessToken = new TextDecoder('utf-8', { fatal: true }).decode(accessTokenInput)
         if (!isHeaderSafeToken(accessToken)) throw new Error('invalid request')
-        operationInput = readOperationRequest(requestInput, operation)
+        operationInput = calibration
+          ? Object.freeze({
+              vendorCode: '9988.HK',
+              fieldIds: Object.freeze(['revenue_oas']),
+              body: CALIBRATION_REQUEST
+            })
+          : readOperationRequest(requestInput, operation)
       } catch {
         throw withStage(
           safeError('IFIND_CONFIG_INVALID', 'CONFIG', 'iFinD client configuration was invalid'),
@@ -1102,8 +1109,10 @@ function createIfindHttpClient({
         requireCurrentGeneration(operationGeneration)
         const responseErrorCode = protocolErrorCode(response)
         if (responseErrorCode === 0) {
+          let calibrationDataVol
           try {
             const dataVol = protocolDataVol(response)
+            if (calibration && dataVol.present) calibrationDataVol = dataVol.value
             const payload = operation === 'quote'
               ? sanitizeQuoteSuccess(response, operationInput)
               : sanitizeFinancialSuccess(response, operationInput)
@@ -1113,7 +1122,10 @@ function createIfindHttpClient({
               dataVol: dataVol.present ? dataVol.value : null
             })
           } catch {
-            throw safeError('IFIND_RESPONSE_SHAPE', 'API', 'iFinD response shape was invalid')
+            throw safeError(
+              'IFIND_RESPONSE_SHAPE', 'API', 'iFinD response shape was invalid',
+              calibrationDataVol
+            )
           }
         }
 
@@ -1172,7 +1184,11 @@ function createIfindHttpClient({
     return executeMarketOperation('financial', accessToken, fixedRequest)
   }
 
-  const client = { diagnose, authenticate: authenticateMarket, quote, financial }
+  function calibrateFinancial(accessToken) {
+    return executeMarketOperation('financial', accessToken, undefined, true)
+  }
+
+  const client = { diagnose, authenticate: authenticateMarket, quote, financial, calibrateFinancial }
   Object.defineProperty(client, 'clear', { value: clear })
   return client
 }
