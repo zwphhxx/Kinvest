@@ -2,6 +2,7 @@
 
 const assert = require('node:assert/strict')
 const { DatabaseSync } = require('node:sqlite')
+const { expectedEvidence } = require('./ifind-report-period-evidence.test')
 const {
   IfindMarketDiagnosticRepository,
   IFIND_MARKET_CASE_COOLDOWN_MS,
@@ -147,6 +148,7 @@ const tests = [
       calibrationId: domain.CALIBRATION_ID, caseId: CASE_ID, displayCode: '9988.HK',
       indicator: 'revenue_oas', parameters: ['20260331', '1', 'BB'], status: 'ready',
       verification: Object.fromEntries(VERIFICATION_KEYS.map((key) => [key, 'unverified'])),
+      periodEvidence: expectedEvidence(),
       observation: null, requestCount: 0, businessRequestCount: 0,
       dataVol: null, attemptedAt: null, errorCode: null
     })
@@ -236,6 +238,115 @@ const tests = [
     assert.equal(service.describe().observation, null)
     assert.deepEqual([f.state.reads, f.state.auth, f.state.financial, f.state.clears], [0, 0, 0, 0])
     assert.equal(f.rows().length, 0)
+  })],
+  ['known numeric observation adds curated comparison only and stays memory-only', async () => withHarness(async (f) => {
+    f.client.calibrateFinancial = async () => {
+      f.state.financial += 1
+      return { payload: payload(247652000000), requestCount: 1, dataVol: 1 }
+    }
+    const service = f.service()
+    assert.deepEqual(service.describe().periodEvidence, expectedEvidence())
+    const result = await service.run()
+    assert.equal(result.status, 'observed-unverified')
+    assert.deepEqual(result.periodEvidence, expectedEvidence(247652000000))
+    assert.equal(result.observation.reportPeriod, null)
+    assert.equal(result.observation.periodType, null)
+    assert.equal(result.observation.currency, null)
+    assert.equal(result.observation.unit, null)
+    assertSafe(result)
+    result.periodEvidence.references[0].period.end = '2026-03-31'
+    result.periodEvidence.parameterEvidence.currencyBasis.meaning = 'CNY'
+    result.periodEvidence.comparisonOnly.length = 0
+    assert.deepEqual(service.describe().periodEvidence, expectedEvidence(247652000000))
+    assert.deepEqual(f.service().describe().periodEvidence, expectedEvidence())
+    assert.equal(JSON.stringify(f.rows()).includes('247652'), false)
+    assert.equal(JSON.stringify(f.rows()).includes('hkexnews'), false)
+    assert.deepEqual(service.clear().periodEvidence, expectedEvidence())
+    const limited = await service.run()
+    assert.equal(limited.status, 'cooldown')
+    assert.deepEqual(limited.periodEvidence, expectedEvidence())
+    assert.deepEqual([f.state.auth, f.state.financial, f.state.clears], [1, 1, 1])
+    assertNoEvidence(f)
+    assertWiped(f.state)
+  })],
+  ['strict result DTO rejects missing evidence, source mismatch and arbitrary promotion', async () => {
+    const initial = domain.createInitialCalibrationResult()
+    const missing = { ...initial }
+    delete missing.periodEvidence
+    const mismatch = expectedEvidence()
+    mismatch.references[0].period = mismatch.references[1].period
+    for (const value of [missing, { ...initial, periodEvidence: mismatch },
+      { ...initial, periodEvidence: { ...expectedEvidence(), actualPeriod: expectedEvidence().references[1].period } },
+      { ...initial, periodEvidence: { ...expectedEvidence(), decision: 'verified' } }]) {
+      assert.throws(() => domain.copyCalibrationResult(value), { code: 'IFIND_CALIBRATION_RESULT_INVALID' })
+    }
+    let reads = 0
+    const malicious = expectedEvidence()
+    Object.defineProperty(malicious.references[0], 'url', {
+      enumerable: true, get() { reads += 1; throw new Error(SECRET) }
+    })
+    assert.throws(() => domain.copyCalibrationResult({ ...initial, periodEvidence: malicious }), {
+      code: 'IFIND_CALIBRATION_RESULT_INVALID'
+    })
+    assert.equal(reads, 0)
+  }],
+  ['third-party evidence and period claims cannot enter the trusted result', async () => {
+    for (const placement of ['envelope', 'payload', 'row', 'table']) {
+      await withHarness(async (f) => {
+        const response = payload(247652000000)
+        const financial = { payload: response, requestCount: 1, dataVol: null }
+        const target = placement === 'envelope' ? financial : placement === 'payload' ? response
+          : placement === 'row' ? response.tables[0] : response.tables[0].table
+        target['periodEvidence'] = {
+          ...expectedEvidence(247652000000), actualPeriod: expectedEvidence().references[1].period,
+          decision: 'verified', url: 'https://untrusted.invalid/'
+        }
+        f.client.calibrateFinancial = async () => {
+          f.state.financial += 1
+          return financial
+        }
+        const result = await f.service().run()
+        assert.equal(result.status, 'failed')
+        assert.equal(result.observation, null)
+        assert.deepEqual(result.periodEvidence, expectedEvidence())
+        assert.deepEqual([f.state.auth, f.state.financial, f.state.clears], [1, 1, 1])
+        assert.equal(f.rows()[0].request_count, 2)
+        assertSafe(result)
+        assertNoEvidence(f)
+        assertWiped(f.state)
+      })
+    }
+  }],
+  ['real service fails closed on an inconsistent server-owned period reference', async () => withHarness(async (f) => {
+    const evidence = require('../domain/ifind-report-period-evidence')
+    const servicePath = require.resolve('../services/ifind-calibration-service')
+    const originalModule = require.cache[servicePath]
+    const originalCreate = evidence.createPeriodEvidence
+    try {
+      evidence.createPeriodEvidence = (value) => {
+        const result = expectedEvidence(value)
+        result.references[0].period = result.references[1].period
+        return result
+      }
+      delete require.cache[servicePath]
+      const { createIfindCalibrationService: createService } = require(servicePath)
+      const service = createService(f.options)
+      const result = await service.run()
+      assert.equal(result.status, 'failed', 'a known source-period mismatch must not be an observed success')
+      assert.equal(result.errorCode, FAILED)
+      assert.equal(result.observation, null)
+      assert.deepEqual(result.periodEvidence, expectedEvidence())
+      assert.equal(f.rows()[0].status, 'failed')
+      assert.equal(f.rows()[0].request_count, 2)
+      assert.deepEqual([f.state.auth, f.state.financial, f.state.clears], [1, 1, 1])
+      assert.equal((await service.run()).status, 'cooldown')
+      assertSafe(result)
+      assertWiped(f.state)
+      assertNoEvidence(f)
+    } finally {
+      evidence.createPeriodEvidence = originalCreate
+      require.cache[servicePath] = originalModule
+    }
   })],
   ['transport observation is deliberately failed full-case bookkeeping, never evidence', async () => withHarness(async (f) => {
     const service = f.service()
@@ -590,6 +701,10 @@ const tests = [
   })],
   ['settlement conflict never publishes an unrecorded observation or retries', async () => withHarness(async (f) => {
     let failures = 0
+    f.client.calibrateFinancial = async () => {
+      f.state.financial += 1
+      return { payload: payload(247652000000), requestCount: 1, dataVol: null }
+    }
     const repository = {
       reserve: f.repository.reserve.bind(f.repository),
       quotaStatus: f.repository.quotaStatus.bind(f.repository),
@@ -600,8 +715,32 @@ const tests = [
     assert.equal(result.status, 'unavailable')
     assert.equal(result.errorCode, UNAVAILABLE)
     assert.equal(result.observation, null)
+    assert.deepEqual(result.periodEvidence, expectedEvidence())
     assert.equal(service.describe().observation, null)
+    assert.deepEqual(service.describe().periodEvidence, expectedEvidence())
     assert.equal(failures, 1)
+    assert.deepEqual([f.state.auth, f.state.financial, f.state.clears], [1, 1, 1])
+    assertSafe(result)
+    assertWiped(f.state)
+    assertNoEvidence(f)
+  })],
+  ['clear during client cleanup also discards numerical comparison signals', async () => withHarness(async (f) => {
+    let service
+    f.client.calibrateFinancial = async () => {
+      f.state.financial += 1
+      return { payload: payload(247652000000), requestCount: 1, dataVol: null }
+    }
+    f.client.clear = () => { f.state.clears += 1; service.clear() }
+    service = f.service()
+    const result = await service.run()
+    assert.equal(result.status, 'failed')
+    assert.equal(result.errorCode, FAILED)
+    assert.equal(result.observation, null)
+    assert.deepEqual(result.periodEvidence, expectedEvidence())
+    assert.deepEqual(service.describe().periodEvidence, expectedEvidence())
+    assert.deepEqual([f.state.auth, f.state.financial, f.state.clears], [1, 1, 1])
+    assert.equal(f.rows()[0].request_count, 2)
+    assertSafe(result)
     assertWiped(f.state)
     assertNoEvidence(f)
   })],

@@ -71,3 +71,12 @@ fresh-process and container runtime load checks exercise their imports.
 After the three required PR checks pass, the user merges manually. Image import,
 production deployment and the first real calibration remain separate approval
 gates. This PR performs none of those operations.
+
+## Report-period evidence follow-up
+
+The [dated report-period evidence record](ifind-report-period-evidence.md)
+separates the frozen request selector from actual vendor-period evidence and
+public issuer comparisons. Matching a disclosure number cannot fill unknown
+metadata or make the observation verified. The quarter and fiscal year ending
+on the same date must remain distinct. Parameter `1` denotes consolidated
+statements, not Q1; `BB` denotes original currency, not a confirmed currency.

@@ -6,6 +6,7 @@ const {
   copyCalibrationResult,
   createInitialCalibrationResult
 } = require('../domain/ifind-calibration')
+const { createPeriodEvidence, copyPeriodEvidence } = require('../domain/ifind-report-period-evidence')
 const {
   IFIND_MARKET_CASE_COOLDOWN_MS,
   IFIND_MARKET_DIAGNOSTIC_LEASE_MS,
@@ -232,6 +233,7 @@ function createIfindCalibrationService(options) {
     let dataVol = null
     let lastTime = reservation.createdAt
     let observation
+    let periodEvidence = null
     let status = 'failed'
     let errorCode = FAILED
     let safeErrorClass = 'NETWORK'
@@ -282,6 +284,9 @@ function createIfindCalibrationService(options) {
         checkLease()
         safeErrorClass = 'RESPONSE_SHAPE'
         observation = parseObservation(financial.payload)
+        // Validate server-owned references too: a contradictory known period must
+        // fail this real run, not become an observed result or a promoted claim.
+        periodEvidence = copyPeriodEvidence(createPeriodEvidence(observation.value), observation.value)
         safeErrorClass = 'NETWORK'
         checkLease()
         status = 'observed-unverified'
@@ -348,13 +353,15 @@ function createIfindCalibrationService(options) {
       active = null
     }
 
-    if (generation === owner.generation) {
-      current = copyCalibrationResult(result)
-    } else if (result.observation !== null) {
+    if (generation !== owner.generation && result.observation !== null) {
       result.status = 'failed'
       result.errorCode = FAILED
       result.observation = null
     }
+    // Only attach comparisons after settlement and late-clear discard paths.
+    // Every discarded observation keeps the initial, comparison-free evidence.
+    if (result.observation !== null) result.periodEvidence = periodEvidence
+    if (generation === owner.generation) current = copyCalibrationResult(result)
     return copyCalibrationResult(result)
   }
 

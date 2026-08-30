@@ -183,6 +183,7 @@
             <div><dt>dataVol</dt><dd id="ifind-calibration-data-vol">未提供</dd></div>
             <div><dt>币种</dt><dd id="ifind-calibration-currency">未知 / 未验证</dd></div>
             <div><dt>单位</dt><dd id="ifind-calibration-unit">未知 / 未验证</dd></div>
+            <div><dt>请求报告期参数</dt><dd id="ifind-calibration-request-selector">20260331（请求参数，非已验证报告期）</dd></div>
             <div><dt>实际报告期</dt><dd id="ifind-calibration-report-period">未知 / 未验证</dd></div>
             <div><dt>期间类型</dt><dd id="ifind-calibration-period-type">未知 / 未验证</dd></div>
             <div><dt>披露口径</dt><dd id="ifind-calibration-disclosure-scope">未知 / 未验证</dd></div>
@@ -197,6 +198,11 @@
             <div><dt>披露口径证据</dt><dd id="ifind-calibration-scope-evidence" data-evidence-status="unverified">未验证</dd></div>
           </dl>
           <p id="ifind-calibration-memory" class="admin-meta">观察值仅暂存于本页内存，刷新或退出后可能丢失。服务端目前仅保存配额及未通过验证的尝试记录，不持久化规范化数值。币种、单位与实际报告期仍未知；固定参数不代表已验证的报告期。</p>
+          <h3>报告期证据与公告比对</h3>
+          <p id="ifind-calibration-period-decision" class="ifind-boundary">实际报告期未证实；披露数字相同也不能确认为同一期。</p>
+          <p id="ifind-calibration-parameter-meanings" class="admin-meta">1 = 合并报表；BB = 原始币种；均不能证明返回值口径。</p>
+          <p class="admin-meta">以下币种和单位只属于公告，不属于上方观察值。相同期末的季度和全年不是同一期间。打开来源不会运行 iFinD 查询。</p>
+          <ul id="ifind-calibration-period-comparisons" class="admin-meta" aria-label="官方公告比较证据"></ul>
           <div class="ifind-diagnostic-actions">
             <p id="ifind-calibration-error" class="admin-meta" role="status" aria-live="polite"></p>
             <button id="ifind-calibration-run" class="auth-primary" type="button" aria-describedby="ifind-calibration-warning ifind-calibration-memory" disabled>校准状态不可用</button>

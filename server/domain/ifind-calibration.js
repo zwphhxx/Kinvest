@@ -1,6 +1,7 @@
 'use strict'
 
 const { types } = require('node:util')
+const { createPeriodEvidence, copyPeriodEvidence } = require('./ifind-report-period-evidence')
 
 const CALIBRATION_ID = 'HK_ALIBABA_REVENUE_OAS_20260331_V1'
 const PARAMETERS = Object.freeze(['20260331', '1', 'BB'])
@@ -16,7 +17,7 @@ const VERIFICATION_KEYS = Object.freeze([
 ])
 const RESULT_KEYS = Object.freeze([
   'calibrationId', 'caseId', 'displayCode', 'indicator', 'parameters', 'status',
-  'verification', 'observation', 'requestCount', 'businessRequestCount',
+  'verification', 'periodEvidence', 'observation', 'requestCount', 'businessRequestCount',
   'dataVol', 'attemptedAt', 'errorCode'
 ])
 const OBSERVATION_KEYS = Object.freeze([
@@ -83,6 +84,7 @@ function createInitialCalibrationResult() {
     parameters: [...PARAMETERS],
     status: 'ready',
     verification: Object.fromEntries(VERIFICATION_KEYS.map((key) => [key, 'unverified'])),
+    periodEvidence: createPeriodEvidence(),
     observation: null,
     requestCount: 0,
     businessRequestCount: 0,
@@ -133,6 +135,8 @@ function validateAndCopy(value) {
       ? 'IFIND_CALIBRATION_FAILED' : 'IFIND_CALIBRATION_UNAVAILABLE')) invalid()
   } else invalid()
 
+  const periodEvidence = copyPeriodEvidence(input.periodEvidence, observation === null ? null : observation.value)
+
   // Rebuild every field, rather than serializing or spreading caller-owned data.
   return {
     calibrationId: CALIBRATION_ID,
@@ -142,6 +146,7 @@ function validateAndCopy(value) {
     parameters,
     status: input.status,
     verification: Object.fromEntries(VERIFICATION_KEYS.map((key) => [key, 'unverified'])),
+    periodEvidence,
     observation,
     requestCount: input.requestCount,
     businessRequestCount: input.businessRequestCount,

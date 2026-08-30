@@ -17,13 +17,56 @@ const SOURCES = Object.fromEntries(['admin.html', 'admin.js', 'admin-contract.js
   .map((name) => [name, fs.readFileSync(path.join(ROOT, 'public', name), 'utf8')]))
 
 function dto(overrides = {}) {
-  return {
+  const result = {
+    periodEvidence: periodEvidence(),
     calibrationId: 'HK_ALIBABA_REVENUE_OAS_20260331_V1',
     caseId: 'HK_ALIBABA_9988', displayCode: '9988.HK', indicator: 'revenue_oas',
     parameters: ['20260331', '1', 'BB'], status: 'ready',
     verification: Object.fromEntries(EVIDENCE.map((key) => [key, 'unverified'])),
     observation: null, requestCount: 0, businessRequestCount: 0, dataVol: null,
     attemptedAt: null, errorCode: null, ...overrides
+  }
+  if (!Object.hasOwn(overrides, 'periodEvidence')) {
+    result.periodEvidence = periodEvidence(result.observation && result.observation.value)
+  }
+  return result
+}
+
+function periodEvidence(value = null) {
+  const references = [
+    {
+      id: 'ALIBABA_REVENUE_20250630_QUARTER',
+      url: 'https://www1.hkexnews.hk/listedco/listconews/sehk/2025/0829/2025082901541_c.pdf',
+      publishedAt: '2025-08-29', pdfPages: [5, 6],
+      period: { type: 'quarter', start: '2025-04-01', end: '2025-06-30' },
+      currency: 'CNY', unit: 'million', revenue: 247652
+    },
+    {
+      id: 'ALIBABA_REVENUE_20260331_QUARTER',
+      url: 'https://www.alibabagroup.com/zh-HK/document-1991237455038119936',
+      publishedAt: '2026-05-13', pdfPages: [],
+      period: { type: 'quarter', start: '2026-01-01', end: '2026-03-31' },
+      currency: 'CNY', unit: 'million', revenue: 243380
+    },
+    {
+      id: 'ALIBABA_REVENUE_20260331_YEAR',
+      url: 'https://www.alibabagroup.com/zh-HK/document-1991237455038119936',
+      publishedAt: '2026-05-13', pdfPages: [],
+      period: { type: 'fiscal-year', start: '2025-04-01', end: '2026-03-31' },
+      currency: 'CNY', unit: 'million', revenue: 1023670
+    }
+  ]
+  return {
+    requestedSelector: '20260331', actualPeriod: null, decision: 'unverified',
+    reasonCode: 'IFIND_REPORT_PERIOD_UNPROVEN', references,
+    comparisonOnly: references.filter((item) => value === item.revenue * 1000000)
+      .map((item) => ({ sourceId: item.id, signal: 'numerical-match-only' })),
+    parameterEvidence: {
+      source: 'ifind-supercommand-ui', observedAt: '2026-08-30',
+      statementScope: { raw: '1', meaning: 'consolidated-statements' },
+      currencyBasis: { raw: 'BB', meaning: 'original-currency' },
+      currentMrqSelector: '8', frozenSelectorMapping: 'unproven'
+    }
   }
 }
 
@@ -165,6 +208,62 @@ function failClosedViewTest() {
     assert.equal(admin.createIfindCalibrationView(dto({ status })).run.disabled, true)
   }
   assert.equal(admin.createIfindCalibrationView(dto({ status: 'failed' })).run.disabled, false)
+}
+
+function periodEvidenceViewTest() {
+  const input = observed({ observation: { ...observed().observation, value: 247652000000 } })
+  const view = admin.createIfindCalibrationView(input)
+  assert.match(view.requestSelector, /20260331.*请求参数/)
+  assert.equal(view.reportPeriod, '未知 / 未验证')
+  assert.match(view.periodDecision, /未证实/)
+  assert.match(view.parameterMeanings, /1 = 合并报表.*BB = 原始币种/)
+  assert.equal(view.periodComparisons.length, 3)
+  assert.match(view.periodComparisons[0].summary, /2025-04-01.*2025-06-30.*单季度.*247,652.*2025-08-29/)
+  assert.match(view.periodComparisons[0].signal, /数值相同.*仅供比对/)
+  assert.match(view.periodComparisons[1].summary, /2026-03-31.*单季度/)
+  assert.match(view.periodComparisons[2].summary, /2026-03-31.*财政年度/)
+  assert.match(view.periodComparisons[1].signal, /不代表接口错误/)
+  for (const key of EVIDENCE) assert.equal(view.verification[key], 'unverified')
+  for (const key of ['currency', 'unit', 'reportPeriod', 'periodType', 'disclosureScope']) {
+    assert.equal(view[key], '未知 / 未验证')
+  }
+  const wrong = [
+    undefined,
+    { ...input.periodEvidence, actualPeriod: { type: 'quarter', start: '2025-04-01', end: '2025-06-30' } },
+    { ...input.periodEvidence, decision: 'verified' },
+    { ...input.periodEvidence, comparisonOnly: [] },
+    { ...input.periodEvidence, unexpected: true },
+    { ...input.periodEvidence, requestedSelector: '8' },
+    { ...input.periodEvidence, references: input.periodEvidence.references.map((ref, index) =>
+      index === 0 ? { ...ref, url: 'javascript:alert(1)' } : ref) }
+  ]
+  let getterReads = 0
+  wrong.push(Object.defineProperty({ ...input.periodEvidence }, 'actualPeriod', {
+    get() { getterReads += 1; return null }
+  }))
+  for (const evidence of wrong) {
+    const rejected = admin.createIfindCalibrationView({ ...input, periodEvidence: evidence })
+    assert.equal(rejected.run.disabled, true)
+    assert.equal(rejected.value, '—')
+    assert.deepEqual(rejected.periodComparisons, [])
+  }
+  assert.equal(getterReads, 0, 'evidence accessors must not execute')
+}
+
+async function periodEvidenceRenderingTest() {
+  const h = harness()
+  h.controller.bind()
+  await h.controller.refresh()
+  assert.match(h.nodes.get('ifind-calibration-request-selector').textContent, /请求参数/)
+  assert.match(h.nodes.get('ifind-calibration-period-decision').textContent, /未证实/)
+  const list = h.nodes.get('ifind-calibration-period-comparisons')
+  assert.equal(list.children.length, 3)
+  const link = list.children[0].children[1]
+  assert.equal(link.attributes.get('href'), periodEvidence().references[0].url)
+  assert.equal(link.attributes.get('rel'), 'noopener noreferrer')
+  assert.equal(h.calls.length, 1, 'source rendering must not fetch any source or run iFinD')
+  h.lifecycle.invalidate()
+  assert.equal(list.children.length, 0, 'session invalidation clears evidence together with observations')
 }
 
 async function confirmationAndSingleCallTest() {
@@ -413,7 +512,8 @@ async function cleanupPreservesOriginalErrorTest() {
 
 async function run() {
   const tests = {
-    viewTest, failClosedViewTest, confirmationAndSingleCallTest, cancelledTest,
+    viewTest, failClosedViewTest, periodEvidenceViewTest, periodEvidenceRenderingTest,
+    confirmationAndSingleCallTest, cancelledTest,
     failureNeverRetriesTest, sessionInvalidationTest, staleRefreshTest, safeErrorsTest,
     bootstrapUnavailableTest, adminTransportTest, adminAuthNoReplayTest, markupTest,
     cleanupPreservesOriginalErrorTest
