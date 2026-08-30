@@ -358,22 +358,24 @@ function createProductionTransport(responses) {
   return {
     calls,
     request(url, options, callback) {
-      const outgoing = new EventEmitter()
       const call = { url, options, body: null }
       calls.push(call)
-      outgoing.write = (body) => { call.body = body }
-      outgoing.destroy = () => {}
-      outgoing.end = () => {
-        queueMicrotask(() => {
-          const response = new EventEmitter()
-          response.statusCode = 200
-          response.headers = Object.freeze({})
-          response.destroy = () => {}
-          callback(response)
-          response.emit('data', Buffer.from(JSON.stringify(responses.shift()), 'utf8'))
-          response.emit('end')
-        })
-      }
+      const outgoing = Object.assign(new EventEmitter(), {
+        write(body) { call.body = body },
+        destroy() {},
+        end() {
+          queueMicrotask(() => {
+            const response = Object.assign(new EventEmitter(), {
+              statusCode: 200,
+              headers: Object.freeze({}),
+              destroy() {}
+            })
+            callback(response)
+            response.emit('data', Buffer.from(JSON.stringify(responses.shift()), 'utf8'))
+            response.emit('end')
+          })
+        }
+      })
       return outgoing
     }
   }
@@ -396,6 +398,14 @@ function createHarness(caseId = 'HK_ALIBABA_9988', overrides = {}) {
   }
 
   const repository = {
+    /**
+     * @returns {{
+     *   status: string, reservation?: ReturnType<typeof reservation>,
+     *   localDayKey?: string, caseAttemptCount?: number, globalAttemptCount?: number,
+     *   retryAt?: number, inFlight?: boolean, inFlightCaseId?: string | null,
+     *   inFlightExpiresAt?: number | null
+     * }} Test doubles include reserved and rejected reservation outcomes.
+     */
     reserve(input) {
       calls.push('reserve')
       assert.deepEqual(input, {
@@ -437,6 +447,7 @@ function createHarness(caseId = 'HK_ALIBABA_9988', overrides = {}) {
   }
 
   const client = {
+    /** @returns {Promise<{accessToken?: Buffer, requestCount: number}>} Includes malformed auth responses under test. */
     async authenticate(refreshToken) {
       calls.push('auth')
       assert.equal(Buffer.isBuffer(refreshToken), true)
@@ -444,6 +455,7 @@ function createHarness(caseId = 'HK_ALIBABA_9988', overrides = {}) {
       accessTokens.push(accessToken)
       return { accessToken, requestCount: 1 }
     },
+    /** @returns {Promise<{payload?: unknown, requestCount: number, dataVol: number}>} Includes hostile protocol responses. */
     async quote(accessToken, request) {
       calls.push('quote')
       assert.equal(Buffer.isBuffer(accessToken), true)
@@ -455,6 +467,7 @@ function createHarness(caseId = 'HK_ALIBABA_9988', overrides = {}) {
       rawBuffers.push(raw)
       return { payload: quotePayload(caseId), requestCount: 1, dataVol: 10 }
     },
+    /** @returns {Promise<{payload?: unknown, requestCount: number, dataVol: number}>} Includes missing financial responses. */
     async financial(accessToken, request) {
       calls.push('financial')
       assert.equal(Buffer.isBuffer(accessToken), true)
@@ -1353,6 +1366,7 @@ async function testExpiredLeaseCannotSettle() {
 }
 
 async function testReservationCorrelationAndStableStatuses() {
+  /** @type {[string, string | number][]} */
   const mismatches = [
     ['runId', 'market_run_ffffffffffffffffffffffff'],
     ['caseId', 'US_APPLE_AAPL'],
@@ -1436,7 +1450,8 @@ async function testExactFinancialParserBoundary() {
     })]
   ]
 
-  for (const [label, mutate] of malformedCases) {
+  for (const entry of malformedCases) {
+    const [label, mutate] = /** @type {[string, (parsed: ReturnType<typeof parseIfindMarketFinancials>) => ReturnType<typeof parseIfindMarketFinancials>]} */ (entry)
     const harness = createHarness()
     harness.dependencies.financialParser = function malformedFinancial(input) {
       harness.calls.push('financial-parser')

@@ -1,6 +1,8 @@
 'use strict'
 
 const assert = require('node:assert/strict')
+const fs = require('node:fs')
+const path = require('node:path')
 const { EventEmitter } = require('node:events')
 const { DatabaseSync } = require('node:sqlite')
 
@@ -24,8 +26,11 @@ const {
 const {
   createIfindMarketDiagnosticService
 } = require('../services/ifind-market-diagnostic-service')
-const accessTokenSuccess = require('./fixtures/ifind/access-token-success.json')
-const tradeDatesSuccess = require('./fixtures/ifind/trade-dates-success.json')
+function readFixture(name) {
+  return JSON.parse(fs.readFileSync(path.join(__dirname, 'fixtures', 'ifind', name), 'utf8'))
+}
+const accessTokenSuccess = readFixture('access-token-success.json')
+const tradeDatesSuccess = readFixture('trade-dates-success.json')
 
 const VERSION_ID = 'v20260830-001'
 
@@ -82,21 +87,23 @@ function controlledRequestStub(responseBodies) {
   }
 
   function request(_url, _options, callback) {
-    const outgoing = new EventEmitter()
-    outgoing.write = () => {}
-    outgoing.destroy = () => {}
-    outgoing.end = () => {
-      const body = pendingBodies.shift()
-      pendingResponses.push(() => {
-        const incoming = new EventEmitter()
-        incoming.statusCode = 200
-        incoming.destroy = () => {}
-        callback(incoming)
-        incoming.emit('data', Buffer.from(JSON.stringify(body)))
-        incoming.emit('end')
-      })
-      wakeWaiters()
-    }
+    const outgoing = Object.assign(new EventEmitter(), {
+      write() {},
+      destroy() {},
+      end() {
+        const body = pendingBodies.shift()
+        pendingResponses.push(() => {
+          const incoming = Object.assign(new EventEmitter(), {
+            statusCode: 200,
+            destroy() {}
+          })
+          callback(incoming)
+          incoming.emit('data', Buffer.from(JSON.stringify(body)))
+          incoming.emit('end')
+        })
+        wakeWaiters()
+      }
+    })
     return outgoing
   }
 
@@ -349,7 +356,17 @@ async function testEnabledRuntimeComposesProductionMarketService() {
   const clientState = { transportCalls: 0 }
   let loadedConfig
   let repositoryDatabase
+  /** @type {{
+   * tokenVersionId: string,
+   * secretProvider: ReturnType<typeof secretProvider>,
+   * client: ReturnType<typeof noNetworkClient>,
+   * catalogLookup: typeof getIfindMarketCase,
+   * manifestLookup: typeof createLiveRequestManifest,
+   * quoteParser: typeof parseIfindMarketQuote,
+   * financialParser: typeof parseIfindMarketFinancials
+   * } | undefined} */
   let serviceOptions
+  /** @type {ReturnType<typeof createIfindMarketDiagnosticService> | undefined} */
   let createdMarketService
   const clients = []
 
@@ -386,6 +403,7 @@ async function testEnabledRuntimeComposesProductionMarketService() {
     assert.equal(repositoryDatabase, database)
     assert.equal(clients.length, 2)
     assert.notEqual(clients[0], clients[1])
+    assert.ok(serviceOptions)
     assert.equal(serviceOptions.tokenVersionId, VERSION_ID)
     assert.equal(serviceOptions.secretProvider, provider)
     assert.equal(serviceOptions.client, clients[1])
@@ -393,7 +411,9 @@ async function testEnabledRuntimeComposesProductionMarketService() {
     assert.equal(serviceOptions.manifestLookup, createLiveRequestManifest)
     assert.equal(serviceOptions.quoteParser, parseIfindMarketQuote)
     assert.equal(serviceOptions.financialParser, parseIfindMarketFinancials)
+    assert.ok(createdMarketService)
     assert.equal(runtime.marketService, createdMarketService)
+    assert.ok(runtime.marketService)
     assert.equal(typeof runtime.marketService.run, 'function')
     assert.equal(typeof runtime.marketService.latest, 'function')
     assert.equal(typeof runtime.marketService.history, 'function')
@@ -543,7 +563,8 @@ async function testInvalidCatalogPreventsListenBeforeSecretLoad() {
       ifindMarketCatalogLookup: null,
       processRef: new EventEmitter(),
       logger: { log() {} }
-    }), (error) => error && error.code === 'IFIND_DIAGNOSTIC_RUNTIME_INVALID')
+    }), (error) => error instanceof Error && 'code' in error &&
+      error.code === 'IFIND_DIAGNOSTIC_RUNTIME_INVALID')
     assert.equal(server.listenCalls, 0)
     assert.equal(providerLoads, 0)
     assert.equal(databaseCloseCalls, 1)

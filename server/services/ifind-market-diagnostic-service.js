@@ -10,7 +10,6 @@ const MAX_REQUEST_COUNT = 5
 const RUN_ID_PATTERN = /^market_run_[a-f0-9]{24,64}$/
 const VERSION_ID_PATTERN = /^v[0-9]{8}-[0-9]{3}$/
 const CASE_ID_PATTERN = /^(?:HK|US|CN)_[A-Z][A-Z0-9]{0,31}_[A-Z0-9]{1,16}$/
-const FAILURE_CODE_PATTERN = /^IFIND_[A-Z0-9_]{1,90}$/
 const FIXED_PARSER_IDS = Object.freeze({
   HK_ALIBABA_9988: 'ifind-hk-equity-v1',
   US_APPLE_AAPL: 'ifind-us-equity-v1',
@@ -1027,7 +1026,7 @@ function createIfindMarketDiagnosticService(options) {
   async function run(input) {
     let refreshToken = null
     let accessToken = null
-    let quotePayload = null
+    let quotePayload
     let financialPayload = null
     let reservation = null
     let requestCount = 0
@@ -1265,7 +1264,9 @@ function createIfindMarketDiagnosticService(options) {
     } finally {
       clearBuffer(refreshToken)
       clearBuffer(accessToken)
+      // eslint-disable-next-line no-useless-assignment -- Release the provider payload reference before client cleanup.
       quotePayload = null
+      // eslint-disable-next-line no-useless-assignment -- Keep explicit cleanup on every terminal path.
       financialPayload = null
       try {
         clientClear.call(config.client)

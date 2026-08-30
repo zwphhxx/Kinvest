@@ -311,7 +311,8 @@ function testIssuerSemantics() {
       payload.tables[0].table[issuer.metadataIds.periodType][0] = 'interim'
     }]
   ]
-  for (const [label, issuer, mutate] of mismatchCases) {
+  for (const entry of mismatchCases) {
+    const [label, issuer, mutate] = /** @type {[string, typeof ISSUERS[number], (payload: ReturnType<typeof makePayload>, issuer: typeof ISSUERS[number]) => void]} */ (entry)
     const payload = makePayload(issuer)
     mutate(payload, issuer)
     assertUnavailable(parse(issuer, payload), label, 'reportPeriodStatus')
@@ -403,7 +404,8 @@ function testSelectionAndChronology() {
       payload.tables[0].table[hk.metadataIds.sourceTime][0] = '2025-03-31T15:59:59.000Z'
     }]
   ]
-  for (const [label, failedField, mutate] of chronologyCases) {
+  for (const entry of chronologyCases) {
+    const [label, failedField, mutate] = /** @type {[string, string, (payload: ReturnType<typeof makePayload>) => void]} */ (entry)
     const payload = makePayload(hk)
     mutate(payload)
     assertUnavailable(parse(hk, payload), label, failedField)
@@ -460,7 +462,8 @@ function testCurrencyEvidence() {
       verifiedAt: '2025-02-30T08:00:00.000Z'
     }), 'currencyStatus']
   ]
-  for (const [label, evidence, failedField] of evidenceCases) {
+  for (const entry of evidenceCases) {
+    const [label, evidence, failedField] = /** @type {[string, ReturnType<typeof currencyEvidence>, string]} */ (entry)
     assertUnavailable(parse(hk, makePayload(hk), verified(), evidence), label, failedField)
   }
 
@@ -477,7 +480,8 @@ function testCurrencyEvidence() {
     assert.equal(getIfindMarketCase(issuer.caseId).liveReady, false, `${issuer.label}: catalog closed`)
     assert.throws(
       () => createLiveRequestManifest(issuer.caseId),
-      (error) => error && error.code === 'IFIND_MARKET_CASE_UNVERIFIED',
+      (error) => error instanceof Error && 'code' in error &&
+        error.code === 'IFIND_MARKET_CASE_UNVERIFIED',
       `${issuer.label}: fixture evidence is not production evidence`
     )
   }
@@ -560,7 +564,8 @@ function testMalformedPayloads() {
       payload.tables[0].table[hk.metadataIds.sourceTime][0] = '2025-05-15T17:30:00+15:00'
     }]
   ]
-  for (const [label, failedField, mutate] of semanticCases) {
+  for (const entry of semanticCases) {
+    const [label, failedField, mutate] = /** @type {[string, string, (payload: ReturnType<typeof makePayload>) => void]} */ (entry)
     const payload = makePayload(hk)
     mutate(payload)
     assertUnavailable(parse(hk, payload), label, failedField)
@@ -753,6 +758,7 @@ function testOutputPurity() {
 }
 
 async function run() {
+  /** @type {[string, () => void][]} */
   const routines = [
     ['issuer semantics', testIssuerSemantics],
     ['selection and chronology', testSelectionAndChronology],

@@ -204,6 +204,7 @@ function quotaStatus(caseId) {
   }
 }
 
+/** @param {{ outcome?: Record<string, unknown> }} [options] */
 function createMarketRuntime({ outcome } = {}) {
   const calls = []
   const latestByCase = new Map(CASE_IDS.map((caseId) => [
@@ -211,6 +212,7 @@ function createMarketRuntime({ outcome } = {}) {
     completedRun(caseId)
   ]))
   const marketService = {
+    /** @returns {unknown} Opaque repository output must be projected by the HTTP boundary. */
     latest(input) {
       calls.push(['latest', input])
       return latestByCase.get(input.caseId) || null
@@ -246,6 +248,13 @@ function createMarketRuntime({ outcome } = {}) {
   }
 }
 
+/**
+ * @param {{
+ *   marketRuntime?: unknown,
+ *   accessRuntime?: ReturnType<typeof createAccessRuntime>,
+ *   trustedProxyAddresses?: string[]
+ * }} [options]
+ */
 async function start({
   marketRuntime = createMarketRuntime(),
   accessRuntime = createAccessRuntime(),
@@ -260,7 +269,7 @@ async function start({
   }))
   await new Promise((resolve, reject) => {
     server.once('error', reject)
-    server.listen(0, '127.0.0.1', resolve)
+    server.listen(0, '127.0.0.1', () => resolve(undefined))
   })
   const address = /** @type {import('node:net').AddressInfo} */ (server.address())
   return {

@@ -60,7 +60,7 @@ function cloneFrozen(value) {
     if (Object.getPrototypeOf(value) !== Array.prototype) {
       throw new Error('Fixed iFinD market catalog contains a non-plain array')
     }
-    const descriptors = Object.getOwnPropertyDescriptors(value)
+    const descriptors = Object.getOwnPropertyDescriptors(/** @type {object} */ (value))
     const length = descriptors.length && descriptors.length.value
     if (!Number.isSafeInteger(length) || length < 0 ||
       Object.getOwnPropertyNames(value).length !== length + 1) {
@@ -242,8 +242,9 @@ function listIfindMarketCases() {
 
 function requireValidCaseId(caseId) {
   if (typeof caseId !== 'string' || caseId.length > 64 || !CASE_ID_PATTERN.test(caseId)) {
-    const error = new Error('Invalid fixed iFinD market case ID')
-    error.code = IFIND_MARKET_CASE_ID_INVALID
+    const error = Object.assign(new Error('Invalid fixed iFinD market case ID'), {
+      code: IFIND_MARKET_CASE_ID_INVALID
+    })
     throw error
   }
   return caseId
@@ -259,15 +260,17 @@ function createLiveRequestManifest(caseId) {
   const validCaseId = requireValidCaseId(caseId)
   const marketCase = MARKET_CASES.find((candidate) => candidate.caseId === validCaseId)
   if (!marketCase) {
-    const error = new Error('Unknown fixed iFinD market case')
-    error.code = IFIND_MARKET_CASE_UNKNOWN
-    error.caseId = caseId
+    const error = Object.assign(new Error('Unknown fixed iFinD market case'), {
+      code: IFIND_MARKET_CASE_UNKNOWN,
+      caseId
+    })
     throw error
   }
   if (!marketCase.liveReady || !caseHasVerifiedRequestEvidence(marketCase)) {
-    const error = new Error('Fixed iFinD market case lacks verified official evidence')
-    error.code = IFIND_MARKET_CASE_UNVERIFIED
-    error.caseId = marketCase.caseId
+    const error = Object.assign(new Error('Fixed iFinD market case lacks verified official evidence'), {
+      code: IFIND_MARKET_CASE_UNVERIFIED,
+      caseId: marketCase.caseId
+    })
     throw error
   }
 

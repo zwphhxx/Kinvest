@@ -605,6 +605,7 @@ async function run() {
     }
   }
 
+  /** @type {Readonly<Record<string, unknown>>} */
   let sharedDag = Object.freeze({ leaf: 'TEST_ONLY_SHARED_LEAF' })
   for (let depth = 0; depth < 6; depth += 1) {
     const parent = {}

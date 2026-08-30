@@ -94,8 +94,11 @@ function serviceFactory(events = []) {
 }
 
 function marketServiceFactory() {
-  return () => Object.freeze({
-    async run() { return { status: 'rejected' } }
+  return (options) => Object.freeze({
+    async run() { return { status: 'rejected' } },
+    latest(input) { return options.repository.latest(input) },
+    history(input) { return options.repository.history(input) },
+    quotaStatus(input) { return options.repository.quotaStatus(input) }
   })
 }
 
@@ -211,6 +214,22 @@ async function testEnabledRuntimeRequiresDeviceApprovalAndSharesDatabase() {
 
   const events = []
   const fixture = runtimeDependencies(events)
+  /** @type {ReturnType<typeof clientFixture>[]} */
+  const clients = []
+  /** @type {number[]} */
+  const clientClearCounts = []
+  fixture.options.createClient = () => {
+    const client = clientFixture(events, fixture.transportCalls)
+    const index = clients.length
+    clients.push(client)
+    clientClearCounts.push(0)
+    const clear = client.clear
+    client.clear = () => {
+      clientClearCounts[index] += 1
+      clear()
+    }
+    return client
+  }
   let repositoryDatabase
   fixture.options.createRepository = (database) => {
     repositoryDatabase = database
@@ -219,6 +238,8 @@ async function testEnabledRuntimeRequiresDeviceApprovalAndSharesDatabase() {
   const runtime = await createIfindDiagnosticRuntime(fixture.options)
   assert.equal(repositoryDatabase, fixture.database)
   assert.equal(fixture.transportCalls.count, 0)
+  assert.equal(clients.length, 2)
+  assert.notStrictEqual(clients[0], clients[1])
   assert.deepStrictEqual(runtime.status, {
     mode: 'admin-diagnostic',
     configured: true,
@@ -226,6 +247,8 @@ async function testEnabledRuntimeRequiresDeviceApprovalAndSharesDatabase() {
   })
   runtime.clear()
   runtime.clear()
+  assert.equal(fixture.transportCalls.count, 0)
+  assert.deepStrictEqual(clientClearCounts, [1, 1])
   assert.deepStrictEqual(events, [
     'database-open', 'service', 'client', 'client', 'provider'
   ])

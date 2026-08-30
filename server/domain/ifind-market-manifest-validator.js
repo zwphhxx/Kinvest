@@ -38,8 +38,9 @@ const REQUIRED_FINANCIAL_METADATA_FIELDS = Object.freeze([
 ])
 
 function invalidManifest() {
-  const error = new Error('iFinD live request manifest is invalid')
-  error.code = 'IFIND_MARKET_MANIFEST_INVALID'
+  const error = Object.assign(new Error('iFinD live request manifest is invalid'), {
+    code: 'IFIND_MARKET_MANIFEST_INVALID'
+  })
   throw error
 }
 
@@ -119,9 +120,15 @@ function arrayValues(value, requireNonEmpty = true) {
   return values
 }
 
+/** @param {string} value */
+function containsControlCharacter(value) {
+  return Array.from(value).some((character) =>
+    character.charCodeAt(0) < 32 || character.charCodeAt(0) === 127)
+}
+
 function trimmedProviderId(value) {
   if (typeof value !== 'string' || value.length === 0 || value.length > 256 ||
-    value.trim() !== value || /[\u0000-\u001f\u007f]/.test(value)) {
+    value.trim() !== value || containsControlCharacter(value)) {
     invalidManifest()
   }
   return value
@@ -129,7 +136,7 @@ function trimmedProviderId(value) {
 
 function evidenceSourceReference(value) {
   if (typeof value !== 'string' || value.length === 0 || value.length > 1024 ||
-    value.trim() !== value || /[\u0000-\u001f\u007f]/.test(value)) {
+    value.trim() !== value || containsControlCharacter(value)) {
     invalidManifest()
   }
   return value
@@ -200,7 +207,7 @@ function requestTemplate(value, endpoint, idKey, evidenceIds) {
 function providerParameterValue(value) {
   if (typeof value === 'string') {
     if (value.length === 0 || value.length > 256 || value.trim() !== value ||
-      /[\u0000-\u001f\u007f]/.test(value)) {
+      containsControlCharacter(value)) {
       invalidManifest()
     }
     return

@@ -1,11 +1,16 @@
 'use strict'
 
 const assert = require('node:assert/strict')
+const fs = require('node:fs')
+const path = require('node:path')
 
 const { parseIfindMarketQuote } = require('../domain/ifind-market-quote-parser')
-const hkFixture = require('./fixtures/ifind/hk-quote-success.json')
-const usFixture = require('./fixtures/ifind/us-quote-success.json')
-const cnFixture = require('./fixtures/ifind/cn-quote-success.json')
+function readFixture(name) {
+  return JSON.parse(fs.readFileSync(path.join(__dirname, 'fixtures', 'ifind', name), 'utf8'))
+}
+const hkFixture = readFixture('hk-quote-success.json')
+const usFixture = readFixture('us-quote-success.json')
+const cnFixture = readFixture('cn-quote-success.json')
 
 const VERIFIED = Object.freeze({
   issuerIdentityStatus: 'verified',
@@ -119,6 +124,11 @@ function completePayload(caseId) {
   return payload
 }
 
+/**
+ * @param {string} caseId
+ * @param {unknown} [payload]
+ * @param {{[K in keyof typeof VERIFIED]: 'verified' | 'unverified' | 'failed' | 'not_applicable' | 'real' | 'mock'}} [verification]
+ */
 function parse(caseId, payload = completePayload(caseId), verification = VERIFIED) {
   return parseIfindMarketQuote({ caseId, payload, verification })
 }
@@ -479,9 +489,15 @@ async function run() {
 
   labeledScenario('defensive output: deeply frozen and metadata-free', () => {
     const result = parse('US_APPLE_AAPL')
-    assert.throws(() => { result.latestPrice = 1 }, TypeError)
+    assert.throws(() => {
+      // @ts-expect-error Deliberately mutate frozen output to verify runtime immutability.
+      result.latestPrice = 1
+    }, TypeError)
     assert.throws(() => { result.verification.scopeStatus = 'failed' }, TypeError)
-    assert.throws(() => { result.missingFields.push('rawProviderMetadata') }, TypeError)
+    assert.throws(() => {
+      // @ts-expect-error Deliberately mutate a readonly array to verify runtime immutability.
+      result.missingFields.push('rawProviderMetadata')
+    }, TypeError)
     assert.deepEqual(Object.keys(result), Object.keys(parse('US_APPLE_AAPL')))
     assert.doesNotMatch(JSON.stringify(result), /thscode|dataVol|TEST_ONLY|errmsg|RequestId/i)
   })

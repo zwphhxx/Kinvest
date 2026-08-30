@@ -256,7 +256,8 @@ function failReservation(repository, reservation, overrides = {}) {
 }
 
 function expectCode(routine, code) {
-  assert.throws(routine, (error) => error && error.code === code)
+  assert.throws(routine, (error) => error instanceof Error &&
+    'code' in error && error.code === code)
 }
 
 function tableSql(database, names) {
@@ -366,7 +367,10 @@ function testSchemaIdentityAndLegacyCompatibility() {
     if (table === 'ifind_market_case_runs') assert.notEqual(sql, original)
     weakenedDatabase.exec(sql)
   }
-  for (const sql of exactIndexes) weakenedDatabase.exec(sql)
+  for (const sql of exactIndexes) {
+    assert.equal(typeof sql, 'string')
+    weakenedDatabase.exec(/** @type {string} */ (sql))
+  }
   expectCode(
     () => new IfindMarketDiagnosticRepository(weakenedDatabase).initialize(),
     'IFIND_MARKET_DIAGNOSTIC_SCHEMA_INCOMPATIBLE'
@@ -549,6 +553,7 @@ function testQuotaStatusUsesOneReadSnapshot() {
 
     const originalPrepare = databases.first.prepare.bind(databases.first)
     let injected = false
+    /** @type {ReturnType<IfindMarketDiagnosticRepository['reserve']> | null} */
     let writerResult = null
     databases.first.prepare = function interceptedPrepare(sql) {
       const statement = originalPrepare(sql)
@@ -576,6 +581,7 @@ function testQuotaStatusUsesOneReadSnapshot() {
     })
     databases.first.prepare = originalPrepare
     assert.equal(injected, true)
+    assert.ok(writerResult)
     assert.equal(writerResult.status, 'reserved')
     const beforeSnapshot = status.caseAttemptCount === 0 &&
       status.globalAttemptCount === 0 && status.inFlight === false
@@ -1170,6 +1176,7 @@ function testTerminalValidationRollbackAndRawRejection() {
 }
 
 async function run() {
+  /** @type {[string, () => void | Promise<void>][]} */
   const tests = [
     ['schema identity and legacy compatibility', testSchemaIdentityAndLegacyCompatibility],
     ['zero identity rejects unknown schema objects', testZeroIdentityRejectsUnknownUserSchemaObjects],

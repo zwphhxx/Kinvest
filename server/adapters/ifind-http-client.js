@@ -492,7 +492,8 @@ function descriptorValue(descriptors, key) {
 
 function providerIdentifier(value) {
   if (typeof value !== 'string' || value.length === 0 || value.length > 256 ||
-      value.trim() !== value || /[\u0000-\u001f\u007f]/.test(value)) {
+      value.trim() !== value || Array.from(value).some((character) =>
+        character.charCodeAt(0) < 32 || character.charCodeAt(0) === 127)) {
     throw new Error('invalid request')
   }
   return value
@@ -504,7 +505,7 @@ function frozenIdentifierArray(value) {
       Object.getOwnPropertySymbols(value).length !== 0) {
     throw new Error('invalid request')
   }
-  const descriptors = Object.getOwnPropertyDescriptors(value)
+  const descriptors = Object.getOwnPropertyDescriptors(/** @type {object} */ (value))
   const lengthDescriptor = descriptors.length
   const length = lengthDescriptor && lengthDescriptor.value
   if (!Number.isSafeInteger(length) || length < 1 || length > 64 ||

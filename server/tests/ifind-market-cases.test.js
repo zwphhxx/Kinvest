@@ -165,7 +165,8 @@ function removeMetric(family, metric) {
 function assertInvalidManifest(candidate, name) {
   assert.throws(
     () => validateLiveRequestManifestDefinition(candidate),
-    (error) => error && error.code === 'IFIND_MARKET_MANIFEST_INVALID',
+    (error) => error instanceof Error && 'code' in error &&
+      error.code === 'IFIND_MARKET_MANIFEST_INVALID',
     name
   )
 }
@@ -288,7 +289,8 @@ async function run() {
     ['primitive indicators', (manifest) => { manifest.indicators = 'verified' }]
   ]
 
-  for (const [name, corrupt] of corruptions) {
+  for (const entry of corruptions) {
+    const [name, corrupt] = /** @type {[string, (manifest: ReturnType<typeof completeVerifiedManifestDefinition>) => void]} */ (entry)
     const manifest = completeVerifiedManifestDefinition()
     corrupt(manifest)
     assertInvalidManifest(manifest, name)
@@ -431,7 +433,7 @@ async function run() {
     for (const lookup of [getIfindMarketCase, createLiveRequestManifest]) {
       assert.throws(
         () => lookup(invalidCaseId),
-        (error) => error &&
+        (error) => error instanceof Error && 'code' in error &&
           error.code === 'IFIND_MARKET_CASE_ID_INVALID' &&
           !Object.hasOwn(error, 'caseId') &&
           (unsafeText === null || !String(error.message).includes(unsafeText))
@@ -448,7 +450,8 @@ async function run() {
   }
   assert.throws(
     () => getIfindMarketCase(hostileCaseId),
-    (error) => error && error.code === 'IFIND_MARKET_CASE_ID_INVALID'
+    (error) => error instanceof Error && 'code' in error &&
+      error.code === 'IFIND_MARKET_CASE_ID_INVALID'
   )
   assert.equal(hostileCaseIdRead, false)
   assert.equal(firstList[0].formatAliases.includes('09988.HK'), true)
@@ -467,15 +470,20 @@ async function run() {
     parserId: 'attacker-parser'
   }
   const pristineAlibaba = getIfindMarketCase('HK_ALIBABA_9988')
-  const browserAttempt = getIfindMarketCase('HK_ALIBABA_9988', hostileBrowserInput)
+  // Deliberately pass an extra runtime argument outside the public signature.
+  const browserAttempt = Reflect.apply(getIfindMarketCase, undefined, [
+    'HK_ALIBABA_9988', hostileBrowserInput
+  ])
   assert.deepEqual(browserAttempt, pristineAlibaba)
   assert.equal(JSON.stringify(browserAttempt).includes('attacker'), false)
   assert.equal(JSON.stringify(browserAttempt).includes('TEST_ONLY_FIXTURE_ID'), false)
 
   for (const marketCase of firstList) {
     assert.throws(
-      () => createLiveRequestManifest(marketCase.caseId, hostileBrowserInput),
-      (error) => error &&
+      () => Reflect.apply(createLiveRequestManifest, undefined, [
+        marketCase.caseId, hostileBrowserInput
+      ]),
+      (error) => error instanceof Error && 'code' in error && 'caseId' in error &&
         error.code === 'IFIND_MARKET_CASE_UNVERIFIED' &&
         error.caseId === marketCase.caseId
     )
