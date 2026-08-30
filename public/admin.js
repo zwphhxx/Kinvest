@@ -29,7 +29,9 @@
     form.setAttribute('aria-busy', String(value))
     password.disabled = value
     button.disabled = value || busy.has('login')
-    if (value) setLive('正在检查管理员会话，请稍候。')
+    const checkingMessage = '正在检查管理员会话，请稍候。'
+    if (value) setLive(checkingMessage)
+    else if (byId('admin-live').textContent === checkingMessage) setLive('')
   }
 
   /**

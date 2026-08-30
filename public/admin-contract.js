@@ -369,6 +369,27 @@
     return result
   }
 
+  function marketOutcomePresentation(status) {
+    const outcomes = {
+      complete: {
+        label: '完整完成', message: '固定市场案例诊断已完成。', tone: 'success'
+      },
+      partial: {
+        label: '部分完成',
+        message: '固定市场案例诊断部分完成，请查看缺失字段与安全错误。',
+        tone: 'warning'
+      },
+      failed: {
+        label: '执行失败',
+        message: '固定市场案例诊断失败，请查看安全错误后重试。',
+        tone: 'error'
+      }
+    }
+    return Object.hasOwn(outcomes, status) ? outcomes[status] : {
+      label: '结果状态不可用', message: '无法确认市场诊断结果，请刷新状态后重试。', tone: 'error'
+    }
+  }
+
   function marketRunDecision({ entry, runtimeStatus, runningCaseId, now }) {
     if (runningCaseId) {
       return Object.freeze({
@@ -380,7 +401,7 @@
     if (runtimeStatus === 'disabled') {
       return Object.freeze({ disabled: true, label: '诊断未启用', tone: 'disabled' })
     }
-    if (runtimeStatus !== 'admin-diagnostic') {
+    if (runtimeStatus !== 'available') {
       return Object.freeze({ disabled: true, label: '状态不可用', tone: 'disabled' })
     }
     if (entry.case.liveReady !== true) {
@@ -407,7 +428,6 @@
       caseId: config.caseId,
       companyName: '案例不可用',
       displayCode: '—',
-      expectedTradingCurrency: '—',
       liveReady: false
     }
     const normalizedEntry = entry && entry.case && entry.case.caseId === config.caseId
@@ -421,6 +441,12 @@
       ? latest.quote
       : null
     const financial = latest && Array.isArray(latest.financial) ? latest.financial : []
+    const reportingCurrencies = uniqueSafeStrings(financial.map((point) =>
+      safeString(point && point.currency, '未提供')
+    ))
+    const result = context.runningCaseId === config.caseId
+      ? { label: '正在运行', tone: 'running' }
+      : (latest ? marketOutcomePresentation(latest.status) : { label: '尚未执行', tone: 'idle' })
     const periods = uniqueSafeStrings(financial.map((point) => point && point.reportPeriod))
     const units = uniqueSafeStrings(financial.map((point) => point && point.unit))
     const missing = financial
@@ -445,12 +471,15 @@
       companyName: safeString(presentation.companyName, '案例不可用'),
       displayCode: safeString(presentation.displayCode),
       lastRun: latest ? safeTimestamp(latest.completedAt, context.dateText) : '尚未执行',
+      runStatus: result.label,
+      runStatusTone: result.tone,
       cooldown,
       dailyAllowance,
       price: quote && finiteNumber(quote.latestPrice) ? String(quote.latestPrice) : '—',
       quoteTime: quote ? safeString(quote.quoteTime) : '—',
       tradingStatus: quote ? tradingStatusLabel(quote.tradingStatus) : '尚无行情',
-      currency: quote ? safeString(quote.currency) : safeString(presentation.expectedTradingCurrency),
+      tradingCurrency: quote ? safeString(quote.currency) : '—',
+      reportingCurrency: reportingCurrencies.length > 0 ? reportingCurrencies.join(' · ') : '—',
       units: units.length > 0 ? units.join(' · ') : '—',
       periods: periods.length > 0 ? periods.join(' · ') : '—',
       validation: latest
@@ -484,17 +513,17 @@
         byCaseId.set(caseId, entry)
       }
     }
-    const runtimeStatus = status && status.runtimeStatus === 'admin-diagnostic'
-      ? 'admin-diagnostic'
+    const runtimeStatus = status && status.runtimeStatus === 'available'
+      ? 'available'
       : (status && status.runtimeStatus === 'disabled' ? 'disabled' : 'unavailable')
     const runningCaseId = IFIND_MARKET_CASES.some((item) => item.caseId === options.runningCaseId)
       ? options.runningCaseId
       : null
     return Object.freeze({
-      statusLabel: runtimeStatus === 'admin-diagnostic'
+      statusLabel: runtimeStatus === 'available'
         ? '固定案例已就绪'
         : (runtimeStatus === 'disabled' ? '三市场诊断未启用' : '三市场诊断状态不可用'),
-      note: runtimeStatus === 'admin-diagnostic'
+      note: runtimeStatus === 'available'
         ? '管理员诊断专用；家庭看板继续使用 Mock 数据。'
         : (runtimeStatus === 'disabled'
             ? '管理员诊断后端未启用；家庭看板继续使用 Mock 数据。'
@@ -540,7 +569,7 @@
 
     function scheduleCooldownRefresh() {
       clearCooldownTimer()
-      if (runningCaseId || !status || status.runtimeStatus !== 'admin-diagnostic' ||
+      if (runningCaseId || !status || status.runtimeStatus !== 'available' ||
         !Array.isArray(status.cases)) return
       const currentTime = now()
       let nearest = null
@@ -577,12 +606,15 @@
         byId(`${prefix}-company`).textContent = card.companyName
         byId(`${prefix}-code`).textContent = card.displayCode
         byId(`${prefix}-last-run`).textContent = card.lastRun
+        byId(`${prefix}-run-status`).textContent = card.runStatus
+        byId(`${prefix}-run-status`).dataset.tone = card.runStatusTone
         byId(`${prefix}-cooldown`).textContent = card.cooldown
         byId(`${prefix}-daily`).textContent = card.dailyAllowance
         byId(`${prefix}-price`).textContent = card.price
         byId(`${prefix}-quote-time`).textContent = card.quoteTime
         byId(`${prefix}-trading-status`).textContent = card.tradingStatus
-        byId(`${prefix}-currency`).textContent = card.currency
+        byId(`${prefix}-trading-currency`).textContent = card.tradingCurrency
+        byId(`${prefix}-reporting-currency`).textContent = card.reportingCurrency
         byId(`${prefix}-units`).textContent = card.units
         byId(`${prefix}-periods`).textContent = card.periods
         byId(`${prefix}-validation`).textContent = card.validation
@@ -662,9 +694,8 @@
           if (generation !== refreshGeneration) return
           render(payload.data)
           if (outcome) {
-            const complete = outcome.data && outcome.data.status === 'complete'
-            setLive(complete ? '固定市场案例诊断已完成。' : '固定市场案例诊断已记录安全结果。',
-              complete ? 'success' : 'error')
+            const presentation = marketOutcomePresentation(outcome.data && outcome.data.status)
+            setLive(presentation.message, presentation.tone)
           }
         })
       } catch (error) {

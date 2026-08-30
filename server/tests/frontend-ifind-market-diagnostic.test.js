@@ -72,7 +72,7 @@ function marketCase(caseId, overrides = {}) {
 
 function payload(overrides = {}) {
   return {
-    runtimeStatus: 'admin-diagnostic',
+    runtimeStatus: 'available',
     cases: [
       marketCase('CN_MOUTAI_600519'),
       marketCase('HK_ALIBABA_9988'),
@@ -107,7 +107,7 @@ class FakeElement {
 const CARD_KEYS = ['hk', 'us', 'cn']
 const CARD_FIELDS = [
   'company', 'code', 'last-run', 'cooldown', 'daily', 'price', 'quote-time',
-  'trading-status', 'currency', 'units', 'periods', 'validation', 'missing',
+  'trading-status', 'trading-currency', 'reporting-currency', 'run-status', 'units', 'periods', 'validation', 'missing',
   'error', 'run'
 ]
 
@@ -183,7 +183,7 @@ async function run() {
   assert.equal(view.cards[0].dailyAllowance, '个案 3 / 5 · 全局 8 / 12')
   assert.equal(view.cards[0].quoteTime, '2026-08-30T15:59:00+08:00')
   assert.equal(view.cards[0].tradingStatus, '交易中')
-  assert.equal(view.cards[0].currency, 'HKD')
+  assert.equal(view.cards[0].tradingCurrency, 'HKD')
   assert.equal(view.cards[0].units, 'million')
   assert.equal(view.cards[0].periods, '2025FY · 2026H1')
   assert.equal(view.cards[0].validation, '行情 已验证 · 财务 已验证')
