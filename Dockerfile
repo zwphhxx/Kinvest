@@ -66,7 +66,7 @@ RUN test -f /tmp/kinvest-github-tmpfs-smoke-ok && \
     test -f /tmp/kinvest-access-preflight-linux-smoke-ok && \
     rm -f /tmp/kinvest-github-tmpfs-smoke-ok && \
     rm -f /tmp/kinvest-access-preflight-linux-smoke-ok && \
-    node -e "require('tencentcloud-sdk-nodejs-ssm'); require('tencentcloud-sdk-nodejs-common'); require('./server/security/github-tmpfs-secret-provider')"
+    node -e "require('tencentcloud-sdk-nodejs-ssm'); require('tencentcloud-sdk-nodejs-common'); require('./server/security/github-tmpfs-secret-provider'); require('./server/domain/ifind-indicator-id'); require('./server/server'); console.log('KINVEST_IMAGE_RUNTIME_LOAD_OK')"
 
 USER 10001:10001
 

@@ -21,6 +21,9 @@ const {
   createAuthHttpController,
   parseStrictJsonBody
 } = require('./http/auth-http')
+const {
+  createIfindMarketDiagnosticHttpController
+} = require('./http/ifind-market-diagnostic-http')
 const { prepareApplication } = require('./pre-listen-preparation')
 
 const PORT = Number(process.env.PORT || 4173)
@@ -301,6 +304,7 @@ async function apiResearch(req, res, code) {
 async function routeApi(req, res, pathname, query, {
   accessRuntime,
   authHttp,
+  ifindMarketDiagnosticHttp,
   publicOrigin
 }) {
   const segments = parseSegments(pathname)
@@ -321,6 +325,7 @@ async function routeApi(req, res, pathname, query, {
     }
     return true
   }
+  if (await ifindMarketDiagnosticHttp.handle(req, res, segments)) return true
   if (await authHttp.handle(req, res, segments)) return true
   if (accessRuntime.status.mode === 'device-approval' &&
     !authHttp.authorizeInvestment(req, res)) return true
@@ -420,6 +425,13 @@ function createRequestHandler({
     publicOrigin,
     trustedProxyAddresses
   })
+  const ifindMarketDiagnosticHttp = createIfindMarketDiagnosticHttpController({
+    accessRuntime,
+    ifindDiagnosticRuntime,
+    now,
+    publicOrigin,
+    trustedProxyAddresses
+  })
   return async (req, res) => {
     try {
       const urlObj = new URL(req.url, `http://localhost:${PORT}`)
@@ -427,6 +439,7 @@ function createRequestHandler({
       if (await routeApi(req, res, pathname, urlObj.searchParams, {
         accessRuntime,
         authHttp,
+        ifindMarketDiagnosticHttp,
         publicOrigin
       })) return
       if (req.method !== 'GET') {
@@ -475,6 +488,13 @@ async function startServer({
   createIfindRepository,
   createIfindClient,
   createIfindService,
+  createIfindMarketRepository,
+  createIfindMarketService,
+  ifindMarketCatalogLookup,
+  ifindMarketManifestLookup,
+  ifindMarketQuoteParser,
+  ifindMarketFinancialParser,
+  ifindMarketIdGenerator,
   runtimeServer,
   port = PORT,
   processRef = process,
@@ -493,7 +513,21 @@ async function startServer({
     ...(loadIfindSecrets ? { loadIfindSecrets } : {}),
     ...(createIfindRepository ? { createIfindRepository } : {}),
     ...(createIfindClient ? { createIfindClient } : {}),
-    ...(createIfindService ? { createIfindService } : {})
+    ...(createIfindService ? { createIfindService } : {}),
+    ...(createIfindMarketRepository !== undefined
+      ? { createIfindMarketRepository } : {}),
+    ...(createIfindMarketService !== undefined
+      ? { createIfindMarketService } : {}),
+    ...(ifindMarketCatalogLookup !== undefined
+      ? { ifindMarketCatalogLookup } : {}),
+    ...(ifindMarketManifestLookup !== undefined
+      ? { ifindMarketManifestLookup } : {}),
+    ...(ifindMarketQuoteParser !== undefined
+      ? { ifindMarketQuoteParser } : {}),
+    ...(ifindMarketFinancialParser !== undefined
+      ? { ifindMarketFinancialParser } : {}),
+    ...(ifindMarketIdGenerator !== undefined
+      ? { ifindMarketIdGenerator } : {})
   })
   try {
     if (!runtimeServer) runtimeServer = http.createServer(prepared.handler)

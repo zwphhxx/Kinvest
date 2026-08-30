@@ -29,7 +29,9 @@
     form.setAttribute('aria-busy', String(value))
     password.disabled = value
     button.disabled = value || busy.has('login')
-    if (value) setLive('正在检查管理员会话，请稍候。')
+    const checkingMessage = '正在检查管理员会话，请稍候。'
+    if (value) setLive(checkingMessage)
+    else if (byId('admin-live').textContent === checkingMessage) setLive('')
   }
 
   /**
@@ -54,9 +56,11 @@
     })
     const payload = await response.json().catch(() => ({}))
     if (!response.ok) {
-      const failure = path.startsWith('/api/admin/ifind/diagnostics')
-        ? adminContracts.ifindDiagnosticApiFailure(response.status, payload)
-        : contracts.classifyApiFailure(response.status, payload)
+      const failure = path.startsWith('/api/admin/ifind/market-cases')
+        ? adminContracts.ifindMarketDiagnosticApiFailure(response.status, payload)
+        : (path.startsWith('/api/admin/ifind/diagnostics')
+            ? adminContracts.ifindDiagnosticApiFailure(response.status, payload)
+            : contracts.classifyApiFailure(response.status, payload))
       throw Object.assign(new Error('ADMIN_REQUEST_FAILED'), {
         ...failure,
         status: response.status
@@ -105,6 +109,7 @@
     byId('approved-devices').replaceChildren()
     byId('auth-audit').replaceChildren()
     ifindController.reset()
+    ifindMarketController.reset()
   }
 
   function showLogin(message = '') {
@@ -294,7 +299,7 @@
     } finally {
       sessionLifecycle.finishRequest(ticket)
     }
-    await ifindController.refresh()
+    await Promise.all([ifindController.refresh(), ifindMarketController.refresh()])
   }
 
   const ifindController = adminContracts.createIfindDiagnosticController({
@@ -307,6 +312,17 @@
     onError: handleError
   })
   ifindController.bind()
+
+  const ifindMarketController = adminContracts.createIfindMarketDiagnosticController({
+    document,
+    sessionLifecycle,
+    request: api,
+    dateText,
+    now: () => Date.now(),
+    setLive,
+    onError: handleError
+  })
+  ifindMarketController.bind()
 
   byId('admin-login-form').addEventListener('submit', async (event) => {
     event.preventDefault()

@@ -1,0 +1,13 @@
+{
+  "errorcode": 0,
+  "tables": [
+    {
+      "thscode": "TEST_ONLY_CN_CODE",
+      "table": {
+        "TEST_ONLY_CN_LATEST_PRICE": [303.75],
+        "TEST_ONLY_CN_CURRENCY": ["CNY"]
+      }
+    }
+  ],
+  "dataVol": 2
+}

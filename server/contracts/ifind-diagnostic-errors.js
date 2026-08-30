@@ -12,25 +12,27 @@ function rule(errorClasses, stages, allowsVendorErrorCode = false) {
 }
 
 const CLIENT_FAILURE_RULES = Object.freeze({
-  IFIND_AUTH_REJECTED: rule(['AUTH'], ['auth', 'probe'], true),
-  IFIND_CLIENT_CLEARED: rule(['CONFIG'], [null, 'auth', 'probe']),
-  IFIND_CLIENT_FAILED: rule(['API'], [null, 'auth', 'probe']),
-  IFIND_CONFIG_INVALID: rule(['CONFIG'], [null, 'auth', 'probe']),
-  IFIND_CONNECTION_TIMEOUT: rule(['NETWORK'], [null, 'auth', 'probe']),
-  IFIND_DUPLICATE_RESPONSE: rule(['NETWORK'], [null, 'auth', 'probe']),
-  IFIND_HTTP_STATUS: rule(['API'], [null, 'auth', 'probe']),
-  IFIND_NETWORK_FAILED: rule(['NETWORK'], [null, 'auth', 'probe']),
-  IFIND_PERMISSION_REJECTED: rule(['PERMISSION'], ['probe'], true),
+  IFIND_AUTH_REJECTED: rule(['AUTH'], ['auth', 'probe', 'quote', 'financial'], true),
+  IFIND_CLIENT_CLEARED: rule(['CONFIG'], [null, 'auth', 'probe', 'quote', 'financial']),
+  IFIND_CLIENT_FAILED: rule(['API'], [null, 'auth', 'probe', 'quote', 'financial']),
+  IFIND_CONFIG_INVALID: rule(['CONFIG'], [null, 'auth', 'probe', 'quote', 'financial']),
+  IFIND_CONNECTION_TIMEOUT: rule(['NETWORK'], [null, 'auth', 'probe', 'quote', 'financial']),
+  IFIND_DUPLICATE_RESPONSE: rule(['NETWORK'], [null, 'auth', 'probe', 'quote', 'financial']),
+  IFIND_FINANCIAL_REJECTED: rule(['API'], ['financial'], true),
+  IFIND_HTTP_STATUS: rule(['API'], [null, 'auth', 'probe', 'quote', 'financial']),
+  IFIND_NETWORK_FAILED: rule(['NETWORK'], [null, 'auth', 'probe', 'quote', 'financial']),
+  IFIND_PERMISSION_REJECTED: rule(['PERMISSION'], ['probe', 'quote', 'financial'], true),
   IFIND_PROBE_REJECTED: rule(['API'], ['probe'], true),
-  IFIND_QUOTA_REJECTED: rule(['QUOTA'], ['probe'], true),
-  IFIND_RESPONSE_ABORTED: rule(['NETWORK'], [null, 'auth', 'probe']),
-  IFIND_RESPONSE_ENCODING: rule(['API'], [null, 'auth', 'probe']),
-  IFIND_RESPONSE_FAILED: rule(['NETWORK'], [null, 'auth', 'probe']),
-  IFIND_RESPONSE_INVALID: rule(['NETWORK'], [null, 'auth', 'probe']),
-  IFIND_RESPONSE_JSON: rule(['API'], [null, 'auth', 'probe']),
-  IFIND_RESPONSE_SHAPE: rule(['API'], [null, 'auth', 'probe']),
-  IFIND_RESPONSE_TOO_LARGE: rule(['API'], [null, 'auth', 'probe']),
-  IFIND_TIMEOUT: rule(['NETWORK'], [null, 'auth', 'probe'])
+  IFIND_QUOTE_REJECTED: rule(['API'], ['quote'], true),
+  IFIND_QUOTA_REJECTED: rule(['QUOTA'], ['probe', 'quote', 'financial'], true),
+  IFIND_RESPONSE_ABORTED: rule(['NETWORK'], [null, 'auth', 'probe', 'quote', 'financial']),
+  IFIND_RESPONSE_ENCODING: rule(['API'], [null, 'auth', 'probe', 'quote', 'financial']),
+  IFIND_RESPONSE_FAILED: rule(['NETWORK'], [null, 'auth', 'probe', 'quote', 'financial']),
+  IFIND_RESPONSE_INVALID: rule(['NETWORK'], [null, 'auth', 'probe', 'quote', 'financial']),
+  IFIND_RESPONSE_JSON: rule(['API'], [null, 'auth', 'probe', 'quote', 'financial']),
+  IFIND_RESPONSE_SHAPE: rule(['API'], [null, 'auth', 'probe', 'quote', 'financial']),
+  IFIND_RESPONSE_TOO_LARGE: rule(['API'], [null, 'auth', 'probe', 'quote', 'financial']),
+  IFIND_TIMEOUT: rule(['NETWORK'], [null, 'auth', 'probe', 'quote', 'financial'])
 })
 
 const REPOSITORY_INTERNAL_FAILURE_RULES = Object.freeze({

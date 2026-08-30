@@ -279,6 +279,15 @@ async function testIfindStructuralPreflight(tempDirectory) {
   const enabledOut = capture()
   const enabledErr = capture()
   const versionId = 'v20260826-001'
+  /** @type {number[]} */
+  const clientClearCounts = []
+  const clients = []
+  let refreshTokenReads = 0
+  let providerClearCalls = 0
+  async function forbiddenRequest() {
+    transportCalls += 1
+    throw new Error('preflight must remain offline')
+  }
   assert.equal(await runAccessPreflight({
     env: {
       ...enabledEnv(productionPath),
@@ -288,17 +297,30 @@ async function testIfindStructuralPreflight(tempDirectory) {
     },
     databasePath: enabledCandidate,
     bootstrap: async () => createSecretRuntime().runtime,
-    loadIfindSecrets: async () => ({
-      readRefreshToken() { return Buffer.from('offline-fixture-token') },
-      clear() {}
-    }),
-    createIfindClient: () => ({
-      async diagnose() {
-        transportCalls += 1
-        throw new Error('preflight must remain offline')
-      },
-      clear() {}
-    }),
+    loadIfindSecrets: async () => {
+      providerCalls += 1
+      return {
+        readRefreshToken() {
+          refreshTokenReads += 1
+          return Buffer.from('offline-fixture-token')
+        },
+        clear() { providerClearCalls += 1 }
+      }
+    },
+    createIfindClient: () => {
+      clientCalls += 1
+      const index = clientClearCounts.length
+      clientClearCounts.push(0)
+      const client = {
+        diagnose: forbiddenRequest,
+        authenticate: forbiddenRequest,
+        quote: forbiddenRequest,
+        financial: forbiddenRequest,
+        clear() { clientClearCounts[index] += 1 }
+      }
+      clients.push(client)
+      return client
+    },
     stdout: enabledOut.stream,
     stderr: enabledErr.stream,
     processRef: new EventEmitter()
@@ -309,6 +331,13 @@ async function testIfindStructuralPreflight(tempDirectory) {
   ].join('\n') + '\n')
   assert.equal(enabledErr.value(), '')
   assert.equal(transportCalls, 0)
+  assert.equal(clientCalls, 2)
+  assert.equal(clients.length, 2)
+  assert.notStrictEqual(clients[0], clients[1])
+  assert.deepStrictEqual(clientClearCounts, [1, 1])
+  assert.equal(providerCalls, 1)
+  assert.equal(providerClearCalls, 1)
+  assert.equal(refreshTokenReads, 0)
 
   for (const [name, code] of [
     ['missing', 'IFIND_TMPFS_BUNDLE_INVALID'],

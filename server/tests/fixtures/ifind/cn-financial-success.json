@@ -1,0 +1,14 @@
+{
+  "errorcode": 0,
+  "tables": [
+    {
+      "thscode": "TEST_ONLY_CN_CODE",
+      "table": {
+        "TEST_ONLY_CN_REVENUE": [3001, 3002, 3003],
+        "TEST_ONLY_CN_NET_PROFIT": [301, 302, 303],
+        "TEST_ONLY_CN_OPERATING_CASH_FLOW": [401, 402, 403]
+      }
+    }
+  ],
+  "dataVol": 9
+}

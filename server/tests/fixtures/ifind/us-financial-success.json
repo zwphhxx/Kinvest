@@ -1,0 +1,14 @@
+{
+  "errorcode": 0,
+  "tables": [
+    {
+      "thscode": "TEST_ONLY_US_CODE",
+      "table": {
+        "TEST_ONLY_US_REVENUE": [2001, 2002, 2003],
+        "TEST_ONLY_US_NET_PROFIT": [201, 202, 203],
+        "TEST_ONLY_US_OPERATING_CASH_FLOW": [301, 302, 303]
+      }
+    }
+  ],
+  "dataVol": 9
+}

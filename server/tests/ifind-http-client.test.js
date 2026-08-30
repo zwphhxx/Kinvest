@@ -12,6 +12,20 @@ const accessTokenSuccess = readFixture('access-token-success.json')
 const tradeDatesSuccess = readFixture('trade-dates-success.json')
 const tradeDatesTimeOnlySuccess = readFixture('trade-dates-time-only-success.json')
 const providerErrors = readFixture('provider-errors.json')
+const marketOperationFixtures = Object.freeze({
+  HK: Object.freeze({
+    quote: readFixture('hk-quote-success.json'),
+    financial: readFixture('hk-financial-success.json')
+  }),
+  US: Object.freeze({
+    quote: readFixture('us-quote-success.json'),
+    financial: readFixture('us-financial-success.json')
+  }),
+  CN: Object.freeze({
+    quote: readFixture('cn-quote-success.json'),
+    financial: readFixture('cn-financial-success.json')
+  })
+})
 
 const REFRESH_TOKEN = 'fake-refresh-token-for-contract-tests'
 const ACCESS_TOKEN = accessTokenSuccess.data.access_token
@@ -352,8 +366,781 @@ function assertNoProviderLeak({
   }
 }
 
+function deepFreezeTestRequest(value) {
+  if (!value || typeof value !== 'object' || Object.isFrozen(value)) return value
+  for (const nested of Object.values(value)) deepFreezeTestRequest(nested)
+  return Object.freeze(value)
+}
+
+function assertPlainFrozenJson(value) {
+  if (!value || typeof value !== 'object') return
+  assert.equal(Object.isFrozen(value), true)
+  assert.equal(
+    Object.getPrototypeOf(value),
+    Array.isArray(value) ? Array.prototype : Object.prototype
+  )
+  for (const nested of Object.values(value)) assertPlainFrozenJson(nested)
+}
+
+function quoteRequest(market) {
+  return deepFreezeTestRequest({
+    vendorCode: `TEST_ONLY_${market}_CODE`,
+    fields: [
+      `TEST_ONLY_${market}_LATEST_PRICE`,
+      `TEST_ONLY_${market}_CURRENCY`
+    ]
+  })
+}
+
+function financialRequest(market) {
+  return deepFreezeTestRequest({
+    vendorCode: `TEST_ONLY_${market}_CODE`,
+    indicatorIds: [
+      `TEST_ONLY_${market}_REVENUE`,
+      `TEST_ONLY_${market}_NET_PROFIT`,
+      `TEST_ONLY_${market}_OPERATING_CASH_FLOW`
+    ],
+    periodParameters: {
+      fullFiscalYears: { reportPeriod: 'TEST_ONLY_ANNUAL' },
+      latestDisclosedInterim: { reportPeriod: 'TEST_ONLY_INTERIM' }
+    }
+  })
+}
+
+async function executeSharedMarketOperation(client, operation, refreshToken, fixedRequest) {
+  const authentication = await client.authenticate(refreshToken)
+  try {
+    const result = await client[operation](authentication.accessToken, fixedRequest)
+    return result.payload
+  } finally {
+    Buffer.prototype.fill.call(authentication.accessToken, 0)
+  }
+}
+
 async function run() {
   const { createIfindHttpClient } = require('../adapters/ifind-http-client')
+
+  const directContractTransport = createRequestStub([
+    accessTokenSuccess,
+    marketOperationFixtures.HK.quote,
+    marketOperationFixtures.HK.financial
+  ])
+  const directContractClient = createIfindHttpClient({
+    request: directContractTransport.request
+  })
+  assert.deepEqual(
+    Object.keys(directContractClient),
+    ['diagnose', 'authenticate', 'quote', 'financial']
+  )
+  const directAuth = await directContractClient.authenticate(
+    Buffer.from(REFRESH_TOKEN, 'utf8')
+  )
+  assert.deepEqual(Object.keys(directAuth), ['accessToken', 'requestCount'])
+  assert.equal(Buffer.isBuffer(directAuth.accessToken), true)
+  assert.equal(directAuth.accessToken.toString('utf8'), ACCESS_TOKEN)
+  assert.equal(directAuth.requestCount, 1)
+  const directQuote = await directContractClient.quote(
+    directAuth.accessToken,
+    quoteRequest('HK')
+  )
+  assert.deepEqual(directQuote, {
+    payload: marketOperationFixtures.HK.quote,
+    requestCount: 1,
+    dataVol: marketOperationFixtures.HK.quote.dataVol
+  })
+  const directFinancial = await directContractClient.financial(
+    directAuth.accessToken,
+    financialRequest('HK')
+  )
+  assert.deepEqual(directFinancial, {
+    payload: marketOperationFixtures.HK.financial,
+    requestCount: 1,
+    dataVol: marketOperationFixtures.HK.financial.dataVol
+  })
+  assert.deepEqual(
+    directContractTransport.calls.map((call) => new URL(call.url).pathname),
+    [
+      '/api/v1/get_access_token',
+      '/api/v1/real_time_quotation',
+      '/api/v1/basic_data_service'
+    ]
+  )
+  directContractClient.clear()
+  assert.equal(directAuth.accessToken.every((byte) => byte === 0), true)
+
+  for (const [market, fixtures] of Object.entries(marketOperationFixtures)) {
+    for (const [operation, fixture] of Object.entries(fixtures)) {
+      const fixtureText = JSON.stringify(fixture)
+      assert.equal(fixtureText.includes('RequestId'), false)
+      assert.equal(fixtureText.includes(REFRESH_TOKEN), false)
+      assert.equal(fixtureText.includes(ACCESS_TOKEN), false)
+      assert.equal(fixtureText.includes('verified'), false)
+
+      const fixedRequest = operation === 'quote'
+        ? quoteRequest(market)
+        : financialRequest(market)
+      const operationTransport = createRequestStub([accessTokenSuccess, fixture])
+      const operationLogger = createCapturingLogger()
+      const operationClient = createIfindHttpClient({
+        request: operationTransport.request,
+        logger: operationLogger.logger
+      })
+      assert.equal(typeof operationClient[operation], 'function')
+      const execution = await captureGlobalOutput(() => executeSharedMarketOperation(
+        operationClient,
+        operation,
+        REFRESH_TOKEN,
+        fixedRequest
+      ))
+      assert.equal(execution.status, 'fulfilled', `${market} ${operation}: expected fulfillment`)
+      assert.deepEqual(operationTransport.calls, [
+        {
+          url: `${ORIGIN}/api/v1/get_access_token`,
+          method: 'POST',
+          headers: {
+            'content-type': 'application/json',
+            refresh_token: REFRESH_TOKEN
+          },
+          body: null
+        },
+        {
+          url: `${ORIGIN}${operation === 'quote'
+            ? '/api/v1/real_time_quotation'
+            : '/api/v1/basic_data_service'}`,
+          method: 'POST',
+          headers: {
+            'content-type': 'application/json',
+            access_token: ACCESS_TOKEN,
+            ifindlang: 'cn'
+          },
+          body: operation === 'quote'
+            ? {
+                codes: fixedRequest.vendorCode,
+                indicators: fixedRequest.fields.join(',')
+              }
+            : {
+                codes: fixedRequest.vendorCode,
+                indicators: fixedRequest.indicatorIds,
+                parameters: fixedRequest.periodParameters
+              }
+        }
+      ])
+      assert.deepEqual(execution.value, fixture)
+      assert.notStrictEqual(execution.value, fixture)
+      assertPlainFrozenJson(execution.value)
+      assertNoProviderLeak({
+        scenario: `${market} ${operation} success`,
+        value: execution.value,
+        logEntries: operationLogger.entries,
+        globalOutputEntries: execution.entries
+      })
+    }
+  }
+
+  const pollutedSuccessMarkers = [
+    'synthetic successful provider message',
+    'synthetic authorization metadata',
+    'synthetic cookie metadata',
+    'synthetic debug metadata',
+    'synthetic nested provider metadata'
+  ]
+  for (const operation of ['quote', 'financial']) {
+    const cleanFixture = marketOperationFixtures.HK[operation]
+    const pollutedSuccess = JSON.parse(JSON.stringify(cleanFixture))
+    Object.assign(pollutedSuccess, {
+      errmsg: pollutedSuccessMarkers[0],
+      RequestId: SYNTHETIC_REQUEST_ID,
+      token: ACCESS_TOKEN,
+      access_token: ACCESS_TOKEN,
+      refresh_token: REFRESH_TOKEN,
+      authorization: pollutedSuccessMarkers[1],
+      headers: { authorization: pollutedSuccessMarkers[1] },
+      cookie: pollutedSuccessMarkers[2],
+      debug: pollutedSuccessMarkers[3],
+      extra: {
+        providerMetadata: pollutedSuccessMarkers[4],
+        headers: { cookie: pollutedSuccessMarkers[2] }
+      }
+    })
+    Object.assign(pollutedSuccess.tables[0], {
+      errmsg: pollutedSuccessMarkers[0],
+      RequestId: SYNTHETIC_REQUEST_ID,
+      headers: { authorization: pollutedSuccessMarkers[1] },
+      debug: { token: ACCESS_TOKEN }
+    })
+    pollutedSuccess.tables[0].table.TEST_ONLY_UNREQUESTED_METADATA = [{
+      refresh_token: REFRESH_TOKEN,
+      cookie: pollutedSuccessMarkers[2],
+      debug: pollutedSuccessMarkers[3]
+    }]
+
+    const pollutedTransport = createRequestStub([accessTokenSuccess, pollutedSuccess])
+    const pollutedClient = createIfindHttpClient({ request: pollutedTransport.request })
+    const execution = await captureGlobalOutput(() => executeSharedMarketOperation(
+      pollutedClient,
+      operation,
+      REFRESH_TOKEN,
+      operation === 'quote' ? quoteRequest('HK') : financialRequest('HK')
+    ))
+    assert.equal(execution.status, 'fulfilled')
+    assert.deepEqual(execution.value, cleanFixture)
+    assert.notStrictEqual(execution.value, pollutedSuccess)
+    assertPlainFrozenJson(execution.value)
+    assertNoProviderLeak({
+      scenario: `${operation} polluted success`,
+      value: execution.value,
+      logEntries: [],
+      globalOutputEntries: execution.entries,
+      rawProviderMarkers: pollutedSuccessMarkers
+    })
+    for (const forbiddenKey of [
+      'errmsg', 'token', 'access_token', 'refresh_token', 'authorization',
+      'headers', 'cookie', 'debug', 'extra', 'TEST_ONLY_UNREQUESTED_METADATA'
+    ]) {
+      assert.equal(
+        containsSentinel(execution.value, forbiddenKey),
+        false,
+        `${operation} polluted success exposed ${forbiddenKey}`
+      )
+    }
+  }
+
+  /** @type {Readonly<Record<string, unknown>>} */
+  let sharedDag = Object.freeze({ leaf: 'TEST_ONLY_SHARED_LEAF' })
+  for (let depth = 0; depth < 6; depth += 1) {
+    const parent = {}
+    for (let branch = 0; branch < 4; branch += 1) {
+      parent[`branch${branch}`] = sharedDag
+    }
+    sharedDag = Object.freeze(parent)
+  }
+  const overBudgetSharedRequest = Object.freeze({
+    vendorCode: 'TEST_ONLY_HK_CODE',
+    indicatorIds: Object.freeze(['TEST_ONLY_HK_REVENUE']),
+    periodParameters: Object.freeze({
+      fullFiscalYears: sharedDag,
+      latestDisclosedInterim: sharedDag
+    })
+  })
+  let sharedDagTransportCalls = 0
+  const sharedDagClient = createIfindHttpClient({
+    request() {
+      sharedDagTransportCalls += 1
+      throw new Error('shared DAG must be rejected before transport')
+    }
+  })
+  await assert.rejects(
+    () => sharedDagClient.financial(Buffer.from(ACCESS_TOKEN), overBudgetSharedRequest),
+    (error) => errorRecord(error).code === 'IFIND_CONFIG_INVALID' &&
+      errorRecord(error).class === 'CONFIG' &&
+      errorRecord(error).stage === 'financial' &&
+      errorRecord(error).requestCount === 0
+  )
+  assert.equal(sharedDagTransportCalls, 0)
+
+  const safeSharedParameters = Object.freeze({ reportPeriod: 'TEST_ONLY_SHARED_PERIOD' })
+  const safeSharedRequest = Object.freeze({
+    vendorCode: 'TEST_ONLY_HK_CODE',
+    indicatorIds: Object.freeze([
+      'TEST_ONLY_HK_REVENUE',
+      'TEST_ONLY_HK_NET_PROFIT',
+      'TEST_ONLY_HK_OPERATING_CASH_FLOW'
+    ]),
+    periodParameters: Object.freeze({
+      fullFiscalYears: safeSharedParameters,
+      latestDisclosedInterim: safeSharedParameters
+    })
+  })
+  const safeSharedTransport = createRequestStub([
+    accessTokenSuccess,
+    marketOperationFixtures.HK.financial
+  ])
+  const safeSharedClient = createIfindHttpClient({ request: safeSharedTransport.request })
+  const safeSharedResult = await executeSharedMarketOperation(
+    safeSharedClient,
+    'financial',
+    REFRESH_TOKEN,
+    safeSharedRequest
+  )
+  assert.deepEqual(safeSharedResult, marketOperationFixtures.HK.financial)
+  assert.equal(safeSharedTransport.calls.length, 2)
+
+  const hostileRequestCases = []
+  let requestAccessorReads = 0
+  const accessorQuoteRequest = {
+    fields: Object.freeze(['TEST_ONLY_HK_LATEST_PRICE'])
+  }
+  Object.defineProperty(accessorQuoteRequest, 'vendorCode', {
+    enumerable: true,
+    get() {
+      requestAccessorReads += 1
+      return 'TEST_ONLY_HK_CODE'
+    }
+  })
+  hostileRequestCases.push({
+    name: 'own accessor',
+    operation: 'quote',
+    request: Object.freeze(accessorQuoteRequest)
+  })
+
+  const liveProxyTarget = quoteRequest('HK')
+  hostileRequestCases.push({
+    name: 'live proxy',
+    operation: 'quote',
+    request: new Proxy(liveProxyTarget, {})
+  })
+
+  const revoked = Proxy.revocable(quoteRequest('HK'), {})
+  revoked.revoke()
+  hostileRequestCases.push({
+    name: 'revoked proxy',
+    operation: 'quote',
+    request: revoked.proxy
+  })
+
+  const customPrototypeRequest = Object.create({ inherited: 'provider field' })
+  Object.defineProperties(customPrototypeRequest, {
+    vendorCode: { value: 'TEST_ONLY_HK_CODE', enumerable: true },
+    fields: {
+      value: Object.freeze(['TEST_ONLY_HK_LATEST_PRICE']),
+      enumerable: true
+    }
+  })
+  hostileRequestCases.push({
+    name: 'custom prototype',
+    operation: 'quote',
+    request: Object.freeze(customPrototypeRequest)
+  })
+
+  let inheritedRequestGetterReads = 0
+  const inheritedRequestPrototype = {}
+  Object.defineProperty(inheritedRequestPrototype, 'vendorCode', {
+    get() {
+      inheritedRequestGetterReads += 1
+      return 'TEST_ONLY_HK_CODE'
+    }
+  })
+  const inheritedFieldRequest = Object.create(inheritedRequestPrototype)
+  Object.defineProperty(inheritedFieldRequest, 'fields', {
+    value: Object.freeze(['TEST_ONLY_HK_LATEST_PRICE']),
+    enumerable: true
+  })
+  hostileRequestCases.push({
+    name: 'inherited provider field',
+    operation: 'quote',
+    request: Object.freeze(inheritedFieldRequest)
+  })
+
+  let nestedParameterAccessorReads = 0
+  const accessorParameters = {}
+  Object.defineProperty(accessorParameters, 'reportPeriod', {
+    enumerable: true,
+    get() {
+      nestedParameterAccessorReads += 1
+      return 'TEST_ONLY_ANNUAL'
+    }
+  })
+  hostileRequestCases.push({
+    name: 'nested parameter accessor',
+    operation: 'financial',
+    request: Object.freeze({
+      vendorCode: 'TEST_ONLY_HK_CODE',
+      indicatorIds: Object.freeze(['TEST_ONLY_HK_REVENUE']),
+      periodParameters: Object.freeze({
+        fullFiscalYears: Object.freeze(accessorParameters),
+        latestDisclosedInterim: Object.freeze({ reportPeriod: 'TEST_ONLY_INTERIM' })
+      })
+    })
+  })
+
+  const cyclicParameters = {}
+  cyclicParameters.self = cyclicParameters
+  Object.freeze(cyclicParameters)
+  hostileRequestCases.push({
+    name: 'cyclic shared graph',
+    operation: 'financial',
+    request: Object.freeze({
+      vendorCode: 'TEST_ONLY_HK_CODE',
+      indicatorIds: Object.freeze(['TEST_ONLY_HK_REVENUE']),
+      periodParameters: Object.freeze({
+        fullFiscalYears: cyclicParameters,
+        latestDisclosedInterim: cyclicParameters
+      })
+    })
+  })
+
+  for (const hostileCase of hostileRequestCases) {
+    let transportCalls = 0
+    const hostileClient = createIfindHttpClient({
+      request() {
+        transportCalls += 1
+        throw new Error('invalid request must not reach transport')
+      }
+    })
+    await assert.rejects(
+      () => hostileClient[hostileCase.operation](
+        Buffer.from(ACCESS_TOKEN),
+        hostileCase.request
+      ),
+      (error) => errorRecord(error).code === 'IFIND_CONFIG_INVALID' &&
+        errorRecord(error).class === 'CONFIG' &&
+        errorRecord(error).stage === hostileCase.operation &&
+        errorRecord(error).requestCount === 0,
+      hostileCase.name
+    )
+    assert.equal(transportCalls, 0, hostileCase.name)
+  }
+  assert.equal(requestAccessorReads, 0)
+  assert.equal(inheritedRequestGetterReads, 0)
+  assert.equal(nestedParameterAccessorReads, 0)
+
+  async function withObjectPrototypeGetter(name, getter, action) {
+    const previous = Object.getOwnPropertyDescriptor(Object.prototype, name)
+    Object.defineProperty(Object.prototype, name, {
+      configurable: true,
+      get: getter
+    })
+    try {
+      return await action()
+    } finally {
+      if (previous) Object.defineProperty(Object.prototype, name, previous)
+      else delete Object.prototype[name]
+    }
+  }
+
+  let inheritedErrorCodeReads = 0
+  await withObjectPrototypeGetter('errorcode', () => {
+    inheritedErrorCodeReads += 1
+    return 0
+  }, async () => {
+    const inheritedCodeAuthTransport = createRequestStub([{
+      data: { access_token: ACCESS_TOKEN }
+    }])
+    const inheritedCodeAuthClient = createIfindHttpClient({
+      request: inheritedCodeAuthTransport.request
+    })
+    await assert.rejects(
+      () => inheritedCodeAuthClient.authenticate(REFRESH_TOKEN),
+      (error) => errorRecord(error).code === 'IFIND_RESPONSE_SHAPE' &&
+        errorRecord(error).stage === 'auth'
+    )
+    assert.equal(inheritedCodeAuthTransport.calls.length, 1)
+
+    for (const operation of ['quote', 'financial']) {
+      const inheritedCodeOperationTransport = createRequestStub([
+        accessTokenSuccess,
+        { tables: marketOperationFixtures.HK[operation].tables, dataVol: 1 }
+      ])
+      const inheritedCodeOperationClient = createIfindHttpClient({
+        request: inheritedCodeOperationTransport.request
+      })
+      await assert.rejects(
+        () => executeSharedMarketOperation(
+          inheritedCodeOperationClient,
+          operation,
+          REFRESH_TOKEN,
+          operation === 'quote' ? quoteRequest('HK') : financialRequest('HK')
+        ),
+        (error) => errorRecord(error).code === 'IFIND_RESPONSE_SHAPE' &&
+          errorRecord(error).stage === operation
+      )
+      assert.equal(inheritedCodeOperationTransport.calls.length, 2)
+    }
+  })
+  assert.equal(inheritedErrorCodeReads, 0)
+
+  let inheritedAccessTokenReads = 0
+  await withObjectPrototypeGetter('access_token', () => {
+    inheritedAccessTokenReads += 1
+    return ACCESS_TOKEN
+  }, async () => {
+    const inheritedTokenTransport = createRequestStub([{ errorcode: 0, data: {} }])
+    const inheritedTokenClient = createIfindHttpClient({ request: inheritedTokenTransport.request })
+    await assert.rejects(
+      () => inheritedTokenClient.authenticate(REFRESH_TOKEN),
+      (error) => errorRecord(error).code === 'IFIND_RESPONSE_SHAPE' &&
+        errorRecord(error).stage === 'auth'
+    )
+    assert.equal(inheritedTokenTransport.calls.length, 1)
+  })
+  assert.equal(inheritedAccessTokenReads, 0)
+
+  let inheritedDataReads = 0
+  await withObjectPrototypeGetter('data', () => {
+    inheritedDataReads += 1
+    return { access_token: ACCESS_TOKEN }
+  }, async () => {
+    const inheritedDataTransport = createRequestStub([{ errorcode: 0 }])
+    const inheritedDataClient = createIfindHttpClient({ request: inheritedDataTransport.request })
+    await assert.rejects(
+      () => inheritedDataClient.authenticate(REFRESH_TOKEN),
+      (error) => errorRecord(error).code === 'IFIND_RESPONSE_SHAPE' &&
+        errorRecord(error).stage === 'auth'
+    )
+    assert.equal(inheritedDataTransport.calls.length, 1)
+  })
+  assert.equal(inheritedDataReads, 0)
+
+  let inheritedFailureMetadataReads = 0
+  await withObjectPrototypeGetter('dataVol', () => {
+    inheritedFailureMetadataReads += 1
+    return 999999
+  }, async () => {
+    for (const operation of ['quote', 'financial']) {
+      const inheritedMetadataTransport = createRequestStub([
+        accessTokenSuccess,
+        { errorcode: -403, errmsg: 'synthetic inherited metadata rejection' }
+      ])
+      const inheritedMetadataClient = createIfindHttpClient({
+        request: inheritedMetadataTransport.request
+      })
+      await assert.rejects(
+        () => executeSharedMarketOperation(
+          inheritedMetadataClient,
+          operation,
+          REFRESH_TOKEN,
+          operation === 'quote' ? quoteRequest('HK') : financialRequest('HK')
+        ),
+        (error) => errorRecord(error).code === 'IFIND_PERMISSION_REJECTED' &&
+          errorRecord(error).stage === operation &&
+          !Object.hasOwn(errorRecord(error), 'dataVol')
+      )
+    }
+  })
+  assert.equal(inheritedFailureMetadataReads, 0)
+
+  const forbiddenTransportControls = [
+    'url', 'endpoint', 'headers', 'host', 'method', 'timeout', 'responseCap', 'route'
+  ]
+  for (const forbiddenName of forbiddenTransportControls) {
+    const overrideTransport = createRequestStub([])
+    const overrideClient = createIfindHttpClient({ request: overrideTransport.request })
+    const fixedRequest = {
+      vendorCode: 'TEST_ONLY_HK_CODE',
+      fields: ['TEST_ONLY_HK_LATEST_PRICE'],
+      [forbiddenName]: 'https://attacker.invalid/provider-route'
+    }
+    deepFreezeTestRequest(fixedRequest)
+    await assert.rejects(
+      () => overrideClient.quote(Buffer.from(ACCESS_TOKEN), fixedRequest),
+      (error) => errorRecord(error).code === 'IFIND_CONFIG_INVALID' &&
+        errorRecord(error).class === 'CONFIG' &&
+        errorRecord(error).stage === 'quote' &&
+        errorRecord(error).requestCount === 0
+    )
+    assert.equal(overrideTransport.calls.length, 0)
+  }
+
+  const mutableRequestTransport = createRequestStub([])
+  const mutableRequestClient = createIfindHttpClient({ request: mutableRequestTransport.request })
+  await assert.rejects(
+    () => mutableRequestClient.quote(Buffer.from(ACCESS_TOKEN), {
+      vendorCode: 'TEST_ONLY_HK_CODE',
+      fields: ['TEST_ONLY_HK_LATEST_PRICE']
+    }),
+    (error) => errorRecord(error).code === 'IFIND_CONFIG_INVALID' &&
+      errorRecord(error).stage === 'quote'
+  )
+  const shallowFrozenRequest = Object.freeze({
+    vendorCode: 'TEST_ONLY_HK_CODE',
+    fields: ['TEST_ONLY_HK_LATEST_PRICE']
+  })
+  await assert.rejects(
+    () => mutableRequestClient.quote(Buffer.from(ACCESS_TOKEN), shallowFrozenRequest),
+    (error) => errorRecord(error).code === 'IFIND_CONFIG_INVALID' &&
+      errorRecord(error).stage === 'quote'
+  )
+  assert.equal(mutableRequestTransport.calls.length, 0)
+
+  const marketFailureCases = [
+    {
+      operation: 'quote',
+      response: { errorcode: -401, errmsg: 'synthetic market auth secret' },
+      code: 'IFIND_AUTH_REJECTED',
+      errorClass: 'AUTH',
+      stage: 'quote'
+    },
+    {
+      operation: 'quote',
+      response: { errorcode: -403, errmsg: 'synthetic permission secret' },
+      code: 'IFIND_PERMISSION_REJECTED',
+      errorClass: 'PERMISSION',
+      stage: 'quote'
+    },
+    {
+      operation: 'financial',
+      response: { errorcode: -429, errmsg: 'synthetic quota secret' },
+      code: 'IFIND_QUOTA_REJECTED',
+      errorClass: 'QUOTA',
+      stage: 'financial'
+    },
+    {
+      operation: 'quote',
+      response: { errorcode: -777, errmsg: 'synthetic quote provider secret' },
+      code: 'IFIND_QUOTE_REJECTED',
+      errorClass: 'API',
+      stage: 'quote'
+    },
+    {
+      operation: 'financial',
+      response: { errorcode: -778, errmsg: 'synthetic financial provider secret' },
+      code: 'IFIND_FINANCIAL_REJECTED',
+      errorClass: 'API',
+      stage: 'financial'
+    }
+  ]
+  for (const failureCase of marketFailureCases) {
+    failureCase.response.RequestId = SYNTHETIC_REQUEST_ID
+    const failureTransport = createRequestStub([accessTokenSuccess, failureCase.response])
+    const failureLogger = createCapturingLogger()
+    const failureClient = createIfindHttpClient({
+      request: failureTransport.request,
+      logger: failureLogger.logger
+    })
+    const execution = await captureGlobalOutput(() => executeSharedMarketOperation(
+      failureClient,
+      failureCase.operation,
+      REFRESH_TOKEN,
+      failureCase.operation === 'quote' ? quoteRequest('HK') : financialRequest('HK')
+    ))
+    assert.equal(execution.status, 'rejected')
+    assert.equal(execution.reason.code, failureCase.code)
+    assert.equal(execution.reason.class, failureCase.errorClass)
+    assert.equal(execution.reason.stage, failureCase.stage)
+    assert.equal(execution.reason.vendorErrorCode, failureCase.response.errorcode)
+    assert.equal(execution.reason.requestCount, 1)
+    assert.equal('cause' in execution.reason, false)
+    assertNoProviderLeak({
+      scenario: `${failureCase.operation} provider rejection`,
+      value: execution.reason,
+      logEntries: failureLogger.entries,
+      globalOutputEntries: execution.entries,
+      rawProviderMarkers: [failureCase.response.errmsg]
+    })
+  }
+
+  const operationAuthTransport = createRequestStub([providerErrors.accessToken])
+  const operationAuthClient = createIfindHttpClient({ request: operationAuthTransport.request })
+  await assert.rejects(
+    () => operationAuthClient.authenticate(REFRESH_TOKEN),
+    (error) => errorRecord(error).code === 'IFIND_AUTH_REJECTED' &&
+      errorRecord(error).stage === 'auth' &&
+      errorRecord(error).requestCount === 1
+  )
+
+  for (const malformedScenario of [
+    {
+      name: 'malformed JSON',
+      chunks: ['{"errorcode":'],
+      code: 'IFIND_RESPONSE_JSON'
+    },
+    {
+      name: 'oversized body',
+      chunks: ['x'.repeat(256 * 1024 + 1)],
+      code: 'IFIND_RESPONSE_TOO_LARGE'
+    }
+  ]) {
+    const rawTransport = createRawRequestStub([
+      { chunks: [JSON.stringify(accessTokenSuccess)] },
+      { chunks: malformedScenario.chunks }
+    ])
+    const rawClient = createIfindHttpClient({ request: rawTransport.request })
+    await assert.rejects(
+      () => executeSharedMarketOperation(rawClient, 'quote', REFRESH_TOKEN, quoteRequest('CN')),
+      (error) => errorRecord(error).code === malformedScenario.code &&
+        errorRecord(error).stage === 'quote' &&
+        errorRecord(error).requestCount === 1,
+      malformedScenario.name
+    )
+    assert.equal(rawTransport.calls[1].requestDestroyCount, 1)
+    assert.equal(rawTransport.calls[1].responseDestroyCount, 1)
+  }
+
+  const operationTimeoutTimers = []
+  const operationTimeoutTransport = createManualRequestTransport()
+  const operationTimeoutClient = createIfindHttpClient({
+    request: operationTimeoutTransport.request,
+    setTimer(handler, milliseconds) {
+      const timer = { handler, milliseconds, cleared: false }
+      operationTimeoutTimers.push(timer)
+      return timer
+    },
+    clearTimer(timer) {
+      timer.cleared = true
+    }
+  })
+  const timedAuthentication = operationTimeoutClient.authenticate(REFRESH_TOKEN)
+  operationTimeoutTransport.calls[0].respond({
+    chunks: [JSON.stringify(accessTokenSuccess)]
+  })
+  await new Promise((resolve) => setImmediate(resolve))
+  const timedAuthenticationResult = await timedAuthentication
+  const timedOperation = operationTimeoutClient.financial(
+    timedAuthenticationResult.accessToken,
+    financialRequest('CN')
+  )
+  const operationTotalTimer = operationTimeoutTimers
+    .filter((timer) => !timer.cleared && timer.milliseconds === 5000)[0]
+  assert.ok(operationTotalTimer)
+  operationTotalTimer.handler()
+  await assert.rejects(
+    () => timedOperation,
+    (error) => errorRecord(error).code === 'IFIND_TIMEOUT' &&
+      errorRecord(error).stage === 'financial'
+  )
+  assert.equal(operationTimeoutTransport.calls[1].destroyCount, 1)
+  assert.equal(operationTimeoutTimers.every((timer) => timer.cleared), true)
+
+  const operationDuplicateTransport = createManualRequestTransport()
+  const operationDuplicateClient = createIfindHttpClient({
+    request: operationDuplicateTransport.request
+  })
+  const duplicateAuthentication = operationDuplicateClient.authenticate(REFRESH_TOKEN)
+  operationDuplicateTransport.calls[0].respond({
+    chunks: [JSON.stringify(accessTokenSuccess)]
+  })
+  await new Promise((resolve) => setImmediate(resolve))
+  const duplicateAuthenticationResult = await duplicateAuthentication
+  const duplicateOperation = operationDuplicateClient.quote(
+    duplicateAuthenticationResult.accessToken,
+    quoteRequest('US')
+  )
+  const firstDuplicateResponse = operationDuplicateTransport.calls[1].respond({ event: null })
+  const secondDuplicateResponse = operationDuplicateTransport.calls[1].respond({ event: null })
+  await assert.rejects(
+    () => duplicateOperation,
+    (error) => errorRecord(error).code === 'IFIND_DUPLICATE_RESPONSE' &&
+      errorRecord(error).stage === 'quote'
+  )
+  assert.equal(firstDuplicateResponse.destroyCount, 1)
+  assert.equal(secondDuplicateResponse.destroyCount, 1)
+
+  const unknownFailureMarker = `synthetic unknown transport failure ${ACCESS_TOKEN}`
+  const unknownBaseTransport = createRequestStub([accessTokenSuccess])
+  let unknownRequestCount = 0
+  function unknownFailureRequest(url, options, callback) {
+    unknownRequestCount += 1
+    if (unknownRequestCount === 2) throw new Error(unknownFailureMarker)
+    return unknownBaseTransport.request(url, options, callback)
+  }
+  const unknownFailureClient = createIfindHttpClient({ request: unknownFailureRequest })
+  const unknownExecution = await captureGlobalOutput(() => executeSharedMarketOperation(
+    unknownFailureClient,
+    'quote',
+    REFRESH_TOKEN,
+    quoteRequest('HK')
+  ))
+  assert.equal(unknownExecution.status, 'rejected')
+  assert.equal(unknownExecution.reason.code, 'IFIND_NETWORK_FAILED')
+  assert.equal(unknownExecution.reason.class, 'NETWORK')
+  assert.equal(unknownExecution.reason.stage, 'quote')
+  assertNoProviderLeak({
+    scenario: 'unknown market transport failure',
+    value: unknownExecution.reason,
+    logEntries: [],
+    globalOutputEntries: unknownExecution.entries,
+    rawProviderMarkers: [unknownFailureMarker]
+  })
 
   const successTransport = createRequestStub([
     accessTokenSuccess,
@@ -368,7 +1155,7 @@ async function run() {
     logger: successLogger.logger
   })
 
-  assert.deepEqual(Object.keys(client), ['diagnose'])
+  assert.deepEqual(Object.keys(client), ['diagnose', 'authenticate', 'quote', 'financial'])
   const successExecution = await captureGlobalOutput(
     () => client.diagnose({ refreshToken: REFRESH_TOKEN })
   )
@@ -833,7 +1620,7 @@ async function run() {
   }
   assert.ok(Buffer.isBuffer(clearedTokenBuffer))
   assert.equal((/** @type {Buffer} */ (clearedTokenBuffer)).every((byte) => byte === 0), true)
-  assert.deepEqual(Object.keys(clearClient), ['diagnose'])
+  assert.deepEqual(Object.keys(clearClient), ['diagnose', 'authenticate', 'quote', 'financial'])
   assert.equal(Object.getOwnPropertyDescriptor(clearClient, 'clear').enumerable, false)
   await clearClient.diagnose({ refreshToken: REFRESH_TOKEN })
   assert.equal(clearTransport.calls.length, 4)

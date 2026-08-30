@@ -375,6 +375,104 @@
 .ifind-diagnostic-actions .admin-meta { margin-top: 4px; }
 .ifind-diagnostic-actions .auth-primary { flex: 0 0 auto; min-width: 180px; }
 
+.ifind-market-diagnostic {
+  background:
+    linear-gradient(110deg, rgba(242, 248, 247, 0.96), rgba(255, 255, 255, 0.93)),
+    #f8fbfb;
+}
+
+.ifind-market-head {
+  display: flex;
+  align-items: flex-start;
+  justify-content: space-between;
+  gap: 24px;
+}
+
+.ifind-market-rail {
+  display: grid;
+  grid-template-columns: repeat(3, minmax(0, 1fr));
+  gap: 12px;
+  margin-top: 22px;
+}
+
+.ifind-market-card {
+  --market-accent: #297d72;
+  min-width: 0;
+  padding: 18px;
+  border: 1px solid #d4e0e3;
+  border-top: 4px solid var(--market-accent);
+  border-radius: 12px;
+  background: rgba(255, 255, 255, 0.82);
+  box-shadow: 0 8px 24px rgba(30, 59, 70, 0.05);
+}
+
+.ifind-market-card[data-market="US"] { --market-accent: #326a91; }
+.ifind-market-card[data-market="CN"] { --market-accent: #9a573f; }
+
+.ifind-market-card-head {
+  display: flex;
+  align-items: flex-start;
+  justify-content: space-between;
+  gap: 12px;
+  min-height: 64px;
+}
+
+.ifind-market-card-head h3 {
+  margin: 0;
+  color: #243f49;
+  font: 600 1.03rem/1.3 "Songti SC", STSong, "Iowan Old Style", Georgia, serif;
+}
+
+.ifind-market-card-head p {
+  margin: 4px 0 0;
+  color: #607681;
+  font: 0.76rem/1.4 "DIN Alternate", "SFMono-Regular", Consolas, monospace;
+}
+
+.ifind-market-tag {
+  order: 2;
+  flex: 0 0 auto;
+  color: var(--market-accent);
+  font: 700 0.68rem/1.3 "DIN Alternate", "SFMono-Regular", Consolas, monospace;
+  letter-spacing: 0.04em;
+  text-transform: uppercase;
+}
+
+.ifind-market-facts {
+  display: grid;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  gap: 0;
+  margin: 15px 0 0;
+  border-top: 1px solid #dce6e9;
+}
+
+.ifind-market-facts div {
+  min-width: 0;
+  padding: 9px 0;
+  border-bottom: 1px solid #e2eaec;
+}
+
+.ifind-market-facts div:nth-child(odd):not(.wide) { padding-right: 10px; }
+.ifind-market-facts .wide { grid-column: 1 / -1; }
+.ifind-market-facts dt { color: #70828a; font-size: 0.68rem; }
+.ifind-market-facts dd {
+  margin: 4px 0 0;
+  color: #2c4650;
+  font: 0.76rem/1.45 "DIN Alternate", "SFMono-Regular", Consolas, monospace;
+  overflow-wrap: anywhere;
+}
+
+.ifind-market-error {
+  min-height: 2.8em;
+  margin: 12px 0;
+  color: #80514a;
+  font-size: 0.74rem;
+  line-height: 1.4;
+}
+
+.ifind-market-card .auth-primary { width: 100%; }
+.ifind-market-card .auth-primary[data-tone="running"] { background: #49636c; }
+
 .admin-list {
   display: grid;
   gap: 10px;
@@ -462,6 +560,9 @@ output:focus-visible {
   .ifind-metrics div:nth-last-child(-n + 4) { border-bottom: 1px solid #dce6e9; }
   .ifind-metrics div:nth-last-child(-n + 2) { border-bottom: 0; }
   .ifind-diagnostic-actions .auth-primary { width: 100%; }
+  .ifind-market-head { flex-direction: column; }
+  .ifind-market-rail { grid-template-columns: 1fr; }
+  .ifind-market-card-head { min-height: 0; }
 }
 
 @media (max-width: 375px) {

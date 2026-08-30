@@ -1,0 +1,13 @@
+{
+  "errorcode": 0,
+  "tables": [
+    {
+      "thscode": "TEST_ONLY_HK_CODE",
+      "table": {
+        "TEST_ONLY_HK_LATEST_PRICE": [101.25],
+        "TEST_ONLY_HK_CURRENCY": ["HKD"]
+      }
+    }
+  ],
+  "dataVol": 2
+}

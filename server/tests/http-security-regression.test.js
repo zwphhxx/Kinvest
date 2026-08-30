@@ -53,10 +53,16 @@ function createRuntime() {
  *   deviceApproval?: any
  * }} [runtime]
  * @param {string} [publicOrigin]
+ * @param {any} [ifindDiagnosticRuntime]
  */
-async function start(runtime = createRuntime(), publicOrigin = ORIGIN) {
+async function start(
+  runtime = createRuntime(),
+  publicOrigin = ORIGIN,
+  ifindDiagnosticRuntime
+) {
   const server = http.createServer(createRequestHandler({
     accessRuntime: runtime,
+    ifindDiagnosticRuntime,
     now: () => NOW,
     publicOrigin,
     trustedProxyAddresses: ['127.0.0.1']
@@ -131,6 +137,185 @@ async function testDefaultDenyInvestmentRouteMatrix() {
         assert.deepEqual(response.body, { error: 'AUTH_REQUIRED' })
       }
     }
+  } finally {
+    await running.close()
+  }
+}
+
+async function testDefaultDenyMarketDiagnosticRouteMatrix() {
+  const running = await start()
+  const routes = [
+    ['GET', '/api/admin/ifind/market-cases', undefined],
+    ['GET', '/api/admin/ifind/market-cases/HK_ALIBABA_9988', undefined],
+    ['POST', '/api/admin/ifind/market-cases/HK_ALIBABA_9988/run', '{}']
+  ]
+  try {
+    for (const [method, pathname, body] of routes) {
+      for (const cookie of [
+        null,
+        `__Host-kinvest-device=${VALID_DEVICE}`,
+        `__Host-kinvest-admin=${ADMIN_TOKEN}`
+      ]) {
+        const headers = body === undefined
+          ? (cookie ? { cookie } : {})
+          : {
+              origin: ORIGIN,
+              'content-type': 'application/json',
+              'x-kinvest-csrf': 'C'.repeat(43),
+              ...(cookie ? { cookie } : {})
+            }
+        const response = await request(running.baseUrl, pathname, {
+          method,
+          headers,
+          body
+        })
+        assert.equal(response.status, 401, `${method} ${pathname} ${cookie}`)
+        assert.deepEqual(response.body, { error: 'ADMIN_AUTH_REQUIRED' })
+      }
+    }
+  } finally {
+    await running.close()
+  }
+}
+
+async function testApprovedFamilyInvestmentRouteMatrixUsesMockData() {
+  const diagnosticCalls = []
+  const unexpectedDiagnosticCall = (name) => () => {
+    diagnosticCalls.push(name)
+    throw new Error(`unexpected diagnostic call: ${name}`)
+  }
+  const ifindDiagnosticRuntime = {
+    status: {
+      mode: 'admin-diagnostic',
+      configured: true,
+      versionId: 'ifind-secrets-v1-20260830'
+    },
+    service: {
+      diagnose: unexpectedDiagnosticCall('legacy-diagnose')
+    },
+    marketService: {
+      latest: unexpectedDiagnosticCall('market-latest'),
+      history: unexpectedDiagnosticCall('market-history'),
+      quotaStatus: unexpectedDiagnosticCall('market-quota-status'),
+      run: unexpectedDiagnosticCall('market-run')
+    }
+  }
+  const running = await start(createRuntime(), ORIGIN, ifindDiagnosticRuntime)
+  const routes = [
+    ['GET', '/api/watchlist', undefined],
+    ['GET', '/api/search?q=ali', undefined],
+    ['GET', '/api/company/9988.HK', undefined],
+    ['POST', '/api/company/9988.HK/refresh', '{}'],
+    ['GET', '/api/research/9988.HK', undefined]
+  ]
+  try {
+    const responses = new Map()
+    for (const [method, pathname, body] of routes) {
+      const headers = body === undefined
+        ? { cookie: `__Host-kinvest-device=${VALID_DEVICE}` }
+        : validMutationHeaders()
+      const response = await request(running.baseUrl, pathname, {
+        method,
+        headers,
+        body
+      })
+      assert.equal(response.status, 200, `${method} ${pathname}`)
+      assert.equal(response.body.success, true, `${method} ${pathname}`)
+      responses.set(`${method} ${pathname}`, response.body)
+    }
+
+    const watchlist = responses.get('GET /api/watchlist').data
+    assert.deepEqual(watchlist.map((company) => ({
+      securityCode: company.securityCode,
+      lastPrice: company.quote.lastPrice,
+      currency: company.quote.currency
+    })), [
+      { securityCode: '9988.HK', lastPrice: 91.6, currency: 'HKD' },
+      { securityCode: 'AAPL.US', lastPrice: 198.2, currency: 'USD' }
+    ])
+
+    const search = responses.get('GET /api/search?q=ali').data
+    assert.equal(search.length, 1)
+    assert.deepEqual({
+      companyId: search[0].companyId,
+      listingId: search[0].listingId,
+      issuerLegalName: search[0].issuerLegalName,
+      securityCode: search[0].securityCode,
+      configured: search[0].configured,
+      ifindVendorCode: search[0].vendorCodes.ifind
+    }, {
+      companyId: 'company-alibaba-group',
+      listingId: 'listing-hkex-9988',
+      issuerLegalName: 'Alibaba Group Holding Limited',
+      securityCode: '9988.HK',
+      configured: true,
+      ifindVendorCode: { code: null, status: 'unverified' }
+    })
+
+    const company = responses.get('GET /api/company/9988.HK').data
+    assert.equal(company.dataMode, 'mock')
+    assert.equal(company.refreshState.snapshotVersion, 'mock-2026-07-28')
+    assert.equal(company.companyId, 'company-alibaba-group')
+    assert.equal(company.listingId, 'listing-hkex-9988')
+    assert.deepEqual(company.quote, {
+      lastPrice: 91.6,
+      currency: 'HKD',
+      changePct: -1.72,
+      volume: 1531200,
+      high3Y: 124.4,
+      low3Y: 56.3,
+      latestHighDate: '2026-06-01T00:00:00.000Z',
+      latestLowDate: '2026-01-20T00:00:00.000Z'
+    })
+    assert.equal(company.financials.validation.annual.sourceMode, 'mock')
+    assert.equal(company.financials.annual[0].dataMode, 'mock')
+    assert.deepEqual({
+      sourceMode: company.financials.annual[0].source.sourceMode,
+      sourceType: company.financials.annual[0].source.sourceType,
+      mockContractVerified:
+        company.financials.annual[0].source.mockContractVerified
+    }, {
+      sourceMode: 'mock',
+      sourceType: 'mock_fixture',
+      mockContractVerified: true
+    })
+    assert.deepEqual(company.businessBreakdown.validation, {
+      status: 'verified',
+      sourceMode: 'mock',
+      errorCode: null
+    })
+
+    const refresh = responses.get('POST /api/company/9988.HK/refresh')
+    assert.equal(refresh.data.dataMode, 'mock')
+    assert.equal(refresh.data.refreshState.snapshotVersion, 'mock-2026-07-28')
+    assert.equal(refresh.data.quote.lastPrice, 91.6)
+    assert.equal(refresh.data.marketSnapshot.fromCache, false)
+    assert.equal(
+      refresh.data.marketSnapshot.sourceTime,
+      '2026-07-28T15:42:00.000Z'
+    )
+    assert.equal(
+      refresh.warning,
+      '演示环境仅刷新快照时间与缓存标记，不调用外部接口。'
+    )
+
+    const research = responses.get('GET /api/research/9988.HK').data
+    assert.equal(research.code, '9988.HK')
+    assert.equal(research.nameZh, '阿里巴巴')
+    assert.equal(research.sourceMode, 'mock')
+    assert.equal(research.state, 'ready')
+    assert.deepEqual(research.modelStatus, {
+      mode: 'safe_mock',
+      called: false,
+      reason: 'MODEL_CONFIGURATION_INCOMPLETE'
+    })
+    assert.deepEqual(research.tags, ['安全 Mock', '未调用模型', '快照绑定'])
+    assert.deepEqual(research.sections.dataSnapshotSummary, {
+      financeRows: 2,
+      newsRows: 2,
+      announcementRows: 2
+    })
+    assert.deepEqual(diagnosticCalls, [])
   } finally {
     await running.close()
   }
@@ -351,6 +536,8 @@ async function testStartupConfigurationDoesNotLeakProcessUmask() {
 
 async function run() {
   await testDefaultDenyInvestmentRouteMatrix()
+  await testDefaultDenyMarketDiagnosticRouteMatrix()
+  await testApprovedFamilyInvestmentRouteMatrixUsesMockData()
   await testRefreshStrictMutationAndExactRoutes()
   await testRefreshUsesInjectedOriginAndDisabledCompatibility()
   await testStrictJsonRejectsMalformedUtf8DuplicatesAndAbort()

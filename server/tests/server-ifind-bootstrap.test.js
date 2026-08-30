@@ -48,9 +48,33 @@ function repositoryFixture() {
   }
 }
 
+function marketRepositoryFixture() {
+  return {
+    initialize() {},
+    reserve() {},
+    complete() {},
+    fail() {},
+    latest() { return null },
+    history() { return [] },
+    quotaStatus() {}
+  }
+}
+
 function clientFixture(events = [], transportCalls = { count: 0 }) {
   return {
     async diagnose() {
+      transportCalls.count += 1
+      throw new Error('transport must not run during startup')
+    },
+    async authenticate() {
+      transportCalls.count += 1
+      throw new Error('transport must not run during startup')
+    },
+    async quote() {
+      transportCalls.count += 1
+      throw new Error('transport must not run during startup')
+    },
+    async financial() {
       transportCalls.count += 1
       throw new Error('transport must not run during startup')
     },
@@ -66,6 +90,15 @@ function serviceFactory(events = []) {
       events.push('service')
       options.client.clear()
     }
+  })
+}
+
+function marketServiceFactory() {
+  return (options) => Object.freeze({
+    async run() { return { status: 'rejected' } },
+    latest(input) { return options.repository.latest(input) },
+    history(input) { return options.repository.history(input) },
+    quotaStatus(input) { return options.repository.quotaStatus(input) }
   })
 }
 
@@ -86,6 +119,8 @@ function runtimeDependencies(events = [], overrides = {}) {
       createRepository: () => repositoryFixture(),
       createClient: () => clientFixture(events, transportCalls),
       createService: serviceFactory(events),
+      createMarketRepository: () => marketRepositoryFixture(),
+      createMarketService: marketServiceFactory(),
       ...overrides
     }
   }
@@ -179,6 +214,22 @@ async function testEnabledRuntimeRequiresDeviceApprovalAndSharesDatabase() {
 
   const events = []
   const fixture = runtimeDependencies(events)
+  /** @type {ReturnType<typeof clientFixture>[]} */
+  const clients = []
+  /** @type {number[]} */
+  const clientClearCounts = []
+  fixture.options.createClient = () => {
+    const client = clientFixture(events, fixture.transportCalls)
+    const index = clients.length
+    clients.push(client)
+    clientClearCounts.push(0)
+    const clear = client.clear
+    client.clear = () => {
+      clientClearCounts[index] += 1
+      clear()
+    }
+    return client
+  }
   let repositoryDatabase
   fixture.options.createRepository = (database) => {
     repositoryDatabase = database
@@ -187,6 +238,8 @@ async function testEnabledRuntimeRequiresDeviceApprovalAndSharesDatabase() {
   const runtime = await createIfindDiagnosticRuntime(fixture.options)
   assert.equal(repositoryDatabase, fixture.database)
   assert.equal(fixture.transportCalls.count, 0)
+  assert.equal(clients.length, 2)
+  assert.notStrictEqual(clients[0], clients[1])
   assert.deepStrictEqual(runtime.status, {
     mode: 'admin-diagnostic',
     configured: true,
@@ -194,8 +247,10 @@ async function testEnabledRuntimeRequiresDeviceApprovalAndSharesDatabase() {
   })
   runtime.clear()
   runtime.clear()
+  assert.equal(fixture.transportCalls.count, 0)
+  assert.deepStrictEqual(clientClearCounts, [1, 1])
   assert.deepStrictEqual(events, [
-    'database-open', 'service', 'client', 'provider'
+    'database-open', 'service', 'client', 'client', 'provider'
   ])
 }
 
@@ -247,7 +302,7 @@ async function testFailureCleanupAndSanitization() {
         options.createService = () => { throw new Error(sensitive) }
       },
       code: 'IFIND_DIAGNOSTIC_RUNTIME_INVALID',
-      expected: ['database-open', 'client', 'provider']
+      expected: ['database-open', 'client', 'client', 'provider']
     },
     {
       name: 'hostile provider',
@@ -263,7 +318,7 @@ async function testFailureCleanupAndSanitization() {
         options.createService = () => new Proxy({}, {})
       },
       code: 'IFIND_DIAGNOSTIC_RUNTIME_INVALID',
-      expected: ['database-open', 'client', 'provider']
+      expected: ['database-open', 'client', 'client', 'provider']
     }
   ]) {
     const events = []
@@ -325,6 +380,8 @@ async function testPreparationPassesFrozenRuntimeAndKeepsHealthUnchanged() {
     },
     createIfindClient: () => clientFixture(events),
     createIfindService: serviceFactory(events),
+    createIfindMarketRepository: () => marketRepositoryFixture(),
+    createIfindMarketService: marketServiceFactory(),
     createHandler(options) {
       receivedRuntime = options.ifindDiagnosticRuntime
       return () => {}
@@ -338,7 +395,9 @@ async function testPreparationPassesFrozenRuntimeAndKeepsHealthUnchanged() {
   })
   prepared.clear()
   prepared.clear()
-  assert.deepStrictEqual(events, ['service', 'client', 'provider', 'access', 'secret'])
+  assert.deepStrictEqual(events, [
+    'service', 'client', 'client', 'provider', 'access', 'secret'
+  ])
 
   const accessRuntime = disabledAccess()
   const baseline = createRequestHandler({ accessRuntime })
@@ -411,12 +470,12 @@ async function testStartupFailuresPreventListenAndCleanEveryPhase() {
     {
       name: 'service',
       override: { createIfindService: () => { throw new Error('sensitive-service') } },
-      expected: ['client', 'provider', 'access', 'secret']
+      expected: ['client', 'client', 'provider', 'access', 'secret']
     },
     {
       name: 'handler',
       override: { createHttpHandler: () => { throw new Error('sensitive-handler') } },
-      expected: ['service', 'client', 'provider', 'access', 'secret']
+      expected: ['service', 'client', 'client', 'provider', 'access', 'secret']
     }
   ]
   for (const fixture of cases) {
@@ -435,6 +494,8 @@ async function testStartupFailuresPreventListenAndCleanEveryPhase() {
       createIfindRepository: () => repositoryFixture(),
       createIfindClient: () => clientFixture(events),
       createIfindService: serviceFactory(events),
+      createIfindMarketRepository: () => marketRepositoryFixture(),
+      createIfindMarketService: marketServiceFactory(),
       createHttpHandler: () => () => {},
       processRef: new EventEmitter(),
       logger: { log() {} },
@@ -465,6 +526,8 @@ async function testShutdownCleanupOrder() {
       createIfindRepository: () => repositoryFixture(),
       createIfindClient: () => clientFixture(events, transportCalls),
       createIfindService: serviceFactory(events),
+      createIfindMarketRepository: () => marketRepositoryFixture(),
+      createIfindMarketService: marketServiceFactory(),
       createHttpHandler: () => () => {},
       closeApplicationDatabase: () => events.push('database'),
       processRef,
@@ -477,7 +540,7 @@ async function testShutdownCleanupOrder() {
     processRef.emit('SIGINT')
     assert.equal(transportCalls.count, 0)
     assert.deepStrictEqual(events, [
-      'service', 'client', 'provider', 'access', 'secret', 'database'
+      'service', 'client', 'client', 'provider', 'access', 'secret', 'database'
     ], shutdown)
   }
 }

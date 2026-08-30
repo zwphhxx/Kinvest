@@ -63,7 +63,14 @@ async function prepareApplication({
   loadIfindSecrets,
   createIfindRepository,
   createIfindClient,
-  createIfindService
+  createIfindService,
+  createIfindMarketRepository,
+  createIfindMarketService,
+  ifindMarketCatalogLookup,
+  ifindMarketManifestLookup,
+  ifindMarketQuoteParser,
+  ifindMarketFinancialParser,
+  ifindMarketIdGenerator
 } = {}) {
   throwIfAborted(signal)
   const secretRuntime = await bootstrap({ env, loadSecrets, signal })
@@ -107,7 +114,21 @@ async function prepareApplication({
       ...(loadIfindSecrets ? { loadSecrets: loadIfindSecrets } : {}),
       ...(createIfindRepository ? { createRepository: createIfindRepository } : {}),
       ...(createIfindClient ? { createClient: createIfindClient } : {}),
-      ...(createIfindService ? { createService: createIfindService } : {})
+      ...(createIfindService ? { createService: createIfindService } : {}),
+      ...(createIfindMarketRepository !== undefined
+        ? { createMarketRepository: createIfindMarketRepository } : {}),
+      ...(createIfindMarketService !== undefined
+        ? { createMarketService: createIfindMarketService } : {}),
+      ...(ifindMarketCatalogLookup !== undefined
+        ? { marketCatalogLookup: ifindMarketCatalogLookup } : {}),
+      ...(ifindMarketManifestLookup !== undefined
+        ? { marketManifestLookup: ifindMarketManifestLookup } : {}),
+      ...(ifindMarketQuoteParser !== undefined
+        ? { marketQuoteParser: ifindMarketQuoteParser } : {}),
+      ...(ifindMarketFinancialParser !== undefined
+        ? { marketFinancialParser: ifindMarketFinancialParser } : {}),
+      ...(ifindMarketIdGenerator !== undefined
+        ? { marketIdGenerator: ifindMarketIdGenerator } : {})
     })
   } catch (error) {
     clearRuntimes(null, accessRuntime, secretRuntime)

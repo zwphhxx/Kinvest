@@ -1,11 +1,19 @@
 const https = require('node:https')
-const { TextDecoder } = require('node:util')
+const { TextDecoder, types } = require('node:util')
+const { isIfindIndicatorId } = require('../domain/ifind-indicator-id')
 const {
   isClientFailureBase,
   isClientFailureMetadata
 } = require('../contracts/ifind-diagnostic-errors')
 
 const ORIGIN = 'https://quantapi.51ifind.com'
+const ENDPOINTS = Object.freeze({
+  auth: '/api/v1/get_access_token',
+  probe: '/api/v1/get_trade_dates',
+  quote: '/api/v1/real_time_quotation',
+  financial: '/api/v1/basic_data_service'
+})
+const ALLOWED_ENDPOINTS = new Set(Object.values(ENDPOINTS))
 const AUTH_ERROR_CODES = new Set([-401])
 const PERMISSION_ERROR_CODES = new Set([-403])
 const QUOTA_ERROR_CODES = new Set([-429])
@@ -21,7 +29,7 @@ const DIAGNOSTIC_REFERENCE_DATE = '2022-07-05'
  *   vendorErrorCode: number | null,
  *   dataVol?: number,
  *   requestCount?: number,
- *   stage?: 'auth' | 'probe'
+ *   stage?: 'auth' | 'probe' | 'quote' | 'financial'
  * }} IfindClientError
  */
 
@@ -89,7 +97,7 @@ function withStage(error, stage) {
     sanitized = safeError('IFIND_CLIENT_FAILED', 'API', 'iFinD diagnostic failed')
   }
   const existing = Object.getOwnPropertyDescriptor(sanitized, 'stage')
-  if (existing && (existing.value === 'auth' || existing.value === 'probe')) {
+  if (existing && ['auth', 'probe', 'quote', 'financial'].includes(existing.value)) {
     return sanitized
   }
   Object.defineProperty(sanitized, 'stage', {
@@ -101,7 +109,50 @@ function withStage(error, stage) {
   return sanitized
 }
 
+function plainJsonSnapshot(value) {
+  if (value === null || typeof value === 'string' || typeof value === 'boolean') return value
+  if (typeof value === 'number') {
+    if (!Number.isFinite(value)) throw new Error('invalid JSON number')
+    return value
+  }
+  if (Array.isArray(value)) {
+    const descriptors = Object.getOwnPropertyDescriptors(value)
+    const snapshot = []
+    for (let index = 0; index < value.length; index += 1) {
+      const descriptor = descriptors[index]
+      if (!descriptor || !Object.hasOwn(descriptor, 'value') || !descriptor.enumerable) {
+        throw new Error('invalid JSON array')
+      }
+      snapshot.push(plainJsonSnapshot(descriptor.value))
+    }
+    return Object.freeze(snapshot)
+  }
+  if (!isRecord(value)) throw new Error('invalid JSON value')
+  const descriptors = Object.getOwnPropertyDescriptors(value)
+  const snapshot = {}
+  for (const key of Object.keys(descriptors)) {
+    const descriptor = descriptors[key]
+    if (!Object.hasOwn(descriptor, 'value') || !descriptor.enumerable) {
+      throw new Error('invalid JSON object')
+    }
+    Object.defineProperty(snapshot, key, {
+      value: plainJsonSnapshot(descriptor.value),
+      enumerable: true,
+      configurable: false,
+      writable: false
+    })
+  }
+  return Object.freeze(snapshot)
+}
+
 function requestJson(request, path, headers, body, setTimer, clearTimer) {
+  if (!ALLOWED_ENDPOINTS.has(path)) {
+    return Promise.reject(safeError(
+      'IFIND_CONFIG_INVALID',
+      'CONFIG',
+      'iFinD client configuration was invalid'
+    ))
+  }
   return new Promise((resolve, reject) => {
     let outgoing = null
     let incoming = null
@@ -273,7 +324,7 @@ function requestJson(request, path, headers, body, setTimer, clearTimer) {
               return
             }
             try {
-              succeed(JSON.parse(text))
+              succeed(plainJsonSnapshot(JSON.parse(text)))
             } catch {
               fail(safeError('IFIND_RESPONSE_JSON', 'API', 'iFinD response JSON was invalid'))
             }
@@ -395,10 +446,10 @@ function requestJson(request, path, headers, body, setTimer, clearTimer) {
   })
 }
 
-function classifyProbeFailure(response) {
-  if (PERMISSION_ERROR_CODES.has(response.errorcode)) return 'PERMISSION'
-  if (QUOTA_ERROR_CODES.has(response.errorcode)) return 'QUOTA'
-  if (AUTH_ERROR_CODES.has(response.errorcode)) return 'AUTH'
+function classifyProbeFailure(errorCode) {
+  if (PERMISSION_ERROR_CODES.has(errorCode)) return 'PERMISSION'
+  if (QUOTA_ERROR_CODES.has(errorCode)) return 'QUOTA'
+  if (AUTH_ERROR_CODES.has(errorCode)) return 'AUTH'
   return 'API'
 }
 
@@ -408,6 +459,321 @@ function isCanonicalCalendarDate(value) {
   }
   const parsed = new Date(`${value}T00:00:00.000Z`)
   return Number.isFinite(parsed.getTime()) && parsed.toISOString().slice(0, 10) === value
+}
+
+function plainDataDescriptors(value, exactKeys, frozen) {
+  if (!value || typeof value !== 'object' || Array.isArray(value) || types.isProxy(value)) {
+    throw new Error('invalid request')
+  }
+  if (Object.getPrototypeOf(value) !== Object.prototype ||
+      Object.getOwnPropertySymbols(value).length !== 0 ||
+      (frozen && !Object.isFrozen(value))) {
+    throw new Error('invalid request')
+  }
+  const descriptors = Object.getOwnPropertyDescriptors(value)
+  const keys = Object.keys(descriptors)
+  if (keys.length !== exactKeys.length ||
+      exactKeys.some((key) => !Object.hasOwn(descriptors, key))) {
+    throw new Error('invalid request')
+  }
+  for (const key of keys) {
+    const descriptor = descriptors[key]
+    if (!Object.hasOwn(descriptor, 'value') || !descriptor.enumerable) {
+      throw new Error('invalid request')
+    }
+  }
+  return descriptors
+}
+
+function descriptorValue(descriptors, key) {
+  const descriptor = descriptors[key]
+  if (!descriptor || !Object.hasOwn(descriptor, 'value')) throw new Error('invalid request')
+  return descriptor.value
+}
+
+function providerIdentifier(value) {
+  if (typeof value !== 'string' || value.length === 0 || value.length > 256 ||
+      value.trim() !== value || Array.from(value).some((character) =>
+        character.charCodeAt(0) < 32 || character.charCodeAt(0) === 127)) {
+    throw new Error('invalid request')
+  }
+  return value
+}
+
+function frozenIdentifierArray(value) {
+  if (!Array.isArray(value) || types.isProxy(value) || !Object.isFrozen(value) ||
+      Object.getPrototypeOf(value) !== Array.prototype ||
+      Object.getOwnPropertySymbols(value).length !== 0) {
+    throw new Error('invalid request')
+  }
+  const descriptors = Object.getOwnPropertyDescriptors(/** @type {object} */ (value))
+  const lengthDescriptor = descriptors.length
+  const length = lengthDescriptor && lengthDescriptor.value
+  if (!Number.isSafeInteger(length) || length < 1 || length > 64 ||
+      Object.keys(descriptors).length !== length + 1) {
+    throw new Error('invalid request')
+  }
+  const identifiers = []
+  const unique = new Set()
+  for (let index = 0; index < length; index += 1) {
+    const descriptor = descriptors[index]
+    if (!descriptor || !Object.hasOwn(descriptor, 'value') || !descriptor.enumerable) {
+      throw new Error('invalid request')
+    }
+    const identifier = providerIdentifier(descriptor.value)
+    if (unique.has(identifier)) throw new Error('invalid request')
+    unique.add(identifier)
+    identifiers.push(identifier)
+  }
+  return Object.freeze(identifiers)
+}
+
+const PARAMETER_VALIDATION_BUDGET = 24
+
+function consumeParameterBudget(state, amount = 1) {
+  state.work += amount
+  if (state.work > PARAMETER_VALIDATION_BUDGET) throw new Error('invalid request')
+}
+
+function frozenProviderParameters(value, state, depth = 0) {
+  if (typeof value === 'string') {
+    consumeParameterBudget(state)
+    return providerIdentifier(value)
+  }
+  if (typeof value === 'number') {
+    if (!Number.isFinite(value)) throw new Error('invalid request')
+    consumeParameterBudget(state)
+    return value
+  }
+  if (typeof value === 'boolean') {
+    consumeParameterBudget(state)
+    return value
+  }
+  if (depth >= 8 || !value || typeof value !== 'object' || types.isProxy(value) ||
+      !Object.isFrozen(value) || Object.getOwnPropertySymbols(value).length !== 0) {
+    throw new Error('invalid request')
+  }
+  if (state.active.has(value)) throw new Error('invalid request')
+  if (state.snapshots.has(value)) return state.snapshots.get(value)
+  state.active.add(value)
+  consumeParameterBudget(state)
+  try {
+  if (Array.isArray(value)) {
+    if (Object.getPrototypeOf(value) !== Array.prototype || value.length > 64) {
+      throw new Error('invalid request')
+    }
+    const descriptors = Object.getOwnPropertyDescriptors(value)
+    if (Object.keys(descriptors).length !== value.length + 1) throw new Error('invalid request')
+    consumeParameterBudget(state, value.length)
+    const snapshot = []
+    for (let index = 0; index < value.length; index += 1) {
+      const descriptor = descriptors[index]
+      if (!descriptor || !Object.hasOwn(descriptor, 'value') || !descriptor.enumerable) {
+        throw new Error('invalid request')
+      }
+      snapshot.push(frozenProviderParameters(descriptor.value, state, depth + 1))
+    }
+    const frozenSnapshot = Object.freeze(snapshot)
+    state.snapshots.set(value, frozenSnapshot)
+    return frozenSnapshot
+  }
+  if (Object.getPrototypeOf(value) !== Object.prototype) throw new Error('invalid request')
+  const descriptors = Object.getOwnPropertyDescriptors(value)
+  const keys = Object.keys(descriptors)
+  if (keys.length < 1 || keys.length > 64) throw new Error('invalid request')
+  consumeParameterBudget(state, keys.length)
+  const snapshot = {}
+  for (const key of keys) {
+    const descriptor = descriptors[key]
+    if (!/^[A-Za-z][A-Za-z0-9_]{0,63}$/.test(key) ||
+        !Object.hasOwn(descriptor, 'value') || !descriptor.enumerable) {
+      throw new Error('invalid request')
+    }
+    Object.defineProperty(snapshot, key, {
+      value: frozenProviderParameters(descriptor.value, state, depth + 1),
+      enumerable: true,
+      configurable: false,
+      writable: false
+    })
+  }
+  const frozenSnapshot = Object.freeze(snapshot)
+  state.snapshots.set(value, frozenSnapshot)
+  return frozenSnapshot
+  } finally {
+    state.active.delete(value)
+  }
+}
+
+function readOperationRequest(request, operation) {
+  if (operation === 'quote') {
+    const descriptors = plainDataDescriptors(request, ['vendorCode', 'fields'], true)
+    const vendorCode = providerIdentifier(descriptorValue(descriptors, 'vendorCode'))
+    const fieldIds = frozenIdentifierArray(descriptorValue(descriptors, 'fields'))
+    if (!fieldIds.every(isIfindIndicatorId)) throw new Error('invalid request')
+    return Object.freeze({
+      vendorCode,
+      fieldIds,
+      body: Object.freeze({
+        codes: vendorCode,
+        indicators: fieldIds.join(',')
+      })
+    })
+  }
+
+  const descriptors = plainDataDescriptors(
+    request,
+    ['vendorCode', 'indicatorIds', 'periodParameters'],
+    true
+  )
+  const periodDescriptors = plainDataDescriptors(
+    descriptorValue(descriptors, 'periodParameters'),
+    ['fullFiscalYears', 'latestDisclosedInterim'],
+    true
+  )
+  const periodParameters = {}
+  const parameterValidationState = {
+    work: 0,
+    active: new Set(),
+    snapshots: new WeakMap()
+  }
+  for (const key of ['fullFiscalYears', 'latestDisclosedInterim']) {
+    Object.defineProperty(periodParameters, key, {
+      value: frozenProviderParameters(
+        descriptorValue(periodDescriptors, key),
+        parameterValidationState
+      ),
+      enumerable: true,
+      configurable: false,
+      writable: false
+    })
+  }
+  const vendorCode = providerIdentifier(descriptorValue(descriptors, 'vendorCode'))
+  const fieldIds = frozenIdentifierArray(descriptorValue(descriptors, 'indicatorIds'))
+  if (!fieldIds.every(isIfindIndicatorId)) throw new Error('invalid request')
+  return Object.freeze({
+    vendorCode,
+    fieldIds,
+    body: Object.freeze({
+      codes: vendorCode,
+      indicators: fieldIds,
+      parameters: Object.freeze(periodParameters)
+    })
+  })
+}
+
+function ownDataValue(record, key) {
+  if (!isRecord(record) || Object.getPrototypeOf(record) !== Object.prototype) {
+    throw new Error('invalid response')
+  }
+  const descriptor = Object.getOwnPropertyDescriptor(record, key)
+  if (!descriptor || !Object.hasOwn(descriptor, 'value') || !descriptor.enumerable) {
+    throw new Error('invalid response')
+  }
+  return descriptor.value
+}
+
+function optionalOwnDataValue(record, key) {
+  if (!isRecord(record) || Object.getPrototypeOf(record) !== Object.prototype) {
+    throw new Error('invalid response')
+  }
+  const descriptor = Object.getOwnPropertyDescriptor(record, key)
+  if (descriptor === undefined) return { present: false, value: undefined }
+  if (!Object.hasOwn(descriptor, 'value') || !descriptor.enumerable) {
+    throw new Error('invalid response')
+  }
+  return { present: true, value: descriptor.value }
+}
+
+function protocolDataValue(record, key) {
+  try {
+    return ownDataValue(record, key)
+  } catch {
+    throw safeError('IFIND_RESPONSE_SHAPE', 'API', 'iFinD response shape was invalid')
+  }
+}
+
+function protocolErrorCode(record) {
+  const errorCode = protocolDataValue(record, 'errorcode')
+  if (!Number.isSafeInteger(errorCode)) {
+    throw safeError('IFIND_RESPONSE_SHAPE', 'API', 'iFinD response shape was invalid')
+  }
+  return errorCode
+}
+
+function protocolDataVol(record) {
+  let field
+  try {
+    field = optionalOwnDataValue(record, 'dataVol')
+  } catch {
+    throw safeError('IFIND_RESPONSE_SHAPE', 'API', 'iFinD response shape was invalid')
+  }
+  if (!field.present) return field
+  if (!Number.isSafeInteger(field.value) || field.value < 0) {
+    throw safeError('IFIND_RESPONSE_SHAPE', 'API', 'iFinD response shape was invalid')
+  }
+  return field
+}
+
+function parserDataArray(value) {
+  if (!Array.isArray(value) || Object.getPrototypeOf(value) !== Array.prototype) {
+    throw new Error('invalid response')
+  }
+  const descriptors = Object.getOwnPropertyDescriptors(value)
+  const snapshot = []
+  for (let index = 0; index < value.length; index += 1) {
+    const descriptor = descriptors[index]
+    if (!descriptor || !Object.hasOwn(descriptor, 'value') || !descriptor.enumerable) {
+      throw new Error('invalid response')
+    }
+    const item = descriptor.value
+    if (item === null || typeof item === 'string' || typeof item === 'boolean') {
+      snapshot.push(item)
+      continue
+    }
+    if (typeof item === 'number' && Number.isFinite(item)) {
+      snapshot.push(item)
+      continue
+    }
+    throw new Error('invalid response')
+  }
+  return Object.freeze(snapshot)
+}
+
+function sanitizeMarketSuccess(response, requestContract) {
+  const tables = ownDataValue(response, 'tables')
+  if (!Array.isArray(tables) || tables.length !== 1) throw new Error('invalid response')
+  const providerTable = tables[0]
+  const providerCode = ownDataValue(providerTable, 'thscode')
+  if (providerCode !== requestContract.vendorCode) throw new Error('invalid response')
+  const providerFields = ownDataValue(providerTable, 'table')
+  const fields = {}
+  for (const fieldId of requestContract.fieldIds) {
+    Object.defineProperty(fields, fieldId, {
+      value: parserDataArray(ownDataValue(providerFields, fieldId)),
+      enumerable: true,
+      configurable: false,
+      writable: false
+    })
+  }
+  const sanitizedTable = Object.freeze({
+    thscode: providerCode,
+    table: Object.freeze(fields)
+  })
+  const sanitized = {
+    errorcode: ownDataValue(response, 'errorcode'),
+    tables: Object.freeze([sanitizedTable])
+  }
+  const dataVol = optionalOwnDataValue(response, 'dataVol')
+  if (dataVol.present) sanitized.dataVol = dataVol.value
+  return Object.freeze(sanitized)
+}
+
+function sanitizeQuoteSuccess(response, requestContract) {
+  return sanitizeMarketSuccess(response, requestContract)
+}
+
+function sanitizeFinancialSuccess(response, requestContract) {
+  return sanitizeMarketSuccess(response, requestContract)
 }
 
 /**
@@ -430,7 +796,7 @@ function createIfindHttpClient({
 
   function clear() {
     generation += 1
-    for (const token of activeAccessTokens) token.fill(0)
+    for (const token of activeAccessTokens) Buffer.prototype.fill.call(token, 0)
     activeAccessTokens.clear()
   }
 
@@ -457,7 +823,7 @@ function createIfindHttpClient({
     function discardAccessToken() {
       if (Buffer.isBuffer(accessToken)) {
         activeAccessTokens.delete(accessToken)
-        accessToken.fill(0)
+        Buffer.prototype.fill.call(accessToken, 0)
       }
       accessToken = null
     }
@@ -495,24 +861,23 @@ function createIfindHttpClient({
           clearTimer
         )
         requireCurrentGeneration(operationGeneration)
-        if (!isRecord(tokenResponse) || !Number.isSafeInteger(tokenResponse.errorcode)) {
-          throw safeError('IFIND_RESPONSE_SHAPE', 'API', 'iFinD response shape was invalid')
-        }
-        if (tokenResponse.errorcode !== 0) {
+        const tokenErrorCode = protocolErrorCode(tokenResponse)
+        if (tokenErrorCode !== 0) {
           throw safeError(
             'IFIND_AUTH_REJECTED',
             'AUTH',
             'iFinD access-token request failed',
             undefined,
-            tokenResponse.errorcode
+            tokenErrorCode
           )
         }
-        if (!isRecord(tokenResponse.data) ||
-            !isHeaderSafeToken(tokenResponse.data.access_token)) {
+        const tokenData = protocolDataValue(tokenResponse, 'data')
+        const providerAccessToken = protocolDataValue(tokenData, 'access_token')
+        if (!isHeaderSafeToken(providerAccessToken)) {
           throw safeError('IFIND_RESPONSE_SHAPE', 'API', 'iFinD response shape was invalid')
         }
         discardAccessToken()
-        accessToken = Buffer.from(tokenResponse.data.access_token, 'utf8')
+        accessToken = Buffer.from(providerAccessToken, 'utf8')
         activeAccessTokens.add(accessToken)
         requireCurrentGeneration(operationGeneration)
       } catch (error) {
@@ -523,6 +888,7 @@ function createIfindHttpClient({
     await authenticate()
 
     let probeResponse
+    let probeDataVol = { present: false, value: undefined }
     try {
       for (let attempt = 0; attempt < 2; attempt += 1) {
         requireCurrentGeneration(operationGeneration)
@@ -553,11 +919,9 @@ function createIfindHttpClient({
           clearTimer
         )
         requireCurrentGeneration(operationGeneration)
-        if (!isRecord(probeResponse) || !Number.isSafeInteger(probeResponse.errorcode)) {
-          throw safeError('IFIND_RESPONSE_SHAPE', 'API', 'iFinD response shape was invalid')
-        }
-        if (probeResponse.errorcode === 0) break
-        const failureClass = classifyProbeFailure(probeResponse)
+        const probeErrorCode = protocolErrorCode(probeResponse)
+        if (probeErrorCode === 0) break
+        const failureClass = classifyProbeFailure(probeErrorCode)
         if (failureClass === 'AUTH' && attempt === 1) {
           discardAccessToken()
           throw safeError(
@@ -565,16 +929,18 @@ function createIfindHttpClient({
             'AUTH',
             'iFinD authentication failed',
             undefined,
-            probeResponse.errorcode
+            probeErrorCode
           )
         }
+        const failureDataVol = protocolDataVol(probeResponse)
+        const safeFailureDataVol = failureDataVol.present ? failureDataVol.value : undefined
         if (failureClass === 'PERMISSION') {
           throw safeError(
             'IFIND_PERMISSION_REJECTED',
             'PERMISSION',
             'iFinD permission denied',
-            probeResponse.dataVol,
-            probeResponse.errorcode
+            safeFailureDataVol,
+            probeErrorCode
           )
         }
         if (failureClass === 'QUOTA') {
@@ -582,8 +948,8 @@ function createIfindHttpClient({
             'IFIND_QUOTA_REJECTED',
             'QUOTA',
             'iFinD quota unavailable',
-            probeResponse.dataVol,
-            probeResponse.errorcode
+            safeFailureDataVol,
+            probeErrorCode
           )
         }
         if (failureClass !== 'AUTH') {
@@ -591,20 +957,20 @@ function createIfindHttpClient({
             'IFIND_PROBE_REJECTED',
             'API',
             'iFinD trade-date probe failed',
-            probeResponse.dataVol,
-            probeResponse.errorcode
+            safeFailureDataVol,
+            probeErrorCode
           )
         }
         discardAccessToken()
         await authenticate()
       }
 
-      if (!isRecord(probeResponse.tables) ||
-          !Array.isArray(probeResponse.tables.time) ||
-          probeResponse.tables.time.length === 0 ||
-          !probeResponse.tables.time.every(isCanonicalCalendarDate) ||
-          (Object.hasOwn(probeResponse, 'dataVol') &&
-            (!Number.isFinite(probeResponse.dataVol) || probeResponse.dataVol < 0))) {
+      const probeTables = protocolDataValue(probeResponse, 'tables')
+      const probeTimes = protocolDataValue(probeTables, 'time')
+      probeDataVol = protocolDataVol(probeResponse)
+      if (!Array.isArray(probeTimes) ||
+          probeTimes.length === 0 ||
+          !probeTimes.every(isCanonicalCalendarDate)) {
         throw safeError('IFIND_RESPONSE_SHAPE', 'API', 'iFinD response shape was invalid')
       }
     } catch (error) {
@@ -613,7 +979,7 @@ function createIfindHttpClient({
 
     const retrievedAt = readNow()
     requireCurrentGeneration(operationGeneration)
-    const hasDataVol = Object.hasOwn(probeResponse, 'dataVol')
+    const hasDataVol = probeDataVol.present
     return {
       route: '/api/v1/get_trade_dates',
       scope: 'market-trade-dates:212001:D:-10',
@@ -621,7 +987,7 @@ function createIfindHttpClient({
       timezone: 'Asia/Shanghai',
       elapsedMs: Math.max(0, retrievedAt.getTime() - startedAt.getTime()),
       requestCount,
-      dataVol: hasDataVol ? probeResponse.dataVol : 'unavailable',
+      dataVol: hasDataVol ? probeDataVol.value : 'unavailable',
       officialQuotaStatus: 'unavailable',
       completeness: hasDataVol ? 'complete' : 'partial'
     }
@@ -632,7 +998,181 @@ function createIfindHttpClient({
     }
   }
 
-  const client = { diagnose }
+  async function authenticateMarket(refreshTokenInput) {
+    let requestCount = 0
+    let accessToken = null
+    let transferred = false
+    function discardAccessToken() {
+      if (Buffer.isBuffer(accessToken)) {
+        activeAccessTokens.delete(accessToken)
+        Buffer.prototype.fill.call(accessToken, 0)
+      }
+      accessToken = null
+    }
+    try {
+      let refreshToken
+      try {
+        if (types.isProxy(refreshTokenInput)) throw new Error('invalid request')
+        refreshToken = Buffer.isBuffer(refreshTokenInput)
+          ? new TextDecoder('utf-8', { fatal: true }).decode(refreshTokenInput)
+          : refreshTokenInput
+        if (!isHeaderSafeToken(refreshToken)) throw new Error('invalid request')
+      } catch {
+        throw withStage(
+          safeError('IFIND_CONFIG_INVALID', 'CONFIG', 'iFinD client configuration was invalid'),
+          'auth'
+        )
+      }
+      const operationGeneration = generation
+      try {
+        requireCurrentGeneration(operationGeneration)
+        requestCount += 1
+        const tokenResponse = await requestJson(
+          request,
+          ENDPOINTS.auth,
+          { refresh_token: refreshToken },
+          undefined,
+          setTimer,
+          clearTimer
+        )
+        requireCurrentGeneration(operationGeneration)
+        const tokenErrorCode = protocolErrorCode(tokenResponse)
+        if (tokenErrorCode !== 0) {
+          throw safeError(
+            'IFIND_AUTH_REJECTED',
+            'AUTH',
+            'iFinD access-token request failed',
+            undefined,
+            tokenErrorCode
+          )
+        }
+        const tokenData = protocolDataValue(tokenResponse, 'data')
+        const providerAccessToken = protocolDataValue(tokenData, 'access_token')
+        if (!isHeaderSafeToken(providerAccessToken)) {
+          throw safeError('IFIND_RESPONSE_SHAPE', 'API', 'iFinD response shape was invalid')
+        }
+        accessToken = Buffer.from(providerAccessToken, 'utf8')
+        activeAccessTokens.add(accessToken)
+        requireCurrentGeneration(operationGeneration)
+        transferred = true
+        return Object.freeze({ accessToken, requestCount: 1 })
+      } catch (error) {
+        throw withStage(error, 'auth')
+      }
+    } catch (error) {
+      throw withRequestCount(error, requestCount)
+    } finally {
+      if (!transferred) discardAccessToken()
+    }
+  }
+
+  async function executeMarketOperation(operation, accessTokenInput, requestInput) {
+    let requestCount = 0
+    try {
+      let operationInput
+      let accessToken
+      try {
+        if (types.isProxy(accessTokenInput) || !Buffer.isBuffer(accessTokenInput)) {
+          throw new Error('invalid request')
+        }
+        accessToken = new TextDecoder('utf-8', { fatal: true }).decode(accessTokenInput)
+        if (!isHeaderSafeToken(accessToken)) throw new Error('invalid request')
+        operationInput = readOperationRequest(requestInput, operation)
+      } catch {
+        throw withStage(
+          safeError('IFIND_CONFIG_INVALID', 'CONFIG', 'iFinD client configuration was invalid'),
+          operation
+        )
+      }
+      const operationGeneration = generation
+      try {
+        requireCurrentGeneration(operationGeneration)
+        requestCount += 1
+        const response = await requestJson(
+          request,
+          ENDPOINTS[operation],
+          {
+            access_token: accessToken,
+            ifindlang: 'cn'
+          },
+          operationInput.body,
+          setTimer,
+          clearTimer
+        )
+        requireCurrentGeneration(operationGeneration)
+        const responseErrorCode = protocolErrorCode(response)
+        if (responseErrorCode === 0) {
+          try {
+            const dataVol = protocolDataVol(response)
+            const payload = operation === 'quote'
+              ? sanitizeQuoteSuccess(response, operationInput)
+              : sanitizeFinancialSuccess(response, operationInput)
+            return Object.freeze({
+              payload,
+              requestCount: 1,
+              dataVol: dataVol.present ? dataVol.value : null
+            })
+          } catch {
+            throw safeError('IFIND_RESPONSE_SHAPE', 'API', 'iFinD response shape was invalid')
+          }
+        }
+
+        const failureClass = classifyProbeFailure(responseErrorCode)
+        if (failureClass === 'AUTH') {
+          throw safeError(
+            'IFIND_AUTH_REJECTED',
+            'AUTH',
+            'iFinD authentication failed',
+            undefined,
+            responseErrorCode
+          )
+        }
+        const failureDataVol = protocolDataVol(response)
+        const safeFailureDataVol = failureDataVol.present ? failureDataVol.value : undefined
+        if (failureClass === 'PERMISSION') {
+          throw safeError(
+            'IFIND_PERMISSION_REJECTED',
+            'PERMISSION',
+            'iFinD permission denied',
+            safeFailureDataVol,
+            responseErrorCode
+          )
+        }
+        if (failureClass === 'QUOTA') {
+          throw safeError(
+            'IFIND_QUOTA_REJECTED',
+            'QUOTA',
+            'iFinD quota unavailable',
+            safeFailureDataVol,
+            responseErrorCode
+          )
+        }
+        throw safeError(
+          operation === 'quote' ? 'IFIND_QUOTE_REJECTED' : 'IFIND_FINANCIAL_REJECTED',
+          'API',
+          operation === 'quote'
+            ? 'iFinD quote request failed'
+            : 'iFinD financial request failed',
+          safeFailureDataVol,
+          responseErrorCode
+        )
+      } catch (error) {
+        throw withStage(error, operation)
+      }
+    } catch (error) {
+      throw withRequestCount(error, requestCount)
+    }
+  }
+
+  function quote(accessToken, fixedRequest) {
+    return executeMarketOperation('quote', accessToken, fixedRequest)
+  }
+
+  function financial(accessToken, fixedRequest) {
+    return executeMarketOperation('financial', accessToken, fixedRequest)
+  }
+
+  const client = { diagnose, authenticate: authenticateMarket, quote, financial }
   Object.defineProperty(client, 'clear', { value: clear })
   return client
 }
