@@ -43,6 +43,11 @@ const REQUIRED_FINANCIAL_METADATA_FIELDS = Object.freeze([
   'sourceMode'
 ])
 
+const LOCAL_FINANCIAL_METADATA_SOURCES = Object.freeze({
+  fetchTime: 'runtime-clock',
+  sourceMode: 'verified-adapter'
+})
+
 function invalidManifest() {
   const error = Object.assign(new Error('iFinD live request manifest is invalid'), {
     code: 'IFIND_MARKET_MANIFEST_INVALID'
@@ -55,7 +60,7 @@ function isProxy(value) {
 }
 
 function plainRecord(value, exactKeys = null) {
-  if (!value || typeof value !== 'object' || Array.isArray(value) || isProxy(value)) {
+  if (!value || typeof value !== 'object' || isProxy(value) || Array.isArray(value)) {
     invalidManifest()
   }
 
@@ -185,7 +190,15 @@ function verifiedFinancialMetadataIds(value, metricIds) {
   const usedIds = new Set(metricIds)
   const ids = []
   for (const field of REQUIRED_FINANCIAL_METADATA_FIELDS) {
-    const mapping = plainRecord(dataValue(descriptors, field), [
+    const value = dataValue(descriptors, field)
+    if (Object.hasOwn(LOCAL_FINANCIAL_METADATA_SOURCES, field)) {
+      const mapping = plainRecord(value, ['source'])
+      if (dataValue(mapping, 'source') !== LOCAL_FINANCIAL_METADATA_SOURCES[field]) {
+        invalidManifest()
+      }
+      continue
+    }
+    const mapping = plainRecord(value, [
       'vendorIndicatorId',
       'evidenceStatus',
       'sourceReference'
@@ -394,6 +407,7 @@ function getVerifiedMarketManifest(bundle, caseId) {
 }
 
 module.exports = {
+  LOCAL_FINANCIAL_METADATA_SOURCES,
   createVerifiedMarketEvidenceBundle,
   getVerifiedMarketManifest,
   validateLiveRequestManifestDefinition

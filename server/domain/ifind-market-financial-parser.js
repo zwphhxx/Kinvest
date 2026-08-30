@@ -447,7 +447,10 @@ function metadataArray(fieldDescriptors, indicatorId, periodCount, failedField) 
   return values ? { values } : { failedFields: [failedField] }
 }
 
-function parsePayload(profileDefinition, payload, verification, currencyEvidence) {
+function parsePayload(profileDefinition, payload, verification, currencyEvidence, fetchedAt) {
+  // Collection time belongs to the trusted service, never to provider content.
+  const fetchTime = parseStrictTimestamp(fetchedAt)
+  if (!fetchTime) return { failedFields: ['scopeStatus'] }
   const payloadDescriptors = ownDataRecord(
     payload,
     ['errorcode', 'tables', 'dataVol'],
@@ -502,9 +505,7 @@ function parsePayload(profileDefinition, payload, verification, currencyEvidence
     ['reportDate', 'reportPeriodStatus'],
     ['periodType', 'reportPeriodStatus'],
     ['disclosureScope', 'scopeStatus'],
-    ['sourceMode', 'scopeStatus'],
-    ['sourceTime', 'scopeStatus'],
-    ['fetchTime', 'scopeStatus']
+    ['sourceTime', 'scopeStatus']
   ]
   for (const [field, failedField] of metadataDefinitions) {
     const parsed = metadataArray(
@@ -573,14 +574,12 @@ function parsePayload(profileDefinition, payload, verification, currencyEvidence
     seenLabels.add(reportPeriod)
     seenDates.add(dateIdentity)
 
-    if (metadata.disclosureScope[index] !== profileDefinition.scope ||
-      metadata.sourceMode[index] !== 'real') {
+    if (metadata.disclosureScope[index] !== profileDefinition.scope) {
       return { failedFields: ['scopeStatus'] }
     }
 
     const sourceTime = parseStrictTimestamp(metadata.sourceTime[index])
-    const fetchTime = parseStrictTimestamp(metadata.fetchTime[index])
-    if (!sourceTime || !fetchTime) return { failedFields: ['scopeStatus'] }
+    if (!sourceTime) return { failedFields: ['scopeStatus'] }
 
     const sourceIssuerDate = calendarDateInTimeZone(
       sourceTime.milliseconds,
@@ -640,7 +639,7 @@ function parsePayload(profileDefinition, payload, verification, currencyEvidence
         periodType: metadata.periodType[index],
         disclosureScope: metadata.disclosureScope[index],
         sourceTime: metadata.sourceTime[index],
-        fetchTime: metadata.fetchTime[index],
+        fetchTime: fetchedAt,
         verification,
         availability: value === null ? 'missing' : 'available'
       }))
@@ -652,7 +651,7 @@ function parsePayload(profileDefinition, payload, verification, currencyEvidence
 function parseIfindMarketFinancials(input) {
   const inputDescriptors = ownDataRecord(
     input,
-    ['caseId', 'payload', 'verification', 'financialReportingCurrencyEvidence', 'manifestBundle'],
+    ['caseId', 'payload', 'verification', 'financialReportingCurrencyEvidence', 'manifestBundle', 'fetchTime'],
     ['caseId', 'payload', 'verification']
   )
   if (!inputDescriptors) return unavailable(null, null)
@@ -678,9 +677,9 @@ function parseIfindMarketFinancials(input) {
     metricIds: Object.fromEntries(manifest.indicators.financial.map((entry) => [
       entry.metric, entry.vendorIndicatorId
     ])),
-    metadataIds: Object.fromEntries(Object.entries(manifest.indicators.financialMetadata).map(([field, entry]) => [
-      field, entry.vendorIndicatorId
-    ]))
+    metadataIds: Object.fromEntries(Object.entries(manifest.indicators.financialMetadata)
+      .filter(([, entry]) => Object.hasOwn(entry, 'vendorIndicatorId'))
+      .map(([field, entry]) => [field, entry.vendorIndicatorId]))
   }
 
   if (!inputDescriptors.financialReportingCurrencyEvidence) {
@@ -710,7 +709,8 @@ function parseIfindMarketFinancials(input) {
     profileDefinition,
     descriptorValue(inputDescriptors, 'payload'),
     verification,
-    evidenceResult.evidence
+    evidenceResult.evidence,
+    inputDescriptors.fetchTime?.value
   )
   if (!parsed.points) {
     return unavailable(profileDefinition, verification, parsed.failedFields)

@@ -789,7 +789,8 @@ function parseFinancials(
   payload,
   verification,
   financialReportingCurrencyEvidence,
-  manifestBundle
+  manifestBundle,
+  fetchTime
 ) {
   const manifest = manifestBundle.manifest
   let parserOutput
@@ -799,7 +800,8 @@ function parseFinancials(
       payload: materializeParserInput(payload),
       verification,
       financialReportingCurrencyEvidence,
-      manifestBundle
+      manifestBundle,
+      fetchTime
     })
   } catch {
     throw new SafeFailure(
@@ -893,7 +895,8 @@ function parseFinancials(
       (!availableValue && !missingValue) ||
       value.currency !== expectedCurrency || value.unit !== 'million' ||
       value.disclosureScope !== expectedScope ||
-      !isStrictTimestamp(value.sourceTime) || !isStrictTimestamp(value.fetchTime)) {
+      !isStrictTimestamp(value.sourceTime) || !isStrictTimestamp(value.fetchTime) ||
+      value.fetchTime !== fetchTime) {
       invalidOutput()
     }
     const identity = `${value.metricKey}\u0000${reportPeriod}`
@@ -954,6 +957,12 @@ function terminalTimestamp(clock, reservation) {
 
 function createTerminalResult(reservation, clock, values) {
   const completedAt = terminalTimestamp(clock, reservation)
+  let safeErrorClass = null
+  if (values.failure) {
+    safeErrorClass = REPOSITORY_SAFE_CLASSES.has(values.failure.safeErrorClass)
+      ? values.failure.safeErrorClass
+      : 'API'
+  }
   return {
     status: values.status,
     quoteStatus: values.quoteStatus,
@@ -961,7 +970,7 @@ function createTerminalResult(reservation, clock, values) {
     requestCount: values.requestCount,
     dataVol: values.dataVol,
     elapsedMs: Math.max(0, completedAt - reservation.createdAt),
-    safeErrorClass: values.failure ? values.failure.safeErrorClass : null,
+    safeErrorClass,
     failureCode: values.failure ? values.failure.failureCode : null,
     vendorErrorCode: values.failure ? values.failure.vendorErrorCode : null,
     completedAt
@@ -1027,6 +1036,7 @@ function createIfindMarketDiagnosticService(options) {
     let accessToken = null
     let quotePayload
     let financialPayload = null
+    let financialFetchTime = null
     let reservation = null
     let requestCount = 0
     let dataVol = 0
@@ -1160,6 +1170,7 @@ function createIfindMarketDiagnosticService(options) {
           dataVol += financialResult.dataVol
           hasDataVol = true
         }
+        financialFetchTime = new Date(terminalTimestamp(config.clock, reservation)).toISOString()
       } catch (error) {
         if (error instanceof SafeFailure) {
           financialFailure = error
@@ -1190,7 +1201,8 @@ function createIfindMarketDiagnosticService(options) {
             financialPayload,
             manifestBundle.financialVerification,
             manifestBundle.financialReportingCurrencyEvidence,
-            manifestBundle
+            manifestBundle,
+            financialFetchTime
           )
         } catch (error) {
           if (error instanceof SafeFailure &&

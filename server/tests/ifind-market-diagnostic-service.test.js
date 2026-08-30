@@ -60,9 +60,7 @@ const FINANCIAL_METADATA_SUFFIXES = Object.freeze({
   reportDate: 'REPORT_DATE',
   periodType: 'PERIOD_TYPE',
   disclosureScope: 'DISCLOSURE_SCOPE',
-  sourceTime: 'SOURCE_TIME',
-  fetchTime: 'FETCH_TIME',
-  sourceMode: 'SOURCE_MODE'
+  sourceTime: 'SOURCE_TIME'
 })
 
 const CASES = Object.freeze({
@@ -168,6 +166,12 @@ function strictLiveCatalog(caseId) {
     vendorIndicatorId: financialId(definition, metric),
     evidenceStatus: 'verified'
   }))
+  /**
+   * @type {Record<string,
+   *   {vendorIndicatorId: string, evidenceStatus: string, sourceReference: string, source?: never} |
+   *   {source: 'runtime-clock' | 'verified-adapter', vendorIndicatorId?: never, evidenceStatus?: never, sourceReference?: never}
+   * >}
+   */
   const financialMetadata = Object.fromEntries(
     Object.entries(FINANCIAL_METADATA_SUFFIXES).map(([field, suffix]) => [field, {
       vendorIndicatorId: metadataId(definition, suffix),
@@ -175,6 +179,8 @@ function strictLiveCatalog(caseId) {
       sourceReference: `fixture://ifind/${definition.market.toLowerCase()}/metadata/${field}`
     }])
   )
+  financialMetadata.fetchTime = { source: 'runtime-clock' }
+  financialMetadata.sourceMode = { source: 'verified-adapter' }
   return {
     caseId,
     companyName: definition.companyName,
@@ -294,8 +300,6 @@ function financialPayload(caseId) {
   table[metadataId(definition, 'PERIOD_TYPE')] = definition.periods.map((period) => period[2])
   table[metadataId(definition, 'DISCLOSURE_SCOPE')] = definition.periods.map(() => definition.scope)
   table[metadataId(definition, 'SOURCE_TIME')] = definition.periods.map((period) => period[3])
-  table[metadataId(definition, 'FETCH_TIME')] = definition.periods.map(() => '2025-12-01T12:00:00.000Z')
-  table[metadataId(definition, 'SOURCE_MODE')] = definition.periods.map(() => 'real')
   return {
     errorcode: 0,
     tables: [{ thscode: definition.vendorCode, table }],
@@ -471,7 +475,7 @@ function createHarness(caseId = 'HK_ALIBABA_9988', overrides = {}) {
             financialId(CASES[caseId], metric)),
           ...[
             'CURRENCY', 'UNIT', 'REPORT_PERIOD', 'REPORT_DATE', 'PERIOD_TYPE',
-            'DISCLOSURE_SCOPE', 'SOURCE_TIME', 'FETCH_TIME', 'SOURCE_MODE'
+            'DISCLOSURE_SCOPE', 'SOURCE_TIME'
           ].map((suffix) => metadataId(CASES[caseId], suffix))
         ],
         periodParameters: {
@@ -620,6 +624,11 @@ async function testThreeMarketSuccess() {
     assert.equal(stored.quoteSnapshot.listingId, CASES[caseId].listingId)
     assert.equal(stored.quoteSnapshot.displayCode, CASES[caseId].displayCode)
     assert.equal(stored.financialPoints.length, 21)
+    for (const point of stored.financialPoints) {
+      assert.equal(new Date(point.fetchTime).toISOString(), new Date(CREATED_AT).toISOString(),
+        `${caseId}: persistence uses the service clock`)
+      assert.ok(new Date(point.sourceTime).getTime() <= CREATED_AT)
+    }
     assert.equal(
       stored.financialPoints.every((point) =>
         /^20[0-9]{2}(?:Q[1-3]|H1|FY)$/.test(point.reportPeriod)),
@@ -644,22 +653,32 @@ async function testThreeMarketSuccess() {
 }
 
 async function testProductionCatalogFailsClosed() {
-  const caseId = 'HK_ALIBABA_9988'
-  const harness = createHarness(caseId, {
-    catalogLookup: getIfindMarketCase,
-    manifestLookup: createLiveRequestManifestBundle
+  for (const caseId of Object.keys(CASES)) {
+    const harness = createHarness(caseId, {
+      catalogLookup: getIfindMarketCase,
+      manifestLookup: createLiveRequestManifestBundle
+    })
+    const result = await harness.service.run({ caseId })
+    assertSafeFailure(result, {
+      status: 'rejected',
+      failureCode: 'IFIND_MARKET_CASE_UNVERIFIED',
+      safeErrorClass: 'CONFIG',
+      stage: 'catalog'
+    })
+    assert.deepEqual(harness.calls, [], `${caseId}: zero reservation, secret, or network access`)
+  }
+}
+
+async function testUnbrandedBundleFailsClosed() {
+  const harness = createHarness('HK_ALIBABA_9988', {
+    manifestLookup: (caseId) => clone(strictManifestEvidence(caseId))
   })
-  const result = await harness.service.run({ caseId })
-  assertSafeFailure(result, {
-    status: 'rejected',
-    failureCode: 'IFIND_MARKET_CASE_UNVERIFIED',
-    safeErrorClass: 'CONFIG',
-    stage: 'catalog'
-  })
-  assert.equal(harness.calls.includes('reserve'), false)
-  assert.equal(harness.calls.includes('provider'), false)
-  assert.equal(harness.calls.includes('auth'), false)
-  assert.deepEqual(harness.calls, [])
+  const result = await harness.service.run({ caseId: 'HK_ALIBABA_9988' })
+  assert.equal(result.status, 'rejected')
+  assert.equal(result.failureCode, 'IFIND_MARKET_CASE_UNVERIFIED')
+  for (const operation of ['reserve', 'provider', 'auth', 'quote', 'financial']) {
+    assert.equal(harness.calls.includes(operation), false, 'unbranded evidence: ' + operation)
+  }
 }
 
 async function testCallerCannotOverrideFixedRequest() {
@@ -1312,6 +1331,8 @@ async function testFinancialRequestUsesOnlyManifestMetadataIds() {
       request.indicatorIds,
       catalog.requestTemplates.financial.indicatorIds
     )
+    assert.equal(request.indicatorIds.length, 14)
+    assert.doesNotMatch(JSON.stringify(request.indicatorIds), /FETCH_TIME|SOURCE_MODE|fetchTime|sourceMode/)
     throw safeClientError({
       code: 'IFIND_FINANCIAL_REJECTED',
       errorClass: 'API',
@@ -1329,6 +1350,74 @@ async function testFinancialRequestUsesOnlyManifestMetadataIds() {
     stage: 'financial',
     vendorErrorCode: 713
   })
+}
+
+async function testFinancialCompletionClockFailureAccountsResponse() {
+  const caseId = 'HK_ALIBABA_9988'
+  const recoveredAt = CREATED_AT + 1_000
+  const completionClocks = [
+    { label: 'NaN', value: NaN },
+    { label: 'undefined', value: undefined },
+    { label: 'after lease expiry', value: CREATED_AT + 30_001 },
+    { label: 'before lease creation', value: CREATED_AT - 1 }
+  ]
+  const accounting = []
+
+  for (const { label, value } of completionClocks) {
+    let responseCompleted = false
+    let completionClockRead = false
+    const clockValues = []
+    const harness = createHarness(caseId, {
+      clock() {
+        const timestamp = !responseCompleted
+          ? CREATED_AT
+          : completionClockRead ? recoveredAt : value
+        if (responseCompleted) completionClockRead = true
+        clockValues.push(timestamp)
+        return timestamp
+      }
+    })
+    const originalFinancial = harness.client.financial
+    harness.client.financial = async function completedFinancialResponse(accessToken, request) {
+      const response = await originalFinancial.call(this, accessToken, request)
+      assert.equal(response.dataVol, 42, `${label}: successful financial response volume`)
+      responseCompleted = true
+      return response
+    }
+    harness.service = createIfindMarketDiagnosticService(harness.dependencies)
+
+    const result = await harness.service.run({ caseId })
+
+    assert.deepEqual(clockValues, [CREATED_AT, value, recoveredAt],
+      `${label}: completion capture fails once, then settlement clock recovers`)
+    assert.equal(result.status, 'partial', label)
+    assert.equal(result.quoteStatus, 'available', label)
+    assert.equal(result.financeStatus, 'unavailable', label)
+    assert.equal(result.requestCount, 3, label)
+    assert.equal(typeof result.failureCode, 'string', `${label}: capture failure is reported`)
+    assert.equal(harness.calls.includes('financial-parser'), false,
+      `${label}: financial parsing requires a trusted completion timestamp`)
+    assert.equal(harness.terminal.complete.length, 1, label)
+    assert.equal(harness.terminal.fail.length, 0, label)
+    const stored = harness.terminal.complete[0]
+    assert.equal(stored.result.status, 'partial', label)
+    assert.equal(stored.result.quoteStatus, 'available', label)
+    assert.equal(stored.result.financeStatus, 'unavailable', label)
+    assert.equal(stored.result.completedAt, recoveredAt, label)
+    assert.equal(stored.result.requestCount, 3, label)
+    assert.equal(stored.result.failureCode, result.failureCode, label)
+    assert.equal(stored.quoteSnapshot.listingId, CASES[caseId].listingId, label)
+    assert.deepEqual(stored.financialPoints, [], `${label}: no financial point persistence`)
+    assert.equal(harness.calls.at(-1), 'client-clear', label)
+    assertZeroed(harness.refreshTokens, `${label}: refresh token cleanup`)
+    assertZeroed(harness.accessTokens, `${label}: access token cleanup`)
+    assertZeroed(harness.rawBuffers, `${label}: raw buffer cleanup`)
+    accounting.push({ clock: label, dataVol: stored.result.dataVol })
+  }
+
+  assert.deepEqual(accounting, completionClocks.map(({ label }) => ({
+    clock: label, dataVol: 52
+  })), 'successful quote (10) and financial (42) responses both count when timestamp capture fails')
 }
 
 async function testExpiredLeaseCannotSettle() {
@@ -1436,6 +1525,27 @@ async function testExactFinancialParserBoundary() {
         ...point,
         disclosureScope: index === 0 ? 'standalone' : point.disclosureScope
       }))
+    })],
+    ['last point spoofs trusted fetch time', (parsed) => ({
+      ...parsed,
+      points: parsed.points.map((point, index) => ({
+        ...point,
+        fetchTime: index === parsed.points.length - 1
+          ? new Date(CREATED_AT + 1).toISOString() : point.fetchTime
+      }))
+    })],
+    ['same instant is not an exact trusted timestamp', (parsed) => ({
+      ...parsed,
+      points: parsed.points.map((point, index) => ({
+        ...point,
+        fetchTime: index === 0 ? '2026-08-29T04:00:00Z' : point.fetchTime
+      }))
+    })],
+    ['missing parser fetch time', (parsed) => ({
+      ...parsed,
+      points: parsed.points.map((point, index) => ({
+        ...point, fetchTime: index === 0 ? undefined : point.fetchTime
+      }))
     })]
   ]
 
@@ -1530,7 +1640,9 @@ async function testSharedSnapshotBudgetAndNullPrototype() {
 async function run() {
   await testRepositoryReadersAreExposed()
   await testThreeMarketSuccess()
+  await testFinancialCompletionClockFailureAccountsResponse()
   await testProductionCatalogFailsClosed()
+  await testUnbrandedBundleFailsClosed()
   await testCallerCannotOverrideFixedRequest()
   await testPartialFinancialAvailability()
   await testStageFailures()

@@ -7,12 +7,16 @@ const { DatabaseSync } = require('node:sqlite')
 const { createIfindHttpClient } = require('../adapters/ifind-http-client')
 const { createIfindDiagnosticRuntime } = require('../ifind-diagnostic-runtime')
 const { createIfindMarketDiagnosticService } = require('../services/ifind-market-diagnostic-service')
+const { parseIfindMarketQuote } = require('../domain/ifind-market-quote-parser')
+const { parseIfindMarketFinancials } = require('../domain/ifind-market-financial-parser')
 const { createRequestHandler } = require('../server')
 const { getIfindMarketCase, createLiveRequestManifestBundle } = require('../domain/ifind-market-cases')
 const {
   createVerifiedMarketEvidenceBundle
 } = require('../domain/ifind-market-manifest-validator')
-const { fixtureCatalog, fixtureEvidence } = require('./helpers/ifind-market-evidence')
+const {
+  fixtureCatalog, fixtureEvidence, REMOTE_FINANCIAL_METADATA_FIELDS
+} = require('./helpers/ifind-market-evidence')
 
 const CASE_IDS = ['HK_ALIBABA_9988', 'US_APPLE_AAPL', 'CN_MOUTAI_600519']
 const NOW = Date.parse('2026-08-29T04:00:00.000Z')
@@ -47,11 +51,10 @@ function fixtureResponses(catalog, halted = false) {
     reportDate: periods.map((entry) => entry[1]),
     periodType: ['annual', 'annual', 'interim'],
     disclosureScope: periods.map(() => market === 'US' ? 'issuer_consolidated' : 'consolidated'),
-    sourceTime: periods.map(() => '2025-11-20T08:00:00.000Z'),
-    fetchTime: periods.map(() => '2025-12-01T12:00:00.000Z'),
-    sourceMode: periods.map(() => 'real')
+    sourceTime: periods.map(() => '2025-11-20T08:00:00.000Z')
   }
-  for (const [field, entry] of Object.entries(catalog.indicators.financialMetadata)) {
+  for (const field of REMOTE_FINANCIAL_METADATA_FIELDS) {
+    const entry = catalog.indicators.financialMetadata[field]
     financialTable[entry.vendorIndicatorId] = metadata[field]
   }
   const payload = (table) => ({
@@ -102,13 +105,15 @@ function transportFixture(responses, holdAt = 0) {
 }
 
 async function harness(caseId, {
-  halted = false, holdAt = 0, errorAt = 0, production = false, configureCatalog = null
+  halted = false, holdAt = 0, errorAt = 0, production = false, configureCatalog = null,
+  configureResponses = null, clock = () => NOW, quoteParser = null, financialParser = null
 } = {}) {
   const catalog = fixtureCatalog(caseId, 'FIXTURE_MAPPED_')
   if (configureCatalog) configureCatalog(catalog)
   const evidence = fixtureEvidence(caseId)
   /** @type {Array<ReturnType<typeof fixtureResponses>[number] | { errorcode: number, errmsg: string }>} */
   const responses = fixtureResponses(catalog, halted)
+  if (configureResponses) configureResponses(responses)
   if (errorAt) responses[errorAt - 1] = { errorcode: -401, errmsg: 'unsafe-provider-detail' }
   const transport = transportFixture(responses, holdAt)
   const database = new DatabaseSync(':memory:')
@@ -126,7 +131,7 @@ async function harness(caseId, {
     },
     accessRuntime: { status: { mode: 'device-approval' } },
     openDatabase: () => database,
-    clock: () => NOW,
+    clock,
     marketIdGenerator: () => 'market_run_' + (++ids).toString(16).padStart(32, '0'),
     loadSecrets: async () => ({
       readRefreshToken() { reads += 1; return Buffer.from('synthetic-integration-refresh') },
@@ -152,8 +157,12 @@ async function harness(caseId, {
         reserves += 1
         return reserve(input)
       }
-      serviceOptions = options
-      return createIfindMarketDiagnosticService(options)
+      serviceOptions = {
+        ...options,
+        ...(quoteParser ? { quoteParser } : {}),
+        ...(financialParser ? { financialParser } : {})
+      }
+      return createIfindMarketDiagnosticService(serviceOptions)
     }
   })
   return {
@@ -182,6 +191,27 @@ async function testTrustedBundleFactory() {
     assert.deepEqual(bundle.manifest.indicators, definition.indicators)
     assert.equal(Object.isFrozen(bundle), true)
     assert.equal(Object.isFrozen(bundle.manifest.indicators.quote[0]), true)
+    for (const [field, source] of [
+      ['fetchTime', 'runtime-clock'], ['sourceMode', 'verified-adapter']
+    ]) {
+      assert.deepEqual(bundle.manifest.indicators.financialMetadata[field], { source })
+      assert.equal(Object.isFrozen(bundle.manifest.indicators.financialMetadata[field]), true)
+      assert.throws(() => { bundle.manifest.indicators.financialMetadata[field].source = 'vendor' }, TypeError)
+    }
+    assert.equal(fixtureResponses(definition)[2].dataVol, 42)
+    for (const family of ['quoteVerification', 'financialVerification']) {
+      for (const dimension of [
+        'issuerIdentityStatus', 'vendorCodeStatus', 'entitlementStatus',
+        'currencyStatus', 'unitStatus', 'reportPeriodStatus', 'scopeStatus'
+      ]) {
+        for (const status of ['unverified', 'failed']) {
+          const incomplete = fixtureEvidence(caseId)
+          incomplete[family][dimension] = status
+          assert.throws(() => createVerifiedMarketEvidenceBundle(fixtureCatalog(caseId), incomplete),
+            `${caseId}: ${family}.${dimension} remains mandatory`)
+        }
+      }
+    }
     definition.indicators.quote[0].vendorIndicatorId = 'UNAPPROVED_CHANGE'
     assert.notEqual(bundle.manifest.indicators.quote[0].vendorIndicatorId, 'UNAPPROVED_CHANGE')
     evidence.quoteVerification.entitlementStatus = 'unverified'
@@ -228,10 +258,22 @@ async function testMappedThreeMarketPersistence() {
       assert.equal(stored.quoteSnapshot.tradingStatus, 'halted', caseId)
       assert.equal(stored.quoteSnapshot.currency, test.catalog.expectedTradingCurrency)
       assert.equal(stored.financialPoints.length, 21)
+      assert.ok(stored.financialPoints.every((point) =>
+        new Date(point.fetchTime).toISOString() === new Date(NOW).toISOString()),
+      caseId + ': persisted fetch time equals the service clock')
       assert.ok(stored.financialPoints.every((point) => point.currency === test.evidence.financialReportingCurrencyEvidence.currency))
       assert.ok(stored.financialPoints.every((point) => point.indicatorId.startsWith('FIXTURE_MAPPED_')))
       assert.ok(stored.financialPoints.some((point) => point.value === null && point.availability === 'missing'))
+      assert.equal(stored.financialPoints.filter((point) =>
+        point.metricKey === 'grossProfit' && point.value === null && point.availability === 'missing').length, 1,
+      'the missing provider metric stays missing without Mock fill')
+      assert.doesNotMatch(JSON.stringify(stored.financialPoints), /Mock/)
       assert.deepEqual(test.transport.paths, ['/api/v1/get_access_token', '/api/v1/real_time_quotation', '/api/v1/basic_data_service'])
+      assert.equal(test.catalog.requestTemplates.financial.indicatorIds.length, 14)
+      for (const id of test.catalog.requestTemplates.financial.indicatorIds) {
+        assert.ok(test.transport.requests[2].body.includes(id), caseId + ': requested remote ID ' + id)
+      }
+      assert.doesNotMatch(test.transport.requests[2].body, /FETCH_TIME|SOURCE_MODE|fetchTime|sourceMode/)
     } finally { test.dispose() }
   }
 }
@@ -245,9 +287,120 @@ async function testProductionEvidenceStillRejectsBeforeTransport() {
       assert.equal(outcome.status, 'rejected')
       assert.equal(test.transport.calls, 0)
       assert.equal(test.reads, 0)
+      assert.equal(test.reserves, 0)
       assert.equal(test.clears, 0)
       assert.equal(test.runtime.marketService.latest({ caseId }), null)
+      assert.equal(test.database.prepare('SELECT COUNT(*) AS count FROM ifind_market_case_runs').get().count, 0)
     } finally { test.dispose() }
+  }
+}
+
+async function testFinancialClockCapturedBeforeParsers() {
+  const caseId = CASE_IDS[0]
+  let now = NOW
+  let observedFetchTime
+  let quoteParsed = false
+  const fetchedAt = NOW + 1234
+  const test = await harness(caseId, {
+    holdAt: 3,
+    clock: () => now,
+    quoteParser(input) {
+      quoteParsed = true
+      now = NOW + 2234
+      return parseIfindMarketQuote(input)
+    },
+    financialParser(input) {
+      observedFetchTime = input.fetchTime
+      now = NOW + 3234
+      return parseIfindMarketFinancials(input)
+    }
+  })
+  let active
+  try {
+    active = test.runtime.marketService.run({ caseId })
+    await Promise.race([
+      test.transport.held,
+      active.then(() => { throw new Error('run ended before the financial response was held') })
+    ])
+    now = fetchedAt
+    test.transport.release()
+    const result = await active
+    assert.equal(result.status, 'complete')
+    assert.equal(quoteParsed, true)
+    assert.equal(observedFetchTime, new Date(fetchedAt).toISOString(),
+      'capture after financial completion, before either parser advances the clock')
+    const stored = test.runtime.marketService.latest({ caseId })
+    assert.equal(stored.financialPoints.length, 21)
+    assert.ok(stored.financialPoints.every((point) => new Date(point.fetchTime).getTime() === fetchedAt))
+  } finally {
+    test.transport.release()
+    if (active) await active
+    test.dispose()
+  }
+}
+
+async function testProviderLocalProvenanceCannotPersist() {
+  for (const caseId of CASE_IDS) {
+    const market = caseId.slice(0, 2)
+    for (const field of [
+      'fetchTime', 'sourceMode', `TEST_ONLY_${market}_FETCH_TIME`, `TEST_ONLY_${market}_SOURCE_MODE`,
+      `FIXTURE_MAPPED_${market}_FETCH_TIME`, `FIXTURE_MAPPED_${market}_SOURCE_MODE`
+    ]) {
+      const test = await harness(caseId, {
+        configureResponses(responses) {
+          const value = field === 'sourceMode' || field.endsWith('SOURCE_MODE')
+            ? 'real' : new Date(NOW).toISOString()
+          responses[2].tables[0].table[field] = [value, value, value]
+          responses[2].dataVol += 3
+        }
+      })
+      try {
+        const result = await test.runtime.marketService.run({ caseId })
+        assert.equal(result.status, 'partial', caseId + ': reject provider ' + field)
+        assert.equal(result.failureCode, 'IFIND_MARKET_FINANCIAL_UNAVAILABLE')
+        const stored = test.runtime.marketService.latest({ caseId })
+        assert.equal(stored.financeStatus, 'unavailable')
+        assert.ok(stored.quoteSnapshot)
+        assert.deepEqual(stored.financialPoints, [], 'provider provenance must never persist')
+        assert.equal(test.transport.calls, 3)
+        assert.equal(test.reads, 1)
+        assert.equal(test.reserves, 1)
+      } finally { test.dispose() }
+    }
+  }
+}
+
+async function testParserFetchTimeSpoofCannotPersist() {
+  for (const caseId of CASE_IDS) {
+    for (const spoof of [new Date(NOW + 1).toISOString(), '2026-08-29T04:00:00Z']) {
+      let observedFetchTime
+      let parsedPointCount = 0
+      let parsedSource
+      const test = await harness(caseId, {
+        financialParser(input) {
+          observedFetchTime = input.fetchTime
+          const parsed = parseIfindMarketFinancials(input)
+          parsedPointCount = parsed.points.length
+          parsedSource = parsed.source
+          return {
+            ...parsed,
+            points: parsed.points.map((point, index) => index === parsed.points.length - 1
+              ? { ...point, fetchTime: spoof } : point)
+          }
+        }
+      })
+      try {
+        const result = await test.runtime.marketService.run({ caseId })
+        assert.equal(observedFetchTime, new Date(NOW).toISOString())
+        assert.equal(parsedSource, 'real', 'spoof test starts with valid parser output')
+        assert.equal(parsedPointCount, 21)
+        assert.equal(result.status, 'partial', caseId + ': last point cannot spoof fetch time')
+        assert.equal(result.failureCode, 'IFIND_MARKET_FINANCIAL_UNAVAILABLE')
+        const stored = test.runtime.marketService.latest({ caseId })
+        assert.ok(stored.quoteSnapshot)
+        assert.deepEqual(stored.financialPoints, [])
+      } finally { test.dispose() }
+    }
   }
 }
 
@@ -345,7 +498,7 @@ function synchronizeTemplateIds(catalog) {
   catalog.requestTemplates.quote.fields = catalog.indicators.quote.map((entry) => entry.vendorIndicatorId)
   catalog.requestTemplates.financial.indicatorIds = [
     ...catalog.indicators.financial.map((entry) => entry.vendorIndicatorId),
-    ...Object.values(catalog.indicators.financialMetadata).map((entry) => entry.vendorIndicatorId)
+    ...REMOTE_FINANCIAL_METADATA_FIELDS.map((field) => catalog.indicators.financialMetadata[field].vendorIndicatorId)
   ]
 }
 
@@ -353,7 +506,7 @@ function configureBoundaryIds(catalog) {
   for (const [prefix, entries] of [
     ['q', catalog.indicators.quote],
     ['f', catalog.indicators.financial],
-    ['m', Object.values(catalog.indicators.financialMetadata)]
+    ['m', REMOTE_FINANCIAL_METADATA_FIELDS.map((field) => catalog.indicators.financialMetadata[field])]
   ]) {
     entries.forEach((entry, index) => {
       entry.vendorIndicatorId = index === 0 ? prefix
@@ -455,10 +608,65 @@ async function runIndicatorIdChecks() {
   assert.equal(failures.length, 0, failures.join('\n'))
 }
 
+async function testRecoveredFinancialClockPersistsPartial() {
+  const failures = []
+  for (const caseId of CASE_IDS) {
+    for (const [label, observedAt] of /** @type {Array<[string, number]>} */ ([
+      ['rollback', NOW - 1], ['invalid', Number.NaN], ['expired', NOW + 30_001]
+    ])) {
+      let transport = null
+      let injected = false
+      let financialParserCalls = 0
+      const test = await harness(caseId, {
+        clock() {
+          if (transport && transport.calls === 3 && !injected) {
+            injected = true
+            return observedAt
+          }
+          return NOW
+        },
+        financialParser() {
+          financialParserCalls += 1
+          throw new Error('Financial parser must not run after clock failure')
+        }
+      })
+      transport = test.transport
+      try {
+        const outcome = await test.runtime.marketService.run({ caseId })
+        assert.equal(injected, true, 'completion clock failure must be exercised')
+        assert.equal(outcome.status, 'partial', `${caseId}/${label}: ${outcome.failureCode}`)
+        const stored = test.runtime.marketService.latest({ caseId })
+        assert.equal(stored.status, 'partial')
+        assert.equal(stored.safeErrorClass, 'API', 'persist only repository-safe classes')
+        assert.equal(stored.failureCode, outcome.failureCode, 'retain originating failure code')
+        if (label === 'rollback') assert.equal(stored.failureCode, 'IFIND_MARKET_CLOCK_ROLLBACK')
+        assert.equal(stored.quoteSnapshot.latestPrice, 101.25, 'preserve the successful quote')
+        assert.equal(stored.quoteSnapshot.currency, test.catalog.expectedTradingCurrency)
+        assert.deepEqual(stored.financialPoints, [], 'never persist unverifiable financial points')
+        assert.equal(stored.dataVol, 52, 'retain quote and financial response accounting')
+        assert.equal(stored.requestCount, 3)
+        assert.equal(financialParserCalls, 0)
+        assert.equal(test.transport.calls, 3)
+        assert.equal(test.reserves, 1)
+        assert.equal(test.reads, 1)
+        assert.equal(test.clears, 1)
+        assert.equal(test.database.prepare('SELECT COUNT(*) AS count FROM ifind_market_case_runs').get().count, 1)
+      } catch (error) {
+        failures.push(`${caseId}/${label}: ${error.message}`)
+      } finally { test.dispose() }
+    }
+  }
+  assert.equal(failures.length, 0, failures.join('\n'))
+}
+
 async function runRepositoryChecks() {
+  await testRecoveredFinancialClockPersistsPartial()
   await testTrustedBundleFactory()
   await testRejectedRequestsCannotClearOwner()
   await testMappedThreeMarketPersistence()
+  await testFinancialClockCapturedBeforeParsers()
+  await testProviderLocalProvenanceCannotPersist()
+  await testParserFetchTimeSpoofCannotPersist()
   await testProductionEvidenceStillRejectsBeforeTransport()
 }
 
