@@ -81,6 +81,7 @@ const tests = [
   require('./deploy-v5-installer.test'),
   require('./deploy-v5-workflow.test'),
   require('./deploy-v5-ifind-docs.test'),
+  require('./ifind-three-market-admin-docs.test'),
   require('./nginx-fixed-ip-gate.test'),
   require('./nginx-config-installer.test'),
   require('./data-lifecycle.test'),

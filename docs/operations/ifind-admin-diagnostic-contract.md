@@ -50,3 +50,16 @@ This fixed request is a minimal diagnostic baseline. It deliberately removes wee
 ## Fixture policy
 
 Contract fixtures are offline and synthetic. Tokens are visibly fake, dates are future synthetic dates, and fixtures contain no account IDs, `RequestId` fields, or copied production values.
+
+## Three-market administrator extension
+
+The administrator-only R1 extension is documented in the
+[three-market administrator diagnostic runbook](ifind-three-market-admin-diagnostics.md).
+It exposes only the fixed cases Alibaba `9988.HK`, Apple `AAPL.US`, and
+Kweichow Moutai `600519.SH`; it does not turn this baseline client into an
+arbitrary provider proxy. The family dashboard remains Mock.
+
+The current production manifest is unverified and therefore remains fail-closed.
+Authenticated indicator evidence and manifest verification are one gate; a
+separately approved, single-case real invocation is a second gate. Neither
+fixtures nor a successful CI run authorize a live request.
