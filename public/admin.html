@@ -162,6 +162,47 @@
           </div>
         </section>
 
+        <section id="ifind-calibration" class="admin-panel admin-panel-wide ifind-diagnostic" aria-labelledby="ifind-calibration-title">
+          <div class="ifind-diagnostic-head">
+            <div>
+              <p class="ticket-label">iFinD / Single indicator / Admin only</p>
+              <h2 id="ifind-calibration-title">单指标校准</h2>
+              <p class="ifind-boundary">仅管理员逐次授权执行；家庭看板继续使用 Mock，校准结果不进入家庭页面。</p>
+            </div>
+            <p class="ifind-enabled-badge">执行状态 <strong id="ifind-calibration-status" role="status" aria-live="polite">尚未读取状态</strong></p>
+          </div>
+          <p class="admin-meta">固定配置 <code>HK_ALIBABA_REVENUE_OAS_20260331_V1</code></p>
+          <p class="admin-meta"><code>HK_ALIBABA_9988</code> / <code>9988.HK</code> / <code>revenue_oas</code> / <code>['20260331','1','BB']</code></p>
+          <p id="ifind-calibration-warning" class="ifind-boundary">每次至多 1 次认证 + 1 次业务请求，0 次重试，可能消耗额度。每次点击均需单独确认；不自动运行或轮询。dataVol 以返回值为准，不假定为 1。</p>
+          <dl class="ifind-metrics" aria-label="未验证的校准观察结果">
+            <div><dt>观察值（未验证）</dt><dd id="ifind-calibration-value">—</dd></div>
+            <div><dt>返回情况</dt><dd id="ifind-calibration-availability">尚无观察值</dd></div>
+            <div><dt>最近尝试</dt><dd id="ifind-calibration-attempted-at">尚未执行</dd></div>
+            <div><dt>请求次数（含认证）</dt><dd id="ifind-calibration-request-count">—</dd></div>
+            <div><dt>业务请求次数</dt><dd id="ifind-calibration-business-request-count">—</dd></div>
+            <div><dt>dataVol</dt><dd id="ifind-calibration-data-vol">未提供</dd></div>
+            <div><dt>币种</dt><dd id="ifind-calibration-currency">未知 / 未验证</dd></div>
+            <div><dt>单位</dt><dd id="ifind-calibration-unit">未知 / 未验证</dd></div>
+            <div><dt>实际报告期</dt><dd id="ifind-calibration-report-period">未知 / 未验证</dd></div>
+            <div><dt>期间类型</dt><dd id="ifind-calibration-period-type">未知 / 未验证</dd></div>
+            <div><dt>披露口径</dt><dd id="ifind-calibration-disclosure-scope">未知 / 未验证</dd></div>
+          </dl>
+          <dl class="ifind-metrics" aria-label="七项证据均未验证">
+            <div><dt>发行人身份</dt><dd id="ifind-calibration-issuer-evidence" data-evidence-status="unverified">未验证</dd></div>
+            <div><dt>供应商代码</dt><dd id="ifind-calibration-code-evidence" data-evidence-status="unverified">未验证</dd></div>
+            <div><dt>指标权限</dt><dd id="ifind-calibration-entitlement-evidence" data-evidence-status="unverified">未验证</dd></div>
+            <div><dt>币种证据</dt><dd id="ifind-calibration-currency-evidence" data-evidence-status="unverified">未验证</dd></div>
+            <div><dt>单位证据</dt><dd id="ifind-calibration-unit-evidence" data-evidence-status="unverified">未验证</dd></div>
+            <div><dt>报告期证据</dt><dd id="ifind-calibration-period-evidence" data-evidence-status="unverified">未验证</dd></div>
+            <div><dt>披露口径证据</dt><dd id="ifind-calibration-scope-evidence" data-evidence-status="unverified">未验证</dd></div>
+          </dl>
+          <p id="ifind-calibration-memory" class="admin-meta">观察值仅暂存于本页内存，刷新或退出后可能丢失。服务端目前仅保存配额及未通过验证的尝试记录，不持久化规范化数值。币种、单位与实际报告期仍未知；固定参数不代表已验证的报告期。</p>
+          <div class="ifind-diagnostic-actions">
+            <p id="ifind-calibration-error" class="admin-meta" role="status" aria-live="polite"></p>
+            <button id="ifind-calibration-run" class="auth-primary" type="button" aria-describedby="ifind-calibration-warning ifind-calibration-memory" disabled>校准状态不可用</button>
+          </div>
+        </section>
+
         <section class="admin-panel">
           <p class="ticket-label">Pending</p>
           <h2>待审批申请</h2>

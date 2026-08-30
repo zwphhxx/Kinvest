@@ -33,6 +33,9 @@ const {
 const {
   createIfindMarketDiagnosticService
 } = require('./services/ifind-market-diagnostic-service')
+const {
+  createIfindCalibrationService
+} = require('./services/ifind-calibration-service')
 
 const SAFE_CODES = new Set([
   'IFIND_DIAGNOSTIC_ACCESS_REQUIRED',
@@ -277,6 +280,7 @@ async function createIfindDiagnosticRuntime(options) {
   let marketClient
   let service
   let marketService
+  let calibrationService = null
   try {
     try {
       provider = await loadSecrets(Object.freeze({
@@ -371,6 +375,18 @@ async function createIfindDiagnosticRuntime(options) {
           !readMethod(marketService, 'quotaStatus')) {
         fail('IFIND_DIAGNOSTIC_RUNTIME_INVALID')
       }
+      // Older injected clients remain usable for their existing diagnostics.
+      // Only the fixed production client capability can expose calibration.
+      if (readMethod(marketClient, 'calibrateFinancial')) {
+        calibrationService = createIfindCalibrationService({
+          repository: marketRepository,
+          client: marketClient,
+          secretProvider: provider,
+          tokenVersionId: contract.versionId,
+          clock,
+          idGenerator: marketIdGenerator
+        })
+      }
     } catch (error) {
       throw sanitizedError(error, 'IFIND_DIAGNOSTIC_RUNTIME_INVALID')
     }
@@ -384,11 +400,13 @@ async function createIfindDiagnosticRuntime(options) {
       }),
       service,
       marketService,
+      ...(calibrationService ? { calibrationService } : {}),
       clear() {
         if (cleared) return
         cleared = true
         clearBestEffort(
           () => clearServiceClient(service, legacyClient),
+          () => { if (calibrationService) calibrationService.clear() },
           () => readMethod(marketClient, 'clear')(),
           () => readMethod(provider, 'clear')()
         )
@@ -397,6 +415,7 @@ async function createIfindDiagnosticRuntime(options) {
   } catch (error) {
     clearBestEffort(
       () => clearServiceClient(service, legacyClient),
+      () => { if (calibrationService) calibrationService.clear() },
       () => {
         if (!marketClient || marketClient === legacyClient) return
         const clearMarketClient = readMethod(marketClient, 'clear')

@@ -743,6 +743,261 @@
     return Object.freeze({ bind, refresh, render, reset, run })
   }
 
+  const IFIND_CALIBRATION_CONFIG = Object.freeze({
+    calibrationId: 'HK_ALIBABA_REVENUE_OAS_20260331_V1',
+    caseId: 'HK_ALIBABA_9988', displayCode: '9988.HK', indicator: 'revenue_oas',
+    parameters: Object.freeze(['20260331', '1', 'BB'])
+  })
+  const IFIND_CALIBRATION_EVIDENCE = Object.freeze({
+    issuerIdentityStatus: 'issuer-evidence', vendorCodeStatus: 'code-evidence',
+    entitlementStatus: 'entitlement-evidence', currencyStatus: 'currency-evidence',
+    unitStatus: 'unit-evidence', reportPeriodStatus: 'period-evidence', scopeStatus: 'scope-evidence'
+  })
+  const IFIND_CALIBRATION_LABELS = Object.freeze({
+    ready: '固定配置就绪', 'observed-unverified': '已取得观察结果，仍未验证',
+    failed: '校准未完成', busy: '校准占用中', cooldown: '校准冷却中',
+    'daily-limit': '今日校准已达上限', unavailable: '校准不可用'
+  })
+  const IFIND_CALIBRATION_CONFIRMATION =
+    "仅执行 HK_ALIBABA_9988 / 9988.HK / revenue_oas / ['20260331','1','BB']。\n" +
+    '本次至多 1 次认证 + 1 次业务请求，0 次重试，可能消耗额度；本次确认不授权后续调用。\n' +
+    '七项证据仍未验证，币种、单位及实际报告期未知；家庭看板继续使用 Mock。\n' +
+    '观察值仅暂存于本页，刷新后可能丢失。确认执行本次校准吗？'
+
+  function normalizeIfindCalibrationDto(input) {
+    if (!input || typeof input !== 'object') return null
+    for (const key of ['calibrationId', 'caseId', 'displayCode', 'indicator']) {
+      if (input[key] !== IFIND_CALIBRATION_CONFIG[key]) return null
+    }
+    if (!Array.isArray(input.parameters) || input.parameters.length !== 3 ||
+      !input.parameters.every((value, index) => value === IFIND_CALIBRATION_CONFIG.parameters[index]) ||
+      !Object.hasOwn(IFIND_CALIBRATION_LABELS, input.status)) return null
+    if (!input.verification || !Object.keys(IFIND_CALIBRATION_EVIDENCE)
+      .every((key) => input.verification[key] === 'unverified')) return null
+    if (!Number.isSafeInteger(input.requestCount) || input.requestCount < 0 || input.requestCount > 2 ||
+      !Number.isSafeInteger(input.businessRequestCount) || input.businessRequestCount < 0 || input.businessRequestCount > 1 ||
+      !(input.dataVol === null || (Number.isSafeInteger(input.dataVol) && input.dataVol >= 0))) return null
+    if (!(input.attemptedAt === null || (typeof input.attemptedAt === 'string' &&
+      /^\d{4}-\d{2}-\d{2}T/.test(input.attemptedAt) && Number.isFinite(Date.parse(input.attemptedAt))))) return null
+    if (!(input.errorCode === null || (typeof input.errorCode === 'string' &&
+      /^IFIND_CALIBRATION_[A-Z0-9_]{1,80}$/.test(input.errorCode)))) return null
+    let observation = null
+    if (input.observation !== null) {
+      const item = input.observation
+      if (!item || item.returnedCode !== IFIND_CALIBRATION_CONFIG.displayCode ||
+        !['currency', 'unit', 'reportPeriod', 'periodType', 'disclosureScope'].every((key) => item[key] === null) ||
+        !((item.availability === 'present' && finiteNumber(item.value)) ||
+          (item.availability === 'missing' && item.value === null))) return null
+      observation = Object.freeze({
+        value: item.value, availability: item.availability, returnedCode: '9988.HK',
+        currency: null, unit: null, reportPeriod: null, periodType: null, disclosureScope: null
+      })
+    }
+    return Object.freeze({
+      ...IFIND_CALIBRATION_CONFIG, status: input.status,
+      verification: Object.freeze(Object.fromEntries(Object.keys(IFIND_CALIBRATION_EVIDENCE)
+        .map((key) => [key, 'unverified']))),
+      observation, requestCount: input.requestCount, businessRequestCount: input.businessRequestCount,
+      dataVol: input.dataVol, attemptedAt: input.attemptedAt, errorCode: input.errorCode
+    })
+  }
+
+  function ifindCalibrationErrorMessage(code) {
+    const messages = {
+      ADMIN_AUTH_REQUIRED: '管理员会话已结束，请重新登录；校准不会自动重试。',
+      ADMIN_CSRF_INVALID: '本次操作凭证已失效，请重新登录并单独确认；校准不会自动重试。',
+      IFIND_CALIBRATION_BUSY: '校准正在占用中，本次不重试。',
+      IFIND_CALIBRATION_COOLDOWN: '校准正在冷却，本次不重试。',
+      IFIND_CALIBRATION_DAILY_LIMIT: '今日校准次数已达上限，本次不重试。',
+      IFIND_CALIBRATION_UNAVAILABLE: '校准状态不可用；其他管理员功能不受影响。'
+    }
+    return Object.hasOwn(messages, code)
+      ? messages[code]
+      : '校准未完成，不会自动重试；七项证据仍未验证。'
+  }
+
+  function ifindCalibrationApiFailure(status, payload) {
+    const calibration = normalizeIfindCalibrationDto(payload && payload.data)
+    const candidate = payload && typeof payload.error === 'string'
+      ? payload.error
+      : (calibration && calibration.errorCode)
+    const code = candidate === 'ADMIN_AUTH_REQUIRED' || candidate === 'ADMIN_CSRF_INVALID' ||
+      (typeof candidate === 'string' && /^IFIND_CALIBRATION_[A-Z0-9_]{1,80}$/.test(candidate))
+      ? candidate
+      : (status === 401 ? 'ADMIN_AUTH_REQUIRED' : 'UNKNOWN')
+    return Object.freeze({ code, message: ifindCalibrationErrorMessage(code), retryable: false, calibration })
+  }
+
+  function createIfindCalibrationView(input, options = {}) {
+    const data = normalizeIfindCalibrationDto(input)
+    const status = data ? data.status : 'unavailable'
+    const observation = data && data.observation
+    const running = options.running === true
+    const canRun = ['ready', 'observed-unverified', 'failed'].includes(status)
+    const dateText = typeof options.dateText === 'function'
+      ? options.dateText
+      : (value) => new Date(value).toLocaleString('zh-CN')
+    return Object.freeze({
+      status,
+      statusLabel: running ? '正在校准，证据仍未验证' : IFIND_CALIBRATION_LABELS[status],
+      statusTone: running ? 'running' : (status === 'observed-unverified' ? 'warning' : 'idle'),
+      verification: Object.freeze(Object.fromEntries(Object.keys(IFIND_CALIBRATION_EVIDENCE)
+        .map((key) => [key, 'unverified']))),
+      value: observation && observation.availability === 'present' ? String(observation.value) : '—',
+      availability: observation
+        ? (observation.availability === 'present' ? '观察到数值（未验证）' : '返回值缺失')
+        : '尚无观察值',
+      requestCount: data ? `${data.requestCount} 次` : '—',
+      businessRequestCount: data ? `${data.businessRequestCount} 次` : '—',
+      dataVol: data && data.dataVol !== null ? String(data.dataVol) : '未提供',
+      attemptedAt: data && data.attemptedAt ? dateText(Date.parse(data.attemptedAt)) : '尚未执行',
+      currency: '未知 / 未验证', unit: '未知 / 未验证', reportPeriod: '未知 / 未验证',
+      periodType: '未知 / 未验证', disclosureScope: '未知 / 未验证',
+      errorMessage: data && data.errorCode ? ifindCalibrationErrorMessage(data.errorCode)
+        : (status === 'unavailable' ? ifindCalibrationErrorMessage('IFIND_CALIBRATION_UNAVAILABLE') : ''),
+      run: Object.freeze({
+        disabled: running || !canRun,
+        label: running ? '正在校准…' : (canRun ? '执行单指标校准（逐次确认）' : IFIND_CALIBRATION_LABELS[status]),
+        tone: running ? 'running' : (canRun ? 'ready' : 'disabled')
+      })
+    })
+  }
+
+  function createIfindCalibrationController(options) {
+    const { document: documentRef, sessionLifecycle, request, setLive, onError } = options
+    const byId = (suffix) => documentRef.getElementById(`ifind-calibration-${suffix}`)
+    let data = null
+    let running = false
+    let bound = false
+    let generation = 0
+    let retainedAttempt = false
+
+    function isStale(error) {
+      return error && (error.name === 'AbortError' || error.message === 'ADMIN_EPOCH_STALE')
+    }
+
+    function render(nextData = data) {
+      data = normalizeIfindCalibrationDto(nextData)
+      const view = createIfindCalibrationView(data, { running, dateText: options.dateText })
+      byId('status').textContent = view.statusLabel
+      byId('status').dataset.tone = view.statusTone
+      const fields = {
+        value: 'value', availability: 'availability', 'attempted-at': 'attemptedAt',
+        'request-count': 'requestCount', 'business-request-count': 'businessRequestCount',
+        'data-vol': 'dataVol', currency: 'currency', unit: 'unit', 'report-period': 'reportPeriod',
+        'period-type': 'periodType', 'disclosure-scope': 'disclosureScope', error: 'errorMessage'
+      }
+      for (const [suffix, key] of Object.entries(fields)) byId(suffix).textContent = view[key]
+      for (const [key, suffix] of Object.entries(IFIND_CALIBRATION_EVIDENCE)) {
+        byId(suffix).textContent = '未验证'
+        byId(suffix).dataset.evidenceStatus = view.verification[key]
+      }
+      const button = byId('run')
+      button.textContent = view.run.label
+      button.disabled = view.run.disabled
+      button.dataset.tone = view.run.tone
+      button.setAttribute('aria-busy', String(running))
+    }
+
+    function beginRequest() {
+      try {
+        return sessionLifecycle.beginRequest()
+      } catch (error) {
+        if (error && error.message === 'ADMIN_EPOCH_INACTIVE') return null
+        throw error
+      }
+    }
+
+    async function refresh() {
+      // GET cannot restore observations: the service does not persist normalized numbers.
+      if (running || retainedAttempt) return
+      const ticket = beginRequest()
+      if (!ticket) return
+      const currentGeneration = ++generation
+      try {
+        const payload = await request('/api/admin/ifind/calibration', { signal: ticket.signal })
+        sessionLifecycle.commit(ticket, () => {
+          if (generation === currentGeneration) render(payload && payload.data)
+        })
+      } catch (error) {
+        if (isStale(error) || generation !== currentGeneration) return
+        if (error.code === 'ADMIN_AUTH_REQUIRED' || error.code === 'ADMIN_CSRF_INVALID') {
+          await onError(error)
+          return
+        }
+        sessionLifecycle.commit(ticket, () => render(null))
+      } finally {
+        sessionLifecycle.finishRequest(ticket)
+      }
+    }
+
+    async function run() {
+      if (running || createIfindCalibrationView(data).run.disabled) return
+      if (typeof options.confirm !== 'function' || options.confirm(IFIND_CALIBRATION_CONFIRMATION) !== true) return
+      const ticket = beginRequest()
+      if (!ticket) return
+      generation += 1
+      sessionLifecycle.commit(ticket, () => {
+        running = true
+        retainedAttempt = true
+        render(null)
+      })
+      let finalizationError
+      try {
+        const payload = await request('/api/admin/ifind/calibration/run', {
+          method: 'POST', body: {}, csrf: true, signal: ticket.signal
+        })
+        sessionLifecycle.commit(ticket, () => {
+          render(payload && payload.data)
+          const view = createIfindCalibrationView(data)
+          setLive(view.status === 'observed-unverified'
+            ? '校准观察结果已返回；七项证据仍未验证，家庭看板继续使用 Mock。'
+            : (view.errorMessage || `${view.statusLabel}；七项证据仍未验证。`),
+          view.status === 'observed-unverified' ? 'warning' : 'error')
+        })
+      } catch (error) {
+        if (isStale(error)) return
+        if (error.code === 'ADMIN_AUTH_REQUIRED' || error.code === 'ADMIN_CSRF_INVALID') {
+          await onError(error)
+          return
+        }
+        sessionLifecycle.commit(ticket, () => {
+          render(error.calibration || null)
+          setLive(ifindCalibrationErrorMessage(error.code), 'error')
+        })
+      } finally {
+        try {
+          sessionLifecycle.commit(ticket, () => {
+            running = false
+            render()
+          })
+        } catch (error) {
+          if (!isStale(error)) finalizationError = error
+        } finally {
+          sessionLifecycle.finishRequest(ticket)
+        }
+      }
+      if (finalizationError) throw finalizationError
+    }
+
+    function bind() {
+      if (bound) return
+      bound = true
+      byId('run').addEventListener('click', run)
+      render()
+    }
+
+    function reset() {
+      generation += 1
+      retainedAttempt = false
+      running = false
+      render(null)
+    }
+
+    sessionLifecycle.onInvalidate(reset)
+    return Object.freeze({ bind, refresh, render, reset, run })
+  }
+
   function approvedRequestDecision(request) {
     return request && Number.isSafeInteger(request.approvedAt)
       ? Object.freeze({ approvable: false, label: '已批准，等待设备兑换' })
@@ -913,10 +1168,14 @@
     createAdminBootstrapGate,
     createAdminSessionLifecycle,
     createAdminSecurityState,
+    createIfindCalibrationController,
+    createIfindCalibrationView,
     createIfindDiagnosticController,
     createIfindDiagnosticView,
     createIfindMarketDiagnosticController,
     createIfindMarketDiagnosticView,
+    ifindCalibrationApiFailure,
+    ifindCalibrationErrorMessage,
     ifindDiagnosticApiFailure,
     ifindDiagnosticErrorMessage,
     ifindDiagnosticSafeErrorClasses,

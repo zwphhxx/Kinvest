@@ -56,11 +56,13 @@
     })
     const payload = await response.json().catch(() => ({}))
     if (!response.ok) {
-      const failure = path.startsWith('/api/admin/ifind/market-cases')
-        ? adminContracts.ifindMarketDiagnosticApiFailure(response.status, payload)
-        : (path.startsWith('/api/admin/ifind/diagnostics')
-            ? adminContracts.ifindDiagnosticApiFailure(response.status, payload)
-            : contracts.classifyApiFailure(response.status, payload))
+      const failure = path.startsWith('/api/admin/ifind/calibration')
+        ? adminContracts.ifindCalibrationApiFailure(response.status, payload)
+        : (path.startsWith('/api/admin/ifind/market-cases')
+            ? adminContracts.ifindMarketDiagnosticApiFailure(response.status, payload)
+            : (path.startsWith('/api/admin/ifind/diagnostics')
+                ? adminContracts.ifindDiagnosticApiFailure(response.status, payload)
+                : contracts.classifyApiFailure(response.status, payload)))
       throw Object.assign(new Error('ADMIN_REQUEST_FAILED'), {
         ...failure,
         status: response.status
@@ -110,6 +112,7 @@
     byId('auth-audit').replaceChildren()
     ifindController.reset()
     ifindMarketController.reset()
+    ifindCalibrationController.reset()
   }
 
   function showLogin(message = '') {
@@ -299,7 +302,9 @@
     } finally {
       sessionLifecycle.finishRequest(ticket)
     }
-    await Promise.all([ifindController.refresh(), ifindMarketController.refresh()])
+    await Promise.all([
+      ifindController.refresh(), ifindMarketController.refresh(), ifindCalibrationController.refresh()
+    ])
   }
 
   const ifindController = adminContracts.createIfindDiagnosticController({
@@ -323,6 +328,20 @@
     onError: handleError
   })
   ifindMarketController.bind()
+
+  const ifindCalibrationController = adminContracts.createIfindCalibrationController({
+    document,
+    sessionLifecycle,
+    request: api,
+    dateText,
+    confirm: (message) => window.confirm(message),
+    setLive,
+    onError: async (error) => {
+      // Calibration never restores credentials or replays a business request automatically.
+      showLogin(adminContracts.ifindCalibrationErrorMessage(error.code))
+    }
+  })
+  ifindCalibrationController.bind()
 
   byId('admin-login-form').addEventListener('submit', async (event) => {
     event.preventDefault()
