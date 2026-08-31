@@ -2,6 +2,11 @@ const https = require('node:https')
 const { TextDecoder, types } = require('node:util')
 const { isIfindIndicatorId } = require('../domain/ifind-indicator-id')
 const { CALIBRATION_REQUEST } = require('../domain/ifind-calibration')
+const { assertReportPeriodDiagnosticJson } = require('./ifind-report-period-json')
+const {
+  REPORT_PERIOD_DIAGNOSTIC_REQUEST,
+  parseReportPeriodDiagnosticObservation
+} = require('../domain/ifind-report-period-diagnostic')
 const {
   isClientFailureBase,
   isClientFailureMetadata
@@ -146,7 +151,7 @@ function plainJsonSnapshot(value) {
   return Object.freeze(snapshot)
 }
 
-function requestJson(request, path, headers, body, setTimer, clearTimer) {
+function requestJson(request, path, headers, body, setTimer, clearTimer, strictReportPeriodJson = false) {
   if (!ALLOWED_ENDPOINTS.has(path)) {
     return Promise.reject(safeError(
       'IFIND_CONFIG_INVALID',
@@ -325,6 +330,7 @@ function requestJson(request, path, headers, body, setTimer, clearTimer) {
               return
             }
             try {
+              if (strictReportPeriodJson) assertReportPeriodDiagnosticJson(text)
               succeed(plainJsonSnapshot(JSON.parse(text)))
             } catch {
               fail(safeError('IFIND_RESPONSE_JSON', 'API', 'iFinD response JSON was invalid'))
@@ -1188,7 +1194,54 @@ function createIfindHttpClient({
     return executeMarketOperation('financial', accessToken, undefined, true)
   }
 
-  const client = { diagnose, authenticate: authenticateMarket, quote, financial, calibrateFinancial }
+  async function diagnoseReportPeriod(accessTokenInput) {
+    let requestCount = 0
+    let dataVol
+    try {
+      if (arguments.length !== 1 || types.isProxy(accessTokenInput) || !Buffer.isBuffer(accessTokenInput)) {
+        throw safeError('IFIND_CONFIG_INVALID', 'CONFIG', 'iFinD client configuration was invalid')
+      }
+      let accessToken
+      try {
+        accessToken = new TextDecoder('utf-8', { fatal: true }).decode(accessTokenInput)
+        if (!isHeaderSafeToken(accessToken)) throw new Error('invalid token')
+      } catch {
+        throw safeError('IFIND_CONFIG_INVALID', 'CONFIG', 'iFinD client configuration was invalid')
+      }
+      const operationGeneration = generation
+      requireCurrentGeneration(operationGeneration)
+      requestCount = 1
+      const response = await requestJson(request, ENDPOINTS.financial,
+        { access_token: accessToken, ifindlang: 'cn' }, REPORT_PERIOD_DIAGNOSTIC_REQUEST, setTimer, clearTimer, true)
+      requireCurrentGeneration(operationGeneration)
+      const errorCode = protocolErrorCode(response)
+      if (errorCode !== 0) {
+        const errorClass = classifyProbeFailure(errorCode)
+        if (errorClass === 'AUTH') {
+          throw safeError('IFIND_AUTH_REJECTED', 'AUTH', 'iFinD authentication failed', undefined, errorCode)
+        }
+        const volume = protocolDataVol(response)
+        dataVol = volume.present ? volume.value : undefined
+        const code = errorClass === 'PERMISSION' ? 'IFIND_PERMISSION_REJECTED'
+          : errorClass === 'QUOTA' ? 'IFIND_QUOTA_REJECTED' : 'IFIND_FINANCIAL_REJECTED'
+        throw safeError(code, errorClass, 'iFinD report-period diagnostic request failed', dataVol, errorCode)
+      }
+      const volume = protocolDataVol(response)
+      dataVol = volume.present ? volume.value : undefined
+      // Drop vendor envelope text, but retain every row/column for strict validation.
+      // The existing calibration sanitizer and fixed business request are unchanged.
+      const payload = Object.freeze({ errorcode: 0, tables: protocolDataValue(response, 'tables'),
+        ...(volume.present ? { dataVol: volume.value } : {}) })
+      parseReportPeriodDiagnosticObservation(payload)
+      return Object.freeze({ payload, requestCount: 1, dataVol: volume.present ? volume.value : null })
+    } catch (error) {
+      const sanitized = SAFE_ERRORS.has(error) ? error
+        : safeError('IFIND_RESPONSE_SHAPE', 'API', 'iFinD response shape was invalid', dataVol)
+      throw withRequestCount(withStage(sanitized, 'financial'), requestCount)
+    }
+  }
+
+  const client = { diagnose, authenticate: authenticateMarket, quote, financial, calibrateFinancial, diagnoseReportPeriod }
   Object.defineProperty(client, 'clear', { value: clear })
   return client
 }

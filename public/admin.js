@@ -1,6 +1,7 @@
 (function startAdminDesk() {
   const contracts = /** @type {any} */ (window).KinvestAuth
   const adminContracts = /** @type {any} */ (window).KinvestAdmin
+  const reportPeriodContracts = /** @type {any} */ (window).KinvestReportPeriod
   const securityState = adminContracts.createAdminSecurityState()
   const sessionLifecycle = adminContracts.createAdminSessionLifecycle()
   const bootstrapGate = adminContracts.createAdminBootstrapGate()
@@ -56,7 +57,9 @@
     })
     const payload = await response.json().catch(() => ({}))
     if (!response.ok) {
-      const failure = path.startsWith('/api/admin/ifind/calibration')
+      const failure = path.startsWith('/api/admin/ifind/report-period-diagnostic') && reportPeriodContracts
+        ? reportPeriodContracts.apiFailure(response.status, payload)
+        : path.startsWith('/api/admin/ifind/calibration')
         ? adminContracts.ifindCalibrationApiFailure(response.status, payload)
         : (path.startsWith('/api/admin/ifind/market-cases')
             ? adminContracts.ifindMarketDiagnosticApiFailure(response.status, payload)
@@ -113,6 +116,7 @@
     ifindController.reset()
     ifindMarketController.reset()
     ifindCalibrationController.reset()
+    ifindReportPeriodController.reset()
   }
 
   function showLogin(message = '') {
@@ -303,7 +307,8 @@
       sessionLifecycle.finishRequest(ticket)
     }
     await Promise.all([
-      ifindController.refresh(), ifindMarketController.refresh(), ifindCalibrationController.refresh()
+      ifindController.refresh(), ifindMarketController.refresh(), ifindCalibrationController.refresh(),
+      ifindReportPeriodController.refresh()
     ])
   }
 
@@ -342,6 +347,16 @@
     }
   })
   ifindCalibrationController.bind()
+
+  // A missing script keeps this independent panel disabled; it cannot run a query.
+  const ifindReportPeriodController = reportPeriodContracts
+    ? reportPeriodContracts.createController({
+        document, sessionLifecycle, request: api, dateText,
+        confirm: (message) => window.confirm(message), setLive,
+        onError: async (error) => showLogin(reportPeriodContracts.errorMessage(error.code))
+      })
+    : { bind() {}, refresh() {}, reset() {} }
+  ifindReportPeriodController.bind()
 
   byId('admin-login-form').addEventListener('submit', async (event) => {
     event.preventDefault()

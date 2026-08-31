@@ -36,6 +36,9 @@ const {
 const {
   createIfindCalibrationService
 } = require('./services/ifind-calibration-service')
+const {
+  createIfindReportPeriodDiagnosticService
+} = require('./services/ifind-report-period-diagnostic-service')
 
 const SAFE_CODES = new Set([
   'IFIND_DIAGNOSTIC_ACCESS_REQUIRED',
@@ -192,6 +195,7 @@ function disabledRuntime() {
     }),
     service: null,
     marketService: null,
+    reportPeriodService: null,
     clear() {}
   })
 }
@@ -281,6 +285,8 @@ async function createIfindDiagnosticRuntime(options) {
   let service
   let marketService
   let calibrationService = null
+  let reportPeriodClient = null
+  let reportPeriodService = null
   try {
     try {
       provider = await loadSecrets(Object.freeze({
@@ -387,6 +393,26 @@ async function createIfindDiagnosticRuntime(options) {
           idGenerator: marketIdGenerator
         })
       }
+      // Preserve older injected clients. The new capability uses its own instance
+      // so late cleanup cannot clear a running market case or calibration token.
+      if (readMethod(marketClient, 'diagnoseReportPeriod')) {
+        const candidate = createClient()
+        if (candidate === legacyClient || candidate === marketClient) {
+          fail('IFIND_DIAGNOSTIC_RUNTIME_INVALID')
+        }
+        reportPeriodClient = candidate
+        if (!readMethod(reportPeriodClient, 'authenticate') ||
+            !readMethod(reportPeriodClient, 'diagnoseReportPeriod') ||
+            !readMethod(reportPeriodClient, 'clear')) fail('IFIND_DIAGNOSTIC_RUNTIME_INVALID')
+        reportPeriodService = createIfindReportPeriodDiagnosticService({
+          repository: marketRepository,
+          client: reportPeriodClient,
+          secretProvider: provider,
+          tokenVersionId: contract.versionId,
+          clock,
+          idGenerator: marketIdGenerator
+        })
+      }
     } catch (error) {
       throw sanitizedError(error, 'IFIND_DIAGNOSTIC_RUNTIME_INVALID')
     }
@@ -401,12 +427,15 @@ async function createIfindDiagnosticRuntime(options) {
       service,
       marketService,
       ...(calibrationService ? { calibrationService } : {}),
+      reportPeriodService,
       clear() {
         if (cleared) return
         cleared = true
         clearBestEffort(
           () => clearServiceClient(service, legacyClient),
           () => { if (calibrationService) calibrationService.clear() },
+          () => { if (reportPeriodService) reportPeriodService.clear() },
+          () => { if (reportPeriodClient) readMethod(reportPeriodClient, 'clear')() },
           () => readMethod(marketClient, 'clear')(),
           () => readMethod(provider, 'clear')()
         )
@@ -416,6 +445,11 @@ async function createIfindDiagnosticRuntime(options) {
     clearBestEffort(
       () => clearServiceClient(service, legacyClient),
       () => { if (calibrationService) calibrationService.clear() },
+      () => { if (reportPeriodService) reportPeriodService.clear() },
+      () => {
+        const clearReportClient = reportPeriodClient && readMethod(reportPeriodClient, 'clear')
+        if (clearReportClient) clearReportClient()
+      },
       () => {
         if (!marketClient || marketClient === legacyClient) return
         const clearMarketClient = readMethod(marketClient, 'clear')
