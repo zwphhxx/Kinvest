@@ -3,6 +3,7 @@ const { TextDecoder, types } = require('node:util')
 const { isIfindIndicatorId } = require('../domain/ifind-indicator-id')
 const { CALIBRATION_REQUEST } = require('../domain/ifind-calibration')
 const { assertReportPeriodDiagnosticJson } = require('./ifind-report-period-json')
+const { summarizeReportPeriodResponse } = require('../domain/ifind-report-period-failure')
 const {
   REPORT_PERIOD_DIAGNOSTIC_REQUEST,
   parseReportPeriodDiagnosticObservation
@@ -1197,6 +1198,7 @@ function createIfindHttpClient({
   async function diagnoseReportPeriod(accessTokenInput) {
     let requestCount = 0
     let dataVol
+    let responseShape = null
     try {
       if (arguments.length !== 1 || types.isProxy(accessTokenInput) || !Buffer.isBuffer(accessTokenInput)) {
         throw safeError('IFIND_CONFIG_INVALID', 'CONFIG', 'iFinD client configuration was invalid')
@@ -1213,6 +1215,7 @@ function createIfindHttpClient({
       requestCount = 1
       const response = await requestJson(request, ENDPOINTS.financial,
         { access_token: accessToken, ifindlang: 'cn' }, REPORT_PERIOD_DIAGNOSTIC_REQUEST, setTimer, clearTimer, true)
+      responseShape = summarizeReportPeriodResponse(response)
       requireCurrentGeneration(operationGeneration)
       const errorCode = protocolErrorCode(response)
       if (errorCode !== 0) {
@@ -1237,6 +1240,9 @@ function createIfindHttpClient({
     } catch (error) {
       const sanitized = SAFE_ERRORS.has(error) ? error
         : safeError('IFIND_RESPONSE_SHAPE', 'API', 'iFinD response shape was invalid', dataVol)
+      if (responseShape !== null) Object.defineProperty(sanitized, 'responseShape', {
+        value: responseShape, enumerable: true, configurable: false, writable: false
+      })
       throw withRequestCount(withStage(sanitized, 'financial'), requestCount)
     }
   }

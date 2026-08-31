@@ -25,7 +25,7 @@ function ready() {
     ],
     status: 'ready', verification: Object.fromEntries(KEYS.map((key) => [key, 'unverified'])),
     observation: null, requestCount: 0, businessRequestCount: 0, dataVol: null,
-    attemptedAt: null, errorCode: null
+    attemptedAt: null, errorCode: null, failureEvidence: null
   }
 }
 
@@ -37,6 +37,24 @@ function observed() {
       returnedCode: '9988.HK', revenue: { value: 0, availability: 'present' },
       dateEvidence: { requestedDataType: 'single-quarter', start: '2025-04-01',
         end: '2025-06-30', availability: 'present', revenuePeriodLink: 'unverified' }
+    }
+  }
+}
+
+function responseShape(changes = {}) {
+  return {
+    tablesShape: 'single', rowShape: 'exact', identityShape: 'match', columnShape: 'known-only',
+    revenueShape: 'number', reportStartShape: 'compact-date', reportEndShape: 'iso-date', ...changes
+  }
+}
+
+function failed(stage = 'financial') {
+  return {
+    ...ready(), status: 'failed', requestCount: stage === 'auth' ? 1 : 2,
+    businessRequestCount: stage === 'auth' ? 0 : 1, attemptedAt: '2026-08-31T04:00:00.000Z',
+    errorCode: `${PREFIX}FAILED`, failureEvidence: {
+      stage, failureCode: 'IFIND_RESPONSE_SHAPE', errorClass: 'API', vendorErrorCode: null,
+      responseShape: stage === 'auth' ? null : responseShape()
     }
   }
 }
@@ -158,6 +176,134 @@ async function run() {
     assert.equal(reads, 0)
   })
 
+  await test('failure evidence is mandatory nullable metadata and copied defensively', () => {
+    for (const input of [ready(), observed(), { ...failed(), failureEvidence: null },
+      { ...ready(), status: 'failed', errorCode: `${PREFIX}FAILED` },
+      { ...ready(), status: 'unavailable', errorCode: `${PREFIX}UNAVAILABLE` },
+      ...['busy', 'cooldown', 'daily-limit'].map((status) => ({ ...ready(), status }))]) {
+      assert.deepEqual(contract.copyResult(input), input)
+    }
+    for (const stage of ['auth', 'financial']) {
+      const input = failed(stage)
+      const copy = contract.copyResult(input)
+      assert.deepEqual(copy, input)
+      assert.notEqual(copy.failureEvidence, input.failureEvidence)
+      input.failureEvidence.failureCode = 'fixture-private-detail'
+      assert.equal(copy.failureEvidence.failureCode, 'IFIND_RESPONSE_SHAPE')
+      if (stage === 'financial') {
+        assert.notEqual(copy.failureEvidence.responseShape, input.failureEvidence.responseShape)
+        input.failureEvidence.responseShape.revenueShape = 'fixture-private-detail'
+        assert.equal(copy.failureEvidence.responseShape.revenueShape, 'number')
+      }
+      for (const key of KEYS) assert.equal(copy.verification[key], 'unverified')
+    }
+    const absent = ready(); delete absent.failureEvidence
+    assert.throws(() => contract.copyResult(absent), { code: `${PREFIX}RESULT_INVALID` })
+  })
+
+  await test('failure metadata mirrors only existing client rules for auth and financial', () => {
+    const rules = require('../contracts/ifind-diagnostic-errors')
+    const codes = [...rules.CLIENT_EMITTABLE_FAILURE_CODES, ...rules.REPOSITORY_INTERNAL_FAILURE_CODES,
+      'UNKNOWN', 'toString', '<script>fixture-private-detail</script>']
+    for (const stage of ['auth', 'financial']) {
+      for (const failureCode of codes) {
+        for (const errorClass of ['AUTH', 'PERMISSION', 'QUOTA', 'NETWORK', 'API', 'CONFIG', 'BUSY', 'RATE_LIMITED']) {
+          for (const vendorErrorCode of [null, -42, 0, '-42']) {
+            const input = failed(stage)
+            Object.assign(input.failureEvidence, { failureCode, errorClass, vendorErrorCode, responseShape: null })
+            if (rules.isClientFailureMetadata(input.failureEvidence)) assert.deepEqual(contract.copyResult(input), input)
+            else assert.throws(() => contract.copyResult(input), { code: `${PREFIX}RESULT_INVALID` })
+          }
+        }
+      }
+    }
+    for (const vendorErrorCode of [Number.MAX_SAFE_INTEGER, -Number.MAX_SAFE_INTEGER, 42]) {
+      const input = failed('auth')
+      Object.assign(input.failureEvidence, { failureCode: 'IFIND_AUTH_REJECTED', errorClass: 'AUTH', vendorErrorCode })
+      assert.deepEqual(contract.copyResult(input), input)
+    }
+    for (const vendorErrorCode of [1.5, NaN, Infinity, Number.MAX_SAFE_INTEGER + 1, {}, [], undefined]) {
+      const input = failed('auth')
+      Object.assign(input.failureEvidence, { failureCode: 'IFIND_AUTH_REJECTED', errorClass: 'AUTH', vendorErrorCode })
+      assert.throws(() => contract.copyResult(input), { code: `${PREFIX}RESULT_INVALID` })
+    }
+  })
+
+  await test('failure stage requires failed status and exact request counts', () => {
+    const variants = [
+      ...['ready', 'busy', 'cooldown', 'daily-limit', 'unavailable'].map((status) => ({
+        ...ready(), status, errorCode: status === 'unavailable' ? `${PREFIX}UNAVAILABLE` : null,
+        failureEvidence: failed().failureEvidence
+      })),
+      { ...observed(), failureEvidence: failed().failureEvidence },
+      { ...failed('auth'), requestCount: 0 },
+      { ...failed('auth'), requestCount: 2, businessRequestCount: 1 },
+      { ...failed(), requestCount: 1, businessRequestCount: 0 },
+      { ...failed(), requestCount: 0, businessRequestCount: 0 },
+      { ...failed(), errorCode: 'IFIND_RESPONSE_SHAPE' }
+    ]
+    for (const stage of [null, 'probe', 'quote', 'financial ', '<script>fixture-private-detail</script>']) {
+      const input = failed(); input.failureEvidence.stage = stage; variants.push(input)
+    }
+    const authShape = failed('auth'); authShape.failureEvidence.responseShape = responseShape(); variants.push(authShape)
+    for (const input of variants) assert.throws(() => contract.copyResult(input), { code: `${PREFIX}RESULT_INVALID` })
+  })
+
+  await test('response shape accepts only flat enums with unavailable propagation', () => {
+    const unavailable = responseShape({ rowShape: 'unavailable', identityShape: 'unavailable', columnShape: 'unavailable',
+      revenueShape: 'unavailable', reportStartShape: 'unavailable', reportEndShape: 'unavailable' })
+    const shapes = ['missing', 'invalid', 'empty', 'multiple'].map((tablesShape) => ({ ...unavailable, tablesShape }))
+    shapes.push({ ...unavailable, rowShape: 'invalid' }, responseShape({ rowShape: 'extra-fields', columnShape: 'extra-fields' }))
+    for (const identityShape of ['unavailable', 'missing', 'match', 'mismatch', 'invalid']) shapes.push(responseShape({ identityShape }))
+    for (const columnShape of ['unavailable', 'invalid']) shapes.push({ ...unavailable, rowShape: 'exact', columnShape })
+    for (const key of ['revenueShape', 'reportStartShape', 'reportEndShape']) {
+      for (const value of ['unavailable', 'missing', 'invalid', 'empty-array', 'multiple-values', 'null', 'number',
+        'decimal-string', 'iso-date', 'compact-date', 'datetime', 'other-string', 'object', 'array', 'boolean', 'unsupported']) {
+        shapes.push(responseShape({ [key]: value }))
+      }
+    }
+    for (const shape of shapes) {
+      const input = failed(); input.failureEvidence.responseShape = shape
+      assert.deepEqual(contract.copyResult(input), input)
+    }
+    const invalidShapes = [responseShape({ tablesShape: 'multiple' }), responseShape({ rowShape: 'invalid' }),
+      responseShape({ columnShape: 'unavailable' }), responseShape({ columnShape: 'invalid' }),
+      { ...unavailable, tablesShape: 'empty', identityShape: 'match' },
+      { ...unavailable, rowShape: 'invalid', columnShape: 'known-only' }]
+    for (const key of Object.keys(responseShape())) {
+      for (const value of ['fixture-private-detail', '2025-04-01', '20250401', 42, null, {}, [], true, undefined]) {
+        invalidShapes.push(responseShape({ [key]: value }))
+      }
+    }
+    for (const shape of invalidShapes) {
+      const input = failed(); input.failureEvidence.responseShape = shape
+      assert.throws(() => contract.copyResult(input), { code: `${PREFIX}RESULT_INVALID` })
+    }
+  })
+
+  await test('failure evidence rejects extras and accessors without reading them', () => {
+    let reads = 0
+    const variants = []
+    for (const level of ['top', 'failure', 'shape']) {
+      for (const change of ['getter', 'extra', 'symbol', 'missing', 'hidden', 'prototype']) {
+        const input = failed()
+        /** @type {Record<string | symbol, unknown>} */
+        const target = level === 'top' ? input : level === 'failure' ? input.failureEvidence : input.failureEvidence.responseShape
+        const key = level === 'top' ? 'failureEvidence' : level === 'failure' ? 'failureCode' : 'tablesShape'
+        if (change === 'getter') Object.defineProperty(target, key, { enumerable: true, get() { reads += 1; return 'fixture-private-detail' } })
+        if (change === 'extra') target.rawError = 'fixture-private-detail'
+        if (change === 'symbol') target[Symbol('raw')] = 'fixture-private-detail'
+        if (change === 'missing') delete target[key]
+        if (change === 'hidden') Object.defineProperty(target, key, { enumerable: false })
+        if (change === 'prototype') Object.setPrototypeOf(target, { rawError: 'fixture-private-detail' })
+        variants.push(input)
+      }
+    }
+    for (const value of [undefined, [], true, 'fixture-private-detail']) variants.push({ ...failed(), failureEvidence: value })
+    for (const input of variants) assert.throws(() => contract.copyResult(input), { code: `${PREFIX}RESULT_INVALID` })
+    assert.equal(reads, 0)
+  })
+
   await test('separate fixed panel and safe integration', () => {
     const h = dom()
     const start = h.html.indexOf('<section id="ifind-report-period"')
@@ -218,6 +364,74 @@ async function run() {
     assert.equal(h.nodes.get('ifind-report-period-start').textContent, '未提供')
     assert.equal(h.nodes.get('ifind-report-period-end').textContent, '未提供')
     assert.equal(h.nodes.get('ifind-report-period-data-vol').textContent, '未提供')
+  })
+
+  await test('failure renderer shows safe Chinese metadata and shape without claiming cause or proof', async () => {
+    for (const stage of ['auth', 'financial']) {
+      const input = failed(stage)
+      if (stage === 'auth') Object.assign(input.failureEvidence, {
+        failureCode: 'IFIND_AUTH_REJECTED', errorClass: 'AUTH', vendorErrorCode: -42
+      })
+      const h = harness(contract, { request: (url) => ({ data: url === POST ? input : ready() }) })
+      h.controller.bind(); await h.controller.refresh(); await h.nodes.get('ifind-report-period-run').click()
+      const detail = h.nodes.get('ifind-report-period-failure').textContent
+      assert.ok(detail.includes(input.failureEvidence.failureCode))
+      assert.ok(detail.includes(input.failureEvidence.errorClass))
+      assert.match(detail, stage === 'auth' ? /认证/ : /业务/)
+      if (stage === 'auth') assert.match(detail, /-42/)
+      const shape = h.nodes.get('ifind-report-period-response-shape').textContent
+      if (stage === 'auth') assert.match(shape, /未提供/)
+      else {
+        assert.match(shape, /结构|形状/)
+        assert.match(shape, /收入.*数值/)
+        assert.match(shape, /起始.*紧凑日期/)
+        assert.match(shape, /截止.*ISO 日期/)
+        assert.match(shape, /不.*原因/)
+        assert.match(shape, /不.*证实/)
+      }
+      assert.doesNotMatch(`${detail} ${shape}`, /2025-04-01|20250401|fixture-private-detail/)
+      assert.match(h.nodes.get('ifind-report-period-error').textContent, /不会自动重试/)
+      assert.match(h.nodes.get('ifind-report-period-verification').textContent, /均未验证/)
+      assert.equal(h.nodes.get('ifind-report-period-value').textContent, '—')
+      assert.equal(h.calls.length, 2)
+    }
+  })
+
+  await test('evidence clears on null results, invalid replies, transport failures and session reset', async () => {
+    for (const next of [ready(), observed(), { ...failed(), failureEvidence: null },
+      { ...ready(), status: 'unavailable', errorCode: `${PREFIX}UNAVAILABLE` },
+      { ...failed(), failureEvidence: { ...failed().failureEvidence, rawError: 'fixture-private-detail' } }, null]) {
+      let reads = 0
+      const h = harness(contract, { request: () => {
+        if (++reads === 1) return { data: failed() }
+        if (next === null) throw new Error('fixture-private-detail')
+        return { data: next }
+      } })
+      await h.controller.refresh()
+      assert.match(h.nodes.get('ifind-report-period-failure').textContent, /IFIND_RESPONSE_SHAPE/)
+      await h.controller.refresh()
+      assert.equal(h.nodes.get('ifind-report-period-failure').textContent, '')
+      assert.equal(h.nodes.get('ifind-report-period-response-shape').textContent, '')
+      assert.doesNotMatch(h.messages.flat().join(' '), /fixture-private-detail/)
+    }
+    const h = harness(contract, { request: () => ({ data: failed() }) })
+    await h.controller.refresh(); h.lifecycle.invalidate()
+    assert.equal(h.nodes.get('ifind-report-period-failure').textContent, '')
+    assert.equal(h.nodes.get('ifind-report-period-response-shape').textContent, '')
+  })
+
+  await test('late failure evidence cannot restore a cleared or newer panel', async () => {
+    for (const invalidate of [false, true]) {
+      const pending = deferred(); let reads = 0
+      const h = harness(contract, { request: () => ++reads === 1 ? pending.promise : { data: ready() } })
+      const first = h.controller.refresh()
+      if (invalidate) h.lifecycle.invalidate()
+      else await h.controller.refresh()
+      pending.resolve({ data: failed() }); await first
+      assert.equal(h.nodes.get('ifind-report-period-failure').textContent, '')
+      assert.equal(h.nodes.get('ifind-report-period-response-shape').textContent, '')
+      assert.equal(h.calls.filter(([url]) => url === POST).length, 0)
+    }
   })
 
   await test('invalid result and arbitrary transport error clear and never retry', async () => {

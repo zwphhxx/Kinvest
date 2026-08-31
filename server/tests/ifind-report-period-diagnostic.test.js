@@ -14,7 +14,7 @@ const VERSION = 'v20260831-001'
 const PREFIX = 'IFIND_REPORT_PERIOD_DIAGNOSTIC_'
 const KEYS = ['diagnosticId', 'caseId', 'displayCode', 'requestedSelector', 'indicators',
   'status', 'verification', 'observation', 'requestCount', 'businessRequestCount',
-  'dataVol', 'attemptedAt', 'errorCode']
+  'dataVol', 'attemptedAt', 'errorCode', 'failureEvidence']
 const VERIFICATION = ['issuerIdentityStatus', 'vendorCodeStatus', 'entitlementStatus',
   'currencyStatus', 'unitStatus', 'reportPeriodStatus', 'scopeStatus']
 const REQUEST = { codes: '9988.HK', indipara: [
@@ -128,7 +128,7 @@ const tests = [
       indicators: REQUEST.indipara.map((item) => ({ indicator: item.indicator, parameters: item.indiparams })),
       status: 'ready', verification: Object.fromEntries(VERIFICATION.map((key) => [key, 'unverified'])),
       observation: null, requestCount: 0, businessRequestCount: 0, dataVol: null,
-      attemptedAt: null, errorCode: null })
+      attemptedAt: null, errorCode: null, failureEvidence: null })
     safe(result)
     const copy = domain.copyReportPeriodDiagnosticResult(result)
     copy.indicators[0].parameters[0] = 'other'
