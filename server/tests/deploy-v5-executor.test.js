@@ -5,12 +5,14 @@ const os = require('node:os')
 const path = require('node:path')
 const vm = require('node:vm')
 const { createRequire } = require('node:module')
-const { spawn, spawnSync } = require('node:child_process')
+const { spawnSync } = require('node:child_process')
+const { spawnTestProcess } = require('./helpers/deployment-test-process')
 
 const rootDir = path.resolve(__dirname, '../..')
 const executorPath = path.join(rootDir, 'deploy/server/deploy-kinvest-v5')
 const runtimeHelperPath = path.join(rootDir, 'deploy/server/deploy-v5-runtime.py')
 const { run: runLinuxTmpfsIntegration } = require('./deploy-v5-linux-tmpfs-integration.test')
+const SYNC_TIMEOUT_MS = 30000
 
 const DIGEST = `ghcr.io/zwphhxx/kinvest@sha256:${'a'.repeat(64)}`
 const IMAGE_ID = `sha256:${'b'.repeat(64)}`
@@ -341,14 +343,15 @@ with tempfile.TemporaryDirectory() as temporary:
     assert not empty.exists()
 `
   const result = spawnSync(process.env.PYTHON || 'python3', ['-c', script, runtimeHelperPath], {
-    encoding: 'utf8', env: { ...process.env, PYTHONDONTWRITEBYTECODE: '1', KINVEST_V5_TEST_ALLOW_NON_TMPFS: '1' }
+    encoding: 'utf8', timeout: SYNC_TIMEOUT_MS, killSignal: 'SIGKILL',
+    env: { ...process.env, PYTHONDONTWRITEBYTECODE: '1', KINVEST_V5_TEST_ALLOW_NON_TMPFS: '1' }
   })
   assert.equal(result.status, 0, result.stderr)
 }
 
 function canonicalState(contract, value) {
   const result = spawnSync(process.env.PYTHON || 'python3', [contract, 'canonical-state'], {
-    encoding: 'utf8', input: `${JSON.stringify(value)}\n`,
+    encoding: 'utf8', input: `${JSON.stringify(value)}\n`, timeout: SYNC_TIMEOUT_MS, killSignal: 'SIGKILL',
     env: { ...process.env, PYTHONDONTWRITEBYTECODE: '1' }
   })
   assert.equal(result.status, 0, result.stderr)
@@ -484,7 +487,7 @@ function makeHarness(options = {}) {
   }
   spawnSync(process.env.PYTHON || 'python3', ['-c',
     'import sqlite3,sys; db=sqlite3.connect(sys.argv[1]); db.execute("PRAGMA user_version=0"); db.commit(); db.close()',
-    path.join(root, 'data/kinvest.sqlite')], { encoding: 'utf8' })
+    path.join(root, 'data/kinvest.sqlite')], { encoding: 'utf8', timeout: SYNC_TIMEOUT_MS, killSignal: 'SIGKILL' })
 
   let transformed = fs.readFileSync(executorPath, 'utf8')
     .replace("ROOT='/root/docker/kinvest'", `ROOT='${root}'`)
@@ -682,24 +685,6 @@ fi
   }
 }
 
-function waitForFile(file, child, output, timeoutMs = 5000) {
-  return new Promise((resolve, reject) => {
-    const deadline = Date.now() + timeoutMs
-    const timer = setInterval(() => {
-      if (fs.existsSync(file)) {
-        clearInterval(timer)
-        resolve()
-      } else if (child.exitCode !== null) {
-        clearInterval(timer)
-        reject(new Error(`controlled child exited before observation: ${output.stderr}`))
-      } else if (Date.now() >= deadline) {
-        clearInterval(timer)
-        reject(new Error(`timed out waiting for controlled fixture: ${path.basename(file)}`))
-      }
-    }, 25)
-  })
-}
-
 function readProcessSurface(pid, controlledFallback) {
   if (process.platform === 'linux' && fs.existsSync(`/proc/${pid}`)) {
     return Buffer.concat([
@@ -709,7 +694,9 @@ function readProcessSurface(pid, controlledFallback) {
   }
   // macOS has no /proc. ps eww is the controlled platform-equivalent view of
   // argv plus environment available to another same-user process.
-  const result = spawnSync('ps', ['eww', '-p', String(pid), '-o', 'command='], { encoding: 'utf8' })
+  const result = spawnSync('ps', ['eww', '-p', String(pid), '-o', 'command='], {
+    encoding: 'utf8', timeout: SYNC_TIMEOUT_MS, killSignal: 'SIGKILL'
+  })
   if (result.status === 0) return result.stdout
   // Sandboxed macOS can deny process-list access. The controlled child records
   // its own argv/environ, which is the same surface ps/env would expose.
@@ -752,7 +739,7 @@ function scanPersistentFiles(root) {
 
 function parseDeploymentState(harness, name = 'current.state') {
   const parsed = spawnSync(process.env.PYTHON || 'python3', [harness.contract, 'parse-state'], {
-    encoding: 'utf8',
+    encoding: 'utf8', timeout: SYNC_TIMEOUT_MS, killSignal: 'SIGKILL',
     input: fs.readFileSync(path.join(harness.root, 'state', name), 'utf8'),
     env: { ...process.env, PYTHONDONTWRITEBYTECODE: '1' }
   })
@@ -802,7 +789,9 @@ async function assertCommittedBundlesReadable(harness) {
 async function run() {
   testRuntimeDurabilityPrimitives()
   assert.equal(fs.existsSync(executorPath), true, 'deploy-v5 executor must exist')
-  const syntax = spawnSync('bash', ['-n', executorPath], { encoding: 'utf8' })
+  const syntax = spawnSync('bash', ['-n', executorPath], {
+    encoding: 'utf8', timeout: SYNC_TIMEOUT_MS, killSignal: 'SIGKILL'
+  })
   assert.equal(syntax.status, 0, syntax.stderr)
 
   const source = fs.readFileSync(executorPath, 'utf8')
@@ -1279,29 +1268,27 @@ module.materialize(sys.argv[2], sys.argv[3], sys.argv[4], sys.argv[5],
   }
 
   const observable = makeHarness()
-  let observedChild
+  const observedPhase = 'deploy-v5-executor/observed'
+  let observedProcess
   try {
     const output = { stdout: '', stderr: '' }
-    const child = spawn(observable.executor, [], {
+    observedProcess = spawnTestProcess(observable.executor, [], {
       env: { ...process.env, PATH: `${observable.bin}:${process.env.PATH}`, FAKE_BLOCK: 'preflight' },
       stdio: ['pipe', 'pipe', 'pipe']
-    })
-    observedChild = child
+    }, { label: observedPhase })
+    const { child } = observedProcess
     child.stdout.on('data', chunk => { output.stdout += chunk })
     child.stderr.on('data', chunk => { output.stderr += chunk })
     child.stdin.end(diagnosticPayload())
-    await waitForFile(observable.observable, child, output)
+    await observedProcess.waitForReady(() => fs.existsSync(observable.observable), `${observedPhase}/preflight-ready`)
     assert.equal(readProcessSurface(child.pid, observable.observable).includes(TOKEN), false)
     fs.writeFileSync(observable.release, '')
-    const result = await new Promise((resolve, reject) => {
-      const timer = setTimeout(() => { child.kill('SIGKILL'); reject(new Error('controlled process observation timed out')) }, 10000)
-      child.on('close', code => { clearTimeout(timer); resolve({ code, ...output }) })
-    })
-    assert.equal(result.code, 0, result.stderr)
-    assert.equal(result.stdout.includes(TOKEN) || result.stderr.includes(TOKEN), false)
+    const result = await observedProcess.waitForExit(`${observedPhase}/exit`)
+    assert.equal(result.status, 0, `${observedPhase}: deployment must succeed`)
+    assert.equal(output.stdout.includes(TOKEN) || output.stderr.includes(TOKEN), false)
     assert.equal(fs.readFileSync(observable.containerEnv, 'utf8').includes(TOKEN), false)
   } finally {
-    if (observedChild && observedChild.exitCode === null) observedChild.kill('SIGKILL')
+    if (observedProcess) await observedProcess.cleanup(`${observedPhase}/cleanup`)
     cleanupHarness(observable)
   }
 
@@ -1382,15 +1369,14 @@ module.materialize(sys.argv[2], sys.argv[3], sys.argv[4], sys.argv[5],
       "write_all(fd, (str(os.getpid()) + '\\n').encode('ascii'))"
     )
   })
-  let collisionChild
+  const collisionPhase = 'deploy-v5-executor/backup-collision'
+  let collisionProcess
   try {
     const barrierRoot = path.join(collision.runRoot, 'backup-barriers')
     fs.mkdirSync(barrierRoot, { mode: 0o700 })
     fs.chmodSync(barrierRoot, 0o700)
     const marker = path.join(barrierRoot, 'backup-before-link.reached')
-    const output = { stdout: '', stderr: '' }
-    collisionChild = spawn(collision.executor, [], {
-      detached: true,
+    collisionProcess = spawnTestProcess(collision.executor, [], {
       env: {
         ...process.env,
         PATH: `${collision.bin}:${process.env.PATH}`,
@@ -1398,11 +1384,12 @@ module.materialize(sys.argv[2], sys.argv[3], sys.argv[4], sys.argv[5],
         KINVEST_V5_TEST_BARRIER: 'backup-before-link'
       },
       stdio: ['pipe', 'pipe', 'pipe']
-    })
-    collisionChild.stdout.on('data', chunk => { output.stdout += chunk })
-    collisionChild.stderr.on('data', chunk => { output.stderr += chunk })
+    }, { label: collisionPhase })
+    const { child: collisionChild } = collisionProcess
+    collisionChild.stdout.resume()
+    collisionChild.stderr.resume()
     collisionChild.stdin.end(diagnosticPayload())
-    await waitForFile(marker, collisionChild, output, 15000)
+    await collisionProcess.waitForReady(() => fs.existsSync(marker), `${collisionPhase}/barrier-ready`)
 
     const registries = fs.readdirSync(collision.runRoot)
       .filter(name => /^kinvest-v5\.candidates\.[A-Za-z0-9]+$/.test(name))
@@ -1420,14 +1407,9 @@ module.materialize(sys.argv[2], sys.argv[3], sys.argv[4], sys.argv[5],
     const helperPid = Number.parseInt(fs.readFileSync(marker, 'utf8').trim(), 10)
     assert.equal(Number.isSafeInteger(helperPid) && helperPid > 1, true)
     process.kill(helperPid, 'SIGTERM')
-    const interrupted = await new Promise((resolve, reject) => {
-      const timer = setTimeout(() => {
-        process.kill(-collisionChild.pid, 'SIGKILL')
-        reject(new Error('full executor backup collision did not terminate'))
-      }, 10000)
-      collisionChild.once('close', code => { clearTimeout(timer); resolve({ code, ...output }) })
-    })
-    assert.notEqual(interrupted.code, 0)
+    const interrupted = await collisionProcess.waitForExit(`${collisionPhase}/interrupted-exit`)
+    assert.notEqual(interrupted.status, 0)
+    await collisionProcess.cleanup(`${collisionPhase}/before-recovery-cleanup`)
     assert.equal(fs.readFileSync(preexistingFinal).equals(expected), true,
       'preexisting same-content final must survive registry recovery')
     assert.equal(fs.existsSync(temporary), false)
@@ -1439,7 +1421,7 @@ module.materialize(sys.argv[2], sys.argv[3], sys.argv[4], sys.argv[5],
     })
     assert.equal(recovered.status, 0, recovered.stderr)
   } finally {
-    if (collisionChild && collisionChild.exitCode === null) process.kill(-collisionChild.pid, 'SIGKILL')
+    if (collisionProcess) await collisionProcess.cleanup(`${collisionPhase}/cleanup`)
     cleanupHarness(collision)
   }
 
@@ -1449,8 +1431,8 @@ module.materialize(sys.argv[2], sys.argv[3], sys.argv[4], sys.argv[5],
   ]) {
     for (const signal of ['SIGTERM', 'SIGKILL']) {
       const gap = makeHarness()
-      let gapChild
-      let cleanupError = null
+      const gapPhase = `deploy-v5-executor/${point}/${signal}`
+      let gapProcess
       try {
         const protectedFinal = path.join(gap.root, 'backups', `preexisting-final-${signal}.sqlite`)
         const manualBackup = path.join(gap.root, 'backups', `manual-${signal}.sqlite`)
@@ -1462,9 +1444,7 @@ module.materialize(sys.argv[2], sys.argv[3], sys.argv[4], sys.argv[5],
         fs.mkdirSync(barrierRoot, { mode: 0o700 })
         fs.chmodSync(barrierRoot, 0o700)
         const marker = path.join(barrierRoot, `${point}.reached`)
-        const output = { stdout: '', stderr: '' }
-        gapChild = spawn(gap.executor, [], {
-          detached: true,
+        gapProcess = spawnTestProcess(gap.executor, [], {
           env: {
             ...process.env,
             PATH: `${gap.bin}:${process.env.PATH}`,
@@ -1472,20 +1452,16 @@ module.materialize(sys.argv[2], sys.argv[3], sys.argv[4], sys.argv[5],
             KINVEST_V5_TEST_BARRIER: point
           },
           stdio: ['pipe', 'pipe', 'pipe']
-        })
-        gapChild.stdout.on('data', chunk => { output.stdout += chunk })
-        gapChild.stderr.on('data', chunk => { output.stderr += chunk })
+        }, { label: gapPhase })
+        const { child: gapChild } = gapProcess
+        gapChild.stdout.resume()
+        gapChild.stderr.resume()
         gapChild.stdin.end(diagnosticPayload())
-        await waitForFile(marker, gapChild, output, 15000)
+        await gapProcess.waitForReady(() => fs.existsSync(marker), `${gapPhase}/barrier-ready`)
         process.kill(-gapChild.pid, signal)
-        const interrupted = await new Promise((resolve, reject) => {
-          const timer = setTimeout(() => {
-            process.kill(-gapChild.pid, 'SIGKILL')
-            reject(new Error(`${point}/${signal} executor did not terminate`))
-          }, 10000)
-          gapChild.once('close', code => { clearTimeout(timer); resolve({ code, ...output }) })
-        })
-        assert.notEqual(interrupted.code, 0, `${point}/${signal}`)
+        const interrupted = await gapProcess.waitForExit(`${gapPhase}/interrupted-exit`)
+        assert.notEqual(interrupted.status, 0, `${point}/${signal}`)
+        await gapProcess.cleanup(`${gapPhase}/before-recovery-cleanup`)
 
         const recovered = spawnSync(gap.executor, [], {
           encoding: 'utf8', input: diagnosticPayload(), timeout: 30000,
@@ -1499,18 +1475,9 @@ module.materialize(sys.argv[2], sys.argv[3], sys.argv[4], sys.argv[5],
         assert.deepEqual(fs.readdirSync(gap.runRoot)
           .filter(name => name.startsWith('kinvest-v5.candidates.')), [], `${point}/${signal}: registry leaked`)
       } finally {
-        if (gapChild && gapChild.exitCode === null) {
-          try { process.kill(-gapChild.pid, 'SIGKILL') } catch (error) {
-            if (error.code !== 'ESRCH') cleanupError = error
-          }
-        }
-        try {
-          cleanupHarness(gap)
-        } catch (error) {
-          cleanupError ??= error
-        }
+        if (gapProcess) await gapProcess.cleanup(`${gapPhase}/cleanup`)
+        cleanupHarness(gap)
       }
-      if (cleanupError) throw cleanupError
     }
   }
 

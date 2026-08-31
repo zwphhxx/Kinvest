@@ -3,7 +3,7 @@ const crypto = require('node:crypto')
 const fs = require('node:fs')
 const os = require('node:os')
 const path = require('node:path')
-const { spawn, spawnSync } = require('node:child_process')
+const { spawnTestProcess } = require('./helpers/deployment-test-process')
 
 const rootDir = path.resolve(__dirname, '../..')
 const assetPath = path.join(rootDir, 'deploy/server/kinvest-nginx-config-installer-v1')
@@ -196,16 +196,23 @@ printf 'KINVEST_NGINX_FIXED_IP_APPLY_OK ip=%s health=ready https=ready\\n' "$(ca
   writeExecutable(installer, source)
   return {
     base, backupRoot, candidate, containerHash, gateCount, installer, kinvestId,
+    processes: [],
     nginxId, nginxIp, operations, target, targetDir, runRoot, containerCandidate,
     deployLock, lockFile
   }
 }
 
-function execute(context, candidate = context.candidate, expectedHash = sha256(fs.readFileSync(candidate)), extraEnv = {}) {
-  return spawnSync('bash', [context.installer, candidate, expectedHash], {
-    encoding: 'utf8',
-    env: { ...process.env, ...extraEnv, PATH: `${path.join(context.base, 'bin')}:${process.env.PATH}` }
-  })
+function execute(context, candidate = context.candidate, expectedHash = sha256(fs.readFileSync(candidate)), extraEnv = {}, label = 'nginx:execute') {
+  return executeAsync(context, extraEnv, label, candidate, expectedHash).waitForResult()
+}
+
+async function removeFixture(context) {
+  let failure
+  for (const managed of context.processes) {
+    try { await managed.cleanup() } catch (error) { failure ||= error }
+  }
+  if (failure) throw failure
+  fs.rmSync(context.base, { recursive: true, force: true })
 }
 
 function backupDirectories(context) {
@@ -235,45 +242,47 @@ function assertTemporaryFilesCleaned(context) {
   )
 }
 
-function holdLock(file, marker) {
-  return spawn('python3', ['-c', `
+function holdLock(context, file, marker) {
+  const managed = spawnTestProcess('python3', ['-c', `
 import fcntl, sys, time
 stream = open(sys.argv[1], 'a+')
 fcntl.flock(stream.fileno(), fcntl.LOCK_EX)
 open(sys.argv[2], 'w').close()
 while True: time.sleep(1)
-`, file, marker], { stdio: 'ignore' })
+`, file, marker], { stdio: 'ignore' }, { label: 'nginx:deploy-lock-holder' })
+  context.processes.push(managed)
+  return managed
 }
 
-async function waitForFile(file, timeoutMs = 5000) {
-  const deadline = Date.now() + timeoutMs
-  while (!fs.existsSync(file)) {
-    if (Date.now() >= deadline) throw new Error(`timed out waiting for ${file}`)
-    await new Promise((resolve) => setTimeout(resolve, 10))
-  }
-}
-
-function executeAsync(context, extraEnv = {}) {
-  const child = spawn('bash', [context.installer, context.candidate, sha256(candidateConfig)], {
-    env: { ...process.env, ...extraEnv, PATH: `${path.join(context.base, 'bin')}:${process.env.PATH}` }
-  })
+function executeAsync(context, extraEnv = {}, label = 'nginx:execute', candidate = context.candidate, expectedHash = sha256(fs.readFileSync(candidate))) {
+  const managed = spawnTestProcess('bash', [context.installer, candidate, expectedHash], {
+    env: { ...process.env, ...extraEnv, PATH: `${path.join(context.base, 'bin')}:${process.env.PATH}` },
+    stdio: ['ignore', 'pipe', 'pipe']
+  }, { label })
+  context.processes.push(managed)
+  const { child } = managed
   let stdout = ''
   let stderr = ''
   child.stdout.on('data', (chunk) => { stdout += chunk })
   child.stderr.on('data', (chunk) => { stderr += chunk })
-  const result = new Promise((resolve) => {
-    child.once('close', (status, signal) => resolve({ signal, status, stderr, stdout }))
-  })
-  return { child, result }
+  return {
+    ...managed,
+    async waitForResult() {
+      const result = await managed.waitForExit(`${label}:exit`)
+      await managed.cleanup(`${label}:cleanup`)
+      return { ...result, stderr, stdout }
+    }
+  }
 }
 
 async function run() {
   assert.equal(fs.existsSync(assetPath), true, 'versioned Nginx config installer asset is required')
-  assert.equal(spawnSync('bash', ['-n', assetPath], { encoding: 'utf8' }).status, 0)
+  const syntax = spawnTestProcess('bash', ['-n', assetPath], { stdio: 'ignore' }, { label: 'nginx:syntax' })
+  try { assert.equal((await syntax.waitForExit()).status, 0) } finally { await syntax.cleanup() }
 
   const success = fixture()
   try {
-    const result = execute(success)
+    const result = await execute(success)
     assert.equal(result.status, 0, result.stderr)
     assert.equal(fs.readFileSync(success.target, 'utf8'), candidateConfig)
     assert.equal(fs.readFileSync(success.containerHash, 'utf8').trim(), sha256(candidateConfig))
@@ -290,86 +299,87 @@ async function run() {
     assert.match(result.stdout, new RegExp(`^KINVEST_NGINX_CONFIG_INSTALL_OK backup=.* sha256=${sha256(candidateConfig)}\\n$`))
     assert.equal(result.stderr, '')
     assertTemporaryFilesCleaned(success)
-  } finally { fs.rmSync(success.base, { recursive: true, force: true }) }
+  } finally { await removeFixture(success) }
 
   const preflight = fixture()
   try {
-    const result = execute(preflight, preflight.candidate, undefined, { PREFLIGHT_FAIL: '1' })
+    const result = await execute(preflight, preflight.candidate, undefined, { PREFLIGHT_FAIL: '1' })
     assertStableFailure(result, 'KINVEST_NGINX_CONFIG_PREFLIGHT_FAILED')
     assertOldState(preflight)
     assert.equal(fs.readFileSync(preflight.gateCount, 'utf8'), '0\n')
     assert.equal(backupDirectories(preflight).length, 0)
     assertTemporaryFilesCleaned(preflight)
-  } finally { fs.rmSync(preflight.base, { recursive: true, force: true }) }
+  } finally { await removeFixture(preflight) }
 
   const locked = fixture()
   try {
-    const result = execute(locked, locked.candidate, undefined, { OWN_LOCK_FAIL: '1' })
+    const result = await execute(locked, locked.candidate, undefined, { OWN_LOCK_FAIL: '1' })
     assertStableFailure(result, 'KINVEST_NGINX_CONFIG_LOCKED')
     assertOldState(locked)
     assert.equal(fs.readFileSync(locked.gateCount, 'utf8'), '0\n')
     assert.equal(backupDirectories(locked).length, 0)
-  } finally { fs.rmSync(locked.base, { recursive: true, force: true }) }
+  } finally { await removeFixture(locked) }
 
   const sharedLocked = fixture()
   const sharedMarker = path.join(sharedLocked.base, 'shared-lock-held')
-  const sharedHolder = holdLock(sharedLocked.deployLock, sharedMarker)
   try {
-    await waitForFile(sharedMarker)
-    const result = execute(sharedLocked)
+    const sharedHolder = holdLock(sharedLocked, sharedLocked.deployLock, sharedMarker)
+    await sharedHolder.waitForReady(() => fs.existsSync(sharedMarker), 'nginx:deploy-lock-holder:ready')
+    const result = await execute(sharedLocked)
     assertStableFailure(result, 'KINVEST_NGINX_CONFIG_DEPLOY_LOCKED')
     assertOldState(sharedLocked)
     assert.equal(fs.readFileSync(sharedLocked.gateCount, 'utf8'), '0\n')
   } finally {
-    sharedHolder.kill('SIGTERM')
-    fs.rmSync(sharedLocked.base, { recursive: true, force: true })
+    await removeFixture(sharedLocked)
   }
 
   const concurrent = fixture()
   const gateHeld = path.join(concurrent.base, 'gate-held')
   const gateRelease = path.join(concurrent.base, 'gate-release')
-  const first = executeAsync(concurrent, { HOLD_GATE_MARKER: gateHeld, RELEASE_GATE_MARKER: gateRelease })
   try {
-    await waitForFile(gateHeld)
-    const second = execute(concurrent)
+    const first = executeAsync(concurrent, {
+      HOLD_GATE_MARKER: gateHeld, RELEASE_GATE_MARKER: gateRelease
+    }, 'nginx:concurrent-first')
+    await first.waitForReady(() => fs.existsSync(gateHeld), 'nginx:concurrent-first:gate-ready')
+    const second = await execute(concurrent, concurrent.candidate, undefined, {}, 'nginx:concurrent-second')
     assertStableFailure(second, 'KINVEST_NGINX_CONFIG_DEPLOY_LOCKED')
     assert.equal(fs.readFileSync(concurrent.target, 'utf8'), candidateConfig)
     write(gateRelease, '')
-    const firstResult = await first.result
+    const firstResult = await first.waitForResult()
     assert.equal(firstResult.status, 0, firstResult.stderr)
     const lockOperations = fs.readFileSync(concurrent.operations, 'utf8').match(/^flock:[89]$/gm)
     assert.deepEqual(lockOperations.slice(0, 2), ['flock:8', 'flock:9'])
   } finally {
-    if (!fs.existsSync(gateRelease)) write(gateRelease, '')
-    first.child.kill('SIGTERM')
-    fs.rmSync(concurrent.base, { recursive: true, force: true })
+    try {
+      if (!fs.existsSync(gateRelease)) write(gateRelease, '')
+    } finally { await removeFixture(concurrent) }
   }
 
   const signalCase = process.env.KINVEST_NGINX_CONFIG_SIGNAL_CASE || 'all'
   if (signalCase !== 'install-move') {
     const snapshotSignal = fixture()
     try {
-      const result = execute(snapshotSignal, snapshotSignal.candidate, undefined, {
+      const result = await execute(snapshotSignal, snapshotSignal.candidate, undefined, {
         SIGNAL_AFTER_SNAPSHOT_CREATE: 'TERM'
       })
       assert.notEqual(result.status, 0)
       assertOldState(snapshotSignal)
       assert.equal(fs.readFileSync(snapshotSignal.gateCount, 'utf8'), '0\n')
       assertTemporaryFilesCleaned(snapshotSignal)
-    } finally { fs.rmSync(snapshotSignal.base, { recursive: true, force: true }) }
+    } finally { await removeFixture(snapshotSignal) }
   }
 
   if (signalCase !== 'snapshot') {
     const installMoveSignal = fixture()
     try {
-      const result = execute(installMoveSignal, installMoveSignal.candidate, undefined, {
+      const result = await execute(installMoveSignal, installMoveSignal.candidate, undefined, {
         SIGNAL_AFTER_INSTALL_MV: 'TERM'
       })
       assertStableFailure(result, 'KINVEST_NGINX_CONFIG_INTERRUPTED')
       assertOldState(installMoveSignal)
       assert.equal(fs.readFileSync(installMoveSignal.gateCount, 'utf8'), '1\n')
       assertTemporaryFilesCleaned(installMoveSignal)
-    } finally { fs.rmSync(installMoveSignal.base, { recursive: true, force: true }) }
+    } finally { await removeFixture(installMoveSignal) }
   }
 
   for (const scenario of [
@@ -385,7 +395,7 @@ async function run() {
   ]) {
     const context = fixture()
     try {
-      const result = execute(context, context.candidate, undefined, scenario.env)
+      const result = await execute(context, context.candidate, undefined, scenario.env)
       assertStableFailure(result, scenario.outputCode || scenario.code)
       assertOldState(context)
       assert.equal(fs.readFileSync(context.gateCount, 'utf8'), '2\n')
@@ -395,86 +405,86 @@ async function run() {
       assert.match(operations, /gate:apply:1/)
       assert.match(operations, /gate:apply:2/)
       assertTemporaryFilesCleaned(context)
-    } finally { fs.rmSync(context.base, { recursive: true, force: true }) }
+    } finally { await removeFixture(context) }
   }
 
   const mismatch = fixture()
   try {
-    const result = execute(mismatch, mismatch.candidate, '0'.repeat(64))
+    const result = await execute(mismatch, mismatch.candidate, '0'.repeat(64))
     assertStableFailure(result, 'KINVEST_NGINX_CONFIG_HASH_MISMATCH')
     assertOldState(mismatch)
-  } finally { fs.rmSync(mismatch.base, { recursive: true, force: true }) }
+  } finally { await removeFixture(mismatch) }
 
   const invalidHash = fixture()
   try {
-    const result = execute(invalidHash, invalidHash.candidate, 'A'.repeat(64))
+    const result = await execute(invalidHash, invalidHash.candidate, 'A'.repeat(64))
     assertStableFailure(result, 'KINVEST_NGINX_CONFIG_HASH_INVALID')
     assertOldState(invalidHash)
-  } finally { fs.rmSync(invalidHash.base, { recursive: true, force: true }) }
+  } finally { await removeFixture(invalidHash) }
 
   const symlink = fixture()
   try {
     const linked = path.join(symlink.base, 'candidate-link.conf')
     fs.symlinkSync(symlink.candidate, linked)
-    const result = execute(symlink, linked, sha256(candidateConfig))
+    const result = await execute(symlink, linked, sha256(candidateConfig))
     assertStableFailure(result, 'KINVEST_NGINX_CONFIG_CANDIDATE_INVALID')
     assertOldState(symlink)
-  } finally { fs.rmSync(symlink.base, { recursive: true, force: true }) }
+  } finally { await removeFixture(symlink) }
 
   const nonRegular = fixture()
   try {
-    const result = execute(nonRegular, nonRegular.base, '0'.repeat(64))
+    const result = await execute(nonRegular, nonRegular.base, '0'.repeat(64))
     assertStableFailure(result, 'KINVEST_NGINX_CONFIG_CANDIDATE_INVALID')
     assertOldState(nonRegular)
-  } finally { fs.rmSync(nonRegular.base, { recursive: true, force: true }) }
+  } finally { await removeFixture(nonRegular) }
 
   const nonRoot = fixture()
   try {
-    const result = execute(nonRoot, nonRoot.candidate, undefined, { FAKE_UID: String(process.getuid() + 1) })
+    const result = await execute(nonRoot, nonRoot.candidate, undefined, { FAKE_UID: String(process.getuid() + 1) })
     assertStableFailure(result, 'KINVEST_NGINX_CONFIG_ROOT_REQUIRED')
     assertOldState(nonRoot)
-  } finally { fs.rmSync(nonRoot.base, { recursive: true, force: true }) }
+  } finally { await removeFixture(nonRoot) }
 
   const oversized = fixture()
   try {
     const large = path.join(oversized.base, 'large.conf')
     write(large, 'x'.repeat(1024 * 1024 + 1), 0o600)
-    const result = execute(oversized, large)
+    const result = await execute(oversized, large)
     assertStableFailure(result, 'KINVEST_NGINX_CONFIG_CANDIDATE_TOO_LARGE')
     assertOldState(oversized)
-  } finally { fs.rmSync(oversized.base, { recursive: true, force: true }) }
+  } finally { await removeFixture(oversized) }
 
   const rollbackFailure = fixture()
   try {
-    const result = execute(rollbackFailure, rollbackFailure.candidate, undefined, { FAIL_GATE_CALLS: '1,2' })
+    const result = await execute(rollbackFailure, rollbackFailure.candidate, undefined, { FAIL_GATE_CALLS: '1,2' })
     assertStableFailure(result, 'KINVEST_NGINX_CONFIG_ROLLBACK_FAILED')
     assert.equal(fs.readFileSync(rollbackFailure.target, 'utf8'), oldConfig)
     assert.equal(fs.readFileSync(rollbackFailure.gateCount, 'utf8'), '2\n')
-  } finally { fs.rmSync(rollbackFailure.base, { recursive: true, force: true }) }
+  } finally { await removeFixture(rollbackFailure) }
 
   const metadataRollback = fixture({ targetMode: 0o644 })
   try {
-    const result = execute(metadataRollback, metadataRollback.candidate, undefined, { FAIL_GATE_CALLS: '1' })
+    const result = await execute(metadataRollback, metadataRollback.candidate, undefined, { FAIL_GATE_CALLS: '1' })
     assertStableFailure(result, 'KINVEST_NGINX_CONFIG_GATE_APPLY_FAILED')
     assertOldState(metadataRollback)
     assert.equal(fs.statSync(metadataRollback.target).mode & 0o777, 0o644)
-  } finally { fs.rmSync(metadataRollback.base, { recursive: true, force: true }) }
+  } finally { await removeFixture(metadataRollback) }
 
   const rollbackSignal = fixture()
   try {
-    const result = execute(rollbackSignal, rollbackSignal.candidate, undefined, {
+    const result = await execute(rollbackSignal, rollbackSignal.candidate, undefined, {
       FAIL_GATE_CALLS: '1',
       SIGNAL_DURING_ROLLBACK: 'TERM'
     })
     assertStableFailure(result, 'KINVEST_NGINX_CONFIG_GATE_APPLY_FAILED')
     assertOldState(rollbackSignal)
     assertTemporaryFilesCleaned(rollbackSignal)
-  } finally { fs.rmSync(rollbackSignal.base, { recursive: true, force: true }) }
+  } finally { await removeFixture(rollbackSignal) }
 
   const blockedCleanup = fixture()
   try {
     const started = Date.now()
-    const result = execute(blockedCleanup, blockedCleanup.candidate, undefined, {
+    const result = await execute(blockedCleanup, blockedCleanup.candidate, undefined, {
       BLOCK_DOCKER_CLEANUP: '1',
       FAIL_GATE_CALLS: '1'
     })
@@ -483,27 +493,27 @@ async function run() {
     assertOldState(blockedCleanup)
     assert.doesNotMatch(result.stdout + result.stderr, /INSTALL_OK/)
     assertTemporaryFilesCleaned(blockedCleanup)
-  } finally { fs.rmSync(blockedCleanup.base, { recursive: true, force: true }) }
+  } finally { await removeFixture(blockedCleanup) }
 
   const rollbackTemporaryFailure = fixture()
   try {
-    const result = execute(rollbackTemporaryFailure, rollbackTemporaryFailure.candidate, undefined, {
+    const result = await execute(rollbackTemporaryFailure, rollbackTemporaryFailure.candidate, undefined, {
       FAIL_GATE_CALLS: '1',
       FAIL_ROLLBACK_MV: '1'
     })
     assertStableFailure(result, 'KINVEST_NGINX_CONFIG_ROLLBACK_FAILED')
     assert.equal(fs.readFileSync(rollbackTemporaryFailure.gateCount, 'utf8'), '1\n')
     assertTemporaryFilesCleaned(rollbackTemporaryFailure)
-  } finally { fs.rmSync(rollbackTemporaryFailure.base, { recursive: true, force: true }) }
+  } finally { await removeFixture(rollbackTemporaryFailure) }
 
   const secret = fixture()
   try {
     const marker = 'token=KINVEST_SUPER_SECRET_12345'
     write(secret.candidate, `${candidateConfig}# ${marker}\n`, 0o600)
-    const result = execute(secret, secret.candidate, undefined, { PREFLIGHT_FAIL: '1' })
+    const result = await execute(secret, secret.candidate, undefined, { PREFLIGHT_FAIL: '1' })
     assertStableFailure(result, 'KINVEST_NGINX_CONFIG_PREFLIGHT_FAILED')
     assert.doesNotMatch(result.stdout + result.stderr, /KINVEST_SUPER_SECRET_12345|token=/)
-  } finally { fs.rmSync(secret.base, { recursive: true, force: true }) }
+  } finally { await removeFixture(secret) }
 }
 
 module.exports = { run }

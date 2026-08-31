@@ -3,7 +3,8 @@ const crypto = require('node:crypto')
 const fs = require('node:fs')
 const os = require('node:os')
 const path = require('node:path')
-const { spawn, spawnSync } = require('node:child_process')
+const { spawnSync } = require('node:child_process')
+const { spawnTestProcess } = require('./helpers/deployment-test-process')
 
 const rootDir = path.resolve(__dirname, '../..')
 const sourceDir = path.join(rootDir, 'deploy/server')
@@ -246,11 +247,80 @@ function installerEnvironment(context, overrides = {}) {
   }
 }
 
-function execute(context, overrides = {}) {
-  return spawnSync('bash', [context.script, sourceDir], {
-    encoding: 'utf8',
-    env: installerEnvironment(context, overrides)
-  })
+const installerProcesses = new WeakMap()
+const MAX_INSTALLER_OUTPUT_BYTES = 1024 * 1024
+
+function trackInstallerProcess(context, managed) {
+  let pending = installerProcesses.get(context)
+  if (!pending) {
+    pending = new Set()
+    installerProcesses.set(context, pending)
+  }
+  pending.add(managed)
+  return managed
+}
+
+async function cleanupInstallerProcess(context, managed, label = 'v4 installer execution cleanup') {
+  await managed.cleanup(label)
+  const pending = installerProcesses.get(context)
+  if (pending) {
+    pending.delete(managed)
+    if (pending.size === 0) installerProcesses.delete(context)
+  }
+}
+
+async function cleanupFixture(context) {
+  const pending = installerProcesses.get(context)
+  if (pending) {
+    for (const managed of pending) {
+      await cleanupInstallerProcess(context, managed, 'v4 installer fixture cleanup')
+    }
+  }
+  fs.rmSync(context.base, { recursive: true, force: true })
+}
+
+async function execute(context, overrides = {}, lifecycleOptions = {}) {
+  const managed = trackInstallerProcess(context, spawnTestProcess('bash', [context.script, sourceDir], {
+    env: installerEnvironment(context, overrides),
+    stdio: ['ignore', 'pipe', 'pipe']
+  }, { label: 'v4 installer execution', ...lifecycleOptions }))
+  const stdout = []
+  const stderr = []
+  let outputBytes = 0
+  let outputLimitExceeded = false
+
+  function capture(chunks, chunk) {
+    if (outputLimitExceeded) return
+    const bytes = Buffer.isBuffer(chunk) ? chunk : Buffer.from(chunk)
+    if (outputBytes + bytes.length > MAX_INSTALLER_OUTPUT_BYTES) {
+      outputLimitExceeded = true
+      // Start bounded termination immediately; finally awaits the cached outcome.
+      void managed.cleanup('v4 installer output limit cleanup').catch(() => {})
+      return
+    }
+    outputBytes += bytes.length
+    chunks.push(bytes)
+  }
+
+  const captureStdout = (chunk) => capture(stdout, chunk)
+  const captureStderr = (chunk) => capture(stderr, chunk)
+  try {
+    managed.child.stdout.on('data', captureStdout)
+    managed.child.stderr.on('data', captureStderr)
+    const result = await managed.waitForExit()
+    if (outputLimitExceeded) throw new Error('v4 installer execution: DEPLOY_TEST_OUTPUT_LIMIT')
+    return {
+      status: result.status,
+      signal: result.signal,
+      stdout: Buffer.concat(stdout).toString('utf8'),
+      stderr: Buffer.concat(stderr).toString('utf8')
+    }
+  } finally {
+    // A rejected cleanup deliberately leaves the handle registered for the fixture.
+    await cleanupInstallerProcess(context, managed)
+    managed.child.stdout.off('data', captureStdout)
+    managed.child.stderr.off('data', captureStderr)
+  }
 }
 
 function fixtureGateSource(context, source) {
@@ -260,48 +330,6 @@ function fixtureGateSource(context, source) {
     .replaceAll('/usr/bin/sudo', path.join(context.bin, 'sudo'))
     .replaceAll('directory_info.st_uid != 0', `directory_info.st_uid != ${process.getuid()}`)
     .replaceAll('marker_info.st_uid != 0', `marker_info.st_uid != ${process.getuid()}`)
-}
-
-function waitFor(check, timeoutMs = 10000) {
-  const started = Date.now()
-  return new Promise((resolve, reject) => {
-    const poll = () => {
-      if (check()) return resolve()
-      if (Date.now() - started >= timeoutMs) return reject(new Error('timed out waiting for installer event'))
-      setTimeout(poll, 10)
-    }
-    poll()
-  })
-}
-
-const childClosures = new WeakMap()
-
-function trackChild(child) {
-  childClosures.set(child, new Promise((resolve) => {
-    child.once('close', (status, signal) => resolve({ signal, status }))
-  }))
-  return child
-}
-
-function waitForExit(child, label, timeoutMs = 15000) {
-  return new Promise((resolve, reject) => {
-    let timedOut = false
-    const timeout = setTimeout(() => {
-      timedOut = true
-      child.kill('SIGKILL')
-    }, timeoutMs)
-    childClosures.get(child).then(({ status, signal }) => {
-      clearTimeout(timeout)
-      if (timedOut) return reject(new Error(`${label}: installer child did not exit within ${timeoutMs}ms`))
-      resolve({ signal, status })
-    })
-  })
-}
-
-async function terminateAndWait(child, label) {
-  if (!child) return
-  if (child.exitCode === null && child.signalCode === null) child.kill('SIGKILL')
-  await waitForExit(child, `${label} cleanup`)
 }
 
 function assertOld(context, existing) {
@@ -336,6 +364,7 @@ function canWriteAs(info, uid, gid) {
 }
 
 async function run() {
+  await require('./installer-execution-lifecycle.test').run()
   assert.match(installerSource, /bash -n "\$LOCAL_SBIN\/kinvest-nginx-fixed-ip-gate"/)
   assert.doesNotMatch(installerSource, /systemctl restart|docker compose|DEPLOY_V4_ENABLED/)
   assert.doesNotMatch(installerSource, /install\.lock|\.install-lock\./)
@@ -350,25 +379,24 @@ async function run() {
   assert.doesNotMatch(gateSource, /timeout|sleep|retry/i)
   assert.match(gateSource, /\.identity\./)
 
-  const timeoutChild = trackChild(spawn(process.execPath, ['-e', 'setInterval(() => {}, 1000)'], { stdio: 'ignore' }))
+  const timeoutProcess = spawnTestProcess(process.execPath, ['-e', 'setInterval(() => {}, 1000)'],
+    { stdio: 'ignore' }, { label: 'v4 timeout regression' })
+  const timeoutChild = timeoutProcess.child
   let timeoutChildClosed = false
   timeoutChild.once('close', () => { timeoutChildClosed = true })
   try {
     await assert.rejects(
-      waitForExit(timeoutChild, 'timeout regression', 25),
+      timeoutProcess.waitForExit('v4 timeout regression', 25),
       (error) => {
         assert.ok(error instanceof Error)
-        assert.match(error.message, /timeout regression/)
+        assert.equal(error.message, 'v4 timeout regression: DEPLOY_TEST_EXIT_TIMEOUT')
         assert.equal(timeoutChildClosed, true)
         return true
       }
     )
     assert.equal(timeoutChild.signalCode, 'SIGKILL')
   } finally {
-    if (!timeoutChildClosed) {
-      timeoutChild.kill('SIGKILL')
-      await new Promise((resolve) => timeoutChild.once('close', resolve))
-    }
+    await timeoutProcess.cleanup('v4 timeout regression cleanup')
   }
 
   const missingIdentity = fixture()
@@ -380,27 +408,27 @@ async function run() {
     assert.notEqual(result.status, 0)
     assert.match(result.stderr, /DEPLOY_V4_GATE_IDENTITY_REQUIRED/)
   } finally {
-    fs.rmSync(missingIdentity.base, { recursive: true, force: true })
+    await cleanupFixture(missingIdentity)
   }
 
   for (const mode of ['missing-user', 'missing-group', 'membership-mismatch']) {
     const invalidIdentity = fixture()
     try {
-      const result = execute(invalidIdentity, { FAKE_IDENTITY_MODE: mode })
+      const result = await execute(invalidIdentity, { FAKE_IDENTITY_MODE: mode })
       assert.notEqual(result.status, 0, mode)
       assert.match(result.stderr, /DEPLOY_V4_GATE_IDENTITY_INVALID/, mode)
     } finally {
-      fs.rmSync(invalidIdentity.base, { recursive: true, force: true })
+      await cleanupFixture(invalidIdentity)
     }
   }
 
   const injectedIdentity = fixture()
   try {
-    const result = execute(injectedIdentity, { KINVEST_DEPLOY_GATE_USER: 'lighthouse ALL=(ALL) NOPASSWD: ALL' })
+    const result = await execute(injectedIdentity, { KINVEST_DEPLOY_GATE_USER: 'lighthouse ALL=(ALL) NOPASSWD: ALL' })
     assert.notEqual(result.status, 0)
     assert.match(result.stderr, /DEPLOY_V4_GATE_IDENTITY_INVALID/)
   } finally {
-    fs.rmSync(injectedIdentity.base, { recursive: true, force: true })
+    await cleanupFixture(injectedIdentity)
   }
 
   const gatePermissionBase = fs.mkdtempSync(path.join(os.tmpdir(), 'kinvest-v4-gate-'))
@@ -447,20 +475,21 @@ PY
     const idle = spawnSync(gate, [], { encoding: 'utf8', env: gateEnv })
     assert.equal(idle.status, 0, idle.stderr)
 
-    holder = trackChild(spawn('python3', ['-c', [
+    holder = spawnTestProcess('python3', ['-c', [
       'import fcntl,os,sys,time',
       'fd=os.open(sys.argv[1], os.O_RDONLY | os.O_DIRECTORY)',
       'fcntl.flock(fd, fcntl.LOCK_EX)',
       'open(sys.argv[2], "w").close()',
       'time.sleep(30)'
-    ].join(';'), publicState, ready], { stdio: 'ignore' }))
-    await waitFor(() => fs.existsSync(ready))
+    ].join(';'), publicState, ready], { stdio: 'ignore' }, { label: 'v4 exclusive gate lock holder' })
+    await holder.waitForReady(() => fs.existsSync(ready), 'v4 exclusive gate lock readiness')
     const busy = spawnSync(gate, [], { encoding: 'utf8', env: gateEnv })
     assert.equal(busy.status, 76)
     assert.equal(busy.stderr, 'DEPLOY_INSTALL_INCOMPLETE\n')
     fs.writeFileSync(marker, 'ACTIVE\n', { mode: 0o640 })
-    holder.kill('SIGKILL')
-    await waitForExit(holder, 'exclusive gate lock holder')
+    holder.child.kill('SIGKILL')
+    await holder.waitForExit('v4 exclusive gate lock completion')
+    await holder.cleanup('v4 exclusive gate lock cleanup')
     const stale = spawnSync(gate, [], { encoding: 'utf8', env: gateEnv })
     assert.equal(stale.status, 76)
     assert.equal(stale.stderr, 'DEPLOY_INSTALL_INCOMPLETE\n')
@@ -480,7 +509,7 @@ PY
     const reconciled = spawnSync(gate, [], { encoding: 'utf8', env: gateEnv })
     assert.equal(reconciled.status, 0, reconciled.stderr)
   } finally {
-    await terminateAndWait(holder, 'exclusive gate lock holder')
+    if (holder) await holder.cleanup('v4 exclusive gate lock cleanup')
     fs.chmodSync(path.join(gatePermissionBase, 'private'), 0o700)
     fs.rmSync(gatePermissionBase, { recursive: true, force: true })
   }
@@ -490,11 +519,11 @@ PY
     fs.mkdirSync(legalTemps.gateStateDir, { mode: 0o750 })
     const legalMarkerTemp = path.join(legalTemps.gateStateDir, '.install-incomplete.XyZ789')
     fs.writeFileSync(legalMarkerTemp, 'partial', { mode: 0o600 })
-    const result = execute(legalTemps)
+    const result = await execute(legalTemps)
     assert.equal(result.status, 0, result.stderr)
     assert.equal(fs.existsSync(legalMarkerTemp), false)
   } finally {
-    fs.rmSync(legalTemps.base, { recursive: true, force: true })
+    await cleanupFixture(legalTemps)
   }
 
   for (const fault of ['symlink', 'wrong-owner', 'hardlink', 'malformed-name']) {
@@ -510,12 +539,12 @@ PY
         if (fault === 'wrong-owner') overrides.FAKE_BAD_OWNER_PATH = candidate
         if (fault === 'hardlink') fs.linkSync(candidate, path.join(malicious.base, 'extra-hardlink'))
       }
-      const result = execute(malicious, overrides)
+      const result = await execute(malicious, overrides)
       assert.notEqual(result.status, 0, fault)
       assert.match(result.stderr, /DEPLOY_V4_GATE_TEMP_INVALID/, fault)
       assert.equal(fs.existsSync(candidate), true, fault)
     } finally {
-      fs.rmSync(malicious.base, { recursive: true, force: true })
+      await cleanupFixture(malicious)
     }
   }
 
@@ -524,11 +553,11 @@ PY
     fs.mkdirSync(legalIdentityTemp.gateStateDir, { mode: 0o750 })
     const candidate = path.join(legalIdentityTemp.gateStateDir, '.identity.AbC123')
     fs.writeFileSync(candidate, 'user=light', { mode: 0o600 })
-    const result = execute(legalIdentityTemp)
+    const result = await execute(legalIdentityTemp)
     assert.equal(result.status, 0, result.stderr)
     assert.equal(fs.existsSync(candidate), false)
   } finally {
-    fs.rmSync(legalIdentityTemp.base, { recursive: true, force: true })
+    await cleanupFixture(legalIdentityTemp)
   }
 
   for (const fault of ['symlink', 'wrong-owner', 'hardlink', 'malformed-name']) {
@@ -543,29 +572,29 @@ PY
         if (fault === 'wrong-owner') overrides.FAKE_BAD_OWNER_PATH = candidate
         if (fault === 'hardlink') fs.linkSync(candidate, path.join(maliciousIdentity.base, 'identity-hardlink'))
       }
-      const result = execute(maliciousIdentity, overrides)
+      const result = await execute(maliciousIdentity, overrides)
       assert.notEqual(result.status, 0, fault)
       assert.match(result.stderr, /DEPLOY_V4_GATE_TEMP_INVALID/, fault)
       assert.equal(fs.existsSync(candidate), true, fault)
     } finally {
-      fs.rmSync(maliciousIdentity.base, { recursive: true, force: true })
+      await cleanupFixture(maliciousIdentity)
     }
   }
 
   const failedIdentity = fixture({ failIdentityTempStage: 'mode' })
   try {
-    const result = execute(failedIdentity)
+    const result = await execute(failedIdentity)
     assert.notEqual(result.status, 0)
     assert.deepEqual(fs.readdirSync(failedIdentity.gateStateDir).filter((name) => name.startsWith('.identity.')), [])
     assert.ok(fs.readFileSync(failedIdentity.fsyncTrace, 'utf8').includes(`dir:${failedIdentity.gateStateDir}\n`))
   } finally {
-    fs.rmSync(failedIdentity.base, { recursive: true, force: true })
+    await cleanupFixture(failedIdentity)
   }
 
   for (const stage of ['created', 'written', 'owned', 'mode', 'durable', 'renamed']) {
     const interrupted = fixture({ killIdentityTempStage: stage })
     try {
-      const killed = execute(interrupted)
+      const killed = await execute(interrupted)
       assert.equal(killed.signal, 'SIGKILL', stage)
       const identityTemps = fs.readdirSync(interrupted.gateStateDir).filter((name) => name.startsWith('.identity.'))
       assert.equal(identityTemps.length, stage === 'renamed' ? 0 : 1, stage)
@@ -575,46 +604,46 @@ PY
         encoding: 'utf8', env: { ...process.env, PATH: `${interrupted.bin}:${process.env.PATH}`, SSH_ORIGINAL_COMMAND: 'deploy-v3' }
       })
       assert.equal(beforeResume.status, stage === 'renamed' ? 0 : 76, stage)
-      const resumed = execute(interrupted)
+      const resumed = await execute(interrupted)
       assert.equal(resumed.status, 0, resumed.stderr)
       const afterResume = spawnSync(gateHarness, [], {
         encoding: 'utf8', env: { ...process.env, PATH: `${interrupted.bin}:${process.env.PATH}`, SSH_ORIGINAL_COMMAND: 'deploy-v3' }
       })
       assert.equal(afterResume.status, 0, stage)
     } finally {
-      fs.rmSync(interrupted.base, { recursive: true, force: true })
+      await cleanupFixture(interrupted)
     }
   }
 
   for (const kind of ['marker']) {
     const failedTemp = fixture({ failGateTemp: kind })
     try {
-      const result = execute(failedTemp)
+      const result = await execute(failedTemp)
       assert.notEqual(result.status, 0, kind)
       const leftovers = fs.readdirSync(failedTemp.gateStateDir).filter((name) => name.startsWith('.install-'))
       assert.deepEqual(leftovers, [], kind)
       assert.ok(fs.readFileSync(failedTemp.fsyncTrace, 'utf8').includes(`dir:${failedTemp.gateStateDir}\n`), kind)
     } finally {
-      fs.rmSync(failedTemp.base, { recursive: true, force: true })
+      await cleanupFixture(failedTemp)
     }
 
     const killedTemp = fixture({ killGateTemp: kind })
     try {
-      const killed = execute(killedTemp)
+      const killed = await execute(killedTemp)
       assert.equal(killed.signal, 'SIGKILL', `${kind}: status=${killed.status} stderr=${killed.stderr}`)
       assert.ok(fs.readdirSync(killedTemp.gateStateDir).some((name) => name.startsWith('.install-incomplete.')), kind)
-      const resumed = execute(killedTemp)
+      const resumed = await execute(killedTemp)
       assert.equal(resumed.status, 0, resumed.stderr)
       assert.deepEqual(fs.readdirSync(killedTemp.gateStateDir).filter((name) => name.startsWith('.install-')), [], kind)
     } finally {
-      fs.rmSync(killedTemp.base, { recursive: true, force: true })
+      await cleanupFixture(killedTemp)
     }
   }
 
   for (const stage of ['created', 'written', 'owned', 'mode', 'durable']) {
     const interrupted = fixture({ killGateTempStage: stage })
     try {
-      const killed = execute(interrupted)
+      const killed = await execute(interrupted)
       assert.equal(killed.signal, 'SIGKILL', stage)
       assert.ok(fs.readdirSync(interrupted.gateStateDir).some((name) => name.startsWith('.install-incomplete.')), stage)
       const gateHarness = path.join(interrupted.base, `temp-gate-${stage}`)
@@ -625,17 +654,17 @@ PY
       })
       assert.equal(blocked.status, 76, stage)
       assert.equal(blocked.stderr, 'DEPLOY_INSTALL_INCOMPLETE\n', stage)
-      const resumed = execute(interrupted)
+      const resumed = await execute(interrupted)
       assert.equal(resumed.status, 0, resumed.stderr)
       assert.deepEqual(fs.readdirSync(interrupted.gateStateDir).filter((name) => name.startsWith('.install-incomplete.')), [], stage)
     } finally {
-      fs.rmSync(interrupted.base, { recursive: true, force: true })
+      await cleanupFixture(interrupted)
     }
   }
 
   const deploymentBusy = fixture()
   try {
-    const result = execute(deploymentBusy, {
+    const result = await execute(deploymentBusy, {
       INSTALL_EVENTS: deploymentBusy.eventLog,
       INSTALLER_LOCK_DIR: deploymentBusy.installerLockDir,
       DEPLOY_LOCK_DIR: deploymentBusy.deployLockDir,
@@ -649,7 +678,7 @@ PY
     assert.equal(events.some((event) => event.endsWith(':target-read')), false)
     assertOld(deploymentBusy, true)
   } finally {
-    fs.rmSync(deploymentBusy.base, { recursive: true, force: true })
+    await cleanupFixture(deploymentBusy)
   }
 
   const concurrent = fixture()
@@ -662,24 +691,24 @@ PY
       INSTALL_LOCK_RELEASE: concurrent.lockRelease,
       INSTALL_TARGET_ROOT: concurrent.base
     }
-    first = trackChild(spawn('bash', [concurrent.script, sourceDir], {
+    first = trackInstallerProcess(concurrent, spawnTestProcess('bash', [concurrent.script, sourceDir], {
       env: installerEnvironment(concurrent, { ...sharedEnvironment, HOLD_LOCK_KIND: 'install', INSTALLER_ID: 'first' }),
       stdio: 'ignore'
-    }))
-    await waitFor(() => fs.existsSync(concurrent.eventLog) && fs.readFileSync(concurrent.eventLog, 'utf8').includes('first:install-lock'))
-    const second = execute(concurrent, { ...sharedEnvironment, INSTALLER_ID: 'second' })
+    }, { label: 'v4 concurrent primary installer' }))
+    await first.waitForReady(() => fs.existsSync(concurrent.eventLog) && fs.readFileSync(concurrent.eventLog, 'utf8').includes('first:install-lock'), 'v4 concurrent installer lock readiness')
+    const second = await execute(concurrent, { ...sharedEnvironment, INSTALLER_ID: 'second' })
     assert.notEqual(second.status, 0)
     const whileLocked = fs.readFileSync(concurrent.eventLog, 'utf8').trim().split('\n')
     assert.equal(whileLocked.includes('second:target-read'), false)
     fs.writeFileSync(concurrent.lockRelease, '')
-    const firstExit = await waitForExit(first, 'concurrent primary installer')
+    const firstExit = await first.waitForExit('v4 concurrent primary installer completion')
     assert.equal(firstExit.status, 0)
     const events = fs.readFileSync(concurrent.eventLog, 'utf8').trim().split('\n')
     assert.ok(events.indexOf('first:install-lock') < events.indexOf('first:deploy-lock'))
     assert.ok(events.indexOf('first:deploy-lock') < events.indexOf('first:target-read'))
   } finally {
-    await terminateAndWait(first, 'concurrent primary installer')
-    fs.rmSync(concurrent.base, { recursive: true, force: true })
+    if (first) await first.cleanup('v4 concurrent primary installer cleanup')
+    await cleanupFixture(concurrent)
   }
 
   const gateWindow = fixture({ pauseBeforeGate: true })
@@ -692,10 +721,10 @@ PY
       INSTALL_LOCK_RELEASE: gateWindow.lockRelease,
       INSTALLER_ID: 'installer'
     }
-    gateWindowChild = trackChild(spawn('bash', [gateWindow.script, sourceDir], {
+    gateWindowChild = trackInstallerProcess(gateWindow, spawnTestProcess('bash', [gateWindow.script, sourceDir], {
       env: installerEnvironment(gateWindow, lockEnvironment), stdio: 'ignore'
-    }))
-    await waitFor(() => fs.existsSync(gateWindow.locksHeldMarker))
+    }, { label: 'v4 gate publication window installer' }))
+    await gateWindowChild.waitForReady(() => fs.existsSync(gateWindow.locksHeldMarker), 'v4 gate publication lock readiness')
     const journal = path.join(gateWindow.serverRoot, 'state/install-v4.journal')
     assert.equal(fs.existsSync(journal), false)
     const gateHarness = path.join(gateWindow.base, 'gate-harness')
@@ -706,7 +735,8 @@ PY
     assert.equal(blocked.status, 76)
     assert.equal(blocked.stderr, 'DEPLOY_INSTALL_INCOMPLETE\n')
     fs.writeFileSync(gateWindow.lockRelease, '')
-    assert.equal((await waitForExit(gateWindowChild, 'gate publication window installer')).status, 0)
+    assert.equal((await gateWindowChild.waitForExit('v4 gate publication window completion')).status, 0)
+    await gateWindowChild.cleanup('v4 gate publication window cleanup')
     fs.rmSync(gateWindow.installerLockDir, { recursive: true, force: true })
     fs.rmSync(gateWindow.deployLockDir, { recursive: true, force: true })
     const installedGate = path.join(gateWindow.base, 'installed-gate')
@@ -724,28 +754,28 @@ PY
     assert.equal(delegated.status, 0, delegated.stderr)
     for (const target of gateWindow.targets) assert.doesNotMatch(fs.readFileSync(target, 'utf8'), /^old-/)
   } finally {
-    await terminateAndWait(gateWindowChild, 'gate publication window installer')
-    fs.rmSync(gateWindow.base, { recursive: true, force: true })
+    if (gateWindowChild) await gateWindowChild.cleanup('v4 gate publication window cleanup')
+    await cleanupFixture(gateWindow)
   }
 
   const signalled = fixture({ replaceFailure: 3, rollbackPause: true })
   let signalledChild
   try {
-    signalledChild = trackChild(spawn('bash', [signalled.script, sourceDir], {
+    signalledChild = trackInstallerProcess(signalled, spawnTestProcess('bash', [signalled.script, sourceDir], {
       env: installerEnvironment(signalled),
       stdio: 'ignore'
-    }))
-    await waitFor(() => fs.existsSync(signalled.rollbackMarker))
-    signalledChild.kill('SIGTERM')
-    signalledChild.kill('SIGTERM')
+    }, { label: 'v4 signalled rollback installer' }))
+    await signalledChild.waitForReady(() => fs.existsSync(signalled.rollbackMarker), 'v4 rollback readiness')
+    signalledChild.child.kill('SIGTERM')
+    signalledChild.child.kill('SIGTERM')
     fs.writeFileSync(signalled.rollbackRelease, '')
-    const childExit = await waitForExit(signalledChild, 'signalled rollback installer')
+    const childExit = await signalledChild.waitForExit('v4 signalled rollback completion')
     assert.notEqual(childExit.status, 0)
     assert.equal(childExit.signal, null)
     assertOld(signalled, true)
   } finally {
-    await terminateAndWait(signalledChild, 'signalled rollback installer')
-    fs.rmSync(signalled.base, { recursive: true, force: true })
+    if (signalledChild) await signalledChild.cleanup('v4 signalled rollback cleanup')
+    await cleanupFixture(signalled)
   }
 
   const markerOnly = fixture()
@@ -753,12 +783,12 @@ PY
     const marker = path.join(markerOnly.gateStateDir, 'install-incomplete')
     fs.mkdirSync(markerOnly.gateStateDir, { mode: 0o750 })
     fs.writeFileSync(marker, 'ACTIVE\n', { mode: 0o640 })
-    const resumed = execute(markerOnly)
+    const resumed = await execute(markerOnly)
     assert.equal(resumed.status, 0, resumed.stderr)
     assert.equal(fs.existsSync(marker), false)
     for (const target of markerOnly.targets) assert.doesNotMatch(fs.readFileSync(target, 'utf8'), /^old-/)
   } finally {
-    fs.rmSync(markerOnly.base, { recursive: true, force: true })
+    await cleanupFixture(markerOnly)
   }
 
   const legacyV1 = fixture({ replaceFailure: 0 })
@@ -786,7 +816,7 @@ PY
       { mode: 0o600 }
     )
 
-    const resumed = execute(legacyV1)
+    const resumed = await execute(legacyV1)
     assert.notEqual(resumed.status, 0)
     for (let index = 0; index < 9; index += 1) {
       assert.equal(fs.readFileSync(legacyV1.targets[index], 'utf8'), `legacy-${index}\n`)
@@ -795,13 +825,13 @@ PY
     assert.equal(fs.readFileSync(legacyV1.targets[9], 'utf8'), 'legacy-transaction-untouched\n')
     assert.equal(fs.statSync(legacyV1.targets[9]).mode & 0o777, 0o644)
   } finally {
-    fs.rmSync(legacyV1.base, { recursive: true, force: true })
+    await cleanupFixture(legacyV1)
   }
 
   for (const killStage of ['before-gate', 'after-gate', 'after-journal']) {
     const interrupted = fixture({ killStage })
     try {
-      const killed = execute(interrupted)
+      const killed = await execute(interrupted)
       assert.equal(killed.signal, 'SIGKILL', killStage)
       const journal = path.join(interrupted.serverRoot, 'state/install-v4.journal')
       assert.equal(fs.existsSync(journal), killStage === 'after-journal', killStage)
@@ -813,19 +843,19 @@ PY
         })
         assert.equal(delegated.status, 0, delegated.stderr)
       }
-      const resumed = execute(interrupted)
+      const resumed = await execute(interrupted)
       assert.equal(resumed.status, 0, resumed.stderr)
       assert.equal(fs.existsSync(journal), false)
       assert.equal(fs.existsSync(path.join(interrupted.gateStateDir, 'install-incomplete')), false)
     } finally {
-      fs.rmSync(interrupted.base, { recursive: true, force: true })
+      await cleanupFixture(interrupted)
     }
   }
 
   for (let index = 0; index < targetCount; index += 1) {
     const interrupted = fixture({ killAfterReplacement: index })
     try {
-      const killed = execute(interrupted)
+      const killed = await execute(interrupted)
       assert.equal(killed.signal, 'SIGKILL', `replacement ${index}`)
       const journal = path.join(interrupted.serverRoot, 'state/install-v4.journal')
       assert.equal(fs.existsSync(journal), true, `replacement ${index}`)
@@ -843,47 +873,47 @@ PY
         assert.match(blocked.stderr, /DEPLOY_INSTALL_INCOMPLETE/)
       }
 
-      const resumed = execute(interrupted)
+      const resumed = await execute(interrupted)
       assert.equal(resumed.status, 0, resumed.stderr)
       assert.equal(fs.existsSync(journal), false)
       for (const target of interrupted.targets) assert.equal(fs.existsSync(target), true)
       assert.doesNotMatch(resumed.stdout + resumed.stderr, /systemctl|docker compose|compose up/i)
     } finally {
-      fs.rmSync(interrupted.base, { recursive: true, force: true })
+      await cleanupFixture(interrupted)
     }
   }
 
   for (let index = 0; index < targetCount; index += 1) {
     const context = fixture({ replaceFailure: index })
     try {
-      const result = execute(context)
+      const result = await execute(context)
       assert.notEqual(result.status, 0, `replacement ${index} unexpectedly succeeded`)
       assertOld(context, true)
     } finally {
-      fs.rmSync(context.base, { recursive: true, force: true })
+      await cleanupFixture(context)
     }
   }
 
   const post = fixture({ postFailure: true })
   try {
-    assert.notEqual(execute(post).status, 0)
+    assert.notEqual((await execute(post)).status, 0)
     assertOld(post, true)
     assertDurableRenames(fs.readFileSync(post.fsyncTrace, 'utf8').trim().split('\n'), '.kinvest-v4-restore.')
   } finally {
-    fs.rmSync(post.base, { recursive: true, force: true })
+    await cleanupFixture(post)
   }
 
   const absent = fixture({ existing: false, replaceFailure: 4 })
   try {
-    assert.notEqual(execute(absent).status, 0)
+    assert.notEqual((await execute(absent)).status, 0)
     assertOld(absent, false)
   } finally {
-    fs.rmSync(absent.base, { recursive: true, force: true })
+    await cleanupFixture(absent)
   }
 
   const success = fixture()
   try {
-    const result = execute(success)
+    const result = await execute(success)
     assert.equal(result.status, 0, result.stderr)
     for (const target of success.targets) assert.equal(fs.existsSync(target), true)
     assert.equal(fs.readFileSync(success.targets[2], 'utf8'), fs.readFileSync(success.targets[3], 'utf8'))
@@ -922,34 +952,38 @@ PY
     }
     assert.doesNotMatch(result.stdout + result.stderr, /systemctl|docker compose|compose up/i)
   } finally {
-    fs.rmSync(success.base, { recursive: true, force: true })
+    await cleanupFixture(success)
   }
 
   const identityReentry = fixture()
   try {
-    assert.equal(execute(identityReentry).status, 0)
-    const mismatch = execute(identityReentry, {
+    assert.equal((await execute(identityReentry)).status, 0)
+    const mismatch = await execute(identityReentry, {
       KINVEST_DEPLOY_GATE_USER: 'alternate',
       KINVEST_DEPLOY_GATE_GROUP: 'alternate'
     })
     assert.notEqual(mismatch.status, 0)
     assert.match(mismatch.stderr, /DEPLOY_V4_GATE_IDENTITY_MISMATCH/)
   } finally {
-    fs.rmSync(identityReentry.base, { recursive: true, force: true })
+    await cleanupFixture(identityReentry)
   }
 
   const v3Journal = fixture()
   try {
     const journal = path.join(v3Journal.serverRoot, 'state/install-v3.journal')
     fs.writeFileSync(journal, 'private-v3\n', { mode: 0o600 })
-    const result = execute(v3Journal)
+    const result = await execute(v3Journal)
     assert.equal(result.status, 76)
     assert.match(result.stderr, /DEPLOY_INSTALL_INCOMPLETE/)
     assert.equal(fs.existsSync(journal), true)
     assertOld(v3Journal, true)
   } finally {
-    fs.rmSync(v3Journal.base, { recursive: true, force: true })
+    await cleanupFixture(v3Journal)
   }
 }
 
-module.exports = { run }
+module.exports = {
+  run,
+  executeInstallerForTest: execute,
+  cleanupInstallerFixtureForTest: cleanupFixture
+}
