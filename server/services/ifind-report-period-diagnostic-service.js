@@ -2,6 +2,8 @@
 
 const { randomBytes } = require('node:crypto')
 const { types } = require('node:util')
+const { createReportPeriodFailureEvidence, summarizeReportPeriodResponse } =
+  require('../domain/ifind-report-period-failure')
 const {
   createInitialReportPeriodDiagnosticResult,
   copyReportPeriodDiagnosticResult,
@@ -184,7 +186,10 @@ function createIfindReportPeriodDiagnosticService(options) {
     let observation
     let status = 'failed'
     let errorCode = FAILED
-    let safeErrorClass = 'NETWORK'
+    let safeErrorClass = 'API'
+    let failureStage = 'auth'
+    let failureEvidence = null
+    let responseShape = null
     let result
 
     function checkLease() {
@@ -210,24 +215,36 @@ function createIfindReportPeriodDiagnosticService(options) {
         const authentication = record(authOutput, ['accessToken', 'requestCount'])
         if (authentication.requestCount !== 1 || !isToken(accessToken) ||
             accessToken.length < 1 || accessToken.length > 4096) fail()
-        safeErrorClass = 'NETWORK'
+        safeErrorClass = 'API'
         checkLease()
         requestCount = 2; businessRequestCount = 1
+        failureStage = 'financial'
         const output = await methods.diagnose.call(config.client, accessToken)
         safeErrorClass = 'RESPONSE_SHAPE'
         const business = record(output, ['payload', 'requestCount', 'dataVol'])
         if (!validVolume(business.dataVol)) fail()
         dataVol = business.dataVol
         if (business.requestCount !== 1) fail()
-        safeErrorClass = 'NETWORK'
+        safeErrorClass = 'API'
         checkLease()
         safeErrorClass = 'RESPONSE_SHAPE'
+        responseShape = summarizeReportPeriodResponse(business.payload)
         observation = parseReportPeriodDiagnosticObservation(business.payload)
-        safeErrorClass = 'NETWORK'
+        safeErrorClass = 'API'
         checkLease()
         status = 'observed-unverified'; errorCode = OBSERVED; safeErrorClass = 'PERIOD_UNVERIFIED'
       } catch (error) {
         observation = null
+        if (requestCount > 0) failureEvidence = createReportPeriodFailureEvidence(error, failureStage)
+        if (failureEvidence === null && safeErrorClass === 'RESPONSE_SHAPE') {
+          failureEvidence = createReportPeriodFailureEvidence({ code: 'IFIND_RESPONSE_SHAPE',
+            failureCode: 'IFIND_RESPONSE_SHAPE', class: 'API', vendorErrorCode: null,
+            stage: failureStage, responseShape }, failureStage)
+        }
+        if (failureEvidence !== null) {
+          safeErrorClass = failureEvidence.failureCode === 'IFIND_RESPONSE_SHAPE' ? 'RESPONSE_SHAPE' :
+            failureEvidence.errorClass === 'CONFIG' ? 'API' : failureEvidence.errorClass
+        }
         if (businessRequestCount === 1 && dataVol === null) {
           const volume = ownValue(error, 'dataVol')
           if (validVolume(volume)) dataVol = volume
@@ -240,7 +257,7 @@ function createIfindReportPeriodDiagnosticService(options) {
       result = {
         ...createInitialReportPeriodDiagnosticResult(), status, observation,
         requestCount, businessRequestCount, dataVol,
-        attemptedAt: new Date(reservation.createdAt).toISOString(), errorCode
+        attemptedAt: new Date(reservation.createdAt).toISOString(), errorCode, failureEvidence
       }
       try {
         // Never persist numerical/date evidence or mark the market case verified.
@@ -249,7 +266,8 @@ function createIfindReportPeriodDiagnosticService(options) {
           result: {
             status: 'failed', quoteStatus: 'not_run', financeStatus: 'unavailable',
             requestCount, dataVol, elapsedMs: completedAt - reservation.createdAt,
-            safeErrorClass, failureCode: errorCode, vendorErrorCode: null, completedAt
+            safeErrorClass, failureCode: failureEvidence?.failureCode || errorCode,
+            vendorErrorCode: failureEvidence?.vendorErrorCode ?? null, completedAt
           }
         })
         const settled = record(settlement, ['status', 'cooldownUntil'])
@@ -257,6 +275,7 @@ function createIfindReportPeriodDiagnosticService(options) {
             settled.cooldownUntil !== completedAt + IFIND_MARKET_CASE_COOLDOWN_MS) fail()
       } catch {
         result.status = 'unavailable'; result.errorCode = UNAVAILABLE; result.observation = null
+        result.failureEvidence = null
       }
     } finally {
       wipe(refreshToken); wipe(accessToken)
@@ -267,8 +286,11 @@ function createIfindReportPeriodDiagnosticService(options) {
       }
       active = null
     }
-    if (generation !== owner.generation && result.observation !== null) {
-      result.status = 'failed'; result.errorCode = FAILED; result.observation = null
+    if (generation !== owner.generation) {
+      result.failureEvidence = null
+      if (result.observation !== null) {
+        result.status = 'failed'; result.errorCode = FAILED; result.observation = null
+      }
     }
     if (generation === owner.generation) current = copyReportPeriodDiagnosticResult(result)
     return copyReportPeriodDiagnosticResult(result)

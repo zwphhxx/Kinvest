@@ -160,7 +160,10 @@ async function rawJsonContract() {
       const ledger = db.prepare('SELECT * FROM ifind_market_case_runs').get()
       assert.equal(ledger.status, 'failed')
       assert.equal(ledger.request_count, 2)
-      assert.equal(ledger.failure_code, 'IFIND_REPORT_PERIOD_DIAGNOSTIC_FAILED')
+      assert.equal(ledger.failure_code, 'IFIND_RESPONSE_JSON')
+      assert.equal(ledger.safe_error_class, 'API')
+      assert.deepEqual(result.failureEvidence, { stage: 'financial', failureCode: 'IFIND_RESPONSE_JSON',
+        errorClass: 'API', vendorErrorCode: null, responseShape: null })
       assert.equal(ledger.data_vol, null)
       for (const table of ['ifind_market_quote_snapshots', 'ifind_market_financial_points']) {
         assert.equal(db.prepare(`SELECT COUNT(*) AS n FROM ${table}`).get().n, 0)
@@ -316,9 +319,66 @@ async function runtimeHttpContract() {
   } finally { runtime.clear(); db.close() }
 }
 
+async function failureEvidenceContract() {
+  const { IfindMarketDiagnosticRepository } = require('../db/ifind-market-diagnostic-repository')
+  const { createIfindReportPeriodDiagnosticService } = require('../services/ifind-report-period-diagnostic-service')
+  const cases = [
+    { wire: response({ revenue_oas: [1], report_sd: ['20260101'], report_ed: ['2026-03-31'] }),
+      code: 'IFIND_RESPONSE_SHAPE', classification: 'RESPONSE_SHAPE', vendor: null, shape: 'compact-date' },
+    { wire: { ...response(), tables: [{ ...response().tables[0], metadata: 'UNTRUSTED' }] },
+      code: 'IFIND_RESPONSE_SHAPE', classification: 'RESPONSE_SHAPE', vendor: null, row: 'extra-fields' },
+    { wire: { errorcode: -403, dataVol: 3, errmsg: 'UNTRUSTED' },
+      code: 'IFIND_PERMISSION_REJECTED', classification: 'PERMISSION', vendor: -403 },
+    { wire: { errorcode: -429, dataVol: 3, errmsg: 'UNTRUSTED' },
+      code: 'IFIND_QUOTA_REJECTED', classification: 'QUOTA', vendor: -429 },
+    { wire: { errorcode: -900, dataVol: 3, errmsg: 'UNTRUSTED' },
+      code: 'IFIND_FINANCIAL_REJECTED', classification: 'API', vendor: -900 },
+    { wire: { errorcode: -401, errmsg: 'UNTRUSTED' }, auth: true,
+      code: 'IFIND_AUTH_REJECTED', classification: 'AUTH', vendor: -401 }
+  ]
+  for (const sample of cases) {
+    const db = new DatabaseSync(':memory:'); const repository = new IfindMarketDiagnosticRepository(db)
+    repository.initialize()
+    const network = transport(sample.auth ? [sample.wire] : [
+      { errorcode: 0, data: { access_token: 'synthetic-access' } }, sample.wire])
+    const client = createIfindHttpClient({ request: network.request })
+    const refresh = Buffer.from('synthetic-refresh')
+    const service = createIfindReportPeriodDiagnosticService({ repository, client,
+      tokenVersionId: 'v20260831-001', clock: () => NOW,
+      secretProvider: { readRefreshToken() { return refresh } } })
+    try {
+      const result = await service.run()
+      assert.equal(result.status, 'failed'); assert.equal(result.observation, null)
+      assert.equal(result.errorCode, 'IFIND_REPORT_PERIOD_DIAGNOSTIC_FAILED')
+      assert.equal(result.failureEvidence.failureCode, sample.code)
+      assert.equal(result.failureEvidence.stage, sample.auth ? 'auth' : 'financial')
+      assert.equal(result.failureEvidence.vendorErrorCode, sample.vendor)
+      if (sample.shape) assert.equal(result.failureEvidence.responseShape.reportStartShape, sample.shape)
+      if (sample.row) assert.equal(result.failureEvidence.responseShape.rowShape, sample.row)
+      assert.ok(Object.values(result.verification).every((value) => value === 'unverified'))
+      assert.deepEqual(service.describe(), result)
+      const ledger = db.prepare('SELECT * FROM ifind_market_case_runs').get()
+      assert.equal(ledger.safe_error_class, sample.classification)
+      assert.equal(ledger.failure_code, sample.code)
+      assert.equal(ledger.vendor_error_code, sample.vendor)
+      assert.equal(ledger.request_count, sample.auth ? 1 : 2)
+      assert.equal(network.calls.length, sample.auth ? 1 : 2)
+      assert.doesNotMatch(JSON.stringify([result, ledger]), /UNTRUSTED|synthetic-|20260101|247652000000|metadata/)
+      assert.ok(refresh.every((byte) => byte === 0))
+      for (const table of ['ifind_market_quote_snapshots', 'ifind_market_financial_points']) {
+        assert.equal(db.prepare(`SELECT COUNT(*) AS n FROM ${table}`).get().n, 0)
+      }
+      service.clear(); assert.equal(service.describe().failureEvidence, null)
+      assert.equal((await service.run()).status, 'cooldown')
+      assert.equal(network.calls.length, sample.auth ? 1 : 2)
+    } finally { service.clear(); client.clear(); db.close() }
+  }
+}
+
 module.exports = { run: async function () {
+  await failureEvidenceContract(); console.log('PASS report-period integration: safe failures survive adapter, service and SQLite')
   await rawJsonContract(); console.log('PASS report-period integration: raw duplicate JSON, parsing limits and failed settlement')
   await transportContract(); console.log('PASS report-period integration: fake HTTPS and calibration preservation')
   await runtimeHttpContract(); console.log('PASS report-period integration: runtime, HTTP gates, SQLite and isolation')
-  console.log('ifind-report-period-diagnostic-integration: 3 tests passed')
+  console.log('ifind-report-period-diagnostic-integration: 4 tests passed')
 } }

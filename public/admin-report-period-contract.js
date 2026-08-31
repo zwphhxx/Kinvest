@@ -10,13 +10,52 @@
     'currencyStatus', 'unitStatus', 'reportPeriodStatus', 'scopeStatus']
   const RESULT_KEYS = ['diagnosticId', 'caseId', 'displayCode', 'requestedSelector',
     'indicators', 'status', 'verification', 'observation', 'requestCount',
-    'businessRequestCount', 'dataVol', 'attemptedAt', 'errorCode']
+    'businessRequestCount', 'dataVol', 'attemptedAt', 'errorCode', 'failureEvidence']
   const FIXED = [
     { indicator: 'revenue_oas', parameters: ['20260331', '1', 'BB'] },
     { indicator: 'report_sd', parameters: ['20260331', '1'] },
     { indicator: 'report_ed', parameters: ['20260331', '1'] }
   ]
   const IDLE = new Set(['ready', 'busy', 'cooldown', 'daily-limit'])
+  // Narrow mirror of server/contracts/ifind-diagnostic-errors.js: only these two stages.
+  const FAILURE_RULES = {
+    IFIND_AUTH_REJECTED: failureRule('AUTH', ['auth', 'financial'], true),
+    IFIND_CLIENT_CLEARED: failureRule('CONFIG', ['auth', 'financial']),
+    IFIND_CLIENT_FAILED: failureRule('API', ['auth', 'financial']),
+    IFIND_CONFIG_INVALID: failureRule('CONFIG', ['auth', 'financial']),
+    IFIND_CONNECTION_TIMEOUT: failureRule('NETWORK', ['auth', 'financial']),
+    IFIND_DUPLICATE_RESPONSE: failureRule('NETWORK', ['auth', 'financial']),
+    IFIND_FINANCIAL_REJECTED: failureRule('API', ['financial'], true),
+    IFIND_HTTP_STATUS: failureRule('API', ['auth', 'financial']),
+    IFIND_NETWORK_FAILED: failureRule('NETWORK', ['auth', 'financial']),
+    IFIND_PERMISSION_REJECTED: failureRule('PERMISSION', ['financial'], true),
+    IFIND_QUOTA_REJECTED: failureRule('QUOTA', ['financial'], true),
+    IFIND_RESPONSE_ABORTED: failureRule('NETWORK', ['auth', 'financial']),
+    IFIND_RESPONSE_ENCODING: failureRule('API', ['auth', 'financial']),
+    IFIND_RESPONSE_FAILED: failureRule('NETWORK', ['auth', 'financial']),
+    IFIND_RESPONSE_INVALID: failureRule('NETWORK', ['auth', 'financial']),
+    IFIND_RESPONSE_JSON: failureRule('API', ['auth', 'financial']),
+    IFIND_RESPONSE_SHAPE: failureRule('API', ['auth', 'financial']),
+    IFIND_RESPONSE_TOO_LARGE: failureRule('API', ['auth', 'financial']),
+    IFIND_TIMEOUT: failureRule('NETWORK', ['auth', 'financial'])
+  }
+  const CLASS_LABELS = { AUTH: '认证', CONFIG: '配置', API: '接口', NETWORK: '网络', PERMISSION: '权限', QUOTA: '额度' }
+  const VALUE_SHAPES = {
+    unavailable: '无法观察', missing: '缺失', invalid: '结构无效', 'empty-array': '空数组',
+    'multiple-values': '多个值', null: '空值', number: '数值', 'decimal-string': '十进制数字文本',
+    'iso-date': 'ISO 日期文本', 'compact-date': '紧凑日期文本', datetime: '日期时间文本',
+    'other-string': '其他文本', object: '对象', array: '数组', boolean: '布尔值', unsupported: '不支持的类型'
+  }
+  const SHAPE_KEYS = ['tablesShape', 'rowShape', 'identityShape', 'columnShape',
+    'revenueShape', 'reportStartShape', 'reportEndShape']
+  const SHAPE_LABELS = {
+    tablesShape: { missing: '缺失', invalid: '结构无效', empty: '空表集合', single: '单表', multiple: '多表' },
+    rowShape: { unavailable: '无法观察', invalid: '结构无效', exact: '固定字段', 'extra-fields': '含额外字段' },
+    identityShape: { unavailable: '无法观察', missing: '缺失', match: '匹配', mismatch: '不匹配', invalid: '结构无效' },
+    columnShape: { unavailable: '无法观察', invalid: '结构无效', 'known-only': '仅已知字段', 'extra-fields': '含额外字段' },
+    revenueShape: VALUE_SHAPES, reportStartShape: VALUE_SHAPES, reportEndShape: VALUE_SHAPES
+  }
+  const SHAPE_TITLES = ['表', '行', '标识', '列', '收入', '起始日期', '截止日期']
   const MESSAGES = {
     ADMIN_AUTH_REQUIRED: '管理员会话已结束，请重新登录。',
     ADMIN_CSRF_INVALID: '操作凭证已失效，请重新登录；本次操作不会自动重试。',
@@ -35,6 +74,10 @@
 
   function invalid() {
     throw Object.assign(new Error('Invalid report-period diagnostic result'), { code: `${PREFIX}RESULT_INVALID` })
+  }
+
+  function failureRule(errorClass, stages, allowsVendorErrorCode = false) {
+    return { errorClass, stages, allowsVendorErrorCode }
   }
 
   function record(value, keys) {
@@ -76,6 +119,36 @@
     if (typeof value !== 'string' || value.length !== 24 || !/^20[0-9]{2}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}\.[0-9]{3}Z$/.test(value)) return false
     const time = Date.parse(value)
     return Number.isFinite(time) && new Date(time).toISOString() === value
+  }
+
+  function copyResponseShape(value) {
+    if (value === null) return null
+    const shape = record(value, SHAPE_KEYS)
+    for (const key of SHAPE_KEYS) {
+      if (typeof shape[key] !== 'string' || !Object.hasOwn(SHAPE_LABELS[key], shape[key])) invalid()
+    }
+    if (shape.tablesShape !== 'single' && SHAPE_KEYS.slice(1).some((key) => shape[key] !== 'unavailable')) invalid()
+    if (shape.rowShape === 'invalid' && SHAPE_KEYS.slice(2).some((key) => shape[key] !== 'unavailable')) invalid()
+    if (['unavailable', 'invalid'].includes(shape.columnShape) &&
+        SHAPE_KEYS.slice(4).some((key) => shape[key] !== 'unavailable')) invalid()
+    return Object.fromEntries(SHAPE_KEYS.map((key) => [key, shape[key]]))
+  }
+
+  function copyFailureEvidence(dto) {
+    if (dto.failureEvidence === null) return null
+    const evidence = record(dto.failureEvidence, ['stage', 'failureCode', 'errorClass', 'vendorErrorCode', 'responseShape'])
+    if (dto.status !== 'failed' || !['auth', 'financial'].includes(evidence.stage)) invalid()
+    if (dto.requestCount !== (evidence.stage === 'auth' ? 1 : 2) ||
+        dto.businessRequestCount !== (evidence.stage === 'auth' ? 0 : 1)) invalid()
+    if (typeof evidence.failureCode !== 'string' || !Object.hasOwn(FAILURE_RULES, evidence.failureCode)) invalid()
+    const rule = FAILURE_RULES[evidence.failureCode]
+    if (evidence.errorClass !== rule.errorClass || !rule.stages.includes(evidence.stage)) invalid()
+    if (evidence.vendorErrorCode !== null && (!rule.allowsVendorErrorCode ||
+        !Number.isSafeInteger(evidence.vendorErrorCode) || evidence.vendorErrorCode === 0)) invalid()
+    const responseShape = copyResponseShape(evidence.responseShape)
+    if (evidence.stage === 'auth' && responseShape !== null) invalid()
+    return { stage: evidence.stage, failureCode: evidence.failureCode, errorClass: evidence.errorClass,
+      vendorErrorCode: evidence.vendorErrorCode, responseShape }
   }
 
   function validate(value) {
@@ -124,12 +197,13 @@
     } else if (dto.status === 'failed' || dto.status === 'unavailable') {
       if (observation !== null || dto.errorCode !== `${PREFIX}${dto.status === 'failed' ? 'FAILED' : 'UNAVAILABLE'}`) invalid()
     } else invalid()
+    const failureEvidence = copyFailureEvidence(dto)
     return {
       diagnosticId: 'HK_ALIBABA_REPORT_PERIOD_20260331_SINGLE_QUARTER_V1',
       caseId: 'HK_ALIBABA_9988', displayCode: '9988.HK', requestedSelector: '20260331', indicators,
       status: dto.status, verification: Object.fromEntries(VERIFICATION.map((key) => [key, 'unverified'])),
       observation, requestCount: dto.requestCount, businessRequestCount: dto.businessRequestCount,
-      dataVol: dto.dataVol, attemptedAt: dto.attemptedAt, errorCode: dto.errorCode
+      dataVol: dto.dataVol, attemptedAt: dto.attemptedAt, errorCode: dto.errorCode, failureEvidence
     }
   }
 
@@ -195,6 +269,14 @@
       put('business-request-count', dto ? `${dto.businessRequestCount} 次` : '—')
       put('data-vol', dto && dto.dataVol !== null ? String(dto.dataVol) : '未提供')
       put('error', dto && (dto.status === 'failed' || dto.status === 'unavailable') ? errorMessage(dto.errorCode) : '')
+      const failure = dto && dto.failureEvidence
+      put('failure', failure ?
+        `失败代码：${failure.failureCode}；类别：${CLASS_LABELS[failure.errorClass]}（${failure.errorClass}）；阶段：${failure.stage === 'auth' ? '认证' : '业务'}。` +
+        (failure.vendorErrorCode === null ? '' : `供应商错误码：${failure.vendorErrorCode}。`) : '')
+      const shape = failure && failure.responseShape
+      put('response-shape', failure ? '返回结构摘要：' + (shape ?
+        SHAPE_KEYS.map((key, index) => `${SHAPE_TITLES[index]}：${SHAPE_LABELS[key][shape[key]]}`).join('；') : '未提供') +
+        '。仅反映类型与结构，不代表失败原因，也不能证实收入报告期。' : '')
       buttonState()
     }
 

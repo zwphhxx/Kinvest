@@ -32,6 +32,7 @@ const runtimeFiles = [
   'server/domain/ifind-calibration.js',
   'server/domain/ifind-report-period-evidence.js',
   'server/domain/ifind-report-period-diagnostic.js',
+  'server/domain/ifind-report-period-failure.js',
   'server/domain/ifind-indicator-id.js',
   'server/domain/ifind-market-cases.js',
   'server/domain/ifind-market-financial-parser.js',

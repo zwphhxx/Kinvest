@@ -41,6 +41,7 @@ const tests = [
   require('./ifind-calibration.test'),
   require('./ifind-report-period-evidence.test'),
   require('./ifind-report-period-diagnostic.test'),
+  require('./ifind-report-period-failure.test'),
   require('./ifind-report-period-diagnostic-integration.test'),
   require('./ifind-calibration-integration.test'),
   require('./ifind-market-quote-parser.test'),

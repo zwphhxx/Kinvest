@@ -1,6 +1,7 @@
 'use strict'
 
 const { types } = require('node:util')
+const { copyReportPeriodFailureEvidence } = require('./ifind-report-period-failure')
 
 const REPORT_PERIOD_DIAGNOSTIC_ID = 'HK_ALIBABA_REPORT_PERIOD_20260331_SINGLE_QUARTER_V1'
 const REPORT_PERIOD_DIAGNOSTIC_REQUEST = Object.freeze({
@@ -18,7 +19,7 @@ const VERIFICATION_KEYS = Object.freeze([
 const RESULT_KEYS = Object.freeze([
   'diagnosticId', 'caseId', 'displayCode', 'requestedSelector', 'indicators',
   'status', 'verification', 'observation', 'requestCount', 'businessRequestCount',
-  'dataVol', 'attemptedAt', 'errorCode'
+  'dataVol', 'attemptedAt', 'errorCode', 'failureEvidence'
 ])
 const IDLE = new Set(['ready', 'busy', 'cooldown', 'daily-limit'])
 const PREFIX = 'IFIND_REPORT_PERIOD_DIAGNOSTIC_'
@@ -127,13 +128,17 @@ function createInitialReportPeriodDiagnosticResult() {
     businessRequestCount: 0,
     dataVol: null,
     attemptedAt: null,
-    errorCode: null
+    errorCode: null,
+    failureEvidence: null
   }
 }
 
 function copyReportPeriodDiagnosticResult(value) {
   try {
     const input = record(value, RESULT_KEYS)
+    const failureEvidence = copyReportPeriodFailureEvidence(input.failureEvidence)
+    if (failureEvidence !== null && (input.status !== 'failed' ||
+        input.requestCount !== (failureEvidence.stage === 'auth' ? 1 : 2))) invalid()
     if (input.diagnosticId !== REPORT_PERIOD_DIAGNOSTIC_ID || input.caseId !== 'HK_ALIBABA_9988' ||
         input.displayCode !== '9988.HK' || input.requestedSelector !== '20260331') invalid()
     const indicators = array(input.indicators, 3).map((value, index) => {
@@ -176,7 +181,8 @@ function copyReportPeriodDiagnosticResult(value) {
       businessRequestCount: input.businessRequestCount,
       dataVol: input.dataVol,
       attemptedAt: input.attemptedAt,
-      errorCode: input.errorCode
+      errorCode: input.errorCode,
+      failureEvidence
     }
   } catch {
     // Do not expose proxy traps, getters, raw provider values or exceptions.
