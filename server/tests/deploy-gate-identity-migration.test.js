@@ -3,7 +3,8 @@ const crypto = require('node:crypto')
 const fs = require('node:fs')
 const os = require('node:os')
 const path = require('node:path')
-const { spawn, spawnSync } = require('node:child_process')
+const { spawnSync } = require('node:child_process')
+const { spawnTestProcess } = require('./helpers/deployment-test-process')
 
 const rootDir = path.resolve(__dirname, '../..')
 const sourcePath = path.join(rootDir, 'deploy/server/migrate-deploy-gate-identity.sh')
@@ -133,6 +134,8 @@ exec /bin/mv -f "\${args[@]}"
 
   return {
     base, bin, currentGid, currentGroup, currentUser, gateDir,
+    processes: [],
+    phase: `migration:${pauseAt || 'execute'}:${failAt || 'forward'}:${rollbackFailAt || 'no-rollback-failure'}`,
     identityArgs: [currentUser, currentGroup, targetUser, targetGroup],
     lockLog, script, serverRoot, stateDir, targetGid, targetGroup, targetUser
   }
@@ -148,11 +151,27 @@ function environment(context, overrides = {}) {
   }
 }
 
-function execute(context, overrides = {}, args = context.identityArgs) {
-  return spawnSync('bash', [context.script, ...args], {
-    encoding: 'utf8',
-    env: environment(context, overrides)
-  })
+async function execute(context, overrides = {}, args = context.identityArgs) {
+  const managed = spawnTestProcess('bash', [context.script, ...args], {
+    env: environment(context, overrides),
+    stdio: ['ignore', 'pipe', 'pipe']
+  }, { label: context.phase })
+  context.processes.push(managed)
+  let stdout = ''
+  let stderr = ''
+  managed.child.stdout.on('data', (chunk) => { stdout += chunk })
+  managed.child.stderr.on('data', (chunk) => { stderr += chunk })
+  const result = await managed.waitForExit(`${context.phase}:exit`)
+  await managed.cleanup(`${context.phase}:cleanup`)
+  return { ...result, stdout, stderr }
+}
+
+function boundedSync(command, args, options = {}, label = 'migration:probe') {
+  const result = spawnSync(command, args, { ...options, encoding: 'utf8', timeout: 30_000, killSignal: 'SIGKILL' })
+  if (result.error && 'code' in result.error && result.error.code === 'ETIMEDOUT') {
+    throw new Error(`${label}: DEPLOY_TEST_EXIT_TIMEOUT`)
+  }
+  return result
 }
 
 function assertCurrent(context) {
@@ -177,38 +196,22 @@ function assertTarget(context) {
   assert.deepEqual(fs.readdirSync(context.gateDir), ['identity'])
 }
 
-function withFixture(callback, options = {}) {
+async function removeFixture(context) {
+  let failure
+  for (const managed of context.processes) {
+    try { await managed.cleanup() } catch (error) { failure ||= error }
+  }
+  if (failure) throw failure
+  fs.rmSync(context.base, { recursive: true, force: true })
+}
+
+async function withFixture(callback, options = {}) {
   const context = fixture(options)
   try {
-    return callback(context)
+    return await callback(context)
   } finally {
-    fs.rmSync(context.base, { recursive: true, force: true })
+    await removeFixture(context)
   }
-}
-
-function waitFor(check, timeoutMs = 3000) {
-  const started = Date.now()
-  return new Promise((resolve, reject) => {
-    const poll = () => {
-      if (check()) return resolve()
-      if (Date.now() - started >= timeoutMs) return reject(new Error('timed out waiting for migration boundary'))
-      setTimeout(poll, 10)
-    }
-    poll()
-  })
-}
-
-function waitForExit(child, timeoutMs = 3000) {
-  return new Promise((resolve, reject) => {
-    const timeout = setTimeout(() => {
-      child.kill('SIGKILL')
-      reject(new Error('migration child did not exit'))
-    }, timeoutMs)
-    child.once('close', (status, signal) => {
-      clearTimeout(timeout)
-      resolve({ signal, status })
-    })
-  })
 }
 
 function startPaused(context, pauseAt) {
@@ -216,16 +219,19 @@ function startPaused(context, pauseAt) {
   const release = path.join(context.base, `${pauseAt}.release`)
   let stdout = ''
   let stderr = ''
-  const child = spawn('/bin/bash', [context.script, ...context.identityArgs], {
+  const phase = `migration:${pauseAt}`
+  const managed = spawnTestProcess('/bin/bash', [context.script, ...context.identityArgs], {
     env: environment(context, {
       MIGRATION_FIXTURE_PAUSE_READY: ready,
       MIGRATION_FIXTURE_PAUSE_RELEASE: release
     }),
     stdio: ['ignore', 'pipe', 'pipe']
-  })
+  }, { label: phase })
+  context.processes.push(managed)
+  const { child } = managed
   child.stdout.on('data', (chunk) => { stdout += chunk })
   child.stderr.on('data', (chunk) => { stderr += chunk })
-  return { child, ready, release, stderr: () => stderr, stdout: () => stdout }
+  return { ...managed, phase, ready, release, stderr: () => stderr, stdout: () => stdout }
 }
 
 function writeGateHarness(context, visibleGids = [context.currentGid, context.targetGid], suffix = 'both') {
@@ -261,17 +267,17 @@ function assertSourceOrWrapperFailClosed(context) {
 }
 
 function systemFlockAvailable() {
-  return spawnSync('flock', ['--version'], { stdio: 'ignore' }).status === 0
+  return boundedSync('flock', ['--version'], { stdio: 'ignore' }, 'migration:flock-availability').status === 0
 }
 
-function probeExclusiveLock(pathname, expectedAvailable) {
-  const result = spawnSync('flock', ['-n', '-x', pathname, 'true'], { stdio: 'ignore' })
+function probeExclusiveLock(pathname, expectedAvailable, label) {
+  const result = boundedSync('flock', ['-n', '-x', pathname, 'true'], { stdio: 'ignore' }, label)
   assert.equal(result.status === 0, expectedAvailable, pathname)
 }
 
 function discoverSystemIdentityPair() {
-  const passwd = spawnSync('/usr/bin/getent', ['passwd'], { encoding: 'utf8' })
-  const groups = spawnSync('/usr/bin/getent', ['group'], { encoding: 'utf8' })
+  const passwd = boundedSync('/usr/bin/getent', ['passwd'], { encoding: 'utf8' }, 'migration:system-passwd')
+  const groups = boundedSync('/usr/bin/getent', ['group'], { encoding: 'utf8' }, 'migration:system-groups')
   if (passwd.status !== 0 || groups.status !== 0) return null
   const groupByGid = new Map(groups.stdout.trim().split('\n').map((line) => {
     const [name, , gid] = line.split(':')
@@ -283,7 +289,7 @@ function discoverSystemIdentityPair() {
     const gid = Number(primaryGid)
     const group = groupByGid.get(gid)
     if (!user || !group || !Number.isInteger(gid)) continue
-    const membership = spawnSync('/usr/bin/id', ['-G', user], { encoding: 'utf8' })
+    const membership = boundedSync('/usr/bin/id', ['-G', user], { encoding: 'utf8' }, 'migration:system-membership')
     if (membership.status !== 0 || !membership.stdout.trim().split(/\s+/).includes(String(gid))) continue
     identities.push({ gid, group, user })
   }
@@ -302,15 +308,16 @@ function discoverSystemIdentityPair() {
 }
 
 function assertForcedCommandFailsClosed(context, harness) {
-  const result = spawnSync(harness, [], {
+  const result = boundedSync(harness, [], {
     encoding: 'utf8',
     env: { ...process.env, SSH_ORIGINAL_COMMAND: 'deploy-v4' }
-  })
+  }, `${context.phase}:forced-command`)
   assert.equal(result.status, 76)
   assert.equal(result.stderr, 'DEPLOY_INSTALL_INCOMPLETE\n')
 }
 
 async function run() {
+  await require('./deployment-test-process.test').run()
   const source = fs.readFileSync(sourcePath, 'utf8')
   assert.match(source, /^#!\/bin\/bash$/m)
   assert.match(source, /^PATH='\/usr\/sbin:\/usr\/bin:\/sbin:\/bin'$/m)
@@ -364,7 +371,7 @@ async function run() {
   assert.doesNotMatch(source, /(?:^|\s)(?:docker|systemctl|sqlite3)(?:\s|$)|compose\s|authorized_keys|sudoers/im)
   assert.doesNotMatch(source, /install-deploy-v4\.sh/)
 
-  withFixture((context) => {
+  await withFixture(async (context) => {
     const malicious = path.join(context.base, 'malicious-python')
     const imported = path.join(context.base, 'sitecustomize-imported')
     fs.mkdirSync(malicious)
@@ -373,21 +380,21 @@ async function run() {
       `from pathlib import Path\nPath(${JSON.stringify(imported)}).write_text('imported')\n`
     )
     fs.chmodSync(context.gateDir, 0o755)
-    const result = execute(context, { PYTHONOPTIMIZE: '1', PYTHONPATH: malicious })
+    const result = await execute(context, { PYTHONOPTIMIZE: '1', PYTHONPATH: malicious })
     assert.notEqual(result.status, 0)
     assert.equal(result.stderr, 'DEPLOY_GATE_IDENTITY_MIGRATION_UNSAFE_STATE\n')
     assert.equal(fs.existsSync(imported), false)
   })
 
-  withFixture((context) => {
-    const result = execute(context)
+  await withFixture(async (context) => {
+    const result = await execute(context)
     assert.equal(result.status, 0, result.stderr)
     assert.equal(result.stdout, 'DEPLOY_GATE_IDENTITY_MIGRATION_OK\n')
     assert.equal(result.stderr, '')
     assert.deepEqual(fs.readFileSync(context.lockLog, 'utf8').trim().split('\n'), ['8', '9'])
     assertTarget(context)
 
-    const reentry = execute(context)
+    const reentry = await execute(context)
     assert.notEqual(reentry.status, 0)
     assert.equal(reentry.stdout, '')
     assert.equal(reentry.stderr, 'DEPLOY_GATE_IDENTITY_MIGRATION_SOURCE_MISMATCH\n')
@@ -395,16 +402,16 @@ async function run() {
   })
 
   for (const args of [[], ['current-user'], ['current-user', 'current-group', 'target-user', 'target-group', 'extra']]) {
-    withFixture((context) => {
-      const result = execute(context, {}, args)
+    await withFixture(async (context) => {
+      const result = await execute(context, {}, args)
       assert.notEqual(result.status, 0)
       assert.equal(result.stderr, 'DEPLOY_GATE_IDENTITY_MIGRATION_USAGE\n')
       assertCurrent(context)
     })
   }
 
-  withFixture((context) => {
-    const result = execute(context, {}, ['current-user;bad', 'current-group', 'target-user', 'target-group'])
+  await withFixture(async (context) => {
+    const result = await execute(context, {}, ['current-user;bad', 'current-group', 'target-user', 'target-group'])
     assert.notEqual(result.status, 0)
     assert.equal(result.stderr, 'DEPLOY_GATE_IDENTITY_MIGRATION_IDENTITY_INVALID\n')
     assertCurrent(context)
@@ -414,8 +421,8 @@ async function run() {
     'missing-current-user', 'missing-current-group', 'missing-target-user',
     'missing-target-group', 'target-membership-mismatch'
   ]) {
-    withFixture((context) => {
-      const result = execute(context, { FAKE_IDENTITY_MODE: mode })
+    await withFixture(async (context) => {
+      const result = await execute(context, { FAKE_IDENTITY_MODE: mode })
       assert.notEqual(result.status, 0, mode)
       assert.equal(result.stderr, 'DEPLOY_GATE_IDENTITY_MIGRATION_IDENTITY_INVALID\n', mode)
       assertCurrent(context)
@@ -433,18 +440,18 @@ async function run() {
       fs.symlinkSync('/dev/null', path.join(context.gateDir, 'identity'))
     }
   ]) {
-    withFixture((context) => {
+    await withFixture(async (context) => {
       mutation(context)
-      const result = execute(context)
+      const result = await execute(context)
       assert.notEqual(result.status, 0)
       assert.equal(result.stderr, 'DEPLOY_GATE_IDENTITY_MIGRATION_UNSAFE_STATE\n')
     })
   }
 
-  withFixture((context) => {
+  await withFixture(async (context) => {
     fs.writeFileSync(path.join(context.gateDir, 'identity'), 'user=wrong\ngroup=current-group\ngid=0\n')
     fs.chmodSync(path.join(context.gateDir, 'identity'), 0o640)
-    const result = execute(context)
+    const result = await execute(context)
     assert.notEqual(result.status, 0)
     assert.equal(result.stderr, 'DEPLOY_GATE_IDENTITY_MIGRATION_SOURCE_MISMATCH\n')
   })
@@ -453,8 +460,8 @@ async function run() {
     { busy: 'MIGRATION_BUSY_GATE', expectedLocks: ['8'] },
     { busy: 'MIGRATION_BUSY_DEPLOY', expectedLocks: ['8', '9'] }
   ]) {
-    withFixture((context) => {
-      const result = execute(context, { [busy]: '1' })
+    await withFixture(async (context) => {
+      const result = await execute(context, { [busy]: '1' })
       assert.notEqual(result.status, 0)
       assert.equal(result.stderr, 'DEPLOY_GATE_IDENTITY_MIGRATION_BUSY\n')
       assert.deepEqual(fs.readFileSync(context.lockLog, 'utf8').trim().split('\n'), expectedLocks)
@@ -463,9 +470,9 @@ async function run() {
   }
 
   for (const journal of ['install-v3.journal', 'install-v4.journal']) {
-    withFixture((context) => {
+    await withFixture(async (context) => {
       fs.writeFileSync(path.join(context.stateDir, journal), 'ACTIVE\n', { mode: 0o600 })
-      const result = execute(context)
+      const result = await execute(context)
       assert.notEqual(result.status, 0)
       assert.equal(result.stderr, 'DEPLOY_GATE_IDENTITY_MIGRATION_INSTALL_INCOMPLETE\n')
       assertCurrent(context)
@@ -479,31 +486,31 @@ async function run() {
     'after-marker-unlink',
     'after-final-validation'
   ]) {
-    withFixture((context) => {
-      const result = execute(context)
+    await withFixture(async (context) => {
+      const result = await execute(context)
       assert.notEqual(result.status, 0, failurePoint)
       assert.equal(result.stderr, 'DEPLOY_GATE_IDENTITY_MIGRATION_FAILED_ROLLED_BACK\n', failurePoint)
       assertCurrent(context)
     }, { failAt: failurePoint })
   }
 
-  withFixture((context) => {
-    const result = execute(context, {
+  await withFixture(async (context) => {
+    const result = await execute(context, {
       KINVEST_DEPLOY_GATE_MIGRATION_FAIL_AT: 'after-marker'
     })
     assert.equal(result.status, 0, result.stderr)
     assertTarget(context)
   })
 
-  withFixture((context) => {
-    const result = execute(context)
+  await withFixture(async (context) => {
+    const result = await execute(context)
     assert.notEqual(result.status, 0)
     assert.equal(result.stderr, 'DEPLOY_GATE_IDENTITY_MIGRATION_FAILED_FAIL_CLOSED\n')
     assert.equal(fs.existsSync(path.join(context.gateDir, 'install-incomplete')), true)
   }, { failAt: 'after-identity-replace', rollbackFailAt: 'rollback-marker-owned' })
 
-  withFixture((context) => {
-    const result = execute(context)
+  await withFixture(async (context) => {
+    const result = await execute(context)
     assert.notEqual(result.status, 0)
     assert.equal(result.stderr, 'DEPLOY_GATE_IDENTITY_MIGRATION_FAILED_FAIL_CLOSED\n')
     const marker = path.join(context.gateDir, 'install-incomplete')
@@ -520,8 +527,8 @@ async function run() {
     'rollback-final-fsync',
     'rollback-final-validated'
   ]) {
-    withFixture((context) => {
-      const result = execute(context)
+    await withFixture(async (context) => {
+      const result = await execute(context)
       assert.notEqual(result.status, 0, rollbackFailAt)
       assertSourceOrWrapperFailClosed(context)
       if (result.stderr === 'DEPLOY_GATE_IDENTITY_MIGRATION_FAILED_FAIL_CLOSED\n') {
@@ -532,10 +539,10 @@ async function run() {
     }, { failAt: 'after-identity-replace', rollbackFailAt })
   }
 
-  withFixture((context) => {
+  await withFixture(async (context) => {
     const identity = path.join(context.gateDir, 'identity')
     fs.linkSync(identity, path.join(context.base, 'identity-hardlink'))
-    const result = execute(context)
+    const result = await execute(context)
     assert.notEqual(result.status, 0)
     assert.equal(result.stderr, 'DEPLOY_GATE_IDENTITY_MIGRATION_UNSAFE_STATE\n')
   })
@@ -545,20 +552,16 @@ async function run() {
     let paused
     try {
       paused = startPaused(context, pauseAt)
-      await waitFor(() => fs.existsSync(paused.ready))
+      await paused.waitForReady(() => fs.existsSync(paused.ready), paused.phase + ":ready")
       paused.child.kill('SIGTERM')
-      const result = await waitForExit(paused.child)
+      const result = await paused.waitForExit(paused.phase + ":exit")
       assert.equal(result.signal, null, pauseAt)
       assert.equal(result.status, 76, pauseAt)
       assert.equal(paused.stdout(), '', pauseAt)
       assert.equal(paused.stderr(), 'DEPLOY_GATE_IDENTITY_MIGRATION_FAILED_ROLLED_BACK\n', pauseAt)
       assertCurrent(context)
     } finally {
-      if (paused?.child.exitCode === null && paused.child.signalCode === null) {
-        paused.child.kill('SIGKILL')
-        await waitForExit(paused.child).catch(() => {})
-      }
-      fs.rmSync(context.base, { recursive: true, force: true })
+      await removeFixture(context)
     }
   }
 
@@ -569,17 +572,18 @@ async function run() {
       const context = fixture({ realFlock: true })
       const ready = path.join(context.base, `real-${lockKind}-flock.ready`)
       const lockPath = lockKind === 'gate' ? context.gateDir : path.join(context.stateDir, 'deploy.lock')
-      const holder = spawn('flock', ['-x', lockPath, 'sh', '-c', `: >'${ready}'; sleep 30`], { stdio: 'ignore' })
       try {
-        await waitFor(() => fs.existsSync(ready))
-        const result = execute(context)
+        const holder = spawnTestProcess('flock', [
+          '-x', lockPath, 'sh', '-c', `: >'${ready}'; while :; do sleep 1; done`
+        ], { stdio: 'ignore' }, { label: `migration:flock-holder:${lockKind}` })
+        context.processes.push(holder)
+        await holder.waitForReady(() => fs.existsSync(ready), `migration:flock-holder:${lockKind}:ready`)
+        const result = await execute(context)
         assert.notEqual(result.status, 0)
         assert.equal(result.stderr, 'DEPLOY_GATE_IDENTITY_MIGRATION_BUSY\n')
         assertCurrent(context)
       } finally {
-        holder.kill('SIGKILL')
-        await waitForExit(holder).catch(() => {})
-        fs.rmSync(context.base, { recursive: true, force: true })
+        await removeFixture(context)
       }
     }
 
@@ -591,20 +595,16 @@ async function run() {
       let paused
       try {
         paused = startPaused(context, scenario.pauseAt)
-        await waitFor(() => fs.existsSync(paused.ready))
-        probeExclusiveLock(context.gateDir, false)
-        probeExclusiveLock(path.join(context.stateDir, 'deploy.lock'), false)
+        await paused.waitForReady(() => fs.existsSync(paused.ready), paused.phase + ":ready")
+        probeExclusiveLock(context.gateDir, false, `${paused.phase}:gate-lock-held`)
+        probeExclusiveLock(path.join(context.stateDir, 'deploy.lock'), false, `${paused.phase}:deploy-lock-held`)
         fs.writeFileSync(paused.release, '')
-        const result = await waitForExit(paused.child)
+        const result = await paused.waitForExit(paused.phase + ":exit")
         assert.equal(result.status, scenario.terminalStatus, scenario.pauseAt)
-        probeExclusiveLock(context.gateDir, true)
-        probeExclusiveLock(path.join(context.stateDir, 'deploy.lock'), true)
+        probeExclusiveLock(context.gateDir, true, `${paused.phase}:gate-lock-released`)
+        probeExclusiveLock(path.join(context.stateDir, 'deploy.lock'), true, `${paused.phase}:deploy-lock-released`)
       } finally {
-        if (paused?.child.exitCode === null && paused.child.signalCode === null) {
-          paused.child.kill('SIGKILL')
-          await waitForExit(paused.child).catch(() => {})
-        }
-        fs.rmSync(context.base, { recursive: true, force: true })
+        await removeFixture(context)
       }
     }
   }
@@ -626,7 +626,7 @@ async function run() {
       let paused
       try {
         paused = startPaused(context, boundary.pauseAt)
-        await waitFor(() => fs.existsSync(paused.ready))
+        await paused.waitForReady(() => fs.existsSync(paused.ready), paused.phase + ":ready")
         const gids = { current: context.currentGid, target: context.targetGid }
         assert.notEqual(gids.current, gids.target)
         assert.equal(fs.statSync(context.gateDir).gid, gids[boundary.directory], boundary.pauseAt)
@@ -643,16 +643,12 @@ async function run() {
         }
         assertForcedCommandFailsClosedForBothPrincipals(context)
         paused.child.kill('SIGTERM')
-        const result = await waitForExit(paused.child)
+        const result = await paused.waitForExit(paused.phase + ":exit")
         assert.equal(result.status, 76, boundary.pauseAt)
         assert.equal(paused.stderr(), 'DEPLOY_GATE_IDENTITY_MIGRATION_FAILED_ROLLED_BACK\n', boundary.pauseAt)
         assertCurrent(context)
       } finally {
-        if (paused?.child.exitCode === null && paused.child.signalCode === null) {
-          paused.child.kill('SIGKILL')
-          await waitForExit(paused.child).catch(() => {})
-        }
-        fs.rmSync(context.base, { recursive: true, force: true })
+        await removeFixture(context)
       }
     }
     if (process.platform === 'linux') assert.equal(distinctGidCoverageRan, true)
@@ -664,8 +660,8 @@ async function run() {
     assert.equal(realFlock, true)
     const systemIdentity = discoverSystemIdentityPair()
     assert.ok(systemIdentity, 'root/Linux integration requires two existing distinct identity pairs')
-    withFixture((context) => {
-      const result = execute(context)
+    await withFixture(async (context) => {
+      const result = await execute(context)
       assert.equal(result.status, 0, result.stderr)
       assertTarget(context)
     }, { realFlock: true, systemIdentity })

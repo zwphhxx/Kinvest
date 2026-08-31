@@ -209,6 +209,41 @@
           </div>
         </section>
 
+        <section id="ifind-report-period" class="admin-panel admin-panel-wide ifind-diagnostic" aria-labelledby="ifind-report-period-title">
+          <div class="ifind-diagnostic-head">
+            <div>
+              <p class="ticket-label">iFinD / Report dates / Admin only</p>
+              <h2 id="ifind-report-period-title">报告期间诊断</h2>
+              <p class="ifind-boundary">独立于单指标校准；日期仅作旁证，家庭页面仍为 Mock。</p>
+            </div>
+            <p class="ifind-enabled-badge">执行状态 <strong id="ifind-report-period-status" role="status" aria-live="polite">尚未读取状态</strong></p>
+          </div>
+          <p class="admin-meta">固定阿里巴巴 <code>9988.HK</code>，报告选择参数 <code>20260331</code>，不是已验证的实际报告期。</p>
+          <ul class="admin-meta">
+            <li><code>revenue_oas(20260331,1,BB)</code>：营业收入，1 = 合并报表，BB = 原始币种。</li>
+            <li><code>report_sd(20260331,1)</code>：报告起始日期，1 = 单季报。</li>
+            <li><code>report_ed(20260331,1)</code>：报告截止日期，1 = 单季报。</li>
+          </ul>
+          <p id="ifind-report-period-warning" class="ifind-boundary">每次需单独确认：至多 1 次认证 + 1 次业务请求（3 个指标），0 次重试；与原阿里巴巴诊断共享本地额度。dataVol 未返回时保持未知。</p>
+          <dl class="ifind-metrics" aria-label="收入及报告日期的未验证观察值">
+            <div><dt>收入观察值（币种、单位未验证）</dt><dd id="ifind-report-period-value">—</dd></div>
+            <div><dt>返回情况</dt><dd id="ifind-report-period-availability">尚无观察值</dd></div>
+            <div><dt>日期指标：起始日</dt><dd id="ifind-report-period-start">未提供</dd></div>
+            <div><dt>日期指标：截止日</dt><dd id="ifind-report-period-end">未提供</dd></div>
+            <div><dt>最近尝试</dt><dd id="ifind-report-period-attempted-at">尚未执行</dd></div>
+            <div><dt>请求次数（含认证）</dt><dd id="ifind-report-period-request-count">—</dd></div>
+            <div><dt>业务请求次数</dt><dd id="ifind-report-period-business-request-count">—</dd></div>
+            <div><dt>dataVol</dt><dd id="ifind-report-period-data-vol">未提供</dd></div>
+          </dl>
+          <p id="ifind-report-period-link" class="ifind-boundary">未验证：日期指标仅作旁证，不能认定为收入报告期。</p>
+          <p id="ifind-report-period-verification" class="admin-meta" data-evidence-status="unverified">发行人、代码、权限、币种、单位、报告期与披露口径：均未验证。</p>
+          <p id="ifind-report-period-memory" class="admin-meta">不自动运行或重试。观察值只在运行内存中暂存，退出或重启可能丢失；缺失值不会由 Mock、请求参数或公告补齐。</p>
+          <div class="ifind-diagnostic-actions">
+            <p id="ifind-report-period-error" class="admin-meta" role="status" aria-live="polite"></p>
+            <button id="ifind-report-period-run" class="auth-primary" type="button" aria-describedby="ifind-report-period-warning ifind-report-period-link ifind-report-period-memory" disabled>诊断状态不可用</button>
+          </div>
+        </section>
+
         <section class="admin-panel">
           <p class="ticket-label">Pending</p>
           <h2>待审批申请</h2>
@@ -253,6 +288,7 @@
 
   <script src="/auth-contract.js" defer></script>
   <script src="/admin-contract.js" defer></script>
+  <script src="/admin-report-period-contract.js" defer></script>
   <script src="/admin.js" defer></script>
 </body>
 </html>

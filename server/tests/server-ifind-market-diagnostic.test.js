@@ -369,6 +369,7 @@ async function testEnabledRuntimeComposesProductionMarketService() {
   /** @type {ReturnType<typeof createIfindMarketDiagnosticService> | undefined} */
   let createdMarketService
   const clients = []
+  const clientClearCounts = []
 
   try {
     const runtime = await createIfindDiagnosticRuntime({
@@ -380,7 +381,16 @@ async function testEnabledRuntimeComposesProductionMarketService() {
         return provider
       },
       createClient() {
-        const client = noNetworkClient(clientState)
+        const productionClient = noNetworkClient(clientState)
+        const clientIndex = clients.length
+        clientClearCounts.push(0)
+        const client = {
+          ...productionClient,
+          clear() {
+            clientClearCounts[clientIndex] += 1
+            productionClient.clear()
+          }
+        }
         clients.push(client)
         return client
       },
@@ -401,8 +411,15 @@ async function testEnabledRuntimeComposesProductionMarketService() {
       bundlePath: '/run/secrets/kinvest-ifind'
     })
     assert.equal(repositoryDatabase, database)
-    assert.equal(clients.length, 2)
+    assert.equal(clients.length, 3)
+    assert.equal(new Set(clients).size, 3)
+    assert.deepEqual(clientClearCounts, [0, 0, 0])
     assert.notEqual(clients[0], clients[1])
+    assert.ok(runtime.reportPeriodService)
+    assert.equal(typeof runtime.reportPeriodService.describe, 'function')
+    assert.equal(typeof runtime.reportPeriodService.run, 'function')
+    assert.equal(typeof runtime.reportPeriodService.clear, 'function')
+    assert.equal(runtime.reportPeriodService.describe().status, 'ready')
     assert.ok(serviceOptions)
     assert.equal(serviceOptions.tokenVersionId, VERSION_ID)
     assert.equal(serviceOptions.secretProvider, provider)
@@ -450,8 +467,12 @@ async function testEnabledRuntimeComposesProductionMarketService() {
       'SELECT COUNT(*) AS count FROM ifind_market_case_runs'
     ).get().count, 0)
 
+    const beforeClear = clientClearCounts.slice()
     runtime.clear()
+    const afterClear = beforeClear.map((count) => count + 1)
+    assert.deepEqual(clientClearCounts, afterClear, 'all three distinct clients receive shutdown cleanup')
     runtime.clear()
+    assert.deepEqual(clientClearCounts, afterClear, 'runtime shutdown cleanup is idempotent')
     assert.equal(providerState.clearCalls, 1)
     assert.equal(database.prepare('SELECT 1 AS value').get().value, 1)
   } finally {
@@ -471,8 +492,9 @@ async function testLegacyAndMarketClientLifecyclesDoNotInterfere() {
     accessTokenSuccess,
     tradeDatesSuccess
   ])
-  const marketTransport = controlledRequestStub([accessTokenSuccess])
-  const transports = [legacyTransport, marketTransport]
+  const marketTransport = controlledRequestStub([accessTokenSuccess, accessTokenSuccess])
+  const reportPeriodTransport = controlledRequestStub([accessTokenSuccess])
+  const transports = [legacyTransport, marketTransport, reportPeriodTransport]
   const clients = []
 
   try {
@@ -488,8 +510,9 @@ async function testLegacyAndMarketClientLifecyclesDoNotInterfere() {
         return client
       }
     })
-    assert.equal(clients.length, 2)
-    const [legacyClient, marketClient] = clients
+    assert.equal(clients.length, 3)
+    assert.equal(new Set(clients).size, 3)
+    const [legacyClient, marketClient, reportPeriodClient] = clients
 
     const activeLegacy = legacyClient.diagnose({
       refreshToken: Buffer.from('fixture-refresh-token')
@@ -522,8 +545,28 @@ async function testLegacyAndMarketClientLifecyclesDoNotInterfere() {
     const authResult = await activeMarket
     assert.equal(Buffer.isBuffer(authResult.accessToken), true)
     assert.equal(authResult.requestCount, 1)
+    assert.equal(authResult.accessToken.toString('utf8'), accessTokenSuccess.data.access_token)
+
+    const activeReportPeriod = reportPeriodClient.authenticate(Buffer.from('fixture-refresh-token'))
+    await reportPeriodTransport.waitForCall(1)
+    marketClient.clear()
+    assert.equal(authResult.accessToken.every((byte) => byte === 0), true)
+    reportPeriodTransport.release(0)
+    const reportPeriodAuth = await activeReportPeriod
+    assert.equal(reportPeriodAuth.requestCount, 1)
+    assert.equal(reportPeriodAuth.accessToken.toString('utf8'), accessTokenSuccess.data.access_token)
+
+    const subsequentMarket = marketClient.authenticate(Buffer.from('fixture-refresh-token'))
+    await marketTransport.waitForCall(2)
+    reportPeriodClient.clear()
+    assert.equal(reportPeriodAuth.accessToken.every((byte) => byte === 0), true)
+    marketTransport.release(1)
+    const subsequentMarketAuth = await subsequentMarket
+    assert.equal(subsequentMarketAuth.requestCount, 1)
+    assert.equal(subsequentMarketAuth.accessToken.toString('utf8'), accessTokenSuccess.data.access_token)
 
     runtime.clear()
+    assert.equal(subsequentMarketAuth.accessToken.every((byte) => byte === 0), true)
     runtime.clear()
     assert.equal(providerState.clearCalls, 1)
   } finally {

@@ -1,36 +1,13 @@
 const assert = require('node:assert/strict')
 const fs = require('node:fs')
 const path = require('node:path')
-const { spawn, spawnSync } = require('node:child_process')
+const { spawnSync } = require('node:child_process')
+const { spawnTestProcess } = require('./helpers/deployment-test-process')
 
 const TMPFS_MAGIC = 0x01021994
 const rootDir = path.resolve(__dirname, '../..')
 const helper = path.join(rootDir, 'deploy/server/deploy-v5-runtime.py')
 const executor = path.join(rootDir, 'deploy/server/deploy-kinvest-v5')
-
-/**
- * @param {string} file
- * @param {import('node:child_process').ChildProcess} child
- * @param {() => string} getStderrText
- * @param {number} [timeoutMs]
- */
-function waitForFile(file, child, getStderrText, timeoutMs = 5000) {
-  return new Promise((resolve, reject) => {
-    const deadline = Date.now() + timeoutMs
-    const timer = setInterval(() => {
-      if (fs.existsSync(file)) {
-        clearInterval(timer)
-        resolve()
-      } else if (child.exitCode !== null) {
-        clearInterval(timer)
-        reject(new Error(`fault-barrier child exited early at ${path.basename(file)}: ${getStderrText()}`))
-      } else if (Date.now() > deadline) {
-        clearInterval(timer)
-        reject(new Error(`fault barrier timeout: ${path.basename(file)}`))
-      }
-    }, 10)
-  })
-}
 
 /**
  * @param {string[]} args
@@ -48,7 +25,7 @@ function runHelper(args, env = {}) {
   })
 }
 
-async function killAtBarrier(args, barrierRoot, point, signal) {
+async function killAtBarrier(args, barrierRoot, point, signal, outstandingProcesses) {
   for (const suffix of ['reached', 'release']) {
     fs.rmSync(path.join(barrierRoot, `${point}.${suffix}`), { force: true })
   }
@@ -62,17 +39,22 @@ async function killAtBarrier(args, barrierRoot, point, signal) {
     KINVEST_V5_TEST_BARRIER: point
   })
   delete env.KINVEST_V5_TEST_ALLOW_NON_TMPFS
-  const child = spawn(process.env.PYTHON || 'python3', [helper, ...args], {
-    detached: true, env, stdio: ['ignore', 'pipe', 'pipe']
-  })
-  let stderrText = ''
-  child.stderr.on('data', value => { stderrText += String(value) })
-  await waitForFile(path.join(barrierRoot, `${point}.reached`), child, () => stderrText)
-  process.kill(-child.pid, signal)
-  await new Promise((resolve, reject) => {
-    const timer = setTimeout(() => reject(new Error(`child did not die at ${point}`)), 5000)
-    child.once('close', () => { clearTimeout(timer); resolve() })
-  })
+  const phase = `deploy-v5-linux-tmpfs/${point}/${signal}`
+  const managed = spawnTestProcess(process.env.PYTHON || 'python3', [helper, ...args], {
+    env, stdio: ['ignore', 'pipe', 'pipe']
+  }, { label: phase })
+  outstandingProcesses.add(managed)
+  try {
+    const { child } = managed
+    child.stdout.resume()
+    child.stderr.resume()
+    await managed.waitForReady(() => fs.existsSync(path.join(barrierRoot, `${point}.reached`)), `${phase}/barrier-ready`)
+    process.kill(-child.pid, signal)
+    await managed.waitForExit(`${phase}/interrupted-exit`)
+  } finally {
+    await managed.cleanup(`${phase}/cleanup`)
+    outstandingProcesses.delete(managed)
+  }
 }
 
 async function run() {
@@ -86,6 +68,7 @@ async function run() {
   assert.equal(fs.statfsSync(tmpfsBase).type, TMPFS_MAGIC,
     'Linux H4-2 integration requires a real writable tmpfs')
   const root = fs.mkdtempSync(path.join(tmpfsBase, 'kinvest-v5-crash-'))
+  const outstandingProcesses = new Set()
   const runRoot = path.join(root, 'run')
   const accessRoot = path.join(runRoot, 'kinvest-secrets')
   const ifindRoot = path.join(runRoot, 'kinvest-ifind-secrets')
@@ -98,9 +81,13 @@ async function run() {
   fs.chmodSync(runRoot, 0o755)
   const uid = String(process.getuid())
   const gid = String(process.getgid())
+  let testFailed = false
+  let testError
 
   try {
-    assert.equal(spawnSync('bash', ['-n', executor], { encoding: 'utf8' }).status, 0,
+    assert.equal(spawnSync('bash', ['-n', executor], {
+      encoding: 'utf8', timeout: 30000, killSignal: 'SIGKILL'
+    }).status, 0,
       'unmodified executor must remain syntactically executable')
     const executorSource = fs.readFileSync(executor, 'utf8')
     assert.match(executorSource, /reserve-registry "\$RUN_ROOT"/)
@@ -108,11 +95,11 @@ async function run() {
     assert.doesNotMatch(executorSource, /secure_temp candidate_registry/)
 
     await killAtBarrier(['reserve-registry', runRoot, uid, gid], barrierRoot,
-      'registry-before-create', 'SIGTERM')
+      'registry-before-create', 'SIGTERM', outstandingProcesses)
     assert.deepEqual(fs.readdirSync(runRoot).filter(name => name.startsWith('kinvest-v5.candidates.')), [])
 
     await killAtBarrier(['reserve-registry', runRoot, uid, gid], barrierRoot,
-      'registry-after-create-zero', 'SIGKILL')
+      'registry-after-create-zero', 'SIGKILL', outstandingProcesses)
     const zeroRegistry = fs.readdirSync(runRoot).find(name => name.startsWith('kinvest-v5.candidates.'))
     assert.ok(zeroRegistry)
     assert.equal(fs.statSync(path.join(runRoot, zeroRegistry)).size, 0)
@@ -129,7 +116,7 @@ async function run() {
       '{}', '{}', 'disabled', '', '', '', '', '{}', 'disabled', '', '', 'EOF'
     ].join('\n') + '\n', { mode: 0o600 })
     await killAtBarrier(['materialize', payload, runRoot, accessRoot, ifindRoot,
-      uid, gid, uid, gid, registry], barrierRoot, 'registry-after-replace', 'SIGKILL')
+      uid, gid, uid, gid, registry], barrierRoot, 'registry-after-replace', 'SIGKILL', outstandingProcesses)
     const backupRoot = path.join(root, 'backups')
     fs.mkdirSync(backupRoot, { mode: 0o700 })
     fs.chmodSync(backupRoot, 0o700)
@@ -154,7 +141,7 @@ async function run() {
         runRoot, uid, gid]).status, 0)
       await killAtBarrier(['commit-backup', backupRoot, sourceBackup,
         `${point}.sqlite`, uid, gid, backupRegistry, runRoot],
-      barrierRoot, point, signal)
+      barrierRoot, point, signal, outstandingProcesses)
       assert.equal(runHelper(['recover', backupRegistry, runRoot, accessRoot, ifindRoot,
         backupRoot, stateRoot, uid, gid]).status, 0)
       assert.equal(fs.readdirSync(backupRoot).some(name => name.includes(point)), false)
@@ -179,7 +166,7 @@ async function run() {
       assert.notEqual(fs.statSync(sourceBackup).ino, fs.statSync(finalBackup).ino)
       await killAtBarrier(['commit-backup', backupRoot, sourceBackup,
         path.basename(finalBackup), uid, gid, backupRegistry, runRoot],
-      barrierRoot, 'backup-before-link', signal)
+      barrierRoot, 'backup-before-link', signal, outstandingProcesses)
       assert.equal(runHelper(['recover', backupRegistry, runRoot, accessRoot, ifindRoot,
         backupRoot, stateRoot, uid, gid]).status, 0)
       assert.equal(fs.existsSync(sourceBackup), false)
@@ -203,14 +190,24 @@ async function run() {
     ]) {
       fs.writeFileSync(source, payload, { mode: 0o600 })
       await killAtBarrier(['state-write', stateRoot, name, source, uid, gid],
-        barrierRoot, point, signal)
+        barrierRoot, point, signal, outstandingProcesses)
       assert.equal(fs.readFileSync(path.join(stateRoot, name), 'utf8'), payload)
       const retry = runHelper(['state-write', stateRoot, name, source, uid, gid])
       assert.equal(retry.status, 0, retry.stderr)
     }
-  } finally {
-    fs.rmSync(root, { recursive: true, force: true })
+  } catch (error) {
+    testFailed = true
+    testError = error
   }
+  const cleanupResults = await Promise.allSettled(Array.from(outstandingProcesses,
+    managed => managed.cleanup('deploy-v5-linux-tmpfs/final-cleanup')))
+  const failedCleanup = cleanupResults.find(result => result.status === 'rejected')
+  if (failedCleanup) {
+    if (testFailed) throw new AggregateError([testError, failedCleanup.reason], 'DEPLOY_TEST_LINUX_CLEANUP_FAILED')
+    throw failedCleanup.reason
+  }
+  fs.rmSync(root, { recursive: true, force: true })
+  if (testFailed) throw testError
 }
 
 module.exports = { run }

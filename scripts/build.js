@@ -5,6 +5,7 @@ const repositoryRoot = path.resolve(__dirname, '..')
 const distDirectory = path.join(repositoryRoot, 'dist')
 const adminDiagnosticRuntimeFiles = Object.freeze([
   'public/admin-contract.js',
+  'public/admin-report-period-contract.js',
   'public/admin.html',
   'public/admin.js',
   'public/auth.css'
@@ -14,6 +15,7 @@ const runtimeFiles = [
   'server/access-preflight.js',
   'server/pre-listen-preparation.js',
   'server/adapters/ifind-http-client.js',
+  'server/adapters/ifind-report-period-json.js',
   'server/adapters/modelAdapter.js',
   'server/ai/model-quota.js',
   'server/ai/research-safety.js',
@@ -29,6 +31,7 @@ const runtimeFiles = [
   'server/domain/security-identity.js',
   'server/domain/ifind-calibration.js',
   'server/domain/ifind-report-period-evidence.js',
+  'server/domain/ifind-report-period-diagnostic.js',
   'server/domain/ifind-indicator-id.js',
   'server/domain/ifind-market-cases.js',
   'server/domain/ifind-market-financial-parser.js',
@@ -51,6 +54,7 @@ const runtimeFiles = [
   'server/security/secret-bootstrap.js',
   'server/services/health.js',
   'server/services/ifind-calibration-service.js',
+  'server/services/ifind-report-period-diagnostic-service.js',
   'server/services/ifind-diagnostic-service.js',
   'server/services/ifind-market-diagnostic-service.js',
   'server/security/tencent-ssm-client.js',

@@ -4,6 +4,8 @@ const crypto = require('node:crypto')
 const fs = require('node:fs')
 const os = require('node:os')
 const path = require('node:path')
+const { observeInstallerProcess } = require('./helpers/deploy-v3-process-lifecycle')
+const { run: runLifecycleTests } = require('./deploy-v3-process-lifecycle.test')
 
 const rootDir = path.resolve(__dirname, '../..')
 const assetNames = [
@@ -183,26 +185,8 @@ function assertDurableTargetRenames(context) {
   assert.ok(trace.slice(markerClear + 1).includes(`dir:${path.join(context.fixture, 'gate-state')}`))
 }
 
-function waitFor(check, timeoutMs = 3000) {
-  const started = Date.now()
-  return new Promise((resolve, reject) => {
-    const poll = () => {
-      if (check()) return resolve()
-      if (Date.now() - started > timeoutMs) return reject(new Error('timed out waiting for v3 installer'))
-      setTimeout(poll, 10)
-    }
-    poll()
-  })
-}
-
-function waitForExit(child, timeoutMs = 5000) {
-  return new Promise((resolve, reject) => {
-    const timeout = setTimeout(() => { child.kill('SIGKILL'); reject(new Error('v3 installer did not exit')) }, timeoutMs)
-    child.once('exit', (status, signal) => { clearTimeout(timeout); resolve({ status, signal }) })
-  })
-}
-
 async function run() {
+  await runLifecycleTests()
   const installerPath = path.join(rootDir, 'deploy/server/install-deploy-v3.sh')
   const installer = fs.readFileSync(installerPath, 'utf8')
   assert.notEqual(fs.statSync(installerPath).mode & 0o111, 0)
@@ -340,6 +324,7 @@ async function run() {
   }
 
   const activeInstall = createFixture(installer)
+  let activeProcess
   try {
     const ready = path.join(activeInstall.fixture, 'marker-ready')
     const release = path.join(activeInstall.fixture, 'marker-release')
@@ -350,13 +335,17 @@ async function run() {
     ))
     const child = spawn('bash', [pausedScript, activeInstall.source], {
       stdio: 'ignore',
+      detached: process.platform !== 'win32',
       env: {
         ...process.env, KINVEST_INSTALL_V3_TEST_ROOT: '1',
         KINVEST_DEPLOY_GATE_USER: 'lighthouse', KINVEST_DEPLOY_GATE_GROUP: 'lighthouse',
         PATH: `${activeInstall.bin}:${process.env.PATH}`
       }
     })
-    await waitFor(() => fs.existsSync(ready))
+    activeProcess = observeInstallerProcess(child, {
+      ownedProcessGroup: process.platform !== 'win32'
+    })
+    await activeProcess.waitForReady(() => fs.existsSync(ready))
     const gateHarness = path.join(activeInstall.fixture, 'active-gate')
     const source = fs.readFileSync(path.join(activeInstall.source, 'kinvest-ssh-command-v3'), 'utf8')
       .replace("GATE_STATE_DIR='/var/lib/kinvest-deploy-gate'", `GATE_STATE_DIR='${path.join(activeInstall.fixture, 'gate-state')}'`)
@@ -371,8 +360,9 @@ async function run() {
     assert.equal(blocked.status, 76)
     assert.equal(blocked.stderr, 'DEPLOY_INSTALL_INCOMPLETE\n')
     fs.writeFileSync(release, '')
-    assert.deepEqual(await waitForExit(child), { status: 0, signal: null })
+    assert.deepEqual(await activeProcess.waitForExit(), { status: 0, signal: null })
   } finally {
+    if (activeProcess) await activeProcess.cleanup()
     fs.rmSync(activeInstall.fixture, { recursive: true, force: true })
   }
 
