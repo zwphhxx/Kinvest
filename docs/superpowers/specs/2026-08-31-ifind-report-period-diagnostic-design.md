@@ -118,11 +118,17 @@ Parser requirements:
   duplicate/unknown indicators, arrays longer than one and structural ambiguity.
 - Normalize revenue using the existing strict finite decimal convention, without
   unit inference. Reject non-finite values, grouping separators and unit suffixes.
-- Initially accept only exact real calendar dates `YYYY-MM-DD` and explicit
-  null for date scalars. Do not guess timestamps, serial dates or other formats.
-  Unsupported formats fail with a stable error, without exposing raw strings.
+- Based on the compact-date response shape observed in production,
+  `report_sd` and `report_ed` may be exact valid real calendar dates in either
+  `YYYY-MM-DD` or `YYYYMMDD` form, plus explicit null for date scalars. Compact
+  values are immediately canonicalized to `YYYY-MM-DD`. Impossible dates,
+  numbers, timestamps, serial dates and all other formats fail with a stable
+  error, without exposing raw values.
 - Missing date columns or explicit null produce partial/missing date evidence;
   a structurally malformed supplied column fails the attempt.
+- Canonicalized dates remain independent, unverified evidence. Accepting the
+  observed compact representation does not link the dates to the revenue
+  observation and does not promote any verification status.
 - Reject impossible dates and a non-null start later than end. Do not attach any
   observation after parsing failure or quota-settlement failure.
 - Strict result copying rejects extra keys, accessors, proxies and fabricated

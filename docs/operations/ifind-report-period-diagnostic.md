@@ -45,10 +45,16 @@ observations, availability, counts and a stable status. All seven verification
 dimensions and `revenuePeriodLink` stay unverified. No verified success badge,
 financial point, quote snapshot or household data is produced.
 
-Dates must be exact valid `YYYY-MM-DD` strings. Missing/null dates stay missing;
-other date formats are rejected rather than guessed. Reversed ranges, ambiguous
-rows, wrong codes or malformed supplied fields fail closed. A valid but
-different date range is evidence to investigate, not proof of an income error.
+Based on the compact-date response shape observed in production, provider
+`report_sd` and `report_ed` values may be exact valid `YYYY-MM-DD` or exact
+valid `YYYYMMDD` strings. Compact values are immediately canonicalized to
+`YYYY-MM-DD`. Missing/null dates stay missing; impossible dates, numbers,
+timestamps and all other formats are rejected rather than guessed. Reversed
+ranges, ambiguous rows, wrong codes or malformed supplied fields fail closed.
+The dates remain independent, unverified evidence: accepting or canonicalizing
+them does not link them to the revenue observation or promote any verification
+status. A valid but different date range is evidence to investigate, not proof
+of an income error.
 
 Revenue is not assigned a currency or scale. Missing values are not zero and are
 not replaced by Mock, selectors, dates from disclosures or earlier attempts.

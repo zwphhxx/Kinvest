@@ -71,6 +71,16 @@ function calendarDate(value) {
   return Number.isFinite(time) && new Date(time).toISOString().slice(0, 10) === value
 }
 
+function normalizeProviderCalendarDate(value) {
+  if (value === null) return null
+  if (typeof value !== 'string') invalid()
+  const normalized = /^[0-9]{8}$/.test(value)
+    ? `${value.slice(0, 4)}-${value.slice(4, 6)}-${value.slice(6, 8)}`
+    : value
+  if (!calendarDate(normalized)) invalid()
+  return normalized
+}
+
 function canonicalTimestamp(value) {
   if (typeof value !== 'string' || value.length !== 24 ||
       !/^20[0-9]{2}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}\.[0-9]{3}Z$/.test(value)) return false
@@ -204,8 +214,12 @@ function parseReportPeriodDiagnosticObservation(payload) {
       value = Number(value)
     }
     if (value !== null && (typeof value !== 'number' || !Number.isFinite(value))) invalid()
-    const start = Object.hasOwn(table, 'report_sd') ? array(table.report_sd, 1)[0] : null
-    const end = Object.hasOwn(table, 'report_ed') ? array(table.report_ed, 1)[0] : null
+    const start = normalizeProviderCalendarDate(
+      Object.hasOwn(table, 'report_sd') ? array(table.report_sd, 1)[0] : null
+    )
+    const end = normalizeProviderCalendarDate(
+      Object.hasOwn(table, 'report_ed') ? array(table.report_ed, 1)[0] : null
+    )
     // Date parameter 1 means single-quarter, not the revenue income-scope parameter.
     // Even matching returned dates cannot establish the revenue's actual period.
     return copyObservation({

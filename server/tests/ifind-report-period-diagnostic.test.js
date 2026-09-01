@@ -139,7 +139,10 @@ const tests = [
     for (const [input, expected] of [[0, 0], [-4.25, -4.25], ['123.50', 123.5], [null, null]]) {
       for (const [dates, start, end, availability] of /** @type {any[]} */ ([
         [{ report_sd: ['2026-01-01'], report_ed: ['2026-03-31'] }, '2026-01-01', '2026-03-31', 'present'],
+        [{ report_sd: ['20260101'], report_ed: ['20260331'] }, '2026-01-01', '2026-03-31', 'present'],
+        [{ report_sd: ['20260101'], report_ed: ['2026-03-31'] }, '2026-01-01', '2026-03-31', 'present'],
         [{ report_sd: ['2024-02-29'] }, '2024-02-29', null, 'partial'],
+        [{ report_sd: ['20240229'] }, '2024-02-29', null, 'partial'],
         [{ report_ed: ['2026-03-31'] }, null, '2026-03-31', 'partial'],
         [{ report_sd: [null], report_ed: [null] }, null, null, 'missing'],
         [{}, null, null, 'missing']
@@ -162,7 +165,7 @@ const tests = [
       payload({ revenue_oas: [1], report_sd: ['2026-04-01'], report_ed: ['2026-03-31'] })]
     for (const value of [NaN, Infinity, -Infinity, undefined, true, {}, [], '', ' 1', '1\n',
       '1,000', '1e3', '0x10', '+1', '01', '.5', '1.', '1million']) invalid.push(payload({ revenue_oas: [value] }))
-    for (const value of [undefined, '', '20260331', '2026-2-01', '2026-02-30', '2025-02-29',
+    for (const value of [undefined, '', '00000101', '20260230', '20250229', '2026-2-01', '2026-02-30', '2025-02-29',
       '2026-03-31T00:00:00Z', '2026-03-31\n', 20260331, true, {}]) {
       invalid.push(payload({ revenue_oas: [1], report_sd: [value] }))
     }
