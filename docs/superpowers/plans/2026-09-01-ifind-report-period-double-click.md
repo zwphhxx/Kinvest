@@ -10,47 +10,51 @@
 
 ---
 
-### Task 1: Preserve completed results across pre-vendor gate failures
+### Task 1: Preserve completed results across successful pre-vendor gate DTOs
 
 **Files:**
 - Modify: `public/admin-report-period-contract.js`
 - Test: `server/tests/frontend-ifind-report-period-diagnostic.test.js`
 
-- [ ] **Step 1: Write the failing sequential-cooldown regression test**
+- [ ] **Step 1: Write failing successful-gate DTO regression tests**
 
-Add a controller test after the existing busy-guard test. The harness must return `ready()` for `GET`, a completed `failed('financial')` DTO for the first `POST`, and throw a safe error with code `IFIND_REPORT_PERIOD_DIAGNOSTIC_COOLDOWN` for the second `POST`:
+Add a controller test after the existing busy-guard test. For each `busy`, `cooldown`, and `daily-limit` status, the harness must return `ready()` for `GET`, a completed `failed('financial')` DTO for the first `POST`, and a successful `{ data: gateDto }` response for the second `POST`:
 
 ```js
-await test('cooldown after a completed run preserves the redacted result', async () => {
-  const completed = failed('financial')
-  let posts = 0
-  const h = harness(contract, {
-    request(url) {
-      if (url !== POST) return { data: ready() }
-      posts += 1
-      if (posts === 1) return { data: completed }
-      throw Object.assign(new Error('ADMIN_REQUEST_FAILED'), {
-        code: `${PREFIX}COOLDOWN`, retryable: false
-      })
-    }
-  })
-  h.controller.bind()
-  await h.controller.refresh()
-  const button = h.nodes.get('ifind-report-period-run')
-  await button.click()
-  const failureBefore = h.nodes.get('ifind-report-period-failure').textContent
-  const shapeBefore = h.nodes.get('ifind-report-period-response-shape').textContent
-  assert.match(failureBefore, /IFIND_RESPONSE_SHAPE/)
-  assert.match(shapeBefore, /返回结构摘要/)
+await test('successful gate DTOs preserve the completed redacted result', async () => {
+  const gateMessages = {
+    busy: '已有报告期间诊断正在运行，本次不重试。',
+    cooldown: '报告期间诊断正在冷却，本次不重试。',
+    'daily-limit': '今日报告期间诊断次数已达上限，本次不重试。'
+  }
+  for (const status of ['busy', 'cooldown', 'daily-limit']) {
+    const completed = failed('financial')
+    const gateDto = { ...ready(), status }
+    let posts = 0
+    const h = harness(contract, {
+      request(url) {
+        if (url !== POST) return { data: ready() }
+        posts += 1
+        return { data: posts === 1 ? completed : gateDto }
+      }
+    })
+    h.controller.bind()
+    await h.controller.refresh()
+    const button = h.nodes.get('ifind-report-period-run')
+    await button.click()
+    const failureBefore = h.nodes.get('ifind-report-period-failure').textContent
+    const shapeBefore = h.nodes.get('ifind-report-period-response-shape').textContent
 
-  await button.click()
+    await button.click()
 
-  assert.equal(posts, 2)
-  assert.equal(h.nodes.get('ifind-report-period-failure').textContent, failureBefore)
-  assert.equal(h.nodes.get('ifind-report-period-response-shape').textContent, shapeBefore)
-  assert.equal(h.nodes.get('ifind-report-period-request-count').textContent, '2 次')
-  assert.equal(h.nodes.get('ifind-report-period-business-request-count').textContent, '1 次')
-  assert.equal(button.disabled, false)
+    assert.equal(posts, 2)
+    assert.equal(h.nodes.get('ifind-report-period-failure').textContent, failureBefore)
+    assert.equal(h.nodes.get('ifind-report-period-response-shape').textContent, shapeBefore)
+    assert.equal(h.nodes.get('ifind-report-period-request-count').textContent, '2 次')
+    assert.equal(h.nodes.get('ifind-report-period-business-request-count').textContent, '1 次')
+    assert.equal(h.nodes.get('ifind-report-period-error').textContent, gateMessages[status])
+    assert.equal(button.disabled, false)
+  }
 })
 ```
 
@@ -62,33 +66,35 @@ Run:
 node server/tests/frontend-ifind-report-period-diagnostic.test.js
 ```
 
-Expected: FAIL because the cooldown path currently calls `render(null)` and clears the failure evidence and request counts.
+Expected: FAIL because the successful gate DTO path currently calls `render(dto)` and replaces the completed failure evidence and request counts.
 
-- [ ] **Step 3: Implement the minimal non-destructive gate classification**
+- [ ] **Step 3: Implement minimal successful gate DTO handling**
 
-In `public/admin-report-period-contract.js`, define the exact non-destructive gate codes next to the controller state:
+In `public/admin-report-period-contract.js`, map the three successful gate DTO statuses to their exact safe message codes next to the controller state:
 
 ```js
-const PRESERVE_RESULT_ERRORS = new Set([
-  `${PREFIX}BUSY`,
-  `${PREFIX}COOLDOWN`,
-  `${PREFIX}DAILY_LIMIT`
+const GATE_RESULT_CODES = new Map([
+  ['busy', `${PREFIX}BUSY`],
+  ['cooldown', `${PREFIX}COOLDOWN`],
+  ['daily-limit', `${PREFIX}DAILY_LIMIT`]
 ])
 ```
 
-Update `showError` so these three codes preserve the rendered DTO while still displaying the safe error message. All other failures retain the existing `render(null)` behavior:
+In the successful `run()` commit path, preserve the rendered DTO for those three statuses while displaying the exact safe gate message. All other successful DTOs continue through `render(dto)`:
 
 ```js
-async function showError(error) {
-  const code = codeOf(error)
-  if (!PRESERVE_RESULT_ERRORS.has(code)) render(null)
-  put('error', errorMessage(code))
-  if (code === 'ADMIN_AUTH_REQUIRED' || code === 'ADMIN_CSRF_INVALID') await onError({ code })
-  else setLive(errorMessage(code), 'error')
+const gateCode = GATE_RESULT_CODES.get(dto.status)
+if (gateCode) {
+  const message = errorMessage(gateCode)
+  put('error', message)
+  setLive(message, 'error')
+} else {
+  render(dto)
+  setLive(dto.status === 'observed-unverified' ? '已取得诊断旁证，收入报告期仍未验证。' : '诊断状态已更新；未自动重试。', '')
 }
 ```
 
-Do not add timers, retries, persistence, new API fields, or changes to `activeRun`.
+Keep `showError` destructive for auth, CSRF, network, malformed, and unknown failures. Do not add timers, retries, persistence, new API fields, or changes to `activeRun`.
 
 - [ ] **Step 4: Verify GREEN and existing single-flight behavior**
 
@@ -98,7 +104,7 @@ Run:
 node server/tests/frontend-ifind-report-period-diagnostic.test.js
 ```
 
-Expected: all frontend report-period tests pass, including the existing test that proves two concurrent activations produce one POST.
+Expected: all frontend report-period tests pass, including the three successful gate DTO cases and the existing test that proves two concurrent activations produce one POST.
 
 - [ ] **Step 5: Run repository checks**
 

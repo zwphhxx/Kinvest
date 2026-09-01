@@ -244,10 +244,10 @@
     let activeRun = null
     let enabled = false
     let bound = false
-    const PRESERVE_RESULT_ERRORS = new Set([
-      `${PREFIX}BUSY`,
-      `${PREFIX}COOLDOWN`,
-      `${PREFIX}DAILY_LIMIT`
+    const GATE_RESULT_CODES = new Map([
+      ['busy', `${PREFIX}BUSY`],
+      ['cooldown', `${PREFIX}COOLDOWN`],
+      ['daily-limit', `${PREFIX}DAILY_LIMIT`]
     ])
 
     function buttonState() {
@@ -296,7 +296,7 @@
 
     async function showError(error) {
       const code = codeOf(error)
-      if (!PRESERVE_RESULT_ERRORS.has(code)) render(null)
+      render(null)
       put('error', errorMessage(code))
       if (code === 'ADMIN_AUTH_REQUIRED' || code === 'ADMIN_CSRF_INVALID') await onError({ code })
       else setLive(errorMessage(code), 'error')
@@ -340,8 +340,15 @@
         const dto = copyEnvelope(payload)
         await sessionLifecycle.commit(ticket, () => {
           if (ownRevision !== revision) return
-          render(dto)
-          setLive(dto.status === 'observed-unverified' ? '已取得诊断旁证，收入报告期仍未验证。' : '诊断状态已更新；未自动重试。', '')
+          const gateCode = GATE_RESULT_CODES.get(dto.status)
+          if (gateCode) {
+            const message = errorMessage(gateCode)
+            put('error', message)
+            setLive(message, 'error')
+          } else {
+            render(dto)
+            setLive(dto.status === 'observed-unverified' ? '已取得诊断旁证，收入报告期仍未验证。' : '诊断状态已更新；未自动重试。', '')
+          }
         })
       } catch (error) {
         if (ownRevision !== revision || ticket.signal?.aborted) return
