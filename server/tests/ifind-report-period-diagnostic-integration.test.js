@@ -96,7 +96,8 @@ async function transportContract() {
   assert.deepEqual(old.payload.tables[0].table, { revenue_oas: [123] })
   assert.doesNotMatch(JSON.stringify(old), /UNTRUSTED/); legacy.clear()
 
-  for (const table of [{ revenue_oas: [null] }, { revenue_oas: [1], report_sd: ['2026-01-01'] }]) {
+  for (const table of [{ revenue_oas: [null] }, { revenue_oas: [1], report_sd: ['2026-01-01'] },
+    { revenue_oas: [1], report_sd: ['20260101'], report_ed: ['20260331'] }]) {
     const net = transport([response(table)]); const c = createIfindHttpClient({ request: net.request })
     const value = await c.diagnoseReportPeriod(Buffer.from('synthetic-access'))
     assert.deepEqual(value.payload.tables[0].table, table); assert.equal(net.calls.length, 1); c.clear()
@@ -219,7 +220,8 @@ async function rawJsonContract() {
 
 async function runtimeHttpContract() {
   const db = new DatabaseSync(':memory:')
-  const network = transport([{ errorcode: 0, data: { access_token: 'synthetic-access' } }, response()])
+  const network = transport([{ errorcode: 0, data: { access_token: 'synthetic-access' } },
+    response({ revenue_oas: ['247652000000'], report_sd: ['20260101'], report_ed: ['20260331'] })])
   let reads = 0; const buffers = []; const clients = []; const clears = []
   const runtime = await createIfindDiagnosticRuntime({
     env: { KINVEST_IFIND_DIAGNOSTIC_MODE: 'admin-diagnostic',
@@ -279,6 +281,8 @@ async function runtimeHttpContract() {
     const observed = await invoke(handler, { method: 'POST', url: `${PATH}/run`, body: '{}' })
     assert.equal(observed.status, 200); assert.equal(observed.body.data.status, 'observed-unverified')
     assert.equal(observed.body.data.observation.revenue.value, 247652000000)
+    assert.equal(observed.body.data.observation.dateEvidence.start, '2026-01-01')
+    assert.equal(observed.body.data.observation.dateEvidence.end, '2026-03-31')
     assert.equal(observed.body.data.observation.dateEvidence.revenuePeriodLink, 'unverified')
     assert.equal(observed.body.data.requestCount, 2); assert.equal(observed.body.data.businessRequestCount, 1)
     assert.ok(Object.values(observed.body.data.verification).every((value) => value === 'unverified'))
@@ -289,7 +293,7 @@ async function runtimeHttpContract() {
     const row = db.prepare('SELECT * FROM ifind_market_case_runs').get()
     assert.equal(row.status, 'failed')
     assert.equal(row.failure_code, 'IFIND_REPORT_PERIOD_DIAGNOSTIC_OBSERVED_UNVERIFIED')
-    assert.doesNotMatch(JSON.stringify(row), /247652|2026-01-01|synthetic/)
+    assert.doesNotMatch(JSON.stringify(row), /247652|20260101|20260331|2026-01-01|synthetic/)
     for (const table of ['ifind_market_quote_snapshots', 'ifind_market_financial_points']) {
       assert.equal(db.prepare(`SELECT COUNT(*) AS n FROM ${table}`).get().n, 0)
     }
@@ -323,7 +327,7 @@ async function failureEvidenceContract() {
   const { IfindMarketDiagnosticRepository } = require('../db/ifind-market-diagnostic-repository')
   const { createIfindReportPeriodDiagnosticService } = require('../services/ifind-report-period-diagnostic-service')
   const cases = [
-    { wire: response({ revenue_oas: [1], report_sd: ['20260101'], report_ed: ['2026-03-31'] }),
+    { wire: response({ revenue_oas: [1], report_sd: ['20260230'], report_ed: ['2026-03-31'] }),
       code: 'IFIND_RESPONSE_SHAPE', classification: 'RESPONSE_SHAPE', vendor: null, shape: 'compact-date' },
     { wire: { ...response(), tables: [{ ...response().tables[0], metadata: 'UNTRUSTED' }] },
       code: 'IFIND_RESPONSE_SHAPE', classification: 'RESPONSE_SHAPE', vendor: null, row: 'extra-fields' },
