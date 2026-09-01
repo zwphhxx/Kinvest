@@ -354,6 +354,44 @@ async function run() {
     assert.equal(cancelled.calls.length, 1)
   })
 
+  await test('successful gate DTOs preserve the completed redacted result', async () => {
+    const gateMessages = {
+      busy: '已有报告期间诊断正在运行，本次不重试。',
+      cooldown: '报告期间诊断正在冷却，本次不重试。',
+      'daily-limit': '今日报告期间诊断次数已达上限，本次不重试。'
+    }
+    for (const status of ['busy', 'cooldown', 'daily-limit']) {
+      const completed = failed('financial')
+      const gateDto = { ...ready(), status }
+      let posts = 0
+      const h = harness(contract, {
+        request(url) {
+          if (url !== POST) return { data: ready() }
+          posts += 1
+          return { data: posts === 1 ? completed : gateDto }
+        }
+      })
+      h.controller.bind()
+      await h.controller.refresh()
+      const button = h.nodes.get('ifind-report-period-run')
+      await button.click()
+      const failureBefore = h.nodes.get('ifind-report-period-failure').textContent
+      const shapeBefore = h.nodes.get('ifind-report-period-response-shape').textContent
+      assert.match(failureBefore, /IFIND_RESPONSE_SHAPE/)
+      assert.match(shapeBefore, /返回结构摘要/)
+
+      await button.click()
+
+      assert.equal(posts, 2)
+      assert.equal(h.nodes.get('ifind-report-period-failure').textContent, failureBefore)
+      assert.equal(h.nodes.get('ifind-report-period-response-shape').textContent, shapeBefore)
+      assert.equal(h.nodes.get('ifind-report-period-request-count').textContent, '2 次')
+      assert.equal(h.nodes.get('ifind-report-period-business-request-count').textContent, '1 次')
+      assert.equal(h.nodes.get('ifind-report-period-error').textContent, gateMessages[status])
+      assert.equal(button.disabled, false)
+    }
+  })
+
   await test('missing is never zero or requested date', async () => {
     const dto = observed()
     dto.observation.revenue = { value: null, availability: 'missing' }

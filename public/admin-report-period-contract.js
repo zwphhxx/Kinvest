@@ -62,6 +62,9 @@
     ORIGIN_INVALID: '当前页面来源无法执行此操作。',
     TRUSTED_CLIENT_REQUIRED: '请求来源未通过验证。',
     CLIENT_IDENTITY_INVALID: '请求来源未通过验证。',
+    [`${PREFIX}BUSY`]: '已有报告期间诊断正在运行，本次不重试。',
+    [`${PREFIX}COOLDOWN`]: '报告期间诊断正在冷却，本次不重试。',
+    [`${PREFIX}DAILY_LIMIT`]: '今日报告期间诊断次数已达上限，本次不重试。',
     [`${PREFIX}UNAVAILABLE`]: '报告期间诊断不可用，请检查本地状态后手工重试。',
     [`${PREFIX}FAILED`]: '本次诊断未完成，不会自动重试。',
     [`${PREFIX}RESULT_INVALID`]: '诊断结果未通过校验，已清除观察值，不会自动重试。',
@@ -241,6 +244,11 @@
     let activeRun = null
     let enabled = false
     let bound = false
+    const GATE_RESULT_CODES = new Map([
+      ['busy', `${PREFIX}BUSY`],
+      ['cooldown', `${PREFIX}COOLDOWN`],
+      ['daily-limit', `${PREFIX}DAILY_LIMIT`]
+    ])
 
     function buttonState() {
       const button = byId('run')
@@ -332,8 +340,15 @@
         const dto = copyEnvelope(payload)
         await sessionLifecycle.commit(ticket, () => {
           if (ownRevision !== revision) return
-          render(dto)
-          setLive(dto.status === 'observed-unverified' ? '已取得诊断旁证，收入报告期仍未验证。' : '诊断状态已更新；未自动重试。', '')
+          const gateCode = GATE_RESULT_CODES.get(dto.status)
+          if (gateCode) {
+            const message = errorMessage(gateCode)
+            put('error', message)
+            setLive(message, 'error')
+          } else {
+            render(dto)
+            setLive(dto.status === 'observed-unverified' ? '已取得诊断旁证，收入报告期仍未验证。' : '诊断状态已更新；未自动重试。', '')
+          }
         })
       } catch (error) {
         if (ownRevision !== revision || ticket.signal?.aborted) return
