@@ -22,6 +22,11 @@ unverified. This directory does not
 supersede the [R1 administrator runbook](../ifind-three-market-admin-diagnostics.md)
 or its independent deployment and per-call approval gates.
 
+The first fixed follow-up proposal is documented in the
+[HK Alibaba probe proposal](../ifind-hk-alibaba-template-probe.md). It fixes
+the candidate identity, quote and revenue request bodies and their maximum
+budget, but remains blocked and has no runtime execution entry.
+
 ## Official documentation versus indicator discovery
 
 The [official manual](https://quantapi.51ifind.com/gwstatic/static/ds_web/quantapi-web/help-center/manual.html)
@@ -123,7 +128,14 @@ indicators, submit an arbitrary request body, or patch the running container
 to get past that guard. No single-indicator calibration route or runner is
 implemented by this change.
 
-## Proposed smallest calibration gate, not approved or implemented
+## Historical single-indicator calibration proposal, superseded
+
+The proposal below records the earlier PR #60 boundary only. It no longer
+defines the current request budget and must not be used for a new approval.
+T11-B2a supersedes it with the fixed three-stage, still-blocked
+[HK Alibaba probe proposal](../ifind-hk-alibaba-template-probe.md). That newer
+proposal also has no execution entry and requires separate implementation,
+deployment and live-call approvals.
 
 The next separate design/implementation decision is a fixed,
 administrator-only calibration entry that can collect missing response
