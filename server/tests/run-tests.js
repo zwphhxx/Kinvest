@@ -37,6 +37,7 @@ const tests = [
   require('./secret-preflight.test'),
   require('./access-preflight.test'),
   require('./ifind-http-client.test'),
+  require('./ifind-market-probe-proposals.test'),
   require('./ifind-market-template-evidence.test'),
   require('./ifind-market-cases.test'),
   require('./ifind-calibration.test'),
