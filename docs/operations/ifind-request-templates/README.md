@@ -10,10 +10,15 @@ They do not change R1, authorize a provider call, or enable a live case.
 | Market and case | Recorded template | Current boundary |
 | --- | --- | --- |
 | HK / `HK_ALIBABA_9988` | [Revenue OAS, requested report end 2026-03-31](hk-alibaba-revenue-oas-20260331.v1.json) | One generated command and a derived HTTP body; no response or entitlement evidence |
-| US / `US_APPLE_AAPL` | None | Do not copy HK indicator IDs, parameters, fiscal periods, or units |
-| CN / `CN_MOUTAI_600519` | None | Do not copy HK indicator IDs, parameters, fiscal periods, or units |
+| US / `US_APPLE_AAPL` | Official documentation uses `AAPL.O` in a date-sequence example | This does not prove that Kinvest display code `AAPL.US` is the iFinD vendor code |
+| SH / `CN_MOUTAI_600519` | Official A-share examples document generic quote fields | No sample-specific response, currency, unit or financial template evidence |
+| SZ / Ping An Bank `000001.SZ` | Official exchange identity plus generic A-share examples | No iFinD identity response or bank-specific financial template evidence |
+| BJ / Guozi Software `920953.BJ` | Official exchange code mapping only | Historical code is not an active alias until iFinD identity independently agrees |
 
-All three production cases remain `liveReady: false`. This directory does not
+All existing production cases remain `liveReady: false`. The five-market
+catalog in [the evidence runbook](../ifind-five-market-template-evidence.md)
+is also non-executable and keeps every vendor code and request block
+unverified. This directory does not
 supersede the [R1 administrator runbook](../ifind-three-market-admin-diagnostics.md)
 or its independent deployment and per-call approval gates.
 
