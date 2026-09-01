@@ -62,6 +62,9 @@
     ORIGIN_INVALID: '当前页面来源无法执行此操作。',
     TRUSTED_CLIENT_REQUIRED: '请求来源未通过验证。',
     CLIENT_IDENTITY_INVALID: '请求来源未通过验证。',
+    [`${PREFIX}BUSY`]: '已有报告期间诊断正在运行，本次不重试。',
+    [`${PREFIX}COOLDOWN`]: '报告期间诊断正在冷却，本次不重试。',
+    [`${PREFIX}DAILY_LIMIT`]: '今日报告期间诊断次数已达上限，本次不重试。',
     [`${PREFIX}UNAVAILABLE`]: '报告期间诊断不可用，请检查本地状态后手工重试。',
     [`${PREFIX}FAILED`]: '本次诊断未完成，不会自动重试。',
     [`${PREFIX}RESULT_INVALID`]: '诊断结果未通过校验，已清除观察值，不会自动重试。',
@@ -241,6 +244,11 @@
     let activeRun = null
     let enabled = false
     let bound = false
+    const PRESERVE_RESULT_ERRORS = new Set([
+      `${PREFIX}BUSY`,
+      `${PREFIX}COOLDOWN`,
+      `${PREFIX}DAILY_LIMIT`
+    ])
 
     function buttonState() {
       const button = byId('run')
@@ -288,7 +296,7 @@
 
     async function showError(error) {
       const code = codeOf(error)
-      render(null)
+      if (!PRESERVE_RESULT_ERRORS.has(code)) render(null)
       put('error', errorMessage(code))
       if (code === 'ADMIN_AUTH_REQUIRED' || code === 'ADMIN_CSRF_INVALID') await onError({ code })
       else setLive(errorMessage(code), 'error')

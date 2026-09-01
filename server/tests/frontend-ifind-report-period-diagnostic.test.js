@@ -354,6 +354,38 @@ async function run() {
     assert.equal(cancelled.calls.length, 1)
   })
 
+  await test('cooldown after a completed run preserves the redacted result', async () => {
+    const completed = failed('financial')
+    let posts = 0
+    const h = harness(contract, {
+      request(url) {
+        if (url !== POST) return { data: ready() }
+        posts += 1
+        if (posts === 1) return { data: completed }
+        throw Object.assign(new Error('ADMIN_REQUEST_FAILED'), {
+          code: `${PREFIX}COOLDOWN`, retryable: false
+        })
+      }
+    })
+    h.controller.bind()
+    await h.controller.refresh()
+    const button = h.nodes.get('ifind-report-period-run')
+    await button.click()
+    const failureBefore = h.nodes.get('ifind-report-period-failure').textContent
+    const shapeBefore = h.nodes.get('ifind-report-period-response-shape').textContent
+    assert.match(failureBefore, /IFIND_RESPONSE_SHAPE/)
+    assert.match(shapeBefore, /返回结构摘要/)
+
+    await button.click()
+
+    assert.equal(posts, 2)
+    assert.equal(h.nodes.get('ifind-report-period-failure').textContent, failureBefore)
+    assert.equal(h.nodes.get('ifind-report-period-response-shape').textContent, shapeBefore)
+    assert.equal(h.nodes.get('ifind-report-period-request-count').textContent, '2 次')
+    assert.equal(h.nodes.get('ifind-report-period-business-request-count').textContent, '1 次')
+    assert.equal(button.disabled, false)
+  })
+
   await test('missing is never zero or requested date', async () => {
     const dto = observed()
     dto.observation.revenue = { value: null, availability: 'missing' }
