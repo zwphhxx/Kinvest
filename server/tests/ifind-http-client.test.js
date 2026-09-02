@@ -430,7 +430,7 @@ async function run() {
   })
   assert.deepEqual(
     Object.keys(directContractClient),
-    ['diagnose', 'authenticate', 'quote', 'financial', 'calibrateFinancial', 'diagnoseReportPeriod']
+    ['diagnose', 'authenticate', 'quote', 'financial', 'calibrateFinancial', 'diagnoseReportPeriod', 'probeFixed']
   )
   const directAuth = await directContractClient.authenticate(
     Buffer.from(REFRESH_TOKEN, 'utf8')
@@ -1155,7 +1155,7 @@ async function run() {
     logger: successLogger.logger
   })
 
-  assert.deepEqual(Object.keys(client), ['diagnose', 'authenticate', 'quote', 'financial', 'calibrateFinancial', 'diagnoseReportPeriod'])
+  assert.deepEqual(Object.keys(client), ['diagnose', 'authenticate', 'quote', 'financial', 'calibrateFinancial', 'diagnoseReportPeriod', 'probeFixed'])
   const successExecution = await captureGlobalOutput(
     () => client.diagnose({ refreshToken: REFRESH_TOKEN })
   )
@@ -1620,7 +1620,7 @@ async function run() {
   }
   assert.ok(Buffer.isBuffer(clearedTokenBuffer))
   assert.equal((/** @type {Buffer} */ (clearedTokenBuffer)).every((byte) => byte === 0), true)
-  assert.deepEqual(Object.keys(clearClient), ['diagnose', 'authenticate', 'quote', 'financial', 'calibrateFinancial', 'diagnoseReportPeriod'])
+  assert.deepEqual(Object.keys(clearClient), ['diagnose', 'authenticate', 'quote', 'financial', 'calibrateFinancial', 'diagnoseReportPeriod', 'probeFixed'])
   assert.equal(Object.getOwnPropertyDescriptor(clearClient, 'clear').enumerable, false)
   await clearClient.diagnose({ refreshToken: REFRESH_TOKEN })
   assert.equal(clearTransport.calls.length, 4)
