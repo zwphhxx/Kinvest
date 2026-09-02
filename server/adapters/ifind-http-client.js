@@ -2,6 +2,7 @@ const https = require('node:https')
 const { TextDecoder, types } = require('node:util')
 const { isIfindIndicatorId } = require('../domain/ifind-indicator-id')
 const { CALIBRATION_REQUEST } = require('../domain/ifind-calibration')
+const { getIfindMarketProbeProposal } = require('../domain/ifind-market-probe-proposals')
 const { assertReportPeriodDiagnosticJson } = require('./ifind-report-period-json')
 const { summarizeReportPeriodResponse } = require('../domain/ifind-report-period-failure')
 const {
@@ -784,6 +785,100 @@ function sanitizeFinancialSuccess(response, requestContract) {
   return sanitizeMarketSuccess(response, requestContract)
 }
 
+function readFixedProbeRequest(proposalId, sequence) {
+  const proposal = getIfindMarketProbeProposal(proposalId)
+  if (!proposal || proposal.proposalId !== 'HK_ALIBABA_9988_V1' ||
+      !Number.isSafeInteger(sequence) || sequence < 1 || sequence > 3) {
+    throw new Error('invalid request')
+  }
+  const fixed = proposal.requests.find((entry) => entry.sequence === sequence)
+  if (!fixed || fixed.method !== 'POST') throw new Error('invalid request')
+  const fieldIds = fixed.stage === 'quote'
+    ? fixed.body.indicators.split(',')
+    : fixed.body.indipara.map((entry) => entry.indicator)
+  return Object.freeze({ stage: fixed.stage, endpoint: fixed.endpoint, body: fixed.body,
+    vendorCode: '9988.HK', fieldIds: Object.freeze(fieldIds) })
+}
+
+const FIXED_PROBE_DANGEROUS_KEYS = new Set(['__proto__', 'prototype', 'constructor'])
+
+function fixedProbeRecord(value, allowed, required = allowed) {
+  if (types.isProxy(value) || !isRecord(value)) throw new Error('invalid response')
+  const prototype = Reflect.getPrototypeOf(value)
+  if (prototype !== Object.prototype && prototype !== null) throw new Error('invalid response')
+  const keys = Reflect.ownKeys(value)
+  if (keys.some((key) => typeof key !== 'string' || FIXED_PROBE_DANGEROUS_KEYS.has(key) ||
+      !allowed.includes(key)) || required.some((key) => !keys.includes(key))) {
+    throw new Error('invalid response')
+  }
+  const snapshot = {}
+  for (const key of keys) {
+    const descriptor = Reflect.getOwnPropertyDescriptor(value, key)
+    if (!descriptor || !descriptor.enumerable || !Object.hasOwn(descriptor, 'value')) {
+      throw new Error('invalid response')
+    }
+    Object.defineProperty(snapshot, key, { value: descriptor.value, enumerable: true,
+      configurable: false, writable: false })
+  }
+  return snapshot
+}
+
+function fixedProbeArray(value, maximum, exact = null) {
+  if (types.isProxy(value) || !Array.isArray(value) ||
+      Reflect.getPrototypeOf(value) !== Array.prototype) throw new Error('invalid response')
+  const lengthDescriptor = Reflect.getOwnPropertyDescriptor(value, 'length')
+  const length = lengthDescriptor && lengthDescriptor.value
+  if (!Number.isSafeInteger(length) || length < 0 || length > maximum ||
+      (exact !== null && length !== exact) || Reflect.ownKeys(value).length !== length + 1) {
+    throw new Error('invalid response')
+  }
+  const snapshot = []
+  for (let index = 0; index < length; index += 1) {
+    const descriptor = Reflect.getOwnPropertyDescriptor(value, String(index))
+    if (!descriptor || !descriptor.enumerable || !Object.hasOwn(descriptor, 'value')) {
+      throw new Error('invalid response')
+    }
+    snapshot.push(descriptor.value)
+  }
+  return snapshot
+}
+
+function fixedProbeString(value) {
+  return typeof value === 'string' && Buffer.byteLength(value, 'utf8') <= 256 &&
+    !/[\p{Cc}\p{Cf}]/u.test(value)
+}
+
+function boundedProbeArray(value) {
+  const snapshot = fixedProbeArray(value, 64)
+  for (const item of snapshot) {
+    if (item === null || typeof item === 'boolean' ||
+        (typeof item === 'number' && Number.isFinite(item)) ||
+        fixedProbeString(item)) continue
+    else throw new Error('invalid response')
+  }
+  return Object.freeze(snapshot)
+}
+
+function sanitizeFixedProbeSuccess(response, requestContract) {
+  const envelope = fixedProbeRecord(response, ['errorcode', 'tables', 'dataVol'],
+    ['errorcode', 'tables'])
+  const providerTable = fixedProbeRecord(fixedProbeArray(envelope.tables, 1, 1)[0],
+    ['thscode', 'table'])
+  const returnedCode = providerTable.thscode
+  if (returnedCode !== requestContract.vendorCode) throw new Error('invalid response')
+  const providerFields = fixedProbeRecord(providerTable.table, requestContract.fieldIds)
+  const fields = {}
+  for (const fieldId of requestContract.fieldIds) {
+    Object.defineProperty(fields, fieldId, { value: boundedProbeArray(providerFields[fieldId]),
+      enumerable: true, configurable: false, writable: false })
+  }
+  const sanitized = { errorcode: envelope.errorcode, tables: Object.freeze([
+    Object.freeze({ thscode: returnedCode, table: Object.freeze(fields) })
+  ]) }
+  if (Object.hasOwn(envelope, 'dataVol')) sanitized.dataVol = envelope.dataVol
+  return Object.freeze(sanitized)
+}
+
 /**
  * @param {{
  *   request?: (url: string, options: any, callback: (response: any) => void) => any,
@@ -1247,7 +1342,64 @@ function createIfindHttpClient({
     }
   }
 
-  const client = { diagnose, authenticate: authenticateMarket, quote, financial, calibrateFinancial, diagnoseReportPeriod }
+  async function probeFixed(accessTokenInput, proposalId, sequence) {
+    let requestCount = 0
+    try {
+      let accessToken
+      let fixed
+      try {
+        if (arguments.length !== 3 || types.isProxy(accessTokenInput) ||
+            !Buffer.isBuffer(accessTokenInput)) throw new Error('invalid request')
+        accessToken = new TextDecoder('utf-8', { fatal: true }).decode(accessTokenInput)
+        if (!isHeaderSafeToken(accessToken)) throw new Error('invalid request')
+        fixed = readFixedProbeRequest(proposalId, sequence)
+      } catch {
+        throw safeError('IFIND_CONFIG_INVALID', 'CONFIG', 'iFinD client configuration was invalid')
+      }
+      const operationGeneration = generation
+      requireCurrentGeneration(operationGeneration)
+      requestCount = 1
+      const response = await requestJson(request, fixed.endpoint,
+        { access_token: accessToken, ifindlang: 'cn' }, fixed.body, setTimer, clearTimer)
+      requireCurrentGeneration(operationGeneration)
+      let responseEnvelope
+      let probePayload = null
+      try {
+        responseEnvelope = fixedProbeRecord(response, ['errorcode', 'tables', 'dataVol'], ['errorcode'])
+        if (Object.hasOwn(responseEnvelope, 'tables')) {
+          probePayload = sanitizeFixedProbeSuccess(responseEnvelope, fixed)
+        }
+      } catch {
+        throw safeError('IFIND_RESPONSE_SHAPE', 'API', 'iFinD response shape was invalid')
+      }
+      const responseErrorCode = protocolErrorCode(responseEnvelope)
+      if (responseErrorCode !== 0) {
+        const errorClass = classifyProbeFailure(responseErrorCode)
+        const volume = protocolDataVol(responseEnvelope)
+        const dataVol = volume.present ? volume.value : undefined
+        const code = errorClass === 'AUTH' ? 'IFIND_AUTH_REJECTED'
+          : errorClass === 'PERMISSION' ? 'IFIND_PERMISSION_REJECTED'
+            : errorClass === 'QUOTA' ? 'IFIND_QUOTA_REJECTED' : 'IFIND_PROBE_REJECTED'
+        throw safeError(code, errorClass, 'iFinD fixed market probe failed', dataVol, responseErrorCode)
+      }
+      let dataVol
+      try {
+        const volume = protocolDataVol(responseEnvelope)
+        dataVol = volume.present ? volume.value : null
+        if (probePayload === null) throw new Error('invalid response')
+        return Object.freeze({ stage: fixed.stage, payload: probePayload, requestCount: 1, dataVol })
+      } catch {
+        throw safeError('IFIND_RESPONSE_SHAPE', 'API', 'iFinD response shape was invalid', dataVol)
+      }
+    } catch (error) {
+      const sanitized = SAFE_ERRORS.has(error) ? error
+        : safeError('IFIND_RESPONSE_SHAPE', 'API', 'iFinD response shape was invalid')
+      throw withRequestCount(withStage(sanitized, 'probe'), requestCount)
+    }
+  }
+
+  const client = { diagnose, authenticate: authenticateMarket, quote, financial, calibrateFinancial,
+    diagnoseReportPeriod, probeFixed }
   Object.defineProperty(client, 'clear', { value: clear })
   return client
 }
