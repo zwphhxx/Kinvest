@@ -34,15 +34,21 @@ GET  /api/admin/ifind/market-probes/HK_ALIBABA_9988_V1
 POST /api/admin/ifind/market-probes/HK_ALIBABA_9988_V1/run
 ```
 
-`GET` 只返回本地状态，不读取秘密、不认证供应商、不消耗额度。响应包含：
+`GET` 只返回本地状态，不读取秘密、不认证供应商、不消耗额度。响应包含 #70 已定义的严格探针 DTO：
 
 ```text
-enabled
 proposalId
-proposal metadata
-result
-quota summary
-canRun
+caseId
+displayCode
+status
+verification
+observations
+requestCount
+businessRequestCount
+dataVol
+attemptedAt
+errorCode
+failureStage
 ```
 
 `POST` 只执行固定提案。它必须满足现有管理员写操作契约：
@@ -51,7 +57,6 @@ canRun
 - 精确同源 `Origin`；
 - 有效 CSRF token；
 - `Content-Type: application/json`；
-- 现有固定动作请求头；
 - 请求体必须是精确空对象，不接受额外字段。
 
 未知提案、额外路径段、查询参数、重复 JSON 键和非规范请求全部失败关闭。未启用 iFinD 管理员诊断时，接口返回稳定的不可用结果，不触碰秘密。
@@ -79,12 +84,12 @@ HTTP 层只输出严格 DTO 和稳定错误码，不输出供应商 `RequestId`�
 - 阿里巴巴 `9988.HK`；
 - 提案 ID 和模板版本；
 - “家庭页面仍为 Mock”的醒目边界；
-- 最近尝试时间、请求次数、业务请求次数和本地额度；
+- 最近尝试时间、请求次数、业务请求次数和保守额度状态；
 - 三个阶段的存在性或可用性观察；
 - 七项验证状态，全部明确显示为“未验证”；
 - 稳定失败原因和冷却状态。
 
-按钮默认禁用，只有管理员状态、运行时状态和本地额度均允许时才启用。点击后先显示固定成本说明，再由管理员确认。请求进行中立即禁用按钮，防止双击产生第二次请求；完成后只刷新一次本地状态，不自动轮询或重试。
+按钮默认禁用，只有管理员状态、运行时状态和探针 DTO 状态均允许时才启用。点击后先显示固定成本说明，再由管理员确认。请求进行中立即禁用按钮，防止双击产生第二次请求；完成后只刷新一次本地状态，不自动轮询或重试。DTO 不提供精确剩余额度时，页面不得推算或伪造余量。
 
 所有供应商派生文本使用 `textContent` 渲染。页面不得使用 `innerHTML` 展示响应内容，也不得把结果写入浏览器持久存储。
 
@@ -93,7 +98,7 @@ HTTP 层只输出严格 DTO 和稳定错误码，不输出供应商 `RequestId`�
 1. 管理员登录后，页面通过 `GET` 读取内存状态。
 2. 管理员点击运行并确认固定调用成本。
 3. 浏览器发送受 Origin、CSRF 和动作头保护的精确 `POST`。
-4. HTTP 层调用 `marketProbeService.runFixed()`。
+4. HTTP 层在精确路径校验通过后调用无参数 `marketProbeService.run()`；固定提案已经封装在服务内部。
 5. 服务先取得共享额度租约，再读取 refresh token、执行一次认证和最多三次顺序业务请求。
 6. 客户端严格清洗响应，服务在租约仍属于当前运行时才发布内存结果。
 7. HTTP 层返回防御性复制的 DTO；页面按未验证观察值展示。
