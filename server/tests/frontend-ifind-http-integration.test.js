@@ -19,7 +19,6 @@ const ADMIN_TOKEN = 'A'.repeat(43)
 const CSRF_TOKEN = 'C'.repeat(43)
 const LIST_URL = '/api/admin/ifind/market-cases'
 const PROBE_URL = '/api/admin/ifind/market-probes/HK_ALIBABA_9988_V1'
-const PROBE_RUN_URL = `${PROBE_URL}/run`
 const FIXTURE_CASE = listIfindMarketCases().find((item) => item.caseId === US_CASE)
 
 function financialPoint(overrides = {}) {

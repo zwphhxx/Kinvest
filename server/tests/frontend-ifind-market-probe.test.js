@@ -35,6 +35,9 @@ function readyResult(overrides = {}) {
   }
 }
 
+/** @typedef {ReturnType<typeof readyResult>} ProbeResult */
+/** @typedef {{ promise: Promise<ProbeResult>, resolve: (value: ProbeResult | PromiseLike<ProbeResult>) => void }} ProbeDeferred */
+
 function observedResult() {
   return readyResult({
     status: 'observed-unverified',
@@ -96,7 +99,11 @@ function documentFixture() {
   ]
   const elements = new Map(ids.map((id) => [id, new Element(id)]))
   return {
-    get: (id) => elements.get(id),
+    get(id) {
+      const element = elements.get(id)
+      if (!element) throw new Error(`MISSING_TEST_ELEMENT:${id}`)
+      return element
+    },
     document: { getElementById: (id) => elements.get(id) || null }
   }
 }
@@ -116,12 +123,20 @@ function lifecycle() {
   }
 }
 
+/** @returns {ProbeDeferred} */
 function deferred() {
-  let resolve
+  /** @type {(value: ProbeResult | PromiseLike<ProbeResult>) => void} */
+  let resolve = () => { throw new Error('DEFERRED_NOT_READY') }
   const promise = new Promise((done) => { resolve = done })
   return { promise, resolve }
 }
 
+/**
+ * @param {{
+ *   responses?: Array<ProbeResult | Promise<ProbeResult>>,
+ *   confirm?: (message: string) => boolean
+ * }} [options]
+ */
 function controllerFixture({ responses = [readyResult()], confirm = () => true } = {}) {
   const nodes = documentFixture()
   const sessionLifecycle = lifecycle()
@@ -129,6 +144,11 @@ function controllerFixture({ responses = [readyResult()], confirm = () => true }
   const errors = []
   const live = []
   let index = 0
+  /** @param {string} [message] @returns {true} */
+  const acceptedConfirmation = (message) => {
+    assert.equal(confirm(message || ''), true, 'this fixture only exercises accepted confirmations')
+    return true
+  }
   const controller = marketProbe.createController({
     document: nodes.document,
     sessionLifecycle,
@@ -139,7 +159,7 @@ function controllerFixture({ responses = [readyResult()], confirm = () => true }
       return { data: await next }
     },
     dateText: (value) => `DATE:${value}`,
-    confirm,
+    confirm: acceptedConfirmation,
     setLive: (message, tone) => { live.push({ message, tone }) },
     onError: async (error) => { errors.push(error) }
   })
@@ -202,6 +222,7 @@ async function confirmationAndSingleFlightTest() {
 }
 
 async function runOutcomeMessagingTest() {
+  /** @type {Array<[string, ProbeResult, string, RegExp]>} */
   const cases = [
     ['observed-unverified', observedResult(), 'success', /探针已完成/],
     ['failed', failedResult('failed'), 'error', /未完成/],
@@ -223,6 +244,7 @@ async function runOutcomeMessagingTest() {
 }
 
 async function trustedResultSurvivesTransportAndApiFailureTest() {
+  /** @type {Array<[Error | ReturnType<typeof marketProbe.apiFailure>, string]>} */
   const failures = [
     [new Error('SENSITIVE_NETWORK_DETAIL'), 'IFIND_MARKET_PROBE_UNAVAILABLE'],
     [marketProbe.apiFailure(503, { error: 'IFIND_MARKET_PROBE_FAILED' }),
@@ -325,6 +347,13 @@ async function cancellationAndStaleSessionTest() {
 }
 
 async function staleGenerationSettlementsStaySilentTest() {
+  /** @typedef {ReturnType<typeof controllerFixture>} ControllerFixture */
+  /** @type {Array<{
+   *   name: string,
+   *   prepare?: boolean,
+   *   start: (fixture: ControllerFixture) => Promise<void>,
+   *   settle: (gate: ProbeDeferred, hostile: object) => void
+   * }>} */
   const staleOutcomes = [
     { name: 'GET success', start: (fixture) => fixture.controller.refresh(),
       settle: (gate) => gate.resolve(observedResult()) },
