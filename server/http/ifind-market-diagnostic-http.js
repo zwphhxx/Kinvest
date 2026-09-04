@@ -11,6 +11,9 @@ const {
   resolveClientIdentity
 } = require('./trusted-client')
 const { listIfindMarketCases } = require('../domain/ifind-market-cases')
+const {
+  copyIfindMarketProbeResult
+} = require('../domain/ifind-market-probe-result')
 
 const ADMIN_COOKIE = '__Host-kinvest-admin'
 const COOKIE_HEADER_LIMIT = 4096
@@ -950,6 +953,10 @@ function createIfindMarketDiagnosticHttpController({
       requireExactTarget(req, endpoint)
     }
 
+    const access = runtimeAccess(ifindDiagnosticRuntime)
+    if (access.status !== 'available') {
+      boundaryError('IFIND_MARKET_PROBE_FAILED', 500)
+    }
     const serviceProperty = optionalOwnDataValue(
       ifindDiagnosticRuntime,
       'marketProbeService'
@@ -967,7 +974,9 @@ function createIfindMarketDiagnosticHttpController({
 
     let result
     try {
-      result = await methodProperty.value.call(serviceProperty.value)
+      result = copyIfindMarketProbeResult(
+        await methodProperty.value.call(serviceProperty.value)
+      )
     } catch {
       boundaryError('IFIND_MARKET_PROBE_FAILED', 500)
     }
