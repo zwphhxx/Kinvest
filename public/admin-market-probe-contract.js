@@ -198,7 +198,9 @@
     const { document, sessionLifecycle, request, dateText, confirm, setLive, onError } = options
     const byId = (id) => document.getElementById(id)
     let generation = 0
-    let requestSequence = 0
+    let getSequence = 0
+    let runSequence = 0
+    let activeRunToken = null
     let running = false
     let bound = false
     let currentStatus = null
@@ -264,7 +266,9 @@
 
     function reset() {
       generation += 1
-      requestSequence += 1
+      getSequence += 1
+      runSequence += 1
+      activeRunToken = null
       running = false
       currentStatus = null
       runAllowed = false
@@ -288,21 +292,35 @@
       buttonState()
     }
 
-    async function guardedRequest(path, requestOptions) {
+    async function guardedRequest(path, requestOptions, runToken = null) {
+      const isStatusRequest = path === STATUS_PATH
       const localGeneration = generation
-      const localSequence = ++requestSequence
+      const localGetSequence = isStatusRequest ? ++getSequence : null
+      const localRunSequence = runSequence
+      const externalGetDuringRun = isStatusRequest && activeRunToken !== null && runToken === null
       const ticket = sessionLifecycle.beginRequest()
+
+      function staleSettlement() {
+        if (localGeneration !== generation) return true
+        if (isStatusRequest) {
+          if (externalGetDuringRun || localGetSequence !== getSequence) return true
+          if (runToken !== null && runToken.sequence !== runSequence) return true
+          return localRunSequence !== runSequence
+        }
+        return runToken === null || activeRunToken !== runToken || runToken.sequence !== runSequence
+      }
+
       try {
         const response = await request(path, { ...requestOptions, signal: ticket.signal })
         const data = copyResult(record(response, ['data']).data)
         return sessionLifecycle.commit(ticket, () => {
-          if (localGeneration !== generation || localSequence !== requestSequence) throw STALE
+          if (staleSettlement()) throw STALE
           runAllowed = path === STATUS_PATH && data.status === 'ready'
           render(data)
           return data
         })
       } catch (error) {
-        if (localGeneration !== generation || localSequence !== requestSequence || error === STALE) return undefined
+        if (staleSettlement() || error === STALE) return undefined
         const safeError = sanitizeFailure(error)
         if (safeError.code === INVALID) reset()
         else {
@@ -320,13 +338,20 @@
       return guardedRequest(STATUS_PATH, {})
     }
 
+    async function refreshAfterRun(runToken) {
+      return guardedRequest(STATUS_PATH, {}, runToken)
+    }
+
     async function run() {
       if (running || currentStatus !== 'ready' || !runAllowed || !confirm(CONFIRMATION)) return undefined
       const runGeneration = generation
+      const runToken = Object.freeze({ sequence: ++runSequence })
+      activeRunToken = runToken
+      runAllowed = false
       running = true
       buttonState()
       try {
-        const result = await guardedRequest(RUN_PATH, { method: 'POST', body: {}, csrf: true })
+        const result = await guardedRequest(RUN_PATH, { method: 'POST', body: {}, csrf: true }, runToken)
         if (result) {
           const notices = {
             'observed-unverified': ['固定港股探针已完成；所有观察仍为未验证。', 'success'],
@@ -339,11 +364,12 @@
           }
           const notice = notices[result.status]
           setLive(notice[0], notice[1])
-          return refresh()
+          return refreshAfterRun(runToken)
         }
         return undefined
       } finally {
-        if (runGeneration === generation) {
+        if (runGeneration === generation && activeRunToken === runToken) {
+          activeRunToken = null
           running = false
           buttonState()
         }

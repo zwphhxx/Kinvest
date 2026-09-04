@@ -382,6 +382,77 @@ async function latestStatusRequestWinsOutOfOrderTest() {
   assert.deepEqual(fixture.live, [])
 }
 
+async function externalGetCannotCancelRunningPostTest() {
+  {
+    const post = deferred()
+    const externalGet = deferred()
+    const fixture = controllerFixture({ responses: [
+      readyResult(), post.promise, externalGet.promise, failedResult('cooldown')
+    ] })
+    await fixture.controller.refresh()
+    const running = fixture.get('ifind-market-probe-run').click()
+    const external = fixture.controller.refresh()
+    externalGet.resolve(readyResult())
+    await external
+    post.resolve(observedResult())
+    await running
+    assert.deepEqual(fixture.calls.map(({ url }) => url), [
+      STATUS_PATH, RUN_PATH, STATUS_PATH, STATUS_PATH
+    ])
+    assert.deepEqual(fixture.live, [{
+      message: '固定港股探针已完成；所有观察仍为未验证。', tone: 'success'
+    }])
+    assert.equal(fixture.get('ifind-market-probe-status').textContent, '冷却中')
+    assert.equal(fixture.get('ifind-market-probe-run').disabled, true)
+    assert.equal(fixture.get('ifind-market-probe-run').attributes.get('aria-busy'), 'false')
+  }
+
+  {
+    const post = deferred()
+    const externalGet = deferred()
+    const internalGet = deferred()
+    const fixture = controllerFixture({ responses: [
+      readyResult(), post.promise, externalGet.promise, internalGet.promise
+    ] })
+    await fixture.controller.refresh()
+    const running = fixture.get('ifind-market-probe-run').click()
+    const external = fixture.controller.refresh()
+    post.resolve(observedResult())
+    await new Promise((resolve) => setImmediate(resolve))
+    assert.deepEqual(fixture.calls.map(({ url }) => url), [
+      STATUS_PATH, RUN_PATH, STATUS_PATH, STATUS_PATH
+    ])
+    internalGet.resolve(failedResult('cooldown'))
+    await running
+    externalGet.resolve(readyResult())
+    await external
+    assert.deepEqual(fixture.live, [{
+      message: '固定港股探针已完成；所有观察仍为未验证。', tone: 'success'
+    }])
+    assert.equal(fixture.get('ifind-market-probe-status').textContent, '冷却中')
+    assert.equal(fixture.get('ifind-market-probe-run').disabled, true)
+    assert.equal(fixture.get('ifind-market-probe-run').attributes.get('aria-busy'), 'false')
+  }
+}
+
+async function externalGetCannotHidePostFailureTest() {
+  const post = deferred()
+  const externalGet = deferred()
+  const fixture = controllerFixture({ responses: [readyResult(), post.promise, externalGet.promise] })
+  await fixture.controller.refresh()
+  const running = fixture.get('ifind-market-probe-run').click()
+  const external = fixture.controller.refresh()
+  externalGet.resolve(readyResult())
+  await external
+  post.resolve(Promise.reject(marketProbe.apiFailure(503, { error: 'IFIND_MARKET_PROBE_FAILED' })))
+  await running
+  assert.equal(fixture.errors.length, 1)
+  assert.equal(fixture.errors[0].code, 'IFIND_MARKET_PROBE_FAILED')
+  assert.equal(fixture.get('ifind-market-probe-run').disabled, true)
+  assert.equal(fixture.get('ifind-market-probe-run').attributes.get('aria-busy'), 'false')
+  assert.deepEqual(fixture.live, [])
+}
+
 async function hostileDtoTest() {
   const base = observedResult()
   const mutations = [
@@ -444,6 +515,7 @@ async function run() {
     hostileRejectionIsNeverInspectedTest, failedRefreshPreservesReadyButDisablesRunTest,
     untrustedResultAndExplicitResetClearTest, cancellationAndStaleSessionTest,
     staleGenerationSettlementsStaySilentTest, latestStatusRequestWinsOutOfOrderTest,
+    externalGetCannotCancelRunningPostTest, externalGetCannotHidePostFailureTest,
     hostileDtoTest, failureMappingTest, htmlContractTest]) {
     await test()
     console.log(`PASS frontend-market-probe: ${test.name}`)
