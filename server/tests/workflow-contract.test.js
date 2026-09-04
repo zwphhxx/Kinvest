@@ -1304,6 +1304,19 @@ function run() {
       workflowBlock(jobs, jobId, 2)
     ])
   )
+  const expectedJobTimeouts = {
+    verify: '45',
+    security: '15',
+    'container-build': '20',
+    publish: '30'
+  }
+  for (const [jobId, timeoutMinutes] of Object.entries(expectedJobTimeouts)) {
+    assert.equal(
+      directScalar(workflowBlock(jobs, jobId, 2), 'timeout-minutes', 4),
+      timeoutMinutes,
+      `${jobId} must keep its reviewed timeout`
+    )
+  }
   assertRequiredPrJobsCannotSkipPullRequests(prJobs)
   const pullRequestSkippingVerify = prJobs.verify.replace(
     '    runs-on: ubuntu-latest',
