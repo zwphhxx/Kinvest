@@ -349,6 +349,7 @@ function createProbeRuntimeHarness(overrides = {}) {
     createMarketProbeService(input) {
       factoryCalls += 1
       factoryInput = input
+      if (overrides.factoryThrows) throw new Error('probe factory failed')
       return probeService
     },
     clock,
@@ -365,6 +366,7 @@ function createProbeRuntimeHarness(overrides = {}) {
     marketClient,
     options,
     provider,
+    providerState,
     reportPeriodClient,
     start: () => createIfindDiagnosticRuntime(options),
     state: {
@@ -396,6 +398,51 @@ async function testDisabledModeDoesNotInitializeMarketRuntime() {
   assert.equal(runtime.marketService, null)
   assert.equal(runtime.marketProbeService, null)
   assert.deepEqual(calls, [])
+}
+
+async function testReadMethodRejectsProxyCallableWithoutExecutingTraps() {
+  const harness = createProbeRuntimeHarness()
+  let traps = 0
+  harness.legacyClient.diagnose = new Proxy(function () {}, {
+    get() {
+      traps += 1
+      throw new Error('callable property trap must not run')
+    },
+    apply() {
+      traps += 1
+      throw new Error('callable apply trap must not run')
+    }
+  })
+  try {
+    await assert.rejects(
+      harness.start(),
+      hasCode('IFIND_DIAGNOSTIC_RUNTIME_INVALID')
+    )
+    assert.equal(traps, 0)
+  } finally {
+    harness.database.close()
+  }
+}
+
+async function testReadMethodUsesTrustedBindForInheritedMethod() {
+  const harness = createProbeRuntimeHarness({ marketHasProbeFixed: false })
+  let bindReads = 0
+  function inheritedDiagnose() { return this }
+  Object.defineProperty(inheritedDiagnose, 'bind', {
+    get() {
+      bindReads += 1
+      throw new Error('candidate bind accessor must not run')
+    }
+  })
+  delete harness.legacyClient.diagnose
+  Object.setPrototypeOf(harness.legacyClient, { diagnose: inheritedDiagnose })
+  try {
+    const runtime = await harness.start()
+    assert.equal(bindReads, 0)
+    runtime.clear()
+  } finally {
+    harness.database.close()
+  }
 }
 
 async function testEnabledRuntimeComposesDedicatedMarketProbeService() {
@@ -483,22 +530,22 @@ async function testOlderMarketClientDoesNotCreateProbeRuntime() {
 }
 
 async function testMarketProbeClientMustBeDistinctAndComplete() {
-  for (const [name, createProbeClient] of [
-    ['legacy reuse', ({ legacyClient }) => legacyClient],
-    ['market reuse', ({ marketClient }) => marketClient],
-    ['report-period reuse', ({ reportPeriodClient }) => reportPeriodClient],
+  for (const [name, createProbeClient, expectedProbeClears] of [
+    ['legacy reuse', ({ legacyClient }) => legacyClient, 0],
+    ['market reuse', ({ marketClient }) => marketClient, 0],
+    ['report-period reuse', ({ reportPeriodClient }) => reportPeriodClient, 0],
     ['missing authenticate', ({ defaultProbeClient }) => ({
       probeFixed: defaultProbeClient.probeFixed,
       clear: defaultProbeClient.clear
-    })],
+    }), 1],
     ['missing probeFixed', ({ defaultProbeClient }) => ({
       authenticate: defaultProbeClient.authenticate,
       clear: defaultProbeClient.clear
-    })],
+    }), 1],
     ['missing clear', ({ defaultProbeClient }) => ({
       authenticate: defaultProbeClient.authenticate,
       probeFixed: defaultProbeClient.probeFixed
-    })]
+    }), 0]
   ]) {
     const harness = createProbeRuntimeHarness({ createProbeClient })
     try {
@@ -511,6 +558,7 @@ async function testMarketProbeClientMustBeDistinctAndComplete() {
       assert.equal(harness.clearCounts.legacy, 1, name)
       assert.equal(harness.clearCounts.market, 1, name)
       assert.equal(harness.clearCounts.reportPeriod, 1, name)
+      assert.equal(harness.clearCounts.probe, expectedProbeClears, name)
     } finally {
       harness.database.close()
     }
@@ -519,10 +567,11 @@ async function testMarketProbeClientMustBeDistinctAndComplete() {
 
 async function testMarketProbeServiceMustExposeRequiredMethods() {
   for (const missing of ['describe', 'run', 'clear']) {
+    let serviceClearCalls = 0
     const service = {
       describe() {},
       async run() {},
-      clear() {}
+      clear() { serviceClearCalls += 1 }
     }
     delete service[missing]
     const harness = createProbeRuntimeHarness({ probeService: service })
@@ -533,9 +582,52 @@ async function testMarketProbeServiceMustExposeRequiredMethods() {
         missing
       )
       assert.equal(harness.state.factoryCalls, 1, missing)
+      assert.equal(serviceClearCalls, missing === 'clear' ? 0 : 1, missing)
+      assert.equal(harness.clearCounts.probe, missing === 'clear' ? 1 : 0, missing)
+      assert.equal(harness.clearCounts.legacy, 1, missing)
+      assert.equal(harness.clearCounts.market, 1, missing)
+      assert.equal(harness.clearCounts.reportPeriod, 1, missing)
     } finally {
       harness.database.close()
     }
+  }
+}
+
+async function testMarketProbeFactoryFailuresCleanOwnedResourcesOnce() {
+  const throwing = createProbeRuntimeHarness({ factoryThrows: true })
+  try {
+    await assert.rejects(
+      throwing.start(),
+      hasCode('IFIND_DIAGNOSTIC_RUNTIME_INVALID')
+    )
+    assert.equal(throwing.state.factoryCalls, 1)
+    assert.deepEqual(throwing.clearCounts, {
+      legacy: 1,
+      market: 1,
+      reportPeriod: 1,
+      probe: 1
+    })
+  } finally {
+    throwing.database.close()
+  }
+
+  const invalid = createProbeRuntimeHarness()
+  invalid.options.createMarketProbeService = null
+  try {
+    await assert.rejects(
+      invalid.start(),
+      hasCode('IFIND_DIAGNOSTIC_RUNTIME_INVALID')
+    )
+    assert.equal(invalid.state.factoryCalls, 0)
+    assert.equal(invalid.providerState.clearCalls, 0)
+    assert.deepEqual(invalid.clearCounts, {
+      legacy: 0,
+      market: 0,
+      reportPeriod: 0,
+      probe: 0
+    })
+  } finally {
+    invalid.database.close()
   }
 }
 
@@ -1010,11 +1102,14 @@ async function run() {
   const initialUmask = process.umask()
   try {
     await testDisabledModeDoesNotInitializeMarketRuntime()
+    await testReadMethodRejectsProxyCallableWithoutExecutingTraps()
+    await testReadMethodUsesTrustedBindForInheritedMethod()
     await testEnabledRuntimeComposesDedicatedMarketProbeService()
     await testMarketProbeCleanupFallsBackToDedicatedClientOnce()
     await testOlderMarketClientDoesNotCreateProbeRuntime()
     await testMarketProbeClientMustBeDistinctAndComplete()
     await testMarketProbeServiceMustExposeRequiredMethods()
+    await testMarketProbeFactoryFailuresCleanOwnedResourcesOnce()
     await testEnabledModeRejectsIncompleteProductionClient()
     await testClientFactoryFailuresCleanDistinctInstances()
     await testEnabledRuntimeComposesProductionMarketService()

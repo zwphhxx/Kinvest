@@ -1,5 +1,7 @@
 const crypto = require('node:crypto')
 const { types } = require('node:util')
+const FUNCTION_BIND = Function.prototype.bind
+const REFLECT_APPLY = Reflect.apply
 const { createIfindHttpClient } = require('./adapters/ifind-http-client')
 const {
   IfindDiagnosticRepository
@@ -114,8 +116,9 @@ function readMethod(value, key) {
       const descriptor = Reflect.getOwnPropertyDescriptor(current, key)
       if (descriptor) {
         return Object.hasOwn(descriptor, 'value') &&
-          typeof descriptor.value === 'function'
-          ? descriptor.value.bind(value)
+          typeof descriptor.value === 'function' &&
+          !types.isProxy(descriptor.value)
+          ? REFLECT_APPLY(FUNCTION_BIND, descriptor.value, [value])
           : null
       }
       current = Reflect.getPrototypeOf(current)

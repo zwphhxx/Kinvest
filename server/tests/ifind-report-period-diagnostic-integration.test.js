@@ -239,7 +239,11 @@ async function runtimeHttpContract() {
   })
   try {
     assert.ok(runtime.reportPeriodService)
-    assert.equal(clients.length, 3, 'report-period diagnostic has its own client')
+    assert.equal(clients.length, 4, 'fixed probe diagnostic has its own client')
+    const [legacyClient, marketClient, reportPeriodClient, probeClient] = clients
+    assert.notEqual(probeClient, legacyClient)
+    assert.notEqual(probeClient, marketClient)
+    assert.notEqual(probeClient, reportPeriodClient)
     const makeHandler = /** @param {any} [value] */ (value = runtime) => createRequestHandler({ accessRuntime: accessRuntime(),
       ifindDiagnosticRuntime: value, now: () => NOW, publicOrigin: ORIGIN, trustedProxyAddresses: ['127.0.0.1'] })
     const handler = makeHandler()
