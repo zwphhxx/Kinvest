@@ -473,6 +473,90 @@
 .ifind-market-card .auth-primary { width: 100%; }
 .ifind-market-card .auth-primary[data-tone="running"] { background: #49636c; }
 
+.ifind-market-probe {
+  background:
+    linear-gradient(118deg, rgba(228, 245, 241, 0.92), rgba(252, 254, 254, 0.96) 42%),
+    #f8fbfb;
+}
+
+.ifind-market-probe-head {
+  display: flex;
+  align-items: flex-start;
+  justify-content: space-between;
+  gap: 24px;
+}
+
+.ifind-market-probe-ticket {
+  display: grid;
+  grid-template-columns: 0.75fr 0.75fr 1.5fr;
+  gap: 1px;
+  margin: 22px 0 16px;
+  border: 1px solid #b8d2d0;
+  border-radius: 12px;
+  overflow: hidden;
+  background: #b8d2d0;
+}
+
+.ifind-market-probe-ticket p {
+  display: grid;
+  gap: 4px;
+  min-width: 0;
+  margin: 0;
+  padding: 14px 16px;
+  background: rgba(255, 255, 255, 0.9);
+}
+
+.ifind-market-probe-ticket span,
+.ifind-market-probe-observations span {
+  color: #67808a;
+  font: 0.7rem/1.4 "DIN Alternate", "SFMono-Regular", Consolas, monospace;
+  letter-spacing: 0.04em;
+}
+
+.ifind-market-probe-ticket strong {
+  color: #23464b;
+  font: 650 0.86rem/1.45 "DIN Alternate", "SFMono-Regular", Consolas, monospace;
+  overflow-wrap: anywhere;
+}
+
+.ifind-market-probe-observations {
+  display: grid;
+  grid-template-columns: repeat(3, minmax(0, 1fr));
+  gap: 12px;
+  margin: 20px 0;
+}
+
+.ifind-market-probe-observations article {
+  position: relative;
+  display: grid;
+  align-content: start;
+  gap: 8px;
+  min-width: 0;
+  min-height: 116px;
+  padding: 16px;
+  border: 1px solid #cee0e1;
+  border-radius: 12px 12px 12px 4px;
+  background: rgba(255, 255, 255, 0.78);
+}
+
+.ifind-market-probe-observations article::before {
+  content: "";
+  position: absolute;
+  inset: 0 auto 0 0;
+  width: 3px;
+  border-radius: 12px 0 0 4px;
+  background: #4b9b91;
+}
+
+.ifind-market-probe-observations strong {
+  color: #294650;
+  font: 0.76rem/1.55 "DIN Alternate", "SFMono-Regular", Consolas, monospace;
+  overflow-wrap: anywhere;
+}
+
+.ifind-market-probe-metrics { margin-top: 0; }
+.ifind-market-probe [data-evidence-status="unverified"] { color: #72591f; }
+
 .admin-list {
   display: grid;
   gap: 10px;
@@ -561,8 +645,12 @@ output:focus-visible {
   .ifind-metrics div:nth-last-child(-n + 2) { border-bottom: 0; }
   .ifind-diagnostic-actions .auth-primary { width: 100%; }
   .ifind-market-head { flex-direction: column; }
+  .ifind-market-probe-head { flex-direction: column; }
   .ifind-market-rail { grid-template-columns: 1fr; }
   .ifind-market-card-head { min-height: 0; }
+  .ifind-market-probe-ticket,
+  .ifind-market-probe-observations { grid-template-columns: 1fr; }
+  .ifind-market-probe-observations article { min-height: 0; }
 }
 
 @media (max-width: 375px) {

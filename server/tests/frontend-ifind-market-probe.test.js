@@ -1,0 +1,262 @@
+'use strict'
+
+const assert = require('node:assert/strict')
+const fs = require('node:fs')
+const path = require('node:path')
+
+const marketProbe = require('../../public/admin-market-probe-contract')
+
+const ROOT = path.resolve(__dirname, '../..')
+const STATUS_PATH = '/api/admin/ifind/market-probes/HK_ALIBABA_9988_V1'
+const RUN_PATH = `${STATUS_PATH}/run`
+const VERIFICATION_IDS = [
+  'issuer-identity', 'vendor-code', 'entitlement', 'currency', 'unit', 'report-period', 'scope'
+]
+
+function readyResult(overrides = {}) {
+  return {
+    proposalId: 'HK_ALIBABA_9988_V1',
+    caseId: 'HK_ALIBABA_9988',
+    displayCode: '9988.HK',
+    status: 'ready',
+    verification: {
+      issuerIdentityStatus: 'unverified', vendorCodeStatus: 'unverified',
+      entitlementStatus: 'unverified', currencyStatus: 'unverified', unitStatus: 'unverified',
+      reportPeriodStatus: 'unverified', scopeStatus: 'unverified'
+    },
+    observations: { identity: null, quote: null, financial: null },
+    requestCount: 0,
+    businessRequestCount: 0,
+    dataVol: null,
+    attemptedAt: null,
+    errorCode: null,
+    failureStage: null,
+    ...overrides
+  }
+}
+
+function observedResult() {
+  return readyResult({
+    status: 'observed-unverified',
+    observations: {
+      identity: { returnedCode: '9988.HK', fields: { ths_stock_short_name_stock: ['阿里巴巴-W'] } },
+      quote: { returnedCode: '9988.HK', fields: {
+        latest: [118.4], preClose: [116.8], open: [117], high: [119], low: [116.5],
+        amount: [1200000], volume: [10000], tradeDate: ['2026-09-02'], tradeTime: ['16:08:00']
+      } },
+      financial: { returnedCode: '9988.HK', fields: { revenue_oas: [243380000000] } }
+    },
+    requestCount: 4,
+    businessRequestCount: 3,
+    dataVol: 3,
+    attemptedAt: '2026-09-02T08:08:00.000Z',
+    errorCode: 'IFIND_MARKET_PROBE_OBSERVED_UNVERIFIED'
+  })
+}
+
+class Element {
+  constructor(id = '') {
+    this.id = id
+    this.textContent = ''
+    this.disabled = false
+    this.dataset = {}
+    this.attributes = new Map()
+    this.listeners = new Map()
+  }
+
+  get innerHTML() { throw new Error('INNER_HTML_READ_FORBIDDEN') }
+  set innerHTML(_value) { throw new Error('INNER_HTML_WRITE_FORBIDDEN') }
+  setAttribute(key, value) { this.attributes.set(key, String(value)) }
+  addEventListener(name, handler) { this.listeners.set(name, handler) }
+  async click() {
+    const handler = this.listeners.get('click')
+    if (handler) return handler({ preventDefault() {} })
+  }
+}
+
+function documentFixture() {
+  const ids = [
+    'ifind-market-probe-status', 'ifind-market-probe-proposal', 'ifind-market-probe-code',
+    'ifind-market-probe-attempted-at', 'ifind-market-probe-request-count',
+    'ifind-market-probe-business-request-count', 'ifind-market-probe-data-vol',
+    'ifind-market-probe-quota', 'ifind-market-probe-identity', 'ifind-market-probe-quote',
+    'ifind-market-probe-financial', 'ifind-market-probe-error', 'ifind-market-probe-run',
+    ...VERIFICATION_IDS.map((name) => `ifind-market-probe-${name}`)
+  ]
+  const elements = new Map(ids.map((id) => [id, new Element(id)]))
+  return {
+    get: (id) => elements.get(id),
+    document: { getElementById: (id) => elements.get(id) || null }
+  }
+}
+
+function lifecycle() {
+  let epoch = 1
+  let active = true
+  return {
+    activate() { active = true; epoch += 1 },
+    invalidate() { active = false; epoch += 1 },
+    beginRequest() { return { epoch, signal: new AbortController().signal } },
+    commit(ticket, operation) {
+      if (!active || ticket.epoch !== epoch) throw new Error('ADMIN_EPOCH_STALE')
+      return operation()
+    },
+    finishRequest() {}
+  }
+}
+
+function deferred() {
+  let resolve
+  const promise = new Promise((done) => { resolve = done })
+  return { promise, resolve }
+}
+
+function controllerFixture({ responses = [readyResult()], confirm = () => true } = {}) {
+  const nodes = documentFixture()
+  const sessionLifecycle = lifecycle()
+  const calls = []
+  const errors = []
+  let index = 0
+  const controller = marketProbe.createController({
+    document: nodes.document,
+    sessionLifecycle,
+    request: async (url, options = {}) => {
+      calls.push({ url, options })
+      const next = responses[Math.min(index, responses.length - 1)]
+      index += 1
+      return { data: await next }
+    },
+    dateText: (value) => `DATE:${value}`,
+    confirm,
+    setLive() {},
+    onError: async (error) => { errors.push(error) }
+  })
+  controller.bind()
+  return { ...nodes, controller, calls, errors, sessionLifecycle }
+}
+
+async function moduleSurfaceTest() {
+  assert.deepEqual(Object.keys(marketProbe).sort(), ['apiFailure', 'createController', 'errorMessage'])
+  assert.equal(Object.isFrozen(marketProbe), true)
+  const source = fs.readFileSync(path.join(ROOT, 'public/admin-market-probe-contract.js'), 'utf8')
+  assert.doesNotMatch(source, /localStorage|sessionStorage|innerHTML/)
+}
+
+async function offlineRefreshAndRenderTest() {
+  const value = observedResult()
+  const fixture = controllerFixture({ responses: [value] })
+  await fixture.controller.refresh()
+  assert.deepEqual(fixture.calls.map(({ url, options }) => [url, options.method || 'GET']), [
+    [STATUS_PATH, 'GET']
+  ])
+  assert.equal(fixture.get('ifind-market-probe-proposal').textContent, 'HK_ALIBABA_9988_V1')
+  assert.equal(fixture.get('ifind-market-probe-code').textContent, '9988.HK')
+  assert.match(fixture.get('ifind-market-probe-identity').textContent, /阿里巴巴-W/)
+  assert.match(fixture.get('ifind-market-probe-quote').textContent, /118\.4/)
+  assert.match(fixture.get('ifind-market-probe-financial').textContent, /243380000000/)
+  for (const name of VERIFICATION_IDS) {
+    const node = fixture.get(`ifind-market-probe-${name}`)
+    assert.equal(node.textContent, '未验证')
+    assert.equal(node.dataset.evidenceStatus, 'unverified')
+  }
+  assert.doesNotMatch(fixture.get('ifind-market-probe-quota').textContent, /剩余|\d+\s*次/)
+}
+
+async function confirmationAndSingleFlightTest() {
+  const gate = deferred()
+  const confirmations = []
+  const fixture = controllerFixture({
+    responses: [readyResult(), gate.promise, observedResult()],
+    confirm: (message) => { confirmations.push(message); return true }
+  })
+  await fixture.controller.refresh()
+  const first = fixture.get('ifind-market-probe-run').click()
+  const second = fixture.get('ifind-market-probe-run').click()
+  assert.equal(confirmations.length, 1)
+  assert.match(confirmations[0], /1 次认证 \+ 3 次业务请求/)
+  assert.match(confirmations[0], /0 次重试/)
+  assert.deepEqual(fixture.calls.map(({ url }) => url), [STATUS_PATH, RUN_PATH])
+  assert.equal(fixture.get('ifind-market-probe-run').disabled, true)
+  gate.resolve(observedResult())
+  await Promise.all([first, second])
+  assert.deepEqual(fixture.calls.map(({ url }) => url), [STATUS_PATH, RUN_PATH, STATUS_PATH])
+  assert.deepEqual(fixture.calls[1].options, {
+    method: 'POST', body: {}, csrf: true, signal: fixture.calls[1].options.signal
+  })
+}
+
+async function cancellationAndStaleSessionTest() {
+  const gate = deferred()
+  const fixture = controllerFixture({ responses: [gate.promise] })
+  const pending = fixture.controller.refresh()
+  fixture.controller.reset()
+  fixture.sessionLifecycle.invalidate()
+  gate.resolve(observedResult())
+  await pending
+  assert.equal(fixture.get('ifind-market-probe-status').textContent, '尚未读取状态')
+  assert.equal(fixture.get('ifind-market-probe-identity').textContent, '—')
+}
+
+async function hostileDtoTest() {
+  const base = observedResult()
+  const mutations = [
+    () => ({ ...base, extra: 'UNTRUSTED' }),
+    () => ({ ...base, refreshToken: 'UNTRUSTED' }),
+    () => ({ ...base, status: 'verified' }),
+    () => ({ ...base, verification: { ...base.verification, currencyStatus: 'verified' } }),
+    () => Object.defineProperty({ ...base }, 'status', { enumerable: true, get() { throw new Error('UNTRUSTED') } }),
+    () => new Proxy(base, { ownKeys() { throw new Error('UNTRUSTED') } }),
+    () => ({ ...base, observations: { ...base.observations,
+      identity: { ...base.observations.identity, RequestId: 'UNTRUSTED' } } }),
+    () => ({ ...base, observations: { ...base.observations,
+      identity: { ...base.observations.identity, fields: {
+        ths_stock_short_name_stock: ['bad\u0000text']
+      } } } }),
+    () => { const cycle = []; cycle.push(cycle); return { ...base, observations: { ...base.observations,
+      identity: { ...base.observations.identity, fields: { ths_stock_short_name_stock: cycle } } } } }
+  ]
+  for (const mutate of mutations) {
+    const fixture = controllerFixture({ responses: [mutate()] })
+    await fixture.controller.refresh()
+    assert.equal(fixture.errors.length, 1)
+    assert.equal(fixture.errors[0].code, 'IFIND_MARKET_PROBE_RESULT_INVALID')
+    assert.equal(fixture.get('ifind-market-probe-identity').textContent, '—')
+  }
+}
+
+async function failureMappingTest() {
+  assert.deepEqual(marketProbe.apiFailure(401, { error: 'ADMIN_AUTH_REQUIRED' }), {
+    code: 'ADMIN_AUTH_REQUIRED'
+  })
+  assert.deepEqual(marketProbe.apiFailure(503, { error: 'IFIND_MARKET_PROBE_FAILED' }), {
+    code: 'IFIND_MARKET_PROBE_FAILED'
+  })
+  assert.deepEqual(marketProbe.apiFailure(500, new Proxy({}, { get() { throw new Error('UNTRUSTED') } })), {
+    code: 'UNKNOWN'
+  })
+  assert.equal(marketProbe.errorMessage('IFIND_MARKET_PROBE_FAILED'),
+    '固定港股探针未完成，不会自动重试。')
+  assert.equal(marketProbe.errorMessage('UNTRUSTED'), '固定港股探针暂时不可用，不会自动重试。')
+}
+
+async function htmlContractTest() {
+  const html = fs.readFileSync(path.join(ROOT, 'public/admin.html'), 'utf8')
+  assert.match(html, /<h2[^>]*>T11 港股模板验证<\/h2>/)
+  assert.match(html, /1 次认证 \+ 3 次业务请求/)
+  assert.match(html, /0 次重试/)
+  assert.match(html, /家庭看板(?:继续|仍为) Mock/)
+  assert.match(html, /<script src="\/admin-market-probe-contract\.js" defer><\/script>[\s\S]*<script src="\/admin\.js" defer><\/script>/)
+  for (const name of VERIFICATION_IDS) {
+    assert.match(html, new RegExp(`id="ifind-market-probe-${name}"[^>]*data-evidence-status="unverified"[^>]*>未验证<`))
+  }
+}
+
+async function run() {
+  for (const test of [moduleSurfaceTest, offlineRefreshAndRenderTest, confirmationAndSingleFlightTest,
+    cancellationAndStaleSessionTest, hostileDtoTest, failureMappingTest, htmlContractTest]) {
+    await test()
+    console.log(`PASS frontend-market-probe: ${test.name}`)
+  }
+}
+
+module.exports = { run }

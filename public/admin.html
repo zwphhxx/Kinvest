@@ -162,6 +162,52 @@
           </div>
         </section>
 
+        <section id="ifind-market-probe" class="admin-panel admin-panel-wide ifind-market-probe" aria-labelledby="ifind-market-probe-title">
+          <div class="ifind-market-probe-head">
+            <div>
+              <p class="ticket-label">iFinD / HK fixed probe / Admin only</p>
+              <h2 id="ifind-market-probe-title">T11 港股模板验证</h2>
+              <p class="ifind-boundary">仅管理员逐次确认；家庭看板继续 Mock，观察值不会发布给家庭成员。</p>
+            </div>
+            <p class="ifind-enabled-badge">探针状态 <strong id="ifind-market-probe-status" role="status" aria-live="polite">尚未读取状态</strong></p>
+          </div>
+
+          <div class="ifind-market-probe-ticket" aria-label="固定港股探针身份">
+            <p><span>固定公司</span><strong>阿里巴巴</strong></p>
+            <p><span>展示代码</span><strong id="ifind-market-probe-code">9988.HK</strong></p>
+            <p><span>提案编号</span><strong id="ifind-market-probe-proposal">HK_ALIBABA_9988_V1</strong></p>
+          </div>
+
+          <p id="ifind-market-probe-warning" class="ifind-boundary">每次最多 1 次认证 + 3 次业务请求，0 次重试；身份、行情、财务依次执行，可能消耗额度。</p>
+          <p class="admin-meta">页面加载只读取本地状态，不会自动调用 iFinD。额度仅显示 ready / cooldown / limit，不声称精确剩余次数。</p>
+
+          <div class="ifind-market-probe-observations" aria-label="三段未验证观察">
+            <article><span>01 / 身份</span><strong id="ifind-market-probe-identity">—</strong></article>
+            <article><span>02 / 行情</span><strong id="ifind-market-probe-quote">—</strong></article>
+            <article><span>03 / 财务</span><strong id="ifind-market-probe-financial">—</strong></article>
+          </div>
+
+          <dl class="ifind-metrics ifind-market-probe-metrics">
+            <div><dt>最近尝试</dt><dd id="ifind-market-probe-attempted-at">尚未执行</dd></div>
+            <div><dt>请求次数（含认证）</dt><dd id="ifind-market-probe-request-count">0 次</dd></div>
+            <div><dt>业务请求次数</dt><dd id="ifind-market-probe-business-request-count">0 次</dd></div>
+            <div><dt>dataVol</dt><dd id="ifind-market-probe-data-vol">未提供</dd></div>
+            <div><dt>发行人身份</dt><dd id="ifind-market-probe-issuer-identity" data-evidence-status="unverified">未验证</dd></div>
+            <div><dt>供应商代码</dt><dd id="ifind-market-probe-vendor-code" data-evidence-status="unverified">未验证</dd></div>
+            <div><dt>指标权限</dt><dd id="ifind-market-probe-entitlement" data-evidence-status="unverified">未验证</dd></div>
+            <div><dt>币种证据</dt><dd id="ifind-market-probe-currency" data-evidence-status="unverified">未验证</dd></div>
+            <div><dt>单位证据</dt><dd id="ifind-market-probe-unit" data-evidence-status="unverified">未验证</dd></div>
+            <div><dt>报告期证据</dt><dd id="ifind-market-probe-report-period" data-evidence-status="unverified">未验证</dd></div>
+            <div><dt>披露口径</dt><dd id="ifind-market-probe-scope" data-evidence-status="unverified">未验证</dd></div>
+            <div><dt>保守额度状态</dt><dd id="ifind-market-probe-quota">ready/cooldown/limit · 尚未读取</dd></div>
+          </dl>
+
+          <div class="ifind-diagnostic-actions">
+            <p id="ifind-market-probe-error" class="admin-meta" role="status" aria-live="polite">无</p>
+            <button id="ifind-market-probe-run" class="auth-primary" type="button" aria-describedby="ifind-market-probe-warning" disabled>探针暂不可运行</button>
+          </div>
+        </section>
+
         <section id="ifind-calibration" class="admin-panel admin-panel-wide ifind-diagnostic" aria-labelledby="ifind-calibration-title">
           <div class="ifind-diagnostic-head">
             <div>
@@ -291,6 +337,7 @@
   <script src="/auth-contract.js" defer></script>
   <script src="/admin-contract.js" defer></script>
   <script src="/admin-report-period-contract.js" defer></script>
+  <script src="/admin-market-probe-contract.js" defer></script>
   <script src="/admin.js" defer></script>
 </body>
 </html>
