@@ -5,6 +5,7 @@ const repositoryRoot = path.resolve(__dirname, '..')
 const distDirectory = path.join(repositoryRoot, 'dist')
 const adminDiagnosticRuntimeFiles = Object.freeze([
   'public/admin-contract.js',
+  'public/admin-market-probe-contract.js',
   'public/admin-report-period-contract.js',
   'public/admin.html',
   'public/admin.js',

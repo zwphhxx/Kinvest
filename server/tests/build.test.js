@@ -2,6 +2,7 @@ const assert = require('assert')
 const { execFileSync } = require('child_process')
 const fs = require('fs')
 const path = require('path')
+const vm = require('vm')
 
 function listRelativeFiles(directory, prefix = '') {
   const files = []
@@ -27,6 +28,7 @@ async function runBuildArtifactsExist() {
   const expectedArtifacts = [
     'package.json',
     'public/admin-contract.js',
+    'public/admin-market-probe-contract.js',
     'public/admin-report-period-contract.js',
     'public/admin.html',
     'public/admin.js',
@@ -220,6 +222,34 @@ async function runBuildArtifactsExist() {
           `${artifact} references missing build artifact: ${pathname}`
         )
       }
+    }
+
+    const builtAdminHtml = fs.readFileSync(
+      path.join(repositoryRoot, 'dist', 'public', 'admin.html'),
+      'utf8'
+    )
+    assert.match(
+      builtAdminHtml,
+      /<script\s+src=["']\/admin-market-probe-contract[.]js["'][^>]*><\/script>/
+    )
+    const builtAdminMarketProbeContractPath = path.join(
+      repositoryRoot,
+      'dist',
+      'public',
+      'admin-market-probe-contract.js'
+    )
+    const browserContext = { window: {} }
+    vm.runInNewContext(
+      fs.readFileSync(builtAdminMarketProbeContractPath, 'utf8'),
+      browserContext,
+      { filename: builtAdminMarketProbeContractPath }
+    )
+    assert.deepStrictEqual(
+      Object.keys(browserContext.window.KinvestAdminMarketProbe).sort(),
+      ['apiFailure', 'createController', 'errorMessage']
+    )
+    for (const method of ['apiFailure', 'createController', 'errorMessage']) {
+      assert.equal(typeof browserContext.window.KinvestAdminMarketProbe[method], 'function')
     }
   } finally {
     fs.rmSync(fixturePath, { force: true })
