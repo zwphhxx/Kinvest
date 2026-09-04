@@ -39,12 +39,14 @@
     IFIND_MARKET_PROBE_RESULT_INVALID: '固定港股探针结果未通过安全校验，已清除显示。'
   }
   const PUBLIC_FAILURES = new Set(Object.keys(ERROR_MESSAGES))
+  const TRUSTED_FAILURES = new WeakSet()
+  const STALE = Object.freeze({})
   const CONFIRMATION = '确认仅为管理员运行阿里巴巴 9988.HK 固定探针？\n' +
     '本次最多 1 次认证 + 3 次业务请求，0 次重试，可能消耗额度。\n' +
     '所有结果仍为未验证，不进入家庭页面。'
 
   function invalid() {
-    throw Object.assign(new Error('Invalid fixed market probe result'), { code: INVALID })
+    throw stableError(INVALID)
   }
 
   function record(value, keys) {
@@ -162,14 +164,14 @@
 
   function apiFailure(status, payload) {
     try {
-      if (payload === null || typeof payload !== 'object' || Array.isArray(payload)) return { code: 'UNKNOWN' }
+      if (payload === null || typeof payload !== 'object' || Array.isArray(payload)) return stableError('UNKNOWN')
       const descriptor = Reflect.getOwnPropertyDescriptor(payload, 'error')
-      if (!descriptor || !Object.hasOwn(descriptor, 'value') || typeof descriptor.value !== 'string') return { code: 'UNKNOWN' }
+      if (!descriptor || !Object.hasOwn(descriptor, 'value') || typeof descriptor.value !== 'string') return stableError('UNKNOWN')
       const code = descriptor.value
-      if (!PUBLIC_FAILURES.has(code)) return { code: status === 401 ? 'ADMIN_AUTH_REQUIRED' : 'UNKNOWN' }
-      return { code }
+      if (!PUBLIC_FAILURES.has(code)) return stableError(status === 401 ? 'ADMIN_AUTH_REQUIRED' : 'UNKNOWN')
+      return stableError(code)
     } catch {
-      return { code: 'UNKNOWN' }
+      return stableError('UNKNOWN')
     }
   }
 
@@ -178,19 +180,17 @@
   }
 
   function stableError(code) {
-    return Object.assign(new Error(code), { code })
+    const error = Object.assign(new Error(code), { code })
+    TRUSTED_FAILURES.add(error)
+    return error
   }
 
   function sanitizeFailure(error) {
-    try {
-      const descriptor = error && typeof error === 'object'
-        ? Reflect.getOwnPropertyDescriptor(error, 'code') : null
-      const code = descriptor && Object.hasOwn(descriptor, 'value') &&
-        typeof descriptor.value === 'string' ? descriptor.value : null
-      if (code === INVALID || (code && PUBLIC_FAILURES.has(code))) return stableError(code)
-    } catch {
-      // Fall through to the stable transport failure below.
-    }
+    if (!TRUSTED_FAILURES.has(error)) return stableError('IFIND_MARKET_PROBE_UNAVAILABLE')
+    const descriptor = Reflect.getOwnPropertyDescriptor(error, 'code')
+    const code = descriptor && Object.hasOwn(descriptor, 'value') &&
+      typeof descriptor.value === 'string' ? descriptor.value : null
+    if (code === INVALID || (code && PUBLIC_FAILURES.has(code))) return stableError(code)
     return stableError('IFIND_MARKET_PROBE_UNAVAILABLE')
   }
 
@@ -201,6 +201,7 @@
     let running = false
     let bound = false
     let currentStatus = null
+    let runAllowed = false
 
     function put(id, value) { byId(id).textContent = value }
 
@@ -221,7 +222,7 @@
 
     function buttonState() {
       const button = byId('ifind-market-probe-run')
-      const available = currentStatus === 'ready' && !running
+      const available = currentStatus === 'ready' && runAllowed && !running
       button.disabled = !available
       button.setAttribute('aria-busy', String(running))
       button.textContent = running ? '正在运行固定探针'
@@ -264,6 +265,7 @@
       generation += 1
       running = false
       currentStatus = null
+      runAllowed = false
       put('ifind-market-probe-status', '尚未读取状态')
       put('ifind-market-probe-proposal', PROPOSAL_ID)
       put('ifind-market-probe-code', DISPLAY_CODE)
@@ -291,14 +293,19 @@
         const response = await request(path, { ...requestOptions, signal: ticket.signal })
         const data = copyResult(record(response, ['data']).data)
         return sessionLifecycle.commit(ticket, () => {
-          if (localGeneration !== generation) throw new Error('ADMIN_EPOCH_STALE')
+          if (localGeneration !== generation) throw STALE
+          runAllowed = path === STATUS_PATH && data.status === 'ready'
           render(data)
           return data
         })
       } catch (error) {
-        if (error && (error.name === 'AbortError' || error.message === 'ADMIN_EPOCH_STALE')) return undefined
+        if (error === STALE) return undefined
         const safeError = sanitizeFailure(error)
         if (safeError.code === INVALID) reset()
+        else {
+          runAllowed = false
+          buttonState()
+        }
         await onError(safeError)
         return undefined
       } finally {
@@ -311,7 +318,7 @@
     }
 
     async function run() {
-      if (running || currentStatus !== 'ready' || !confirm(CONFIRMATION)) return undefined
+      if (running || currentStatus !== 'ready' || !runAllowed || !confirm(CONFIRMATION)) return undefined
       running = true
       buttonState()
       try {

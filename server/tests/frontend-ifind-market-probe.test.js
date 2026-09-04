@@ -152,6 +152,10 @@ async function moduleSurfaceTest() {
   assert.equal(Object.isFrozen(marketProbe), true)
   const source = fs.readFileSync(path.join(ROOT, 'public/admin-market-probe-contract.js'), 'utf8')
   assert.doesNotMatch(source, /localStorage|sessionStorage|innerHTML/)
+  const adminSource = fs.readFileSync(path.join(ROOT, 'public/admin.js'), 'utf8')
+  assert.match(adminSource,
+    /if \(path\.startsWith\('\/api\/admin\/ifind\/market-probes\/'\) && marketProbeContracts\) throw failure/,
+    'the locally branded API failure must reach its controller without object spreading')
 }
 
 async function offlineRefreshAndRenderTest() {
@@ -221,9 +225,8 @@ async function runOutcomeMessagingTest() {
 async function trustedResultSurvivesTransportAndApiFailureTest() {
   const failures = [
     [new Error('SENSITIVE_NETWORK_DETAIL'), 'IFIND_MARKET_PROBE_UNAVAILABLE'],
-    [Object.assign(new Error('SENSITIVE_API_DETAIL'), {
-      code: 'IFIND_MARKET_PROBE_FAILED', rawResponse: 'SENSITIVE_RAW_RESPONSE'
-    }), 'IFIND_MARKET_PROBE_FAILED']
+    [marketProbe.apiFailure(503, { error: 'IFIND_MARKET_PROBE_FAILED' }),
+      'IFIND_MARKET_PROBE_FAILED']
   ]
   for (const [failure, expectedCode] of failures) {
     const fixture = controllerFixture({ responses: [observedResult(), Promise.reject(failure)] })
@@ -238,6 +241,56 @@ async function trustedResultSurvivesTransportAndApiFailureTest() {
     assert.deepEqual(Object.keys(fixture.errors[0]), ['code'])
     assert.doesNotMatch(JSON.stringify(fixture.errors[0]), /SENSITIVE/)
   }
+}
+
+async function hostileRejectionIsNeverInspectedTest() {
+  const scenarios = [
+    (trapped) => Object.defineProperties({}, {
+      name: { get() { trapped(); throw new Error('SENSITIVE_NAME') } },
+      message: { get() { trapped(); throw new Error('SENSITIVE_MESSAGE') } },
+      code: { get() { trapped(); throw new Error('SENSITIVE_CODE') } }
+    }),
+    (trapped) => new Proxy({}, {
+      get() { trapped(); throw new Error('SENSITIVE_GET') },
+      getOwnPropertyDescriptor() { trapped(); throw new Error('SENSITIVE_DESCRIPTOR') },
+      ownKeys() { trapped(); throw new Error('SENSITIVE_KEYS') },
+      getPrototypeOf() { trapped(); throw new Error('SENSITIVE_PROTOTYPE') }
+    })
+  ]
+  for (const create of scenarios) {
+    let traps = 0
+    const hostile = create(() => { traps += 1 })
+    const fixture = controllerFixture({ responses: [Promise.reject(hostile)] })
+    await fixture.controller.refresh()
+    assert.equal(traps, 0)
+    assert.equal(fixture.errors.length, 1)
+    assert.equal(fixture.errors[0].code, 'IFIND_MARKET_PROBE_UNAVAILABLE')
+    assert.equal(fixture.errors[0].message, 'IFIND_MARKET_PROBE_UNAVAILABLE')
+    assert.deepEqual(Object.keys(fixture.errors[0]), ['code'])
+  }
+}
+
+async function failedRefreshPreservesReadyButDisablesRunTest() {
+  const fixture = controllerFixture({ responses: [
+    readyResult(), Promise.reject(new Error('SENSITIVE_NETWORK_DETAIL')),
+    readyResult(), observedResult(), observedResult()
+  ] })
+  await fixture.controller.refresh()
+  assert.equal(fixture.get('ifind-market-probe-run').disabled, false)
+  await fixture.controller.refresh()
+  assert.equal(fixture.get('ifind-market-probe-status').textContent, '可以手工运行')
+  assert.equal(fixture.get('ifind-market-probe-proposal').textContent, 'HK_ALIBABA_9988_V1')
+  assert.equal(fixture.get('ifind-market-probe-run').disabled, true)
+  await fixture.get('ifind-market-probe-run').click()
+  assert.deepEqual(fixture.calls.map(({ url }) => url), [STATUS_PATH, STATUS_PATH],
+    'stale ready state must not permit a POST')
+
+  await fixture.controller.refresh()
+  assert.equal(fixture.get('ifind-market-probe-run').disabled, false)
+  await fixture.get('ifind-market-probe-run').click()
+  assert.deepEqual(fixture.calls.map(({ url }) => url), [
+    STATUS_PATH, STATUS_PATH, STATUS_PATH, RUN_PATH, STATUS_PATH
+  ])
 }
 
 async function untrustedResultAndExplicitResetClearTest() {
@@ -296,15 +349,17 @@ async function hostileDtoTest() {
 }
 
 async function failureMappingTest() {
-  assert.deepEqual(marketProbe.apiFailure(401, { error: 'ADMIN_AUTH_REQUIRED' }), {
-    code: 'ADMIN_AUTH_REQUIRED'
-  })
-  assert.deepEqual(marketProbe.apiFailure(503, { error: 'IFIND_MARKET_PROBE_FAILED' }), {
-    code: 'IFIND_MARKET_PROBE_FAILED'
-  })
-  assert.deepEqual(marketProbe.apiFailure(500, new Proxy({}, { get() { throw new Error('UNTRUSTED') } })), {
-    code: 'UNKNOWN'
-  })
+  const authFailure = marketProbe.apiFailure(401, { error: 'ADMIN_AUTH_REQUIRED' })
+  assert.equal(authFailure.code, 'ADMIN_AUTH_REQUIRED')
+  assert.equal(authFailure.message, 'ADMIN_AUTH_REQUIRED')
+  assert.deepEqual(Object.keys(authFailure), ['code'])
+  const probeFailure = marketProbe.apiFailure(503, { error: 'IFIND_MARKET_PROBE_FAILED' })
+  assert.equal(probeFailure.code, 'IFIND_MARKET_PROBE_FAILED')
+  assert.equal(probeFailure.message, 'IFIND_MARKET_PROBE_FAILED')
+  const unknownFailure = marketProbe.apiFailure(500,
+    new Proxy({}, { getOwnPropertyDescriptor() { throw new Error('UNTRUSTED') } }))
+  assert.equal(unknownFailure.code, 'UNKNOWN')
+  assert.equal(unknownFailure.message, 'UNKNOWN')
   assert.equal(marketProbe.errorMessage('IFIND_MARKET_PROBE_FAILED'),
     '固定港股探针未完成，不会自动重试。')
   assert.equal(marketProbe.errorMessage('UNTRUSTED'), '固定港股探针暂时不可用，不会自动重试。')
@@ -325,6 +380,7 @@ async function htmlContractTest() {
 async function run() {
   for (const test of [moduleSurfaceTest, offlineRefreshAndRenderTest, confirmationAndSingleFlightTest,
     runOutcomeMessagingTest, trustedResultSurvivesTransportAndApiFailureTest,
+    hostileRejectionIsNeverInspectedTest, failedRefreshPreservesReadyButDisablesRunTest,
     untrustedResultAndExplicitResetClearTest, cancellationAndStaleSessionTest, hostileDtoTest,
     failureMappingTest, htmlContractTest]) {
     await test()

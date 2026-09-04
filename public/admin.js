@@ -69,6 +69,7 @@
             : (path.startsWith('/api/admin/ifind/diagnostics')
                 ? adminContracts.ifindDiagnosticApiFailure(response.status, payload)
                 : contracts.classifyApiFailure(response.status, payload)))
+      if (path.startsWith('/api/admin/ifind/market-probes/') && marketProbeContracts) throw failure
       throw Object.assign(new Error('ADMIN_REQUEST_FAILED'), {
         ...failure,
         status: response.status
