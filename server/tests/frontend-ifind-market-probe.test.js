@@ -319,6 +319,67 @@ async function cancellationAndStaleSessionTest() {
   await pending
   assert.equal(fixture.get('ifind-market-probe-status').textContent, '尚未读取状态')
   assert.equal(fixture.get('ifind-market-probe-identity').textContent, '—')
+  assert.equal(fixture.get('ifind-market-probe-run').disabled, true)
+  assert.deepEqual(fixture.errors, [])
+  assert.deepEqual(fixture.live, [])
+}
+
+async function staleGenerationSettlementsStaySilentTest() {
+  const staleOutcomes = [
+    { name: 'GET success', start: (fixture) => fixture.controller.refresh(),
+      settle: (gate) => gate.resolve(observedResult()) },
+    { name: 'GET failure', start: (fixture) => fixture.controller.refresh(),
+      settle: (gate, hostile) => gate.resolve(Promise.reject(hostile)) },
+    { name: 'POST success', prepare: true,
+      start: (fixture) => fixture.get('ifind-market-probe-run').click(),
+      settle: (gate) => gate.resolve(observedResult()) },
+    { name: 'POST failure', prepare: true,
+      start: (fixture) => fixture.get('ifind-market-probe-run').click(),
+      settle: (gate, hostile) => gate.resolve(Promise.reject(hostile)) }
+  ]
+  for (const scenario of staleOutcomes) {
+    let traps = 0
+    const hostile = new Proxy({}, {
+      get() { traps += 1; throw new Error('SENSITIVE_GET') },
+      getOwnPropertyDescriptor() { traps += 1; throw new Error('SENSITIVE_DESCRIPTOR') },
+      ownKeys() { traps += 1; throw new Error('SENSITIVE_KEYS') }
+    })
+    const gate = deferred()
+    const responses = scenario.prepare ? [readyResult(), gate.promise] : [gate.promise]
+    const fixture = controllerFixture({ responses })
+    if (scenario.prepare) await fixture.controller.refresh()
+    const pending = scenario.start(fixture)
+    fixture.controller.reset()
+    fixture.sessionLifecycle.invalidate()
+    fixture.sessionLifecycle.activate()
+    scenario.settle(gate, hostile)
+    await pending
+    assert.equal(traps, 0, scenario.name)
+    assert.deepEqual(fixture.errors, [], scenario.name)
+    assert.deepEqual(fixture.live, [], scenario.name)
+    assert.equal(fixture.get('ifind-market-probe-status').textContent, '尚未读取状态', scenario.name)
+    assert.equal(fixture.get('ifind-market-probe-identity').textContent, '—', scenario.name)
+    assert.equal(fixture.get('ifind-market-probe-run').disabled, true, scenario.name)
+  }
+}
+
+async function latestStatusRequestWinsOutOfOrderTest() {
+  const older = deferred()
+  const newer = deferred()
+  const fixture = controllerFixture({ responses: [older.promise, newer.promise] })
+  const olderPending = fixture.controller.refresh()
+  const newerPending = fixture.controller.refresh()
+  newer.resolve(failedResult('cooldown'))
+  await newerPending
+  assert.equal(fixture.get('ifind-market-probe-status').textContent, '冷却中')
+  assert.equal(fixture.get('ifind-market-probe-run').disabled, true)
+
+  older.resolve(readyResult())
+  await olderPending
+  assert.equal(fixture.get('ifind-market-probe-status').textContent, '冷却中')
+  assert.equal(fixture.get('ifind-market-probe-run').disabled, true)
+  assert.deepEqual(fixture.errors, [])
+  assert.deepEqual(fixture.live, [])
 }
 
 async function hostileDtoTest() {
@@ -381,8 +442,9 @@ async function run() {
   for (const test of [moduleSurfaceTest, offlineRefreshAndRenderTest, confirmationAndSingleFlightTest,
     runOutcomeMessagingTest, trustedResultSurvivesTransportAndApiFailureTest,
     hostileRejectionIsNeverInspectedTest, failedRefreshPreservesReadyButDisablesRunTest,
-    untrustedResultAndExplicitResetClearTest, cancellationAndStaleSessionTest, hostileDtoTest,
-    failureMappingTest, htmlContractTest]) {
+    untrustedResultAndExplicitResetClearTest, cancellationAndStaleSessionTest,
+    staleGenerationSettlementsStaySilentTest, latestStatusRequestWinsOutOfOrderTest,
+    hostileDtoTest, failureMappingTest, htmlContractTest]) {
     await test()
     console.log(`PASS frontend-market-probe: ${test.name}`)
   }

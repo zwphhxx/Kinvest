@@ -198,6 +198,7 @@
     const { document, sessionLifecycle, request, dateText, confirm, setLive, onError } = options
     const byId = (id) => document.getElementById(id)
     let generation = 0
+    let requestSequence = 0
     let running = false
     let bound = false
     let currentStatus = null
@@ -263,6 +264,7 @@
 
     function reset() {
       generation += 1
+      requestSequence += 1
       running = false
       currentStatus = null
       runAllowed = false
@@ -288,18 +290,19 @@
 
     async function guardedRequest(path, requestOptions) {
       const localGeneration = generation
+      const localSequence = ++requestSequence
       const ticket = sessionLifecycle.beginRequest()
       try {
         const response = await request(path, { ...requestOptions, signal: ticket.signal })
         const data = copyResult(record(response, ['data']).data)
         return sessionLifecycle.commit(ticket, () => {
-          if (localGeneration !== generation) throw STALE
+          if (localGeneration !== generation || localSequence !== requestSequence) throw STALE
           runAllowed = path === STATUS_PATH && data.status === 'ready'
           render(data)
           return data
         })
       } catch (error) {
-        if (error === STALE) return undefined
+        if (localGeneration !== generation || localSequence !== requestSequence || error === STALE) return undefined
         const safeError = sanitizeFailure(error)
         if (safeError.code === INVALID) reset()
         else {
@@ -319,6 +322,7 @@
 
     async function run() {
       if (running || currentStatus !== 'ready' || !runAllowed || !confirm(CONFIRMATION)) return undefined
+      const runGeneration = generation
       running = true
       buttonState()
       try {
@@ -339,8 +343,10 @@
         }
         return undefined
       } finally {
-        running = false
-        buttonState()
+        if (runGeneration === generation) {
+          running = false
+          buttonState()
+        }
       }
     }
 
