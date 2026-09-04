@@ -54,6 +54,17 @@ function observedResult() {
   })
 }
 
+function failedResult(status) {
+  if (status === 'cooldown' || status === 'daily-limit') return readyResult({ status })
+  if (status === 'unavailable') return readyResult({
+    status, errorCode: 'IFIND_MARKET_PROBE_UNAVAILABLE', failureStage: 'provider'
+  })
+  return readyResult({
+    status: 'failed', requestCount: 1, attemptedAt: '2026-09-02T08:08:00.000Z',
+    errorCode: 'IFIND_MARKET_PROBE_FAILED', failureStage: 'auth'
+  })
+}
+
 class Element {
   constructor(id = '') {
     this.id = id
@@ -116,6 +127,7 @@ function controllerFixture({ responses = [readyResult()], confirm = () => true }
   const sessionLifecycle = lifecycle()
   const calls = []
   const errors = []
+  const live = []
   let index = 0
   const controller = marketProbe.createController({
     document: nodes.document,
@@ -128,11 +140,11 @@ function controllerFixture({ responses = [readyResult()], confirm = () => true }
     },
     dateText: (value) => `DATE:${value}`,
     confirm,
-    setLive() {},
+    setLive: (message, tone) => { live.push({ message, tone }) },
     onError: async (error) => { errors.push(error) }
   })
   controller.bind()
-  return { ...nodes, controller, calls, errors, sessionLifecycle }
+  return { ...nodes, controller, calls, errors, live, sessionLifecycle }
 }
 
 async function moduleSurfaceTest() {
@@ -183,6 +195,65 @@ async function confirmationAndSingleFlightTest() {
   assert.deepEqual(fixture.calls[1].options, {
     method: 'POST', body: {}, csrf: true, signal: fixture.calls[1].options.signal
   })
+}
+
+async function runOutcomeMessagingTest() {
+  const cases = [
+    ['observed-unverified', observedResult(), 'success', /探针已完成/],
+    ['failed', failedResult('failed'), 'error', /未完成/],
+    ['unavailable', failedResult('unavailable'), 'error', /暂时不可用/],
+    ['cooldown', failedResult('cooldown'), 'warning', /冷却/],
+    ['daily-limit', failedResult('daily-limit'), 'warning', /上限/]
+  ]
+  for (const [name, result, tone, message] of cases) {
+    const fixture = controllerFixture({ responses: [readyResult(), result, result] })
+    await fixture.controller.refresh()
+    await fixture.get('ifind-market-probe-run').click()
+    assert.equal(fixture.live.length, 1, name)
+    assert.equal(fixture.live[0].tone, tone, name)
+    assert.match(fixture.live[0].message, message, name)
+    if (name !== 'observed-unverified') {
+      assert.doesNotMatch(fixture.live[0].message, /探针已完成/, name)
+    }
+  }
+}
+
+async function trustedResultSurvivesTransportAndApiFailureTest() {
+  const failures = [
+    [new Error('SENSITIVE_NETWORK_DETAIL'), 'IFIND_MARKET_PROBE_UNAVAILABLE'],
+    [Object.assign(new Error('SENSITIVE_API_DETAIL'), {
+      code: 'IFIND_MARKET_PROBE_FAILED', rawResponse: 'SENSITIVE_RAW_RESPONSE'
+    }), 'IFIND_MARKET_PROBE_FAILED']
+  ]
+  for (const [failure, expectedCode] of failures) {
+    const fixture = controllerFixture({ responses: [observedResult(), Promise.reject(failure)] })
+    await fixture.controller.refresh()
+    const trustedIdentity = fixture.get('ifind-market-probe-identity').textContent
+    await fixture.controller.refresh()
+    assert.equal(fixture.get('ifind-market-probe-identity').textContent, trustedIdentity)
+    assert.equal(fixture.get('ifind-market-probe-status').textContent, '已观察，均未验证')
+    assert.equal(fixture.errors.length, 1)
+    assert.equal(fixture.errors[0].code, expectedCode)
+    assert.equal(fixture.errors[0].message, expectedCode)
+    assert.deepEqual(Object.keys(fixture.errors[0]), ['code'])
+    assert.doesNotMatch(JSON.stringify(fixture.errors[0]), /SENSITIVE/)
+  }
+}
+
+async function untrustedResultAndExplicitResetClearTest() {
+  const invalid = { ...observedResult(), rawResponse: 'UNTRUSTED' }
+  const fixture = controllerFixture({ responses: [observedResult(), invalid] })
+  await fixture.controller.refresh()
+  assert.match(fixture.get('ifind-market-probe-identity').textContent, /阿里巴巴-W/)
+  await fixture.controller.refresh()
+  assert.equal(fixture.errors[0].code, 'IFIND_MARKET_PROBE_RESULT_INVALID')
+  assert.equal(fixture.get('ifind-market-probe-identity').textContent, '—')
+
+  const restored = controllerFixture({ responses: [observedResult()] })
+  await restored.controller.refresh()
+  restored.controller.reset()
+  assert.equal(restored.get('ifind-market-probe-identity').textContent, '—')
+  assert.equal(restored.get('ifind-market-probe-status').textContent, '尚未读取状态')
 }
 
 async function cancellationAndStaleSessionTest() {
@@ -253,7 +324,9 @@ async function htmlContractTest() {
 
 async function run() {
   for (const test of [moduleSurfaceTest, offlineRefreshAndRenderTest, confirmationAndSingleFlightTest,
-    cancellationAndStaleSessionTest, hostileDtoTest, failureMappingTest, htmlContractTest]) {
+    runOutcomeMessagingTest, trustedResultSurvivesTransportAndApiFailureTest,
+    untrustedResultAndExplicitResetClearTest, cancellationAndStaleSessionTest, hostileDtoTest,
+    failureMappingTest, htmlContractTest]) {
     await test()
     console.log(`PASS frontend-market-probe: ${test.name}`)
   }

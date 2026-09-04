@@ -177,6 +177,23 @@
     return ERROR_MESSAGES[code] || '固定港股探针暂时不可用，不会自动重试。'
   }
 
+  function stableError(code) {
+    return Object.assign(new Error(code), { code })
+  }
+
+  function sanitizeFailure(error) {
+    try {
+      const descriptor = error && typeof error === 'object'
+        ? Reflect.getOwnPropertyDescriptor(error, 'code') : null
+      const code = descriptor && Object.hasOwn(descriptor, 'value') &&
+        typeof descriptor.value === 'string' ? descriptor.value : null
+      if (code === INVALID || (code && PUBLIC_FAILURES.has(code))) return stableError(code)
+    } catch {
+      // Fall through to the stable transport failure below.
+    }
+    return stableError('IFIND_MARKET_PROBE_UNAVAILABLE')
+  }
+
   function createController(options) {
     const { document, sessionLifecycle, request, dateText, confirm, setLive, onError } = options
     const byId = (id) => document.getElementById(id)
@@ -280,8 +297,9 @@
         })
       } catch (error) {
         if (error && (error.name === 'AbortError' || error.message === 'ADMIN_EPOCH_STALE')) return undefined
-        reset()
-        await onError(error && typeof error.code === 'string' ? error : Object.assign(new Error(INVALID), { code: INVALID }))
+        const safeError = sanitizeFailure(error)
+        if (safeError.code === INVALID) reset()
+        await onError(safeError)
         return undefined
       } finally {
         sessionLifecycle.finishRequest(ticket)
@@ -299,7 +317,17 @@
       try {
         const result = await guardedRequest(RUN_PATH, { method: 'POST', body: {}, csrf: true })
         if (result) {
-          setLive('固定港股探针已完成；所有观察仍为未验证。', 'success')
+          const notices = {
+            'observed-unverified': ['固定港股探针已完成；所有观察仍为未验证。', 'success'],
+            failed: ['固定港股探针未完成，不会自动重试。', 'error'],
+            unavailable: ['固定港股探针暂时不可用，不会自动重试。', 'error'],
+            cooldown: ['固定港股探针正在冷却，本次不会运行或重试。', 'warning'],
+            'daily-limit': ['固定港股探针已达到今日额度上限，本次不会运行或重试。', 'warning'],
+            busy: ['已有固定港股探针正在运行，本次不会重复执行。', 'warning'],
+            ready: ['固定港股探针未执行，请重新读取状态后手工确认。', 'warning']
+          }
+          const notice = notices[result.status]
+          setLive(notice[0], notice[1])
           return refresh()
         }
         return undefined
