@@ -530,35 +530,67 @@ async function testOlderMarketClientDoesNotCreateProbeRuntime() {
 }
 
 async function testMarketProbeClientMustBeDistinctAndComplete() {
-  for (const [name, createProbeClient, expectedProbeClears] of [
-    ['legacy reuse', ({ legacyClient }) => legacyClient, 0],
-    ['market reuse', ({ marketClient }) => marketClient, 0],
-    ['report-period reuse', ({ reportPeriodClient }) => reportPeriodClient, 0],
-    ['missing authenticate', ({ defaultProbeClient }) => ({
-      probeFixed: defaultProbeClient.probeFixed,
-      clear: defaultProbeClient.clear
-    }), 1],
-    ['missing probeFixed', ({ defaultProbeClient }) => ({
-      authenticate: defaultProbeClient.authenticate,
-      clear: defaultProbeClient.clear
-    }), 1],
-    ['missing clear', ({ defaultProbeClient }) => ({
-      authenticate: defaultProbeClient.authenticate,
-      probeFixed: defaultProbeClient.probeFixed
-    }), 0]
-  ]) {
-    const harness = createProbeRuntimeHarness({ createProbeClient })
+  const cases = [
+    {
+      name: 'legacy reuse',
+      createProbeClient: ({ legacyClient }) => legacyClient,
+      expectedProbeClears: 0
+    },
+    {
+      name: 'market reuse',
+      createProbeClient: ({ marketClient }) => marketClient,
+      expectedProbeClears: 0
+    },
+    {
+      name: 'report-period reuse',
+      createProbeClient: ({ reportPeriodClient }) => reportPeriodClient,
+      expectedProbeClears: 0
+    },
+    {
+      name: 'missing authenticate',
+      createProbeClient: ({ defaultProbeClient }) => ({
+        probeFixed: defaultProbeClient.probeFixed,
+        clear: defaultProbeClient.clear
+      }),
+      expectedProbeClears: 1
+    },
+    {
+      name: 'missing probeFixed',
+      createProbeClient: ({ defaultProbeClient }) => ({
+        authenticate: defaultProbeClient.authenticate,
+        clear: defaultProbeClient.clear
+      }),
+      expectedProbeClears: 1
+    },
+    {
+      name: 'missing clear',
+      createProbeClient: ({ defaultProbeClient }) => ({
+        authenticate: defaultProbeClient.authenticate,
+        probeFixed: defaultProbeClient.probeFixed
+      }),
+      expectedProbeClears: 0
+    }
+  ]
+
+  for (const fixture of cases) {
+    const harness = createProbeRuntimeHarness({
+      createProbeClient: fixture.createProbeClient
+    })
     try {
       await assert.rejects(
         harness.start(),
         hasCode('IFIND_DIAGNOSTIC_RUNTIME_INVALID'),
-        name
+        fixture.name
       )
-      assert.equal(harness.state.factoryCalls, 0, name)
-      assert.equal(harness.clearCounts.legacy, 1, name)
-      assert.equal(harness.clearCounts.market, 1, name)
-      assert.equal(harness.clearCounts.reportPeriod, 1, name)
-      assert.equal(harness.clearCounts.probe, expectedProbeClears, name)
+      assert.equal(harness.state.factoryCalls, 0, fixture.name)
+      assert.equal(harness.clearCounts.legacy, 1, fixture.name)
+      assert.equal(harness.clearCounts.market, 1, fixture.name)
+      assert.equal(harness.clearCounts.reportPeriod, 1, fixture.name)
+      assert.equal(
+        harness.clearCounts.probe,
+        fixture.expectedProbeClears,
+        fixture.name
+      )
     } finally {
       harness.database.close()
     }
