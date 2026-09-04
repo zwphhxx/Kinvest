@@ -1340,6 +1340,27 @@ function run() {
     assert.doesNotMatch(job, /\$\{\{\s*secrets\./)
   }
 
+  for (const jobId of ['verify', 'security']) {
+    const job = prJobs[jobId]
+    const enableLockedNpm = namedStep(job, 'Enable locked npm')
+    assert.equal(directScalar(enableLockedNpm, 'shell', 8), 'bash')
+    assert.match(
+      enableLockedNpm,
+      /run: \|\n {10}set -euo pipefail\n {10}corepack enable npm\n {10}test "\$\(npm --version\)" = "11\.12\.1"/,
+      `${jobId} must enable the npm shim and immediately fail closed unless npm 11.12.1 is active`
+    )
+    assert.ok(
+      job.indexOf('- name: Enable locked npm') <
+        job.indexOf('- name: Install locked dependencies'),
+      `${jobId} must activate the npm shim before every npm command`
+    )
+    assert.doesNotMatch(
+      job,
+      /continue-on-error\s*:|\|\|\s*true|npm audit[^\n]*(?:--audit-level=(?:low|moderate)|--omit)|npm config set audit false/,
+      `${jobId} must not bypass, downgrade, or disable dependency checks`
+    )
+  }
+
   assert.equal(
     directScalar(namedStep(prJobs.verify, 'Install locked dependencies'), 'run', 8),
     'npm ci'
@@ -1354,8 +1375,23 @@ function run() {
     'npm ci'
   )
   assert.equal(
+    directScalar(namedStep(prJobs.security, 'Verify installed dependency tree'), 'run', 8),
+    'npm ls --all'
+  )
+  assert.equal(
     directScalar(namedStep(prJobs.security, 'Audit high severity dependencies'), 'run', 8),
     'npm audit --audit-level=high'
+  )
+  const securityNpmCommands = [
+    '- name: Install locked dependencies',
+    '- name: Verify installed dependency tree',
+    '- name: Audit high severity dependencies'
+  ].map((stepName) => prJobs.security.indexOf(stepName))
+  assert.ok(
+    securityNpmCommands.every((index) => index >= 0) &&
+      securityNpmCommands[0] < securityNpmCommands[1] &&
+      securityNpmCommands[1] < securityNpmCommands[2],
+    'security must run npm ci, npm ls --all, then npm audit --audit-level=high in order'
   )
   const repositoryScan = namedStep(prJobs.security, 'Scan tracked files for secrets')
   assert.equal(directScalar(repositoryScan, 'shell', 8), 'bash')
