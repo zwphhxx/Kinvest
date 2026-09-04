@@ -8,6 +8,7 @@ const vm = require('node:vm')
 
 const admin = require('../../public/admin-contract')
 const auth = require('../../public/auth-contract')
+const marketProbe = require('../../public/admin-market-probe-contract')
 const { listIfindMarketCases } = require('../domain/ifind-market-cases')
 const { createIfindMarketDiagnosticHttpController } = require('../http/ifind-market-diagnostic-http')
 
@@ -17,6 +18,7 @@ const US_CASE = 'US_APPLE_AAPL'
 const ADMIN_TOKEN = 'A'.repeat(43)
 const CSRF_TOKEN = 'C'.repeat(43)
 const LIST_URL = '/api/admin/ifind/market-cases'
+const PROBE_URL = '/api/admin/ifind/market-probes/HK_ALIBABA_9988_V1'
 const FIXTURE_CASE = listIfindMarketCases().find((item) => item.caseId === US_CASE)
 
 function financialPoint(overrides = {}) {
@@ -50,11 +52,36 @@ function storedRun(status) {
   }
 }
 
+function probeResult(status = 'ready') {
+  const observed = status === 'observed-unverified'
+  return {
+    proposalId: 'HK_ALIBABA_9988_V1', caseId: 'HK_ALIBABA_9988', displayCode: '9988.HK', status,
+    verification: {
+      issuerIdentityStatus: 'unverified', vendorCodeStatus: 'unverified',
+      entitlementStatus: 'unverified', currencyStatus: 'unverified', unitStatus: 'unverified',
+      reportPeriodStatus: 'unverified', scopeStatus: 'unverified'
+    },
+    observations: observed ? {
+      identity: { returnedCode: '9988.HK', fields: { ths_stock_short_name_stock: ['阿里巴巴-W'] } },
+      quote: { returnedCode: '9988.HK', fields: {
+        latest: [118.4], preClose: [116.8], open: [117], high: [119], low: [116.5],
+        amount: [1200000], volume: [10000], tradeDate: ['2026-09-02'], tradeTime: ['16:08:00']
+      } },
+      financial: { returnedCode: '9988.HK', fields: { revenue_oas: [243380000000] } }
+    } : { identity: null, quote: null, financial: null },
+    requestCount: observed ? 4 : 0, businessRequestCount: observed ? 3 : 0,
+    dataVol: observed ? 3 : null, attemptedAt: observed ? '2026-09-02T08:08:00.000Z' : null,
+    errorCode: observed ? 'IFIND_MARKET_PROBE_OBSERVED_UNVERIFIED' : null,
+    failureStage: null
+  }
+}
+
 // Only the repository/service and authenticated-session dependencies are fixtures.
 // Routing, runtime projection, DTO validation and serialization are the real HTTP controller.
 function httpFixture({ mode = 'available', outcome = 'complete', initial = null } = {}) {
   let latest = initial
   let runCount = 0
+  let probeRunCount = 0
   const service = {
     latest: ({ caseId }) => caseId === US_CASE ? latest : null,
     history: ({ caseId }) => caseId === US_CASE && latest ? [latest] : [],
@@ -82,6 +109,10 @@ function httpFixture({ mode = 'available', outcome = 'complete', initial = null 
       }
     }
   }
+  const probeService = {
+    describe() { return probeRunCount ? probeResult('observed-unverified') : probeResult() },
+    async run() { probeRunCount += 1; return probeResult('observed-unverified') }
+  }
   const controller = createIfindMarketDiagnosticHttpController({
     publicOrigin: 'https://dearmina.cn', trustedProxyAddresses: ['127.0.0.1'],
     now: () => NOW,
@@ -104,11 +135,12 @@ function httpFixture({ mode = 'available', outcome = 'complete', initial = null 
     },
     ifindDiagnosticRuntime: mode === 'disabled' ? { status: { mode: 'disabled' } } : {
       status: { mode: 'admin-diagnostic', configured: true, versionId: 'v20260830-001' },
-      ...(mode === 'available' ? { marketService: service } : {})
+      ...(mode === 'available' ? { marketService: service, marketProbeService: probeService } : {})
     }
   })
   return {
     runCount: () => runCount,
+    probeRunCount: () => probeRunCount,
     async request(url, options = {}) {
       const method = options.method || 'GET'
       const body = options.body === undefined ? '' : JSON.stringify(options.body)
@@ -190,6 +222,29 @@ function uiController(document, request, setLive = () => {}) {
     document, request, sessionLifecycle: lifecycle, dateText: String, now: () => NOW,
     setLive, onError: async (error) => { throw error }
   })
+}
+
+function probeUiController(document, request, confirm = () => true) {
+  const lifecycle = admin.createAdminSessionLifecycle()
+  lifecycle.activate()
+  return marketProbe.createController({
+    document, request, sessionLifecycle: lifecycle, dateText: String, confirm,
+    setLive() {}, onError: async (error) => { throw error }
+  })
+}
+
+async function probeEndpointTest() {
+  const fixture = httpFixture()
+  const nodes = dom()
+  const controller = probeUiController(nodes.document, fixture.request)
+  controller.bind()
+  await controller.refresh()
+  assert.equal(fixture.probeRunCount(), 0, 'status GET stays local')
+  assert.equal(nodes.get('ifind-market-probe-status').textContent, '可以手工运行')
+  await nodes.get('ifind-market-probe-run').listeners.get('click')({ preventDefault() {} })
+  assert.equal(fixture.probeRunCount(), 1)
+  assert.equal(nodes.get('ifind-market-probe-request-count').textContent, '4 次')
+  assert.equal(nodes.get('ifind-market-probe-issuer-identity').textContent, '未验证')
 }
 
 async function runtimeDtoTest() {
@@ -281,7 +336,8 @@ async function bootstrapTest() {
     const nodes = dom()
     let finishRestore = () => {}
     const restoration = new Promise((resolve) => { finishRestore = () => resolve(undefined) })
-    const window = { KinvestAdmin: admin, KinvestAuth: auth, addEventListener() {} }
+    const window = { KinvestAdmin: admin, KinvestAuth: auth,
+      KinvestAdminMarketProbe: marketProbe, addEventListener() {}, confirm: () => false }
     vm.runInNewContext(script, {
       window, document: nodes.document,
       async fetch(url) {
@@ -295,7 +351,8 @@ async function bootstrapTest() {
           '/api/admin/devices': { data: [] },
           '/api/admin/audit': { data: { admin: [], device: [] } },
           '/api/admin/ifind/diagnostics': { data: null },
-          [LIST_URL]: { data: { runtimeStatus: 'disabled', cases: [] } }
+          [LIST_URL]: { data: { runtimeStatus: 'disabled', cases: [] } },
+          [PROBE_URL]: { data: probeResult() }
         }
         assert.ok(Object.hasOwn(replies, url), 'no unexpected or real endpoint')
         return { ok: true, status: 200, json: async () => replies[url] }
@@ -318,7 +375,8 @@ async function bootstrapTest() {
 
 async function run() {
   const failures = []
-  for (const [name, test] of Object.entries({ runtimeDtoTest, currencyDtoTest, outcomeDtoTest, bootstrapTest })) {
+  for (const [name, test] of Object.entries({ runtimeDtoTest, currencyDtoTest, outcomeDtoTest,
+    probeEndpointTest, bootstrapTest })) {
     try { await test() } catch (error) {
       error.message = `${name}: ${error.message}`
       failures.push(error)

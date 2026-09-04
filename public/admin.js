@@ -2,6 +2,7 @@
   const contracts = /** @type {any} */ (window).KinvestAuth
   const adminContracts = /** @type {any} */ (window).KinvestAdmin
   const reportPeriodContracts = /** @type {any} */ (window).KinvestReportPeriod
+  const marketProbeContracts = /** @type {any} */ (window).KinvestAdminMarketProbe
   const securityState = adminContracts.createAdminSecurityState()
   const sessionLifecycle = adminContracts.createAdminSessionLifecycle()
   const bootstrapGate = adminContracts.createAdminBootstrapGate()
@@ -57,7 +58,9 @@
     })
     const payload = await response.json().catch(() => ({}))
     if (!response.ok) {
-      const failure = path.startsWith('/api/admin/ifind/report-period-diagnostic') && reportPeriodContracts
+      const failure = path.startsWith('/api/admin/ifind/market-probes/') && marketProbeContracts
+        ? marketProbeContracts.apiFailure(response.status, payload)
+        : path.startsWith('/api/admin/ifind/report-period-diagnostic') && reportPeriodContracts
         ? reportPeriodContracts.apiFailure(response.status, payload)
         : path.startsWith('/api/admin/ifind/calibration')
         ? adminContracts.ifindCalibrationApiFailure(response.status, payload)
@@ -66,6 +69,7 @@
             : (path.startsWith('/api/admin/ifind/diagnostics')
                 ? adminContracts.ifindDiagnosticApiFailure(response.status, payload)
                 : contracts.classifyApiFailure(response.status, payload)))
+      if (path.startsWith('/api/admin/ifind/market-probes/') && marketProbeContracts) throw failure
       throw Object.assign(new Error('ADMIN_REQUEST_FAILED'), {
         ...failure,
         status: response.status
@@ -117,6 +121,7 @@
     ifindMarketController.reset()
     ifindCalibrationController.reset()
     ifindReportPeriodController.reset()
+    ifindMarketProbeController.reset()
   }
 
   function showLogin(message = '') {
@@ -308,7 +313,7 @@
     }
     await Promise.all([
       ifindController.refresh(), ifindMarketController.refresh(), ifindCalibrationController.refresh(),
-      ifindReportPeriodController.refresh()
+      ifindReportPeriodController.refresh(), ifindMarketProbeController.refresh()
     ])
   }
 
@@ -357,6 +362,22 @@
       })
     : { bind() {}, refresh() {}, reset() {} }
   ifindReportPeriodController.bind()
+
+  // A missing script keeps the fixed probe disabled and cannot trigger a provider request.
+  const ifindMarketProbeController = marketProbeContracts
+    ? marketProbeContracts.createController({
+        document, sessionLifecycle, request: api, dateText,
+        confirm: (message) => window.confirm(message), setLive,
+        onError: async (error) => {
+          if (error.code === 'ADMIN_AUTH_REQUIRED' || error.code === 'ADMIN_CSRF_INVALID') {
+            await handleError(error)
+            return
+          }
+          setLive(marketProbeContracts.errorMessage(error.code), 'error')
+        }
+      })
+    : { bind() {}, refresh() {}, reset() {} }
+  ifindMarketProbeController.bind()
 
   byId('admin-login-form').addEventListener('submit', async (event) => {
     event.preventDefault()

@@ -1,5 +1,7 @@
 const crypto = require('node:crypto')
 const { types } = require('node:util')
+const FUNCTION_BIND = Function.prototype.bind
+const REFLECT_APPLY = Reflect.apply
 const { createIfindHttpClient } = require('./adapters/ifind-http-client')
 const {
   IfindDiagnosticRepository
@@ -39,6 +41,9 @@ const {
 const {
   createIfindReportPeriodDiagnosticService
 } = require('./services/ifind-report-period-diagnostic-service')
+const {
+  createIfindMarketProbeService
+} = require('./services/ifind-market-probe-service')
 
 const SAFE_CODES = new Set([
   'IFIND_DIAGNOSTIC_ACCESS_REQUIRED',
@@ -111,8 +116,9 @@ function readMethod(value, key) {
       const descriptor = Reflect.getOwnPropertyDescriptor(current, key)
       if (descriptor) {
         return Object.hasOwn(descriptor, 'value') &&
-          typeof descriptor.value === 'function'
-          ? descriptor.value.bind(value)
+          typeof descriptor.value === 'function' &&
+          !types.isProxy(descriptor.value)
+          ? REFLECT_APPLY(FUNCTION_BIND, descriptor.value, [value])
           : null
       }
       current = Reflect.getPrototypeOf(current)
@@ -138,7 +144,7 @@ function readOptions(options) {
       'createClient', 'createService', 'clock', 'idSource',
       'createMarketRepository', 'createMarketService', 'marketCatalogLookup',
       'marketManifestLookup', 'marketQuoteParser', 'marketFinancialParser',
-      'marketIdGenerator'
+      'marketIdGenerator', 'createMarketProbeService'
     ]) {
       const property = readDataProperty(options, key)
       if (!property) fail('IFIND_DIAGNOSTIC_RUNTIME_INVALID')
@@ -195,6 +201,7 @@ function disabledRuntime() {
     }),
     service: null,
     marketService: null,
+    marketProbeService: null,
     reportPeriodService: null,
     clear() {}
   })
@@ -244,6 +251,9 @@ async function createIfindDiagnosticRuntime(options) {
   const createMarketService = Object.hasOwn(config, 'createMarketService')
     ? config.createMarketService
     : createIfindMarketDiagnosticService
+  const createMarketProbe = Object.hasOwn(config, 'createMarketProbeService')
+    ? config.createMarketProbeService
+    : createIfindMarketProbeService
   const marketCatalogLookup = Object.hasOwn(config, 'marketCatalogLookup')
     ? config.marketCatalogLookup
     : getIfindMarketCase
@@ -266,12 +276,14 @@ async function createIfindDiagnosticRuntime(options) {
     typeof createService !== 'function' || typeof clock !== 'function' ||
     typeof idSource !== 'function' || typeof createMarketRepository !== 'function' ||
     typeof createMarketService !== 'function' || typeof marketCatalogLookup !== 'function' ||
+    typeof createMarketProbe !== 'function' ||
     typeof marketManifestLookup !== 'function' || typeof marketQuoteParser !== 'function' ||
     typeof marketFinancialParser !== 'function' || typeof marketIdGenerator !== 'function' ||
     types.isProxy(openDatabase) ||
     types.isProxy(loadSecrets) || types.isProxy(createRepository) ||
     types.isProxy(createClient) || types.isProxy(createService) ||
     types.isProxy(createMarketRepository) || types.isProxy(createMarketService) ||
+    types.isProxy(createMarketProbe) ||
     types.isProxy(marketCatalogLookup) || types.isProxy(marketManifestLookup) ||
     types.isProxy(marketQuoteParser) || types.isProxy(marketFinancialParser) ||
     types.isProxy(marketIdGenerator) || types.isProxy(clock) ||
@@ -287,6 +299,8 @@ async function createIfindDiagnosticRuntime(options) {
   let calibrationService = null
   let reportPeriodClient = null
   let reportPeriodService = null
+  let probeClient = null
+  let marketProbeService = null
   try {
     try {
       provider = await loadSecrets(Object.freeze({
@@ -413,6 +427,32 @@ async function createIfindDiagnosticRuntime(options) {
           idGenerator: marketIdGenerator
         })
       }
+      if (readMethod(marketClient, 'probeFixed')) {
+        const candidate = createClient()
+        if (candidate === legacyClient || candidate === marketClient ||
+            candidate === reportPeriodClient) {
+          fail('IFIND_DIAGNOSTIC_RUNTIME_INVALID')
+        }
+        probeClient = candidate
+        if (!readMethod(probeClient, 'authenticate') ||
+            !readMethod(probeClient, 'probeFixed') ||
+            !readMethod(probeClient, 'clear')) {
+          fail('IFIND_DIAGNOSTIC_RUNTIME_INVALID')
+        }
+        marketProbeService = createMarketProbe({
+          repository: marketRepository,
+          client: probeClient,
+          secretProvider: provider,
+          tokenVersionId: contract.versionId,
+          clock,
+          idGenerator: marketIdGenerator
+        })
+        if (!readMethod(marketProbeService, 'describe') ||
+            !readMethod(marketProbeService, 'run') ||
+            !readMethod(marketProbeService, 'clear')) {
+          fail('IFIND_DIAGNOSTIC_RUNTIME_INVALID')
+        }
+      }
     } catch (error) {
       throw sanitizedError(error, 'IFIND_DIAGNOSTIC_RUNTIME_INVALID')
     }
@@ -426,6 +466,7 @@ async function createIfindDiagnosticRuntime(options) {
       }),
       service,
       marketService,
+      marketProbeService,
       ...(calibrationService ? { calibrationService } : {}),
       reportPeriodService,
       clear() {
@@ -436,6 +477,7 @@ async function createIfindDiagnosticRuntime(options) {
           () => { if (calibrationService) calibrationService.clear() },
           () => { if (reportPeriodService) reportPeriodService.clear() },
           () => { if (reportPeriodClient) readMethod(reportPeriodClient, 'clear')() },
+          () => clearServiceClient(marketProbeService, probeClient),
           () => readMethod(marketClient, 'clear')(),
           () => readMethod(provider, 'clear')()
         )
@@ -450,6 +492,7 @@ async function createIfindDiagnosticRuntime(options) {
         const clearReportClient = reportPeriodClient && readMethod(reportPeriodClient, 'clear')
         if (clearReportClient) clearReportClient()
       },
+      () => clearServiceClient(marketProbeService, probeClient),
       () => {
         if (!marketClient || marketClient === legacyClient) return
         const clearMarketClient = readMethod(marketClient, 'clear')

@@ -65,6 +65,7 @@ const tests = [
   require('./frontend-auth-state.test'),
   require('./frontend-auth-contract.test'),
   require('./frontend-ifind-market-diagnostic.test'),
+  require('./frontend-ifind-market-probe.test'),
   require('./frontend-ifind-calibration.test'),
   require('./frontend-ifind-report-period-diagnostic.test'),
   require('./frontend-ifind-http-integration.test'),
