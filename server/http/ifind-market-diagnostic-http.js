@@ -86,6 +86,7 @@ const LOCAL_BOUNDARY_STATUS = new Map([
   ['COOKIE_INVALID', 400],
   ['HEADER_INVALID', 400],
   ['IFIND_MARKET_CASE_NOT_FOUND', 404],
+  ['IFIND_MARKET_PROBE_FAILED', 500],
   ['INTERNAL_ERROR', 500],
   ['JSON_INVALID', 400],
   ['JSON_REQUIRED', 415],
@@ -924,11 +925,63 @@ function createIfindMarketDiagnosticHttpController({
     return true
   }
 
+  async function routeMarketProbe(req, res, segments) {
+    assertNoDuplicateHeaders(req)
+    const proposalId = 'HK_ALIBABA_9988_V1'
+    const isRead = segments.length === 5 && segments[4] === proposalId &&
+      req.method === 'GET'
+    const isRun = segments.length === 6 && segments[4] === proposalId &&
+      segments[5] === 'run' && req.method === 'POST'
+    if (!isRead && !isRun) {
+      sendJson(res, { error: 'NOT_FOUND' }, 404)
+      return true
+    }
+
+    const endpoint = `/api/admin/ifind/market-probes/${proposalId}`
+    if (isRun) {
+      requireOrigin(req)
+      authenticateMutation(req, res)
+      requireTrustedClient(req)
+      requireExactTarget(req, `${endpoint}/run`)
+      requireExactEmptyObject(await parseLocalStrictJson(req))
+    } else {
+      if (req.headers.origin !== undefined) requireOrigin(req)
+      authenticateAdmin(req, res)
+      requireExactTarget(req, endpoint)
+    }
+
+    const serviceProperty = optionalOwnDataValue(
+      ifindDiagnosticRuntime,
+      'marketProbeService'
+    )
+    const methodProperty = serviceProperty.found
+      ? optionalOwnDataValue(
+          serviceProperty.value,
+          isRun ? 'run' : 'describe'
+        )
+      : { found: false, value: null }
+    if (!methodProperty.found || typeof methodProperty.value !== 'function' ||
+      types.isProxy(methodProperty.value)) {
+      boundaryError('IFIND_MARKET_PROBE_FAILED', 500)
+    }
+
+    let result
+    try {
+      result = await methodProperty.value.call(serviceProperty.value)
+    } catch {
+      boundaryError('IFIND_MARKET_PROBE_FAILED', 500)
+    }
+    sendJson(res, { data: result })
+    return true
+  }
+
   async function route(req, res, segments) {
     if (segments[1] === 'admin' && segments[2] === 'ifind' &&
       segments[3] === 'report-period-diagnostic') return routeReportPeriodDiagnostic(req, res, segments)
     if (segments[1] === 'admin' && segments[2] === 'ifind' &&
       segments[3] === 'calibration') return routeCalibration(req, res, segments)
+    if (segments[1] === 'admin' && segments[2] === 'ifind' &&
+      segments[3] === 'market-probes') return routeMarketProbe(req, res, segments)
     if (segments[1] !== 'admin' || segments[2] !== 'ifind' ||
       segments[3] !== 'market-cases') return false
 

@@ -248,6 +248,26 @@ function createMarketRuntime({ outcome } = {}) {
   }
 }
 
+function createMarketProbeRuntime({
+  description = { proposalId: 'HK_ALIBABA_9988_V1', status: 'ready' },
+  outcome = { proposalId: 'HK_ALIBABA_9988_V1', status: 'complete' }
+} = {}) {
+  const runtime = createMarketRuntime()
+  const probeCalls = []
+  runtime.marketProbeService = {
+    describe(...args) {
+      probeCalls.push(['describe', args])
+      return description
+    },
+    async run(...args) {
+      probeCalls.push(['run', args])
+      return outcome
+    }
+  }
+  runtime.probeCalls = probeCalls
+  return runtime
+}
+
 /**
  * @param {{
  *   marketRuntime?: unknown,
@@ -421,6 +441,267 @@ function assertNoSensitivePayload(value) {
     'company-alibaba-group'
   ]) {
     assert.equal(serialized.includes(marker), false, marker)
+  }
+}
+
+async function testFixedMarketProbeSuccessBoundary() {
+  const description = {
+    proposalId: 'HK_ALIBABA_9988_V1',
+    securityCode: '9988.HK',
+    requestBudget: 3
+  }
+  const outcome = {
+    proposalId: 'HK_ALIBABA_9988_V1',
+    status: 'complete',
+    requestCount: 3
+  }
+  const marketRuntime = createMarketProbeRuntime({ description, outcome })
+  let providerReads = 0
+  let supplierReads = 0
+  Object.defineProperty(marketRuntime, 'provider', {
+    enumerable: true,
+    get() {
+      providerReads += 1
+      throw new Error('provider must remain behind the service')
+    }
+  })
+  Object.defineProperty(marketRuntime.marketProbeService, 'supplier', {
+    enumerable: true,
+    get() {
+      supplierReads += 1
+      throw new Error('supplier must remain behind the service')
+    }
+  })
+  const running = await start({ marketRuntime })
+  const endpoint = '/api/admin/ifind/market-probes/HK_ALIBABA_9988_V1'
+  try {
+    const read = await request(running.baseUrl, endpoint, {
+      headers: { cookie: adminCookie() }
+    })
+    assert.equal(read.status, 200)
+    assert.deepEqual(read.body, { data: description })
+    assert.deepEqual(marketRuntime.probeCalls, [['describe', []]])
+    assert.deepEqual(marketRuntime.calls, [])
+    assert.equal(providerReads, 0)
+    assert.equal(supplierReads, 0)
+
+    const run = await request(running.baseUrl, `${endpoint}/run`, {
+      method: 'POST', headers: postHeaders(), body: '{}'
+    })
+    assert.equal(run.status, 200)
+    assert.deepEqual(run.body, { data: outcome })
+    assert.deepEqual(marketRuntime.probeCalls, [
+      ['describe', []],
+      ['run', []]
+    ])
+    assert.deepEqual(marketRuntime.calls, [])
+    assert.equal(providerReads, 0)
+    assert.equal(supplierReads, 0)
+  } finally {
+    await running.close()
+  }
+}
+
+async function testFixedMarketProbeRejectsInvalidAccessAndTargets() {
+  const marketRuntime = createMarketProbeRuntime()
+  const running = await start({ marketRuntime })
+  const endpoint = '/api/admin/ifind/market-probes/HK_ALIBABA_9988_V1'
+  try {
+    for (const headers of [
+      {},
+      { cookie: `__Host-kinvest-device=${DEVICE_TOKEN}` }
+    ]) {
+      const response = await request(running.baseUrl, endpoint, { headers })
+      assert.equal(response.status, 401)
+    }
+
+    const invalidReads = [
+      `${endpoint}?detail=1`,
+      `${endpoint}/`,
+      '/api/admin/ifind/market-probes/HK_ALIBABA_9988_V1%2Frun',
+      `${endpoint}/extra`,
+      '/api/admin/ifind/market-probes/HK_ALIBABA_9988_V2',
+      `${endpoint}/run`
+    ]
+    for (const pathname of invalidReads) {
+      const response = await request(running.baseUrl, pathname, {
+        headers: { cookie: adminCookie() }
+      })
+      assert.equal(response.status, 404, pathname)
+    }
+
+    const unauthenticatedPostHeaders = postHeaders()
+    const missingOriginHeaders = postHeaders()
+    const missingCsrfHeaders = postHeaders()
+    delete unauthenticatedPostHeaders.cookie
+    delete missingOriginHeaders.origin
+    delete missingCsrfHeaders['x-kinvest-csrf']
+    const mutationCases = [
+      [unauthenticatedPostHeaders, '{}', 401, 'ADMIN_AUTH_REQUIRED'],
+      [{ ...postHeaders(), cookie: `__Host-kinvest-device=${DEVICE_TOKEN}` }, '{}', 401, 'ADMIN_AUTH_REQUIRED'],
+      [missingOriginHeaders, '{}', 403, 'ORIGIN_INVALID'],
+      [{ ...postHeaders(), origin: 'https://attacker.example' }, '{}', 403, 'ORIGIN_INVALID'],
+      [missingCsrfHeaders, '{}', 403, 'ADMIN_CSRF_INVALID'],
+      [{ ...postHeaders(), 'x-kinvest-csrf': 'B'.repeat(43) }, '{}', 403, 'ADMIN_CSRF_INVALID'],
+      [{ ...postHeaders(), 'content-type': 'text/plain' }, '{}', 415, 'JSON_REQUIRED'],
+      [postHeaders(), '', 400, 'JSON_INVALID'],
+      [postHeaders(), '[]', 400, 'JSON_INVALID'],
+      [postHeaders(), '{"field":1,"field":2}', 400, 'JSON_INVALID'],
+      [postHeaders(), '{"field":1}', 400, 'JSON_INVALID']
+    ]
+    for (const [headers, body, status, error] of mutationCases) {
+      const response = await request(running.baseUrl, `${endpoint}/run`, {
+        method: 'POST', headers, body
+      })
+      assert.equal(response.status, status, `${status} ${error}`)
+      assert.deepEqual(response.body, { error })
+    }
+
+    for (const pathname of [`${endpoint}/run?force=1`, endpoint]) {
+      const response = await request(running.baseUrl, pathname, {
+        method: 'POST', headers: postHeaders(), body: '{}'
+      })
+      assert.equal(response.status, 404, pathname)
+    }
+    assert.deepEqual(marketRuntime.probeCalls, [])
+    assert.deepEqual(marketRuntime.calls, [])
+  } finally {
+    await running.close()
+  }
+}
+
+async function testFixedMarketProbeFailsClosedAfterAuthentication() {
+  const missingRuntime = createMarketRuntime()
+  const accessRuntime = createAccessRuntime()
+  const missingServer = await start({
+    marketRuntime: missingRuntime,
+    accessRuntime
+  })
+  const endpoint = '/api/admin/ifind/market-probes/HK_ALIBABA_9988_V1'
+  try {
+    const unauthenticated = await request(missingServer.baseUrl, endpoint)
+    assert.equal(unauthenticated.status, 401)
+    assert.deepEqual(unauthenticated.body, { error: 'ADMIN_AUTH_REQUIRED' })
+
+    const authenticated = await request(missingServer.baseUrl, endpoint, {
+      headers: { cookie: adminCookie() }
+    })
+    assert.equal(authenticated.status, 500)
+    assert.deepEqual(authenticated.body, { error: 'IFIND_MARKET_PROBE_FAILED' })
+    assert.deepEqual(accessRuntime.calls, [['authenticate', ADMIN_TOKEN]])
+    assert.deepEqual(missingRuntime.calls, [])
+  } finally {
+    await missingServer.close()
+  }
+
+  const hostileScenarios = [
+    {
+      name: 'runtime proxy',
+      create(state) {
+        return new Proxy(createMarketRuntime(), {
+          get() {
+            state.reads += 1
+            throw new Error('RequestId=runtime-secret')
+          }
+        })
+      }
+    },
+    {
+      name: 'service accessor',
+      create(state) {
+        const runtime = createMarketRuntime()
+        Object.defineProperty(runtime, 'marketProbeService', {
+          enumerable: true,
+          get() {
+            state.reads += 1
+            throw new Error('RequestId=service-secret')
+          }
+        })
+        return runtime
+      }
+    },
+    {
+      name: 'service proxy',
+      create(state) {
+        const runtime = createMarketRuntime()
+        runtime.marketProbeService = new Proxy({}, {
+          get() {
+            state.reads += 1
+            throw new Error('RequestId=method-secret')
+          }
+        })
+        return runtime
+      }
+    },
+    {
+      name: 'method accessor',
+      create(state) {
+        const runtime = createMarketRuntime()
+        runtime.marketProbeService = {}
+        Object.defineProperty(runtime.marketProbeService, 'describe', {
+          enumerable: true,
+          get() {
+            state.reads += 1
+            throw new Error('RequestId=describe-secret')
+          }
+        })
+        return runtime
+      }
+    }
+  ]
+  for (const scenario of hostileScenarios) {
+    const state = { reads: 0 }
+    const running = await start({ marketRuntime: scenario.create(state) })
+    try {
+      const response = await request(running.baseUrl, endpoint, {
+        headers: { cookie: adminCookie() }
+      })
+      assert.equal(response.status, 500, scenario.name)
+      assert.deepEqual(response.body, { error: 'IFIND_MARKET_PROBE_FAILED' })
+      assert.equal(state.reads, 0, scenario.name)
+    } finally {
+      await running.close()
+    }
+  }
+}
+
+async function testFixedMarketProbeSanitizesServiceExceptions() {
+  const endpoint = '/api/admin/ifind/market-probes/HK_ALIBABA_9988_V1'
+  for (const operation of ['describe', 'run']) {
+    const state = { reads: 0 }
+    const marketRuntime = createMarketProbeRuntime()
+    marketRuntime.marketProbeService[operation] = () => {
+      throw new Proxy(Object.create(null), {
+        get() {
+          state.reads += 1
+          return 'RequestId token stack cause arbitrary secret'
+        },
+        getPrototypeOf() {
+          state.reads += 1
+          return null
+        }
+      })
+    }
+    const running = await start({ marketRuntime })
+    try {
+      const response = operation === 'run'
+        ? await request(running.baseUrl, `${endpoint}/run`, {
+            method: 'POST', headers: postHeaders(), body: '{}'
+          })
+        : await request(running.baseUrl, endpoint, {
+            headers: { cookie: adminCookie() }
+          })
+      assert.equal(response.status, 500, operation)
+      assert.deepEqual(response.body, { error: 'IFIND_MARKET_PROBE_FAILED' })
+      assert.equal(state.reads, 0, operation)
+      for (const marker of [
+        'RequestId', 'token', 'stack', 'cause', 'arbitrary', 'secret'
+      ]) {
+        assert.equal(JSON.stringify(response.body).includes(marker), false, marker)
+      }
+    } finally {
+      await running.close()
+    }
   }
 }
 
@@ -1215,6 +1496,10 @@ async function testIndependentReportingCurrencyProjection() {
 }
 
 async function run() {
+  await testFixedMarketProbeSuccessBoundary()
+  await testFixedMarketProbeRejectsInvalidAccessAndTargets()
+  await testFixedMarketProbeFailsClosedAfterAuthentication()
+  await testFixedMarketProbeSanitizesServiceExceptions()
   await testNumericProviderCodesStayInternal()
   await testIndependentReportingCurrencyProjection()
   await testListDetailAndRunSuccessProjection()
