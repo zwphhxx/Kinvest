@@ -16,7 +16,7 @@ const PROPOSAL_ID = 'HK_ALIBABA_9988_V1'
 const VERSION = 'v20260901-001'
 const RESULT_KEYS = ['proposalId', 'caseId', 'displayCode', 'status', 'availability', 'verification',
   'observations', 'requestCount', 'businessRequestCount', 'dataVol', 'attemptedAt',
-  'errorCode', 'failureStage']
+  'errorCode', 'failureStage', 'rejectionStage']
 const VERIFICATION_KEYS = ['issuerIdentityStatus', 'vendorCodeStatus', 'entitlementStatus',
   'currencyStatus', 'unitStatus', 'reportPeriodStatus', 'scopeStatus']
 const STAGES = ['identity', 'quote', 'financial']
@@ -246,7 +246,7 @@ const tests = [
       verification: Object.fromEntries(VERIFICATION_KEYS.map((key) => [key, 'unverified'])),
       observations: { identity: null, quote: null, financial: null }, requestCount: 0,
       businessRequestCount: 0, dataVol: null, attemptedAt: null, errorCode: null,
-      failureStage: null })
+      failureStage: null, rejectionStage: null })
     assertSafeResult(initial)
     for (const status of ['ready', 'busy', 'cooldown', 'daily-limit']) {
       assertSafeResult({ ...initial, status, availability: status })
@@ -648,6 +648,75 @@ const tests = [
       assert.deepEqual(service.describe(), result)
       assertClean(value)
     })
+  }],
+  ['shape rejection locations survive adapter, service and strict DTO without widening acceptance', async () => {
+    const cases = [
+      { location: 'envelope', response: { ...providerPayload('identity'), extra: 'DROP_ME' } },
+      { location: 'tables', response: { errorcode: 0, tables: [] } },
+      { location: 'returned-code', response: { errorcode: 0, tables: [
+        { thscode: '09888.HK', table: summary('identity').fields }] } },
+      { location: 'indicator-fields', response: { errorcode: 0, tables: [
+        { thscode: '9988.HK', table: { other: ['DROP_ME'] } }] } },
+      { location: 'field-values', response: { errorcode: 0, tables: [
+        { thscode: '9988.HK', table: { ths_stock_short_name_stock: [{ nested: 'DROP_ME' }] } }] } }
+    ]
+    for (const scenario of cases) await using(async (value) => {
+      const stub = createRequestStub([scenario.response])
+      const adapter = createIfindHttpClient({ request: stub.request })
+      value.client.probeFixed = adapter.probeFixed.bind(adapter)
+      const service = value.service()
+      const result = await service.run()
+      assertSafeResult(result)
+      assert.equal(result.errorCode, 'IFIND_RESPONSE_SHAPE')
+      assert.equal(result.failureStage, 'identity')
+      assert.equal(result.rejectionStage, scenario.location)
+      assert.deepEqual([result.requestCount, result.businessRequestCount, stub.calls.length], [2, 1, 1])
+      assert.deepEqual(service.describe(), result)
+      assert.equal((await service.run()).rejectionStage, null)
+      assert.deepEqual(service.describe(), result)
+      value.state.now += COOLDOWN
+      assert.deepEqual(service.describe(), { ...result, availability: 'ready' })
+      assert.equal(stub.calls.length, 1)
+      assertClean(value)
+      for (const bad of [
+        { ...result, rejectionStage: 'DROP_ME' },
+        { ...result, errorCode: 'IFIND_PERMISSION_REJECTED' },
+        { ...result, failureStage: 'auth' },
+        { ...domain.createInitialIfindMarketProbeResult(), rejectionStage: scenario.location }
+      ]) assert.throws(() => domain.copyIfindMarketProbeResult(bad),
+        { code: 'IFIND_MARKET_PROBE_RESULT_INVALID' })
+    })
+  }],
+  ['rejection location is allowlisted and never reads hostile error properties', async () => {
+    let traps = 0
+    const errors = [
+      { code: 'IFIND_RESPONSE_SHAPE', rejectionStage: 'DROP_ME' },
+      { code: 'IFIND_TIMEOUT', rejectionStage: 'envelope' },
+      Object.defineProperty({ code: 'IFIND_RESPONSE_SHAPE' }, 'rejectionStage', {
+        get() { traps += 1; throw new Error('DROP_ME') } }),
+      { code: 'IFIND_RESPONSE_SHAPE', rejectionStage: new Proxy({}, {
+        get() { traps += 1; throw new Error('DROP_ME') } }) }
+    ]
+    for (const error of errors) await using(async (value) => {
+      value.client.probeFixed = async () => { throw error }
+      const result = await value.service().run()
+      assertSafeResult(result)
+      assert.equal(result.rejectionStage, null)
+      assertClean(value)
+    })
+    await using(async (value) => {
+      value.client.probeFixed = async () => {
+        throw { code: 'IFIND_RESPONSE_SHAPE', rejectionStage: 'tables' }
+      }
+      const repository = { reserve: value.repository.reserve.bind(value.repository),
+        quotaStatus: value.repository.quotaStatus.bind(value.repository),
+        fail() { return { status: 'conflict' } } }
+      const result = await value.service({ repository }).run()
+      assertSafeResult(result)
+      assert.equal(result.failureStage, 'lease')
+      assert.equal(result.rejectionStage, null)
+    })
+    assert.equal(traps, 0)
   }],
   ['active rerun preserves the preceding terminal observation while reporting busy', async () => using(async (value) => {
     const gate = deferred(); const entered = deferred()

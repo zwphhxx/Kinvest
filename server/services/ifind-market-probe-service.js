@@ -19,6 +19,7 @@ const UNAVAILABLE = 'IFIND_MARKET_PROBE_UNAVAILABLE'
 const OBSERVED = 'IFIND_MARKET_PROBE_OBSERVED_UNVERIFIED'
 const FAILURE_CODES = new Set(['IFIND_AUTH_REJECTED', 'IFIND_PERMISSION_REJECTED',
   'IFIND_QUOTA_REJECTED', 'IFIND_RESPONSE_SHAPE', 'IFIND_TIMEOUT', 'IFIND_NETWORK_FAILED'])
+const REJECTION_STAGES = new Set(['envelope', 'tables', 'returned-code', 'indicator-fields', 'field-values'])
 const MIN_TIME = Date.parse('2000-01-01T00:00:00.000Z')
 /** @typedef {'identity' | 'quote' | 'financial'} ProbeStage */
 /** @typedef {{returnedCode: string, fields: Record<string, Array<null | string | number | boolean>>}} ProbeObservation */
@@ -224,6 +225,7 @@ function createIfindMarketProbeService(options) {
   }
 
   async function run(...args) {
+    let rejectionStage = null
     if (args.length !== 0) throw new IfindMarketProbeServiceError(FAILED)
     if (active || CLIENT_OWNERS.has(config.client)) return idleResult('busy')
     let reservation
@@ -329,6 +331,10 @@ function createIfindMarketProbeService(options) {
         } else {
           status = 'failed'; errorCode = failureStage === 'lease' ? FAILED : failureCode(error)
         }
+        if (errorCode === 'IFIND_RESPONSE_SHAPE' && STAGES.some((stage) => stage === failureStage)) {
+          const location = ownValue(error, 'rejectionStage')
+          rejectionStage = REJECTION_STAGES.has(location) ? location : null
+        }
         try {
           const now = timestamp()
           if (now >= lastTime) lastTime = now
@@ -339,12 +345,13 @@ function createIfindMarketProbeService(options) {
 
       result = copyIfindMarketProbeResult({ ...createInitialIfindMarketProbeResult(), status,
         availability: 'cooldown', observations, requestCount, businessRequestCount, dataVol,
-        attemptedAt: new Date(reservation.createdAt).toISOString(), errorCode, failureStage })
+        attemptedAt: new Date(reservation.createdAt).toISOString(), errorCode, failureStage,
+        rejectionStage })
       if (generation !== owner.generation) {
         status = 'failed'; errorCode = FAILED; failureStage = 'lease'
         observations = { identity: null, quote: null, financial: null }
         result = copyIfindMarketProbeResult({ ...result, status, observations,
-          errorCode, failureStage })
+          errorCode, failureStage, rejectionStage: null })
       }
       const completedAt = Math.min(lastTime, reservation.leaseExpiresAt)
       try {
@@ -362,7 +369,7 @@ function createIfindMarketProbeService(options) {
       } catch {
         result = copyIfindMarketProbeResult({ ...result, status: 'unavailable', availability: 'unavailable',
           observations: { identity: null, quote: null, financial: null },
-          errorCode: UNAVAILABLE, failureStage: 'lease' })
+          errorCode: UNAVAILABLE, failureStage: 'lease', rejectionStage: null })
       }
     } finally {
       wipe(refreshToken); wipe(accessToken)

@@ -29,6 +29,8 @@ const SAFE_ERRORS = new WeakSet()
 // Fixed baseline from the official iFinD HTTP example, not a dynamic market date.
 const DIAGNOSTIC_REFERENCE_DATE = '2022-07-05'
 
+/** @typedef {'envelope' | 'tables' | 'returned-code' | 'indicator-fields' | 'field-values'} FixedProbeRejectionStage */
+
 /**
  * @typedef {Error & {
  *   code: string,
@@ -37,6 +39,7 @@ const DIAGNOSTIC_REFERENCE_DATE = '2022-07-05'
  *   vendorErrorCode: number | null,
  *   dataVol?: number,
  *   requestCount?: number,
+ *   rejectionStage?: FixedProbeRejectionStage,
  *   stage?: 'auth' | 'probe' | 'quote' | 'financial'
  * }} IfindClientError
  */
@@ -903,17 +906,23 @@ function boundedProbeArray(value) {
   return Object.freeze(snapshot)
 }
 
-function sanitizeFixedProbeSuccess(response, requestContract) {
-  const envelope = fixedProbeRecord(response, ['errorcode', 'tables', 'dataVol'],
-    ['errorcode', 'tables'])
-  const providerTable = fixedProbeRecord(fixedProbeArray(envelope.tables, 1, 1)[0],
-    ['thscode', 'table'])
-  const returnedCode = providerTable.thscode
-  if (returnedCode !== requestContract.vendorCode) throw new Error('invalid response')
-  const providerFields = fixedProbeRecord(providerTable.table, requestContract.fieldIds)
+/** @param {<T>(stage: FixedProbeRejectionStage, read: () => T) => T} validate */
+function sanitizeFixedProbeSuccess(response, requestContract, validate) {
+  const envelope = validate('envelope', () => fixedProbeRecord(response,
+    ['errorcode', 'tables', 'dataVol'], ['errorcode', 'tables']))
+  const providerTable = validate('tables', () => fixedProbeRecord(
+    fixedProbeArray(envelope.tables, 1, 1)[0], ['thscode', 'table']))
+  const returnedCode = validate('returned-code', () => {
+    const value = providerTable.thscode
+    if (value !== requestContract.vendorCode) throw new Error('invalid response')
+    return value
+  })
+  const providerFields = validate('indicator-fields', () =>
+    fixedProbeRecord(providerTable.table, requestContract.fieldIds))
   const fields = {}
   for (const fieldId of requestContract.fieldIds) {
-    Object.defineProperty(fields, fieldId, { value: boundedProbeArray(providerFields[fieldId]),
+    Object.defineProperty(fields, fieldId, {
+      value: validate('field-values', () => boundedProbeArray(providerFields[fieldId])),
       enumerable: true, configurable: false, writable: false })
   }
   const sanitized = { errorcode: envelope.errorcode, tables: Object.freeze([
@@ -1388,6 +1397,24 @@ function createIfindHttpClient({
 
   async function probeFixed(accessTokenInput, proposalId, sequence) {
     let requestCount = 0
+    /** @type {FixedProbeRejectionStage | null} */
+    let rejectionStage = null
+    /**
+     * @template T
+     * @param {FixedProbeRejectionStage} boundary
+     * @param {() => T} read
+     * @returns {T}
+     */
+    function validate(boundary, read) {
+      try {
+        return read()
+      } catch (error) {
+        // Record only the validator that actually rejected, never vendor text
+        // or properties of the thrown value. This state belongs to one probe.
+        rejectionStage = boundary
+        throw error
+      }
+    }
     try {
       let accessToken
       let fixed
@@ -1408,19 +1435,19 @@ function createIfindHttpClient({
       requireCurrentGeneration(operationGeneration)
       let responseEnvelope
       try {
-        responseEnvelope = projectFixedProbeEnvelope(response)
+        responseEnvelope = validate('envelope', () => projectFixedProbeEnvelope(response))
       } catch {
         throw safeError('IFIND_RESPONSE_SHAPE', 'API', 'iFinD response shape was invalid')
       }
-      const responseErrorCode = protocolErrorCode(responseEnvelope)
+      const responseErrorCode = validate('envelope', () => protocolErrorCode(responseEnvelope))
       if (responseErrorCode !== 0) {
         const errorClass = classifyProbeFailure(responseErrorCode)
-        const volume = protocolDataVol(responseEnvelope)
+        const volume = validate('envelope', () => protocolDataVol(responseEnvelope))
         const dataVol = volume.present ? volume.value : undefined
         // Error envelopes may omit tables or use null. Non-null tables remain strict.
         if (Object.hasOwn(responseEnvelope, 'tables') && responseEnvelope.tables !== null) {
           try {
-            sanitizeFixedProbeSuccess(responseEnvelope, fixed)
+            sanitizeFixedProbeSuccess(responseEnvelope, fixed, validate)
           } catch {
             throw safeError('IFIND_RESPONSE_SHAPE', 'API', 'iFinD response shape was invalid')
           }
@@ -1432,9 +1459,9 @@ function createIfindHttpClient({
       }
       let dataVol
       try {
-        const volume = protocolDataVol(responseEnvelope)
+        const volume = validate('envelope', () => protocolDataVol(responseEnvelope))
         dataVol = volume.present ? volume.value : null
-        const probePayload = sanitizeFixedProbeSuccess(responseEnvelope, fixed)
+        const probePayload = sanitizeFixedProbeSuccess(responseEnvelope, fixed, validate)
         return Object.freeze({ stage: fixed.stage, payload: probePayload, requestCount: 1, dataVol })
       } catch {
         throw safeError('IFIND_RESPONSE_SHAPE', 'API', 'iFinD response shape was invalid', dataVol)
@@ -1442,6 +1469,11 @@ function createIfindHttpClient({
     } catch (error) {
       const sanitized = SAFE_ERRORS.has(error) ? error
         : safeError('IFIND_RESPONSE_SHAPE', 'API', 'iFinD response shape was invalid')
+      if (sanitized.code === 'IFIND_RESPONSE_SHAPE' && rejectionStage !== null) {
+        Object.defineProperty(sanitized, 'rejectionStage', {
+          value: rejectionStage, enumerable: true, configurable: false, writable: false
+        })
+      }
       throw withRequestCount(withStage(sanitized, 'probe'), requestCount)
     }
   }

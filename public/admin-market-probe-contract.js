@@ -12,11 +12,14 @@
   const INVALID = 'IFIND_MARKET_PROBE_RESULT_INVALID'
   const RESULT_KEYS = ['proposalId', 'caseId', 'displayCode', 'status', 'verification',
     'observations', 'requestCount', 'businessRequestCount', 'dataVol', 'attemptedAt',
-    'errorCode', 'failureStage', 'availability']
+    'errorCode', 'failureStage', 'availability', 'rejectionStage']
   const VERIFICATION_KEYS = ['issuerIdentityStatus', 'vendorCodeStatus', 'entitlementStatus',
     'currencyStatus', 'unitStatus', 'reportPeriodStatus', 'scopeStatus']
   const STAGES = ['identity', 'quote', 'financial']
   const FAILURE_STAGES = new Set(['provider', 'auth', 'identity', 'quote', 'financial', 'lease'])
+  const REJECTION_STAGES = new Set(['envelope', 'tables', 'returned-code', 'indicator-fields', 'field-values'])
+  const REJECTION_LABELS = { envelope: '响应外层', tables: '数据表结构',
+    'returned-code': '返回证券代码', 'indicator-fields': '指标字段', 'field-values': '字段值类型或范围' }
   const IDLE = new Set(['ready', 'busy', 'cooldown', 'daily-limit'])
   const AVAILABILITY = new Set([...IDLE, 'unavailable'])
   const FAILURE_CODES = new Set(['IFIND_MARKET_PROBE_FAILED', 'IFIND_AUTH_REJECTED',
@@ -130,6 +133,9 @@
   function copyResult(value) {
     try {
       const input = record(value, RESULT_KEYS)
+      if (input.rejectionStage !== null && (input.status !== 'failed' ||
+          input.errorCode !== 'IFIND_RESPONSE_SHAPE' || !STAGES.includes(input.failureStage) ||
+          !REJECTION_STAGES.has(input.rejectionStage))) invalid()
       if (!AVAILABILITY.has(input.availability)) invalid()
       if (input.proposalId !== PROPOSAL_ID || input.caseId !== CASE_ID || input.displayCode !== DISPLAY_CODE) invalid()
       const verification = record(input.verification, VERIFICATION_KEYS)
@@ -171,7 +177,8 @@
         verification: Object.fromEntries(VERIFICATION_KEYS.map((key) => [key, 'unverified'])),
         observations, requestCount: input.requestCount,
         businessRequestCount: input.businessRequestCount, dataVol: input.dataVol,
-        attemptedAt: input.attemptedAt, errorCode: input.errorCode, failureStage: input.failureStage
+        attemptedAt: input.attemptedAt, errorCode: input.errorCode, failureStage: input.failureStage,
+        rejectionStage: input.rejectionStage
       }
     } catch {
       invalid()
@@ -244,7 +251,9 @@
       if (value.errorCode === 'IFIND_MARKET_PROBE_OBSERVED_UNVERIFIED') {
         return '已取得观察值，但七项证据仍未验证。'
       }
-      return `${STAGE_LABELS[value.failureStage]}阶段：${errorMessage(value.errorCode)} (${value.errorCode})`
+      const location = value.rejectionStage === null ? ''
+        : ` 拒绝位置：${REJECTION_LABELS[value.rejectionStage]}。`
+      return `${STAGE_LABELS[value.failureStage]}阶段：${errorMessage(value.errorCode)} (${value.errorCode})${location}`
     }
 
     function buttonState() {

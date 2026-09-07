@@ -32,6 +32,7 @@ function readyResult(overrides = {}) {
     attemptedAt: null,
     errorCode: null,
     failureStage: null,
+    rejectionStage: null,
     ...overrides
   }
 }
@@ -606,6 +607,45 @@ async function boundedFailureDetailsTest() {
   }
 }
 
+async function rejectionLocationRenderingTest() {
+  const labels = { envelope: '响应外层', tables: '数据表结构',
+    'returned-code': '返回证券代码', 'indicator-fields': '指标字段', 'field-values': '字段值类型或范围' }
+  for (const [rejectionStage, label] of Object.entries(labels)) {
+    const result = readyResult({ status: 'failed', availability: 'cooldown',
+      failureStage: 'identity', errorCode: 'IFIND_RESPONSE_SHAPE', rejectionStage,
+      requestCount: 2, businessRequestCount: 1, attemptedAt: '2026-09-02T08:08:00.000Z' })
+    const fixture = controllerFixture({ responses: [readyResult(), result, result] })
+    await fixture.controller.refresh()
+    await fixture.get('ifind-market-probe-run').click()
+    assert.deepEqual(fixture.errors, [])
+    assert.ok(fixture.get('ifind-market-probe-error').textContent.includes(`拒绝位置：${label}`))
+    assert.ok(fixture.live[0].message.includes(`拒绝位置：${label}`))
+    assert.equal(fixture.live[0].tone, 'error')
+    assert.equal(fixture.calls.filter(({ url }) => url === RUN_PATH).length, 1)
+    assert.equal(fixture.get('ifind-market-probe-run').disabled, true)
+    for (const invalid of [
+      { ...result, rejectionStage: 'UNTRUSTED_DETAIL' },
+      { ...result, errorCode: 'IFIND_TIMEOUT' },
+      { ...result, failureStage: 'auth' },
+      { ...readyResult(), rejectionStage },
+      { ...observedResult(), rejectionStage }
+    ]) {
+      const rejected = controllerFixture({ responses: [invalid] })
+      await rejected.controller.refresh()
+      assert.equal(rejected.errors[0].code, 'IFIND_MARKET_PROBE_RESULT_INVALID')
+      assert.equal(rejected.get('ifind-market-probe-run').disabled, true)
+      assert.doesNotMatch(rejected.get('ifind-market-probe-error').textContent, /UNTRUSTED_DETAIL/)
+    }
+  }
+  let traps = 0
+  const hostile = Object.defineProperty(readyResult(), 'rejectionStage', {
+    enumerable: true, get() { traps += 1; throw new Error('UNTRUSTED_DETAIL') } })
+  const rejected = controllerFixture({ responses: [hostile] })
+  await rejected.controller.refresh()
+  assert.equal(rejected.errors[0].code, 'IFIND_MARKET_PROBE_RESULT_INVALID')
+  assert.equal(traps, 0)
+}
+
 async function run() {
   for (const test of [moduleSurfaceTest, offlineRefreshAndRenderTest, confirmationAndSingleFlightTest,
     runOutcomeMessagingTest, trustedResultSurvivesTransportAndApiFailureTest,
@@ -614,7 +654,7 @@ async function run() {
     staleGenerationSettlementsStaySilentTest, latestStatusRequestWinsOutOfOrderTest,
     externalGetCannotCancelRunningPostTest, externalGetCannotHidePostFailureTest,
     hostileDtoTest, failureMappingTest, terminalResultRecoveryTest,
-    blockedPostDoesNotAnnouncePreviousSuccessTest, boundedFailureDetailsTest, htmlContractTest]) {
+    blockedPostDoesNotAnnouncePreviousSuccessTest, boundedFailureDetailsTest, rejectionLocationRenderingTest, htmlContractTest]) {
     await test()
     console.log(`PASS frontend-market-probe: ${test.name}`)
   }
