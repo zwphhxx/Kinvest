@@ -254,6 +254,7 @@ function readyMarketProbeResult() {
     caseId: 'HK_ALIBABA_9988',
     displayCode: '9988.HK',
     status: 'ready',
+    availability: 'ready',
     verification: {
       issuerIdentityStatus: 'unverified',
       vendorCodeStatus: 'unverified',
@@ -277,6 +278,7 @@ function observedMarketProbeResult() {
   return {
     ...readyMarketProbeResult(),
     status: 'observed-unverified',
+    availability: 'cooldown',
     observations: {
       identity: {
         returnedCode: '9988.HK',

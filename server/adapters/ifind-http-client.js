@@ -802,6 +802,50 @@ function readFixedProbeRequest(proposalId, sequence) {
 
 const FIXED_PROBE_DANGEROUS_KEYS = new Set(['__proto__', 'prototype', 'constructor'])
 
+// Response fields evidenced by docs/operations/ifind-admin-diagnostic-contract.md.
+// Request indicator names do not establish additional response-envelope fields.
+const FIXED_PROBE_METADATA_KEYS = Object.freeze(['errmsg', 'perf', 'datatype', 'inputParams'])
+
+function assertFixedProbeMetadata(value, budget, depth = 0) {
+  budget.remaining -= 1
+  if (budget.remaining < 0 || types.isProxy(value)) throw new Error('invalid response')
+  if (value === null || typeof value === 'boolean' ||
+      (typeof value === 'number' && Number.isFinite(value))) return
+  if (typeof value === 'string') {
+    if (Buffer.byteLength(value, 'utf8') > 4096) throw new Error('invalid response')
+    return
+  }
+  if (depth >= 4 || !value || typeof value !== 'object') throw new Error('invalid response')
+  if (Array.isArray(value)) {
+    for (const item of fixedProbeArray(value, 64)) {
+      assertFixedProbeMetadata(item, budget, depth + 1)
+    }
+    return
+  }
+  const keys = Reflect.ownKeys(value)
+  if (keys.length > 64 || keys.some((key) => !fixedProbeString(key))) {
+    throw new Error('invalid response')
+  }
+  const record = fixedProbeRecord(value, keys)
+  for (const key of keys) assertFixedProbeMetadata(record[key], budget, depth + 1)
+}
+
+function projectFixedProbeEnvelope(response) {
+  const payloadKeys = ['errorcode', 'tables', 'dataVol']
+  const envelope = fixedProbeRecord(response, [...payloadKeys, ...FIXED_PROBE_METADATA_KEYS],
+    ['errorcode'])
+  const budget = { remaining: 128 }
+  for (const key of FIXED_PROBE_METADATA_KEYS) {
+    if (Object.hasOwn(envelope, key)) assertFixedProbeMetadata(envelope[key], budget)
+  }
+  // Only the original payload contract reaches the unchanged success sanitizer.
+  const projected = {}
+  for (const key of payloadKeys) {
+    if (Object.hasOwn(envelope, key)) projected[key] = envelope[key]
+  }
+  return projected
+}
+
 function fixedProbeRecord(value, allowed, required = allowed) {
   if (types.isProxy(value) || !isRecord(value)) throw new Error('invalid response')
   const prototype = Reflect.getPrototypeOf(value)
@@ -1363,12 +1407,8 @@ function createIfindHttpClient({
         { access_token: accessToken, ifindlang: 'cn' }, fixed.body, setTimer, clearTimer)
       requireCurrentGeneration(operationGeneration)
       let responseEnvelope
-      let probePayload = null
       try {
-        responseEnvelope = fixedProbeRecord(response, ['errorcode', 'tables', 'dataVol'], ['errorcode'])
-        if (Object.hasOwn(responseEnvelope, 'tables')) {
-          probePayload = sanitizeFixedProbeSuccess(responseEnvelope, fixed)
-        }
+        responseEnvelope = projectFixedProbeEnvelope(response)
       } catch {
         throw safeError('IFIND_RESPONSE_SHAPE', 'API', 'iFinD response shape was invalid')
       }
@@ -1377,6 +1417,14 @@ function createIfindHttpClient({
         const errorClass = classifyProbeFailure(responseErrorCode)
         const volume = protocolDataVol(responseEnvelope)
         const dataVol = volume.present ? volume.value : undefined
+        // Error envelopes may omit tables or use null. Non-null tables remain strict.
+        if (Object.hasOwn(responseEnvelope, 'tables') && responseEnvelope.tables !== null) {
+          try {
+            sanitizeFixedProbeSuccess(responseEnvelope, fixed)
+          } catch {
+            throw safeError('IFIND_RESPONSE_SHAPE', 'API', 'iFinD response shape was invalid')
+          }
+        }
         const code = errorClass === 'AUTH' ? 'IFIND_AUTH_REJECTED'
           : errorClass === 'PERMISSION' ? 'IFIND_PERMISSION_REJECTED'
             : errorClass === 'QUOTA' ? 'IFIND_QUOTA_REJECTED' : 'IFIND_PROBE_REJECTED'
@@ -1386,7 +1434,7 @@ function createIfindHttpClient({
       try {
         const volume = protocolDataVol(responseEnvelope)
         dataVol = volume.present ? volume.value : null
-        if (probePayload === null) throw new Error('invalid response')
+        const probePayload = sanitizeFixedProbeSuccess(responseEnvelope, fixed)
         return Object.freeze({ stage: fixed.stage, payload: probePayload, requestCount: 1, dataVol })
       } catch {
         throw safeError('IFIND_RESPONSE_SHAPE', 'API', 'iFinD response shape was invalid', dataVol)

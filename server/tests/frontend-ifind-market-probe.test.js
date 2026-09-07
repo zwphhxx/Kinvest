@@ -19,6 +19,7 @@ function readyResult(overrides = {}) {
     caseId: 'HK_ALIBABA_9988',
     displayCode: '9988.HK',
     status: 'ready',
+    availability: 'ready',
     verification: {
       issuerIdentityStatus: 'unverified', vendorCodeStatus: 'unverified',
       entitlementStatus: 'unverified', currencyStatus: 'unverified', unitStatus: 'unverified',
@@ -41,6 +42,7 @@ function readyResult(overrides = {}) {
 function observedResult() {
   return readyResult({
     status: 'observed-unverified',
+    availability: 'cooldown',
     observations: {
       identity: { returnedCode: '9988.HK', fields: { ths_stock_short_name_stock: ['阿里巴巴-W'] } },
       quote: { returnedCode: '9988.HK', fields: {
@@ -58,12 +60,13 @@ function observedResult() {
 }
 
 function failedResult(status) {
-  if (status === 'cooldown' || status === 'daily-limit') return readyResult({ status })
+  if (status === 'cooldown' || status === 'daily-limit') return readyResult({ status, availability: status })
   if (status === 'unavailable') return readyResult({
-    status, errorCode: 'IFIND_MARKET_PROBE_UNAVAILABLE', failureStage: 'provider'
+    status, availability: 'unavailable', errorCode: 'IFIND_MARKET_PROBE_UNAVAILABLE', failureStage: 'provider'
   })
   return readyResult({
     status: 'failed', requestCount: 1, attemptedAt: '2026-09-02T08:08:00.000Z',
+    availability: 'cooldown',
     errorCode: 'IFIND_MARKET_PROBE_FAILED', failureStage: 'auth'
   })
 }
@@ -95,6 +98,7 @@ function documentFixture() {
     'ifind-market-probe-business-request-count', 'ifind-market-probe-data-vol',
     'ifind-market-probe-quota', 'ifind-market-probe-identity', 'ifind-market-probe-quote',
     'ifind-market-probe-financial', 'ifind-market-probe-error', 'ifind-market-probe-run',
+    'ifind-market-probe-refresh',
     ...VERIFICATION_IDS.map((name) => `ifind-market-probe-${name}`)
   ]
   const elements = new Map(ids.map((id) => [id, new Element(id)]))
@@ -531,10 +535,74 @@ async function htmlContractTest() {
   assert.match(html, /<h2[^>]*>T11 港股模板验证<\/h2>/)
   assert.match(html, /1 次认证 \+ 3 次业务请求/)
   assert.match(html, /0 次重试/)
+  assert.match(html, /id="ifind-market-probe-refresh"/)
+  assert.match(html, /仅更新本地状态，不调用 iFinD/)
   assert.match(html, /家庭看板(?:继续|仍为) Mock/)
   assert.match(html, /<script src="\/admin-market-probe-contract\.js" defer><\/script>[\s\S]*<script src="\/admin\.js" defer><\/script>/)
   for (const name of VERIFICATION_IDS) {
     assert.match(html, new RegExp(`id="ifind-market-probe-${name}"[^>]*data-evidence-status="unverified"[^>]*>未验证<`))
+  }
+}
+
+async function terminalResultRecoveryTest() {
+  for (const previous of [failedResult('failed'), observedResult()]) {
+    const ready = { ...previous, availability: 'ready' }
+    const fixture = controllerFixture({ responses: [previous, ready, previous, previous] })
+    await fixture.controller.refresh()
+    const identity = fixture.get('ifind-market-probe-identity').textContent
+    const count = fixture.get('ifind-market-probe-request-count').textContent
+    assert.equal(fixture.get('ifind-market-probe-run').disabled, true)
+    await fixture.get('ifind-market-probe-refresh').click()
+    assert.deepEqual(fixture.calls.map(({ url }) => url), [STATUS_PATH, STATUS_PATH])
+    assert.equal(fixture.get('ifind-market-probe-run').disabled, false)
+    assert.equal(fixture.get('ifind-market-probe-identity').textContent, identity)
+    assert.equal(fixture.get('ifind-market-probe-request-count').textContent, count)
+    assert.match(fixture.get('ifind-market-probe-quota').textContent, /可手工运行/)
+    await fixture.get('ifind-market-probe-run').click()
+    assert.equal(fixture.calls.filter(({ url }) => url === RUN_PATH).length, 1)
+  }
+}
+
+async function blockedPostDoesNotAnnouncePreviousSuccessTest() {
+  for (const status of ['busy', 'cooldown', 'daily-limit']) {
+    const retained = { ...observedResult(), availability: status }
+    const fixture = controllerFixture({ responses: [
+      { ...observedResult(), availability: 'ready' },
+      readyResult({ status, availability: status }), retained
+    ] })
+    await fixture.controller.refresh()
+    await fixture.get('ifind-market-probe-run').click()
+    assert.deepEqual(fixture.calls.map(({ url }) => url), [STATUS_PATH, RUN_PATH, STATUS_PATH])
+    assert.equal(fixture.live.length, 1)
+    assert.equal(fixture.live[0].tone, 'warning')
+    assert.doesNotMatch(fixture.live[0].message, /探针已完成/)
+    assert.equal(fixture.get('ifind-market-probe-status').textContent, '已观察，均未验证')
+    assert.match(fixture.get('ifind-market-probe-identity').textContent, /阿里巴巴-W/)
+    assert.equal(fixture.get('ifind-market-probe-request-count').textContent, '4 次')
+    assert.equal(fixture.get('ifind-market-probe-run').disabled, true)
+    await fixture.get('ifind-market-probe-run').click()
+    assert.equal(fixture.calls.filter(({ url }) => url === RUN_PATH).length, 1)
+  }
+}
+
+async function boundedFailureDetailsTest() {
+  const result = { ...failedResult('failed'), failureStage: 'identity',
+    requestCount: 2, businessRequestCount: 1, errorCode: 'IFIND_RESPONSE_SHAPE' }
+  const fixture = controllerFixture({ responses: [result] })
+  await fixture.controller.refresh()
+  assert.deepEqual(fixture.errors, [])
+  assert.match(fixture.get('ifind-market-probe-error').textContent, /身份/)
+  assert.match(fixture.get('ifind-market-probe-error').textContent, /响应结构/)
+  assert.match(fixture.get('ifind-market-probe-error').textContent, /IFIND_RESPONSE_SHAPE/)
+  for (const bad of [
+    { ...result, availability: 'automatically-retry' },
+    { ...result, errorCode: 'SENSITIVE_VENDOR_MESSAGE' },
+    { ...readyResult(), availability: 'cooldown' }
+  ]) {
+    const rejected = controllerFixture({ responses: [bad] })
+    await rejected.controller.refresh()
+    assert.equal(rejected.errors[0].code, 'IFIND_MARKET_PROBE_RESULT_INVALID')
+    assert.equal(rejected.get('ifind-market-probe-run').disabled, true)
   }
 }
 
@@ -545,7 +613,8 @@ async function run() {
     untrustedResultAndExplicitResetClearTest, cancellationAndStaleSessionTest,
     staleGenerationSettlementsStaySilentTest, latestStatusRequestWinsOutOfOrderTest,
     externalGetCannotCancelRunningPostTest, externalGetCannotHidePostFailureTest,
-    hostileDtoTest, failureMappingTest, htmlContractTest]) {
+    hostileDtoTest, failureMappingTest, terminalResultRecoveryTest,
+    blockedPostDoesNotAnnouncePreviousSuccessTest, boundedFailureDetailsTest, htmlContractTest]) {
     await test()
     console.log(`PASS frontend-market-probe: ${test.name}`)
   }
