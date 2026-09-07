@@ -9,7 +9,7 @@ const DISPLAY_CODE = '9988.HK'
 const OBSERVED = 'IFIND_MARKET_PROBE_OBSERVED_UNVERIFIED'
 const FAILED = 'IFIND_MARKET_PROBE_FAILED'
 const UNAVAILABLE = 'IFIND_MARKET_PROBE_UNAVAILABLE'
-const RESULT_KEYS = Object.freeze(['proposalId', 'caseId', 'displayCode', 'status', 'verification',
+const RESULT_KEYS = Object.freeze(['proposalId', 'caseId', 'displayCode', 'status', 'availability', 'verification',
   'observations', 'requestCount', 'businessRequestCount', 'dataVol', 'attemptedAt',
   'errorCode', 'failureStage'])
 const VERIFICATION_KEYS = Object.freeze(['issuerIdentityStatus', 'vendorCodeStatus',
@@ -17,6 +17,9 @@ const VERIFICATION_KEYS = Object.freeze(['issuerIdentityStatus', 'vendorCodeStat
 const STAGES = Object.freeze(['identity', 'quote', 'financial'])
 const FAILURE_STAGES = new Set(['provider', 'auth', ...STAGES, 'lease'])
 const IDLE_STATUSES = new Set(['ready', 'busy', 'cooldown', 'daily-limit'])
+const AVAILABILITIES = new Set([...IDLE_STATUSES, 'unavailable'])
+const FAILURE_CODES = new Set([FAILED, 'IFIND_AUTH_REJECTED', 'IFIND_PERMISSION_REJECTED',
+  'IFIND_QUOTA_REJECTED', 'IFIND_RESPONSE_SHAPE', 'IFIND_TIMEOUT', 'IFIND_NETWORK_FAILED'])
 const FIELD_KEYS = Object.freeze({
   identity: Object.freeze(['ths_stock_short_name_stock']),
   quote: Object.freeze(['latest', 'preClose', 'open', 'high', 'low', 'amount', 'volume',
@@ -99,6 +102,7 @@ function createInitialIfindMarketProbeResult() {
     caseId: CASE_ID,
     displayCode: DISPLAY_CODE,
     status: 'ready',
+    availability: 'ready',
     verification: Object.fromEntries(VERIFICATION_KEYS.map((key) => [key, 'unverified'])),
     observations: emptyObservations(),
     requestCount: 0,
@@ -114,7 +118,7 @@ function copyIfindMarketProbeResult(value) {
   try {
     const input = record(value, RESULT_KEYS)
     if (input.proposalId !== PROPOSAL_ID || input.caseId !== CASE_ID ||
-        input.displayCode !== DISPLAY_CODE) invalid()
+        input.displayCode !== DISPLAY_CODE || !AVAILABILITIES.has(input.availability)) invalid()
     const verification = record(input.verification, VERIFICATION_KEYS)
     for (const key of VERIFICATION_KEYS) if (verification[key] !== 'unverified') invalid()
     const sourceObservations = record(input.observations, STAGES)
@@ -128,7 +132,8 @@ function copyIfindMarketProbeResult(value) {
         (input.attemptedAt !== null && !canonicalTimestamp(input.attemptedAt))) invalid()
 
     if (IDLE_STATUSES.has(input.status)) {
-      if (STAGES.some((stage) => observations[stage] !== null) || input.requestCount !== 0 ||
+      if (input.availability !== input.status ||
+          STAGES.some((stage) => observations[stage] !== null) || input.requestCount !== 0 ||
           input.dataVol !== null || input.attemptedAt !== null || input.errorCode !== null ||
           input.failureStage !== null) invalid()
     } else if (input.status === 'observed-unverified') {
@@ -136,8 +141,9 @@ function copyIfindMarketProbeResult(value) {
           input.businessRequestCount !== 3 || input.attemptedAt === null ||
           input.errorCode !== OBSERVED || input.failureStage !== null) invalid()
     } else if (input.status === 'failed' || input.status === 'unavailable') {
-      const expectedError = input.status === 'failed' ? FAILED : UNAVAILABLE
-      if (input.errorCode !== expectedError || !FAILURE_STAGES.has(input.failureStage) ||
+      const validError = input.status === 'failed' ? FAILURE_CODES.has(input.errorCode)
+        : input.errorCode === UNAVAILABLE
+      if (!validError || !FAILURE_STAGES.has(input.failureStage) ||
           (input.requestCount > 0 && input.attemptedAt === null)) invalid()
       let missingSeen = false
       for (let index = 0; index < STAGES.length; index += 1) {
@@ -152,6 +158,7 @@ function copyIfindMarketProbeResult(value) {
       caseId: CASE_ID,
       displayCode: DISPLAY_CODE,
       status: input.status,
+      availability: input.availability,
       verification: Object.fromEntries(VERIFICATION_KEYS.map((key) => [key, 'unverified'])),
       observations,
       requestCount: input.requestCount,

@@ -56,6 +56,7 @@ function probeResult(status = 'ready') {
   const observed = status === 'observed-unverified'
   return {
     proposalId: 'HK_ALIBABA_9988_V1', caseId: 'HK_ALIBABA_9988', displayCode: '9988.HK', status,
+    availability: observed ? 'cooldown' : status,
     verification: {
       issuerIdentityStatus: 'unverified', vendorCodeStatus: 'unverified',
       entitlementStatus: 'unverified', currencyStatus: 'unverified', unitStatus: 'unverified',

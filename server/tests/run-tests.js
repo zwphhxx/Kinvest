@@ -39,6 +39,7 @@ const tests = [
   require('./ifind-http-client.test'),
   require('./ifind-market-probe-proposals.test'),
   require('./ifind-market-probe-runtime.test'),
+  require('./ifind-market-probe-envelope.test'),
   require('./ifind-market-template-evidence.test'),
   require('./ifind-market-cases.test'),
   require('./ifind-calibration.test'),

@@ -12,12 +12,18 @@
   const INVALID = 'IFIND_MARKET_PROBE_RESULT_INVALID'
   const RESULT_KEYS = ['proposalId', 'caseId', 'displayCode', 'status', 'verification',
     'observations', 'requestCount', 'businessRequestCount', 'dataVol', 'attemptedAt',
-    'errorCode', 'failureStage']
+    'errorCode', 'failureStage', 'availability']
   const VERIFICATION_KEYS = ['issuerIdentityStatus', 'vendorCodeStatus', 'entitlementStatus',
     'currencyStatus', 'unitStatus', 'reportPeriodStatus', 'scopeStatus']
   const STAGES = ['identity', 'quote', 'financial']
   const FAILURE_STAGES = new Set(['provider', 'auth', 'identity', 'quote', 'financial', 'lease'])
   const IDLE = new Set(['ready', 'busy', 'cooldown', 'daily-limit'])
+  const AVAILABILITY = new Set([...IDLE, 'unavailable'])
+  const FAILURE_CODES = new Set(['IFIND_MARKET_PROBE_FAILED', 'IFIND_AUTH_REJECTED',
+    'IFIND_PERMISSION_REJECTED', 'IFIND_QUOTA_REJECTED', 'IFIND_RESPONSE_SHAPE',
+    'IFIND_TIMEOUT', 'IFIND_NETWORK_FAILED'])
+  const STAGE_LABELS = { provider: '凭据加载', auth: '认证', identity: '身份',
+    quote: '行情', financial: '财务', lease: '执行租约' }
   const FIELD_KEYS = {
     identity: ['ths_stock_short_name_stock'],
     quote: ['latest', 'preClose', 'open', 'high', 'low', 'amount', 'volume', 'tradeDate', 'tradeTime'],
@@ -35,6 +41,12 @@
     TRUSTED_CLIENT_REQUIRED: '请求来源未通过验证。',
     CLIENT_IDENTITY_INVALID: '请求来源未通过验证。',
     IFIND_MARKET_PROBE_FAILED: '固定港股探针未完成，不会自动重试。',
+    IFIND_AUTH_REJECTED: '供应商认证被拒绝，不会自动重试。',
+    IFIND_PERMISSION_REJECTED: '供应商权限校验未通过，不会自动重试。',
+    IFIND_QUOTA_REJECTED: '供应商额度不足，不会自动重试。',
+    IFIND_RESPONSE_SHAPE: '供应商响应结构未通过校验，不会自动重试。',
+    IFIND_TIMEOUT: '供应商请求超时，不会自动重试。',
+    IFIND_NETWORK_FAILED: '供应商网络请求失败，不会自动重试。',
     IFIND_MARKET_PROBE_UNAVAILABLE: '固定港股探针暂时不可用，不会自动重试。',
     IFIND_MARKET_PROBE_RESULT_INVALID: '固定港股探针结果未通过安全校验，已清除显示。'
   }
@@ -118,6 +130,7 @@
   function copyResult(value) {
     try {
       const input = record(value, RESULT_KEYS)
+      if (!AVAILABILITY.has(input.availability)) invalid()
       if (input.proposalId !== PROPOSAL_ID || input.caseId !== CASE_ID || input.displayCode !== DISPLAY_CODE) invalid()
       const verification = record(input.verification, VERIFICATION_KEYS)
       for (const key of VERIFICATION_KEYS) if (verification[key] !== 'unverified') invalid()
@@ -131,6 +144,7 @@
           (input.businessRequestCount === 0 && input.dataVol !== null) ||
           (input.attemptedAt !== null && !timestamp(input.attemptedAt))) invalid()
       if (IDLE.has(input.status)) {
+        if (input.availability !== input.status) invalid()
         if (STAGES.some((stage) => observations[stage] !== null) || input.requestCount !== 0 ||
             input.dataVol !== null || input.attemptedAt !== null || input.errorCode !== null ||
             input.failureStage !== null) invalid()
@@ -139,8 +153,9 @@
             input.businessRequestCount !== 3 || input.attemptedAt === null ||
             input.errorCode !== 'IFIND_MARKET_PROBE_OBSERVED_UNVERIFIED' || input.failureStage !== null) invalid()
       } else if (input.status === 'failed' || input.status === 'unavailable') {
-        const expected = input.status === 'failed' ? 'IFIND_MARKET_PROBE_FAILED' : 'IFIND_MARKET_PROBE_UNAVAILABLE'
-        if (input.errorCode !== expected || !FAILURE_STAGES.has(input.failureStage) ||
+        const validCode = input.status === 'failed' ? FAILURE_CODES.has(input.errorCode)
+          : input.errorCode === 'IFIND_MARKET_PROBE_UNAVAILABLE'
+        if (!validCode || !FAILURE_STAGES.has(input.failureStage) ||
             (input.requestCount > 0 && input.attemptedAt === null)) invalid()
         let missing = false
         for (let index = 0; index < STAGES.length; index += 1) {
@@ -152,6 +167,7 @@
       return {
         proposalId: PROPOSAL_ID, caseId: CASE_ID, displayCode: DISPLAY_CODE,
         status: input.status,
+        availability: input.availability,
         verification: Object.fromEntries(VERIFICATION_KEYS.map((key) => [key, 'unverified'])),
         observations, requestCount: input.requestCount,
         businessRequestCount: input.businessRequestCount, dataVol: input.dataVol,
@@ -203,7 +219,7 @@
     let activeRunToken = null
     let running = false
     let bound = false
-    let currentStatus = null
+    let currentAvailability = null
     let runAllowed = false
 
     function put(id, value) { byId(id).textContent = value }
@@ -223,20 +239,29 @@
       return 'ready/cooldown/limit · 以最新状态为准'
     }
 
+    function resultError(value) {
+      if (value.errorCode === null) return '无'
+      if (value.errorCode === 'IFIND_MARKET_PROBE_OBSERVED_UNVERIFIED') {
+        return '已取得观察值，但七项证据仍未验证。'
+      }
+      return `${STAGE_LABELS[value.failureStage]}阶段：${errorMessage(value.errorCode)} (${value.errorCode})`
+    }
+
     function buttonState() {
       const button = byId('ifind-market-probe-run')
-      const available = currentStatus === 'ready' && runAllowed && !running
+      const available = currentAvailability === 'ready' && runAllowed && !running
       button.disabled = !available
       button.setAttribute('aria-busy', String(running))
       button.textContent = running ? '正在运行固定探针'
         : available ? '运行固定探针'
-          : currentStatus === 'cooldown' ? '探针冷却中'
-            : currentStatus === 'daily-limit' ? '今日额度已达上限'
-              : currentStatus === 'busy' ? '已有探针运行中' : '探针暂不可运行'
+          : currentAvailability === 'cooldown' ? '探针冷却中'
+            : currentAvailability === 'daily-limit' ? '今日额度已达上限'
+              : currentAvailability === 'busy' ? '已有探针运行中' : '探针暂不可运行'
+      byId('ifind-market-probe-refresh').disabled = running
     }
 
     function render(value) {
-      currentStatus = value.status
+      currentAvailability = value.availability
       put('ifind-market-probe-status', STATUS_LABELS[value.status])
       put('ifind-market-probe-proposal', value.proposalId)
       put('ifind-market-probe-code', value.displayCode)
@@ -245,13 +270,11 @@
       put('ifind-market-probe-request-count', `${value.requestCount} 次`)
       put('ifind-market-probe-business-request-count', `${value.businessRequestCount} 次`)
       put('ifind-market-probe-data-vol', value.dataVol === null ? '未提供' : String(value.dataVol))
-      put('ifind-market-probe-quota', quotaText(value.status))
+      put('ifind-market-probe-quota', quotaText(value.availability))
       put('ifind-market-probe-identity', observationText(value.observations.identity))
       put('ifind-market-probe-quote', observationText(value.observations.quote))
       put('ifind-market-probe-financial', observationText(value.observations.financial))
-      put('ifind-market-probe-error', value.errorCode === null ? '无'
-        : value.errorCode === 'IFIND_MARKET_PROBE_OBSERVED_UNVERIFIED'
-          ? '已取得观察值，但七项证据仍未验证。' : errorMessage(value.errorCode))
+      put('ifind-market-probe-error', resultError(value))
       for (const [key, suffix] of [
         ['issuerIdentityStatus', 'issuer-identity'], ['vendorCodeStatus', 'vendor-code'],
         ['entitlementStatus', 'entitlement'], ['currencyStatus', 'currency'],
@@ -270,7 +293,7 @@
       runSequence += 1
       activeRunToken = null
       running = false
-      currentStatus = null
+      currentAvailability = null
       runAllowed = false
       put('ifind-market-probe-status', '尚未读取状态')
       put('ifind-market-probe-proposal', PROPOSAL_ID)
@@ -315,7 +338,7 @@
         const data = copyResult(record(response, ['data']).data)
         return sessionLifecycle.commit(ticket, () => {
           if (staleSettlement()) throw STALE
-          runAllowed = path === STATUS_PATH && data.status === 'ready'
+          runAllowed = path === STATUS_PATH && data.availability === 'ready'
           render(data)
           return data
         })
@@ -343,7 +366,7 @@
     }
 
     async function run() {
-      if (running || currentStatus !== 'ready' || !runAllowed || !confirm(CONFIRMATION)) return undefined
+      if (running || currentAvailability !== 'ready' || !runAllowed || !confirm(CONFIRMATION)) return undefined
       const runGeneration = generation
       const runToken = Object.freeze({ sequence: ++runSequence })
       activeRunToken = runToken
@@ -355,7 +378,7 @@
         if (result) {
           const notices = {
             'observed-unverified': ['固定港股探针已完成；所有观察仍为未验证。', 'success'],
-            failed: ['固定港股探针未完成，不会自动重试。', 'error'],
+            failed: [resultError(result), 'error'],
             unavailable: ['固定港股探针暂时不可用，不会自动重试。', 'error'],
             cooldown: ['固定港股探针正在冷却，本次不会运行或重试。', 'warning'],
             'daily-limit': ['固定港股探针已达到今日额度上限，本次不会运行或重试。', 'warning'],
@@ -380,6 +403,10 @@
       if (bound) return
       bound = true
       byId('ifind-market-probe-run').addEventListener('click', run)
+      byId('ifind-market-probe-refresh').addEventListener('click', () => {
+        if (!running) return refresh()
+        return undefined
+      })
       reset()
     }
 

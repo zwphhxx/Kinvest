@@ -17,6 +17,8 @@ const PROPOSAL_ID = 'HK_ALIBABA_9988_V1'
 const FAILED = 'IFIND_MARKET_PROBE_FAILED'
 const UNAVAILABLE = 'IFIND_MARKET_PROBE_UNAVAILABLE'
 const OBSERVED = 'IFIND_MARKET_PROBE_OBSERVED_UNVERIFIED'
+const FAILURE_CODES = new Set(['IFIND_AUTH_REJECTED', 'IFIND_PERMISSION_REJECTED',
+  'IFIND_QUOTA_REJECTED', 'IFIND_RESPONSE_SHAPE', 'IFIND_TIMEOUT', 'IFIND_NETWORK_FAILED'])
 const MIN_TIME = Date.parse('2000-01-01T00:00:00.000Z')
 /** @typedef {'identity' | 'quote' | 'financial'} ProbeStage */
 /** @typedef {{returnedCode: string, fields: Record<string, Array<null | string | number | boolean>>}} ProbeObservation */
@@ -125,12 +127,24 @@ function wipe(value) {
 function idleResult(status) {
   const result = createInitialIfindMarketProbeResult()
   result.status = status
+  result.availability = status
   return result
 }
 
 function unavailableResult(attemptedAt = null, failureStage = 'lease') {
   return copyIfindMarketProbeResult({ ...createInitialIfindMarketProbeResult(),
-    status: 'unavailable', attemptedAt, errorCode: UNAVAILABLE, failureStage })
+    status: 'unavailable', availability: 'unavailable', attemptedAt, errorCode: UNAVAILABLE, failureStage })
+}
+
+function withAvailability(result, availability) {
+  if (result.status === 'observed-unverified' || result.status === 'failed' ||
+      result.status === 'unavailable') return copyIfindMarketProbeResult({ ...result, availability })
+  return availability === 'unavailable' ? unavailableResult() : idleResult(availability)
+}
+
+function failureCode(error) {
+  const code = ownValue(error, 'code')
+  return FAILURE_CODES.has(code) ? code : FAILED
 }
 
 function copyProbeEnvelope(value, expectedStage) {
@@ -186,9 +200,7 @@ function createIfindMarketProbeService(options) {
     return now
   }
 
-  function describe() {
-    if (active || CLIENT_OWNERS.has(config.client)) return idleResult('busy')
-    if (current.status !== 'ready') return copyIfindMarketProbeResult(current)
+  function availability() {
     try {
       const now = timestamp()
       if (lastStartedAt !== null && now < lastStartedAt) fail()
@@ -200,11 +212,15 @@ function createIfindMarketProbeService(options) {
       if (typeof inFlight !== 'boolean' || !Number.isSafeInteger(caseRemaining) || caseRemaining < 0 ||
           !Number.isSafeInteger(globalRemaining) || globalRemaining < 0 ||
           (cooldownUntil !== null && !Number.isSafeInteger(cooldownUntil))) fail()
-      if (inFlight) return idleResult('busy')
-      if (cooldownUntil !== null && now < cooldownUntil) return idleResult('cooldown')
-      if (caseRemaining === 0 || globalRemaining === 0) return idleResult('daily-limit')
-      return copyIfindMarketProbeResult(current)
-    } catch { return unavailableResult() }
+      if (active || CLIENT_OWNERS.has(config.client) || inFlight) return 'busy'
+      if (cooldownUntil !== null && now < cooldownUntil) return 'cooldown'
+      if (caseRemaining === 0 || globalRemaining === 0) return 'daily-limit'
+      return 'ready'
+    } catch { return 'unavailable' }
+  }
+
+  function describe() {
+    return withAvailability(current, availability())
   }
 
   async function run(...args) {
@@ -306,11 +322,12 @@ function createIfindMarketProbeService(options) {
         checkLease()
         status = 'observed-unverified'; errorCode = OBSERVED; failureStage = null
       } catch (error) {
-        if (error instanceof LeaseFailure) failureStage = 'lease'
+        if (!types.isProxy(error) && error !== null && typeof error === 'object' &&
+            Reflect.getPrototypeOf(error) === LeaseFailure.prototype) failureStage = 'lease'
         if (failureStage === 'provider') {
           status = 'unavailable'; errorCode = UNAVAILABLE
         } else {
-          status = 'failed'; errorCode = FAILED
+          status = 'failed'; errorCode = failureStage === 'lease' ? FAILED : failureCode(error)
         }
         try {
           const now = timestamp()
@@ -321,7 +338,7 @@ function createIfindMarketProbeService(options) {
       }
 
       result = copyIfindMarketProbeResult({ ...createInitialIfindMarketProbeResult(), status,
-        observations, requestCount, businessRequestCount, dataVol,
+        availability: 'cooldown', observations, requestCount, businessRequestCount, dataVol,
         attemptedAt: new Date(reservation.createdAt).toISOString(), errorCode, failureStage })
       if (generation !== owner.generation) {
         status = 'failed'; errorCode = FAILED; failureStage = 'lease'
@@ -343,7 +360,7 @@ function createIfindMarketProbeService(options) {
         if (settled.status !== 'completed' ||
             settled.cooldownUntil !== completedAt + IFIND_MARKET_CASE_COOLDOWN_MS) fail()
       } catch {
-        result = copyIfindMarketProbeResult({ ...result, status: 'unavailable',
+        result = copyIfindMarketProbeResult({ ...result, status: 'unavailable', availability: 'unavailable',
           observations: { identity: null, quote: null, financial: null },
           errorCode: UNAVAILABLE, failureStage: 'lease' })
       }

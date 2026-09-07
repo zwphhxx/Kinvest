@@ -14,12 +14,15 @@ const NOW = Date.parse('2026-09-01T04:00:00.000Z')
 const CASE_ID = 'HK_ALIBABA_9988'
 const PROPOSAL_ID = 'HK_ALIBABA_9988_V1'
 const VERSION = 'v20260901-001'
-const RESULT_KEYS = ['proposalId', 'caseId', 'displayCode', 'status', 'verification',
+const RESULT_KEYS = ['proposalId', 'caseId', 'displayCode', 'status', 'availability', 'verification',
   'observations', 'requestCount', 'businessRequestCount', 'dataVol', 'attemptedAt',
   'errorCode', 'failureStage']
 const VERIFICATION_KEYS = ['issuerIdentityStatus', 'vendorCodeStatus', 'entitlementStatus',
   'currencyStatus', 'unitStatus', 'reportPeriodStatus', 'scopeStatus']
 const STAGES = ['identity', 'quote', 'financial']
+const AVAILABILITIES = ['ready', 'busy', 'cooldown', 'daily-limit', 'unavailable']
+const FAILURE_CODES = ['IFIND_AUTH_REJECTED', 'IFIND_PERMISSION_REJECTED',
+  'IFIND_QUOTA_REJECTED', 'IFIND_RESPONSE_SHAPE', 'IFIND_TIMEOUT', 'IFIND_NETWORK_FAILED']
 const FIELDS = Object.freeze({
   identity: Object.freeze(['ths_stock_short_name_stock']),
   quote: Object.freeze(['latest', 'preClose', 'open', 'high', 'low', 'amount', 'volume',
@@ -239,13 +242,14 @@ const tests = [
     assert.equal(domain.IFIND_MARKET_PROBE_RESULT_INVALID, 'IFIND_MARKET_PROBE_RESULT_INVALID')
     const initial = domain.createInitialIfindMarketProbeResult()
     assert.deepEqual(initial, { proposalId: PROPOSAL_ID, caseId: CASE_ID, displayCode: '9988.HK',
-      status: 'ready', verification: Object.fromEntries(VERIFICATION_KEYS.map((key) => [key, 'unverified'])),
+      status: 'ready', availability: 'ready',
+      verification: Object.fromEntries(VERIFICATION_KEYS.map((key) => [key, 'unverified'])),
       observations: { identity: null, quote: null, financial: null }, requestCount: 0,
       businessRequestCount: 0, dataVol: null, attemptedAt: null, errorCode: null,
       failureStage: null })
     assertSafeResult(initial)
     for (const status of ['ready', 'busy', 'cooldown', 'daily-limit']) {
-      assertSafeResult({ ...initial, status })
+      assertSafeResult({ ...initial, status, availability: status })
     }
     const observed = { ...initial, status: 'observed-unverified',
       observations: Object.fromEntries(STAGES.map((stage) => [stage, summary(stage)])),
@@ -257,6 +261,13 @@ const tests = [
       identity: summary('identity'), quote: null, financial: null }, requestCount: 3,
       businessRequestCount: 2, errorCode: 'IFIND_MARKET_PROBE_FAILED', failureStage: 'quote' }
     assertSafeResult(failed)
+    for (const availability of AVAILABILITIES) {
+      assertSafeResult({ ...observed, availability })
+      assertSafeResult({ ...failed, availability })
+      assertSafeResult({ ...failed, status: 'unavailable', availability,
+        errorCode: 'IFIND_MARKET_PROBE_UNAVAILABLE' })
+      for (const errorCode of FAILURE_CODES) assertSafeResult({ ...failed, availability, errorCode })
+    }
 
     let traps = 0
     const hostile = (value) => new Proxy(value, {
@@ -311,7 +322,19 @@ const tests = [
       get() { traps += 1; throw new Error('UNTRUSTED') } })
     const proxyArray = structuredClone(observed)
     proxyArray.observations.quote.fields.latest = hostile([1])
-    invalid.push(accessorArray, proxyArray)
+    const missingAvailability = { ...initial }; delete missingAvailability.availability
+    invalid.push(accessorArray, proxyArray, missingAvailability,
+      ...[undefined, null, 'unknown', {}, hostile({})].map((availability) => ({ ...initial, availability })),
+      { ...initial, availability: 'cooldown' }, { ...initial, status: 'busy' },
+      { ...failed, errorCode: 'IFIND_AUTH_FAILED' },
+      { ...failed, errorCode: 'IFIND_PERMISSION_DENIED' },
+      { ...failed, errorCode: 'IFIND_QUOTA_EXCEEDED' },
+      { ...failed, errorCode: 'IFIND_NETWORK_ERROR' },
+      { ...failed, errorCode: 'IFIND_UNTRUSTED' },
+      { ...observed, errorCode: 'IFIND_TIMEOUT' },
+      { ...failed, status: 'unavailable', errorCode: 'IFIND_TIMEOUT' },
+      Object.defineProperty({ ...initial }, 'availability', { enumerable: true,
+        get() { traps += 1; throw new Error('UNTRUSTED') } }))
     const revoked = Proxy.revocable({}, {}); revoked.revoke(); invalid.push(revoked.proxy)
     for (const value of invalid) assert.throws(() => domain.copyIfindMarketProbeResult(value),
       { code: 'IFIND_MARKET_PROBE_RESULT_INVALID' })
@@ -409,6 +432,7 @@ const tests = [
       const result = await service.run()
       assertSafeResult(result)
       assert.equal(result.status, 'observed-unverified')
+      assert.equal(result.availability, 'cooldown')
       assert.deepEqual(result.observations, Object.fromEntries(STAGES.map((stage) => [stage, summary(stage)])))
       assert.deepEqual([result.requestCount, result.businessRequestCount, result.dataVol], [4, 3, 3])
       assert.deepEqual([value.state.reads, value.state.auth, value.state.probes.join(','), value.state.clears],
@@ -423,6 +447,238 @@ const tests = [
         'SYNTHETIC_ALIBABA')
       assertClean(value)
     })],
+  ['terminal outcome survives cooldown, shared busy and daily limits until the next run', async () =>
+    using(async (value) => {
+      let quotaReads = 0
+      const repository = { reserve: value.repository.reserve.bind(value.repository),
+        fail: value.repository.fail.bind(value.repository),
+        quotaStatus(input) { quotaReads += 1; return value.repository.quotaStatus(input) } }
+      const service = value.service({ repository })
+      assert.equal(service.describe().availability, 'ready')
+      const terminal = await service.run()
+      const expected = (availability) => ({ ...terminal, availability })
+      const blocked = (status) => ({ ...domain.createInitialIfindMarketProbeResult(),
+        status, availability: status })
+      assert.deepEqual(service.describe(), expected('cooldown'))
+      assert.deepEqual(await service.run(), blocked('cooldown'))
+      value.state.now = NOW + COOLDOWN - 1
+      assert.deepEqual(service.describe(), expected('cooldown'))
+      value.state.now += 1
+      assert.deepEqual(service.describe(), expected('ready'))
+      const pending = value.repository.reserve({ runId: runId(), caseId: 'US_APPLE_AAPL',
+        createdAt: value.state.now, tokenVersionId: VERSION })
+      assert.equal(pending.status, 'reserved')
+      assert.deepEqual(service.describe(), expected('busy'))
+      assert.deepEqual(await service.run(), blocked('busy'))
+      assert.equal(value.state.reads, 1)
+      value.state.now += LEASE
+      assert.deepEqual(service.describe(), expected('ready'))
+      for (let index = 1; index <= 4; index += 1) seed(value, CASE_ID, NOW + (index + 1) * COOLDOWN)
+      value.state.now = NOW + 6 * COOLDOWN
+      assert.deepEqual(service.describe(), expected('daily-limit'))
+      assert.deepEqual(await service.run(), blocked('daily-limit'))
+      value.state.now = Date.parse('2026-09-01T16:00:00.000Z')
+      assert.deepEqual(service.describe(), expected('ready'))
+      assert.ok(quotaReads >= 8)
+      assert.equal(value.state.reads, 1)
+      assertClean(value)
+    })],
+  ['blocked POSTs return idle outcomes without calls or erasing the previous terminal result', async () => {
+    for (const status of ['busy', 'cooldown', 'daily-limit']) await using(async (value) => {
+      const service = value.service()
+      const terminal = await service.run()
+      assert.equal(terminal.status, 'observed-unverified')
+      if (status === 'busy') {
+        value.state.now = NOW + COOLDOWN
+        assert.equal(value.repository.reserve({ runId: runId(), caseId: 'US_APPLE_AAPL',
+          createdAt: value.state.now, tokenVersionId: VERSION }).status, 'reserved')
+      }
+      if (status === 'daily-limit') {
+        for (let index = 1; index <= 4; index += 1) seed(value, CASE_ID, NOW + index * COOLDOWN)
+        value.state.now = NOW + 5 * COOLDOWN
+      }
+      const callCounts = () => ({ reads: value.state.reads, auth: value.state.auth,
+        probes: [...value.state.probes], clears: value.state.clears, rows: value.rows().length })
+      const before = callCounts()
+      const result = await service.run()
+      assertSafeResult(result)
+      assert.deepEqual(result, { ...domain.createInitialIfindMarketProbeResult(),
+        status, availability: status })
+      assert.deepEqual(callCounts(), before)
+      assert.deepEqual(service.describe(), { ...terminal, availability: status })
+      assertClean(value)
+    })
+  }],
+  ['failed outcomes recover eligibility at cooldown boundary and retain classified failures', async () => {
+    for (const stage of ['provider', 'auth', ...STAGES]) await using(async (value) => {
+      if (stage === 'provider') value.secretProvider.readRefreshToken = () => {
+        throw new Error('UNTRUSTED provider text')
+      }
+      if (stage === 'auth') value.client.authenticate = async () => {
+        throw Object.assign(new Error('UNTRUSTED auth text'), { code: 'IFIND_AUTH_REJECTED' })
+      }
+      if (STAGES.includes(stage)) {
+        const original = value.client.probeFixed
+        value.client.probeFixed = async function (...args) {
+          if (STAGES[args[2] - 1] === stage) {
+            value.state.probes.push(args[2])
+            throw Object.assign(new Error('UNTRUSTED provider text'), { code: 'IFIND_TIMEOUT' })
+          }
+          return original.apply(this, args)
+        }
+      }
+      const service = value.service()
+      const terminal = await service.run()
+      assertSafeResult(terminal)
+      assert.equal(terminal.availability, 'cooldown')
+      assert.equal(terminal.failureStage, stage)
+      assert.equal(terminal.errorCode, stage === 'provider' ? 'IFIND_MARKET_PROBE_UNAVAILABLE'
+        : stage === 'auth' ? 'IFIND_AUTH_REJECTED' : 'IFIND_TIMEOUT')
+      assert.doesNotMatch(JSON.stringify(terminal), /UNTRUSTED/)
+      value.state.now = NOW + COOLDOWN - 1
+      assert.deepEqual(service.describe(), terminal)
+      value.state.now += 1
+      assert.deepEqual(service.describe(), { ...terminal, availability: 'ready' })
+      assertClean(value)
+    })
+  }],
+  ['describe preserves terminal data on quota failure and never invokes quota accessors or proxies', async () => {
+    for (const terminalFirst of [false, true]) await using(async (value) => {
+      let quotaFailure = null
+      let traps = 0
+      const repository = { reserve: value.repository.reserve.bind(value.repository),
+        fail: value.repository.fail.bind(value.repository),
+        quotaStatus(input) {
+          if (quotaFailure === 'throw') throw new Error('UNTRUSTED quota')
+          return quotaFailure || value.repository.quotaStatus(input)
+        } }
+      const service = value.service({ repository })
+      const terminal = terminalFirst ? await service.run() : null
+      const quota = value.repository.quotaStatus({ caseId: CASE_ID, now: NOW })
+      const revoked = Proxy.revocable({}, {}); revoked.revoke()
+      const failures = ['throw', {}, new Proxy(quota, {
+        get() { traps += 1; throw new Error('UNTRUSTED') },
+        getOwnPropertyDescriptor() { traps += 1; throw new Error('UNTRUSTED') }
+      }), revoked.proxy, Object.defineProperty({ ...quota }, 'inFlight', { enumerable: true,
+        get() { traps += 1; throw new Error('UNTRUSTED') } })]
+      for (const failure of failures) {
+        quotaFailure = failure
+        const result = service.describe()
+        assertSafeResult(result)
+        assert.equal(result.availability, 'unavailable')
+        if (terminal) assert.deepEqual(result, { ...terminal, availability: 'unavailable' })
+        else assert.equal(result.status, 'unavailable')
+      }
+      quotaFailure = null
+      value.state.now = NOW + COOLDOWN
+      assert.equal(service.describe().availability, 'ready')
+      if (terminal) assert.deepEqual(service.describe(), { ...terminal, availability: 'ready' })
+      else assert.equal(service.describe().status, 'ready')
+      assert.equal(traps, 0)
+      assertClean(value)
+    })
+  }],
+  ['allowlisted own failure codes survive without reading arbitrary messages, accessors or proxies', async () => {
+    let traps = 0
+    const trapped = () => { traps += 1; throw new Error('UNTRUSTED') }
+    const cases = FAILURE_CODES.map((code) => [
+      Object.defineProperty(Object.assign(new Error('UNTRUSTED'), { code }), 'message', { get: trapped }), code
+    ])
+    const revoked = Proxy.revocable({}, {}); revoked.revoke()
+    for (const error of [null, 'UNTRUSTED', { code: 'IFIND_UNTRUSTED', message: 'UNTRUSTED' },
+      { code: 'IFIND_AUTH_FAILED' }, Object.create({ code: 'IFIND_TIMEOUT' }),
+      Object.defineProperty({}, 'code', { get: trapped }),
+      { code: new Proxy({}, { get: trapped, getPrototypeOf: trapped }) },
+      new Proxy({}, { get: trapped, getPrototypeOf: trapped, getOwnPropertyDescriptor: trapped }),
+      revoked.proxy]) cases.push([error, 'IFIND_MARKET_PROBE_FAILED'])
+    for (const [error, expectedCode] of cases) await using(async (value) => {
+      const original = value.client.probeFixed
+      value.client.probeFixed = async function (...args) {
+        if (args[2] === 2) { value.state.probes.push(2); throw error }
+        return original.apply(this, args)
+      }
+      const result = await value.service().run()
+      assertSafeResult(result)
+      assert.equal(result.errorCode, expectedCode)
+      assert.equal(result.failureStage, 'quote')
+      assert.equal(result.availability, 'cooldown')
+      assert.deepEqual([result.requestCount, result.businessRequestCount, result.dataVol], [3, 2, 1])
+      assert.deepEqual(result.observations, { identity: summary('identity'), quote: null, financial: null })
+      assert.equal(value.rows()[0].failure_code, expectedCode)
+      assert.doesNotMatch(JSON.stringify(result), /UNTRUSTED/)
+      assertClean(value)
+    })
+    assert.equal(traps, 0)
+  }],
+  ['actual adapter classifications settle safely through the service and repository', async () => {
+    const scenarios = [
+      { response: { errorcode: -401 }, code: 'IFIND_AUTH_REJECTED' },
+      { response: { errorcode: -403 }, code: 'IFIND_PERMISSION_REJECTED' },
+      { response: { errorcode: -429 }, code: 'IFIND_QUOTA_REJECTED' },
+      { response: { errorcode: 0, tables: [] }, code: 'IFIND_RESPONSE_SHAPE' },
+      { response: { errorcode: -777 }, code: 'IFIND_MARKET_PROBE_FAILED' },
+      { transport: 'network', code: 'IFIND_NETWORK_FAILED' },
+      { transport: 'timeout', code: 'IFIND_TIMEOUT' }
+    ]
+    for (const scenario of scenarios) await using(async (value) => {
+      const stub = createRequestStub([scenario.response])
+      let transportCalls = 0
+      const request = scenario.transport ? () => {
+        transportCalls += 1
+        if (scenario.transport === 'network') throw new Error('UNTRUSTED transport')
+        /** @type {any} */
+        const outgoing = new EventEmitter()
+        outgoing.write = () => {}
+        outgoing.setTimeout = () => {}
+        outgoing.destroy = () => {}
+        outgoing.end = () => queueMicrotask(() => outgoing.emit('timeout'))
+        return outgoing
+      } : stub.request
+      const adapter = createIfindHttpClient({ request })
+      value.client.probeFixed = adapter.probeFixed.bind(adapter)
+      const service = value.service()
+      const result = await service.run()
+      assertSafeResult(result)
+      assert.deepEqual([result.status, result.errorCode, result.failureStage, result.availability],
+        ['failed', scenario.code, 'identity', 'cooldown'])
+      assert.deepEqual([result.requestCount, result.businessRequestCount], [2, 1])
+      assert.equal(scenario.transport ? transportCalls : stub.calls.length, 1)
+      const row = value.rows()[0]
+      assert.deepEqual([row.status, row.failure_code, row.vendor_error_code], ['failed', scenario.code, null])
+      assert.deepEqual(service.describe(), result)
+      assertClean(value)
+    })
+  }],
+  ['active rerun preserves the preceding terminal observation while reporting busy', async () => using(async (value) => {
+    const gate = deferred(); const entered = deferred()
+    let hold = false
+    const original = value.client.probeFixed
+    value.client.probeFixed = async function (...args) {
+      const result = await original.apply(this, args)
+      if (hold && args[2] === 1) { entered.resolve(); await gate.promise }
+      return result
+    }
+    const service = value.service()
+    const terminal = await service.run()
+    value.state.now = NOW + COOLDOWN
+    hold = true
+    const running = service.run()
+    await entered.promise
+    try {
+      assert.deepEqual(service.describe(), { ...terminal, availability: 'busy' })
+      const before = { reads: value.state.reads, auth: value.state.auth,
+        probes: [...value.state.probes], clears: value.state.clears }
+      assert.deepEqual(await service.run(), { ...domain.createInitialIfindMarketProbeResult(),
+        status: 'busy', availability: 'busy' })
+      assert.deepEqual({ reads: value.state.reads, auth: value.state.auth,
+        probes: [...value.state.probes], clears: value.state.clears }, before)
+      assert.deepEqual(service.describe(), { ...terminal, availability: 'busy' })
+      assert.equal(value.state.clears, 1)
+    } finally { gate.resolve() }
+    assert.equal((await running).availability, 'cooldown')
+    assert.equal(value.state.clears, 2)
+    assertClean(value)
+  })],
   ['malformed reserved receipt grants no ownership and leaves stale-lease recovery authoritative', async () => {
     const corruptions = [
       (reserved) => ({ ...reserved, reservation: { ...reserved.reservation,
