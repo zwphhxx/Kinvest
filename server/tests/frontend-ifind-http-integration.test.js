@@ -73,7 +73,8 @@ function probeResult(status = 'ready') {
     requestCount: observed ? 4 : 0, businessRequestCount: observed ? 3 : 0,
     dataVol: observed ? 3 : null, attemptedAt: observed ? '2026-09-02T08:08:00.000Z' : null,
     errorCode: observed ? 'IFIND_MARKET_PROBE_OBSERVED_UNVERIFIED' : null,
-    failureStage: null
+    failureStage: null,
+    rejectionStage: null
   }
 }
 

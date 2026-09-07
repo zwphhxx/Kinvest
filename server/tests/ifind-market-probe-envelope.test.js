@@ -78,8 +78,9 @@ function safeFailure(code, errorClass = 'API', vendorErrorCode = null, dataVol =
     assert.equal(error.requestCount, 1)
     assert.equal(error.dataVol, dataVol)
     const allowed = ['stack', 'message', 'code', 'class', 'failureCode',
-      'vendorErrorCode', 'stage', 'requestCount', 'dataVol']
+      'vendorErrorCode', 'stage', 'requestCount', 'dataVol', 'rejectionStage']
     assert.ok(Object.getOwnPropertyNames(error).every((key) => allowed.includes(key)))
+    if (code !== 'IFIND_RESPONSE_SHAPE') assert.equal(Object.hasOwn(error, 'rejectionStage'), false)
     assert.doesNotMatch(JSON.stringify(Object.getOwnPropertyDescriptors(error)),
       /SYNTHETIC_PRIVATE_VENDOR_TEXT|synthetic-access|RequestId|rawResponse|cause/)
     return true
@@ -223,6 +224,188 @@ const tests = [
     } finally { client.clear() }
   }]
 ]
+
+
+function rejectionFailure(rejectionStage, dataVol = undefined) {
+  return (error) => {
+    safeFailure('IFIND_RESPONSE_SHAPE', 'API', null, dataVol)(error)
+    assert.deepEqual(Object.getOwnPropertyDescriptor(error, 'rejectionStage'), {
+      value: rejectionStage, enumerable: true, configurable: false, writable: false
+    })
+    assert.equal(error.message, 'iFinD response shape was invalid')
+    assert.equal(Object.getOwnPropertySymbols(error).length, 0)
+    return true
+  }
+}
+
+// Isolated test-only seam: HTTP JSON cannot contain proxies/accessors. Inject after
+// the JSON boundary to exercise the real fixed-probe validators without changing
+// production exports or invoking hostile serialization hooks.
+let injectedClientFactory
+function injectedClient(response, failure = undefined) {
+  if (!injectedClientFactory) {
+    const Module = require('node:module')
+    const filename = require.resolve('../adapters/ifind-http-client')
+    const source = require('node:fs').readFileSync(filename, 'utf8')
+    // Node's public typings omit these loader internals used only by this seam.
+    const isolated = /** @type {InstanceType<typeof Module> & {
+      paths: string[], _compile: (source: string, filename: string) => void
+    }} */ (new Module(filename))
+    isolated.filename = filename
+    isolated.paths = (/** @type {{ paths: string[] }} */ (/** @type {unknown} */ (module))).paths
+    isolated._compile(source + '\nmodule.exports = (response, failure) => {\n' +
+      '  requestJson = async () => { if (failure !== undefined) throw failure; return response }\n' +
+      '  return createIfindHttpClient({ request() { throw new Error("Offline only") } })\n' +
+      '}\n', filename)
+    injectedClientFactory = isolated.exports
+  }
+  return injectedClientFactory(response, failure)
+}
+
+async function injectedProbe(response, failure = undefined) {
+  const client = injectedClient(response, failure)
+  try {
+    return await client.probeFixed(Buffer.from('synthetic-access'), PROPOSAL_ID, 1)
+  } finally { client.clear() }
+}
+
+tests.push(
+  ['reports envelope validator rejection without raw names or values', async () => {
+    for (const body of [
+      null, [], { ...payload(), [MARKER]: MARKER },
+      { ...payload(), errmsg: MARKER.repeat(1000) },
+      { ...payload(), errorcode: MARKER },
+      { ...payload(), dataVol: MARKER },
+      { ...payload(), errorcode: -403, tables: null, dataVol: -1 },
+      { tables: [] }, { errorcode: 0 }
+    ]) {
+      await assert.rejects(probe(body), rejectionFailure('envelope'))
+    }
+  }],
+  ['reports tables validator rejection for array and row structure', async () => {
+    for (const tables of [null, [], {}, [null], [payload().tables[0], payload().tables[0]],
+      [{ ...payload().tables[0], [MARKER]: MARKER }], [{ table: {} }],
+      [{ thscode: '9988.HK' }]]) {
+      await assert.rejects(probe({ errorcode: 0, tables }), rejectionFailure('tables'))
+    }
+  }],
+  ['reports returned-code validator rejection without normalizing HK identity', async () => {
+    for (const thscode of ['09988.HK', '9988.hk', '9988.HK ', MARKER, null, 9988, {}]) {
+      await assert.rejects(probe({ errorcode: 0,
+        tables: [{ ...payload().tables[0], thscode }] }), rejectionFailure('returned-code'))
+    }
+  }],
+  ['reports exact indicator-field record rejection', async () => {
+    for (const table of [null, [], {}, { [MARKER]: [MARKER] },
+      { ...payload().tables[0].table, [MARKER]: [MARKER] }]) {
+      await assert.rejects(probe({ errorcode: 0, tables: [{ thscode: '9988.HK', table }] }),
+        rejectionFailure('indicator-fields'))
+    }
+  }],
+  ['reports bounded field-value rejection', async () => {
+    for (const values of [null, 1, {}, MARKER, [MARKER.repeat(100)], [{}],
+      [[1]], Array(65).fill(1), ['bad\u0000value'], ['bad\u202evalue']]) {
+      await assert.rejects(probe({ errorcode: 0, tables: [{ thscode: '9988.HK',
+        table: { ths_stock_short_name_stock: values } }] }), rejectionFailure('field-values'))
+    }
+  }],
+  ['keeps validation order and usage metadata on success and vendor-error paths', async () => {
+    for (const errorcode of [0, -403]) {
+      const malformed = payload()
+      malformed.errorcode = errorcode
+      malformed.tables[0].table.extra = [MARKER]
+      await assert.rejects(probe(malformed),
+        rejectionFailure('indicator-fields', errorcode === 0 ? 1 : undefined))
+      await assert.rejects(probe({ ...malformed, dataVol: -1 }), rejectionFailure('envelope'))
+    }
+    const malformed = payload()
+    malformed.tables[0].thscode = MARKER
+    malformed.tables[0].table = {}
+    await assert.rejects(probe(malformed), rejectionFailure('returned-code', 1))
+  }],
+  ['rejects proxies, accessors and sparse arrays at their actual boundary without traps', async () => {
+    let traps = 0
+    const trap = () => { traps += 1; throw new Error(MARKER) }
+    const hostile = (value) => new Proxy(value, {
+      // Promise assimilation precedes validation; let this fixture reach it.
+      get(_target, key) { return key === 'then' ? undefined : trap() },
+      ownKeys: trap, getPrototypeOf: trap, getOwnPropertyDescriptor: trap
+    })
+    const accessor = (value, key) => Object.defineProperty(value, key, {
+      enumerable: true, configurable: true, get: trap
+    })
+    /** @type {Array<[string, unknown]>} */
+    const cases = [
+      ['envelope', hostile(payload())],
+      ['envelope', accessor(payload(), 'dataVol')],
+      ['envelope', { ...payload(), inputParams: hostile({}) }],
+      ['envelope', { ...payload(), inputParams: accessor({}, 'secret') }],
+      ['tables', { errorcode: 0, tables: hostile([]) }],
+      ['tables', { errorcode: 0, tables: [hostile({})] }],
+      ['tables', { errorcode: 0, tables: [accessor(payload().tables[0], 'thscode')] }],
+      ['tables', { errorcode: 0, tables: Array(1) }],
+      ['returned-code', { errorcode: 0,
+        tables: [{ ...payload().tables[0], thscode: hostile({}) }] }],
+      ['indicator-fields', { errorcode: 0,
+        tables: [{ thscode: '9988.HK', table: hostile({}) }] }],
+      ['indicator-fields', { errorcode: 0, tables: [{ thscode: '9988.HK',
+        table: accessor({}, 'ths_stock_short_name_stock') }] }]
+    ]
+    for (const values of [hostile([]), accessor([1], '0'), Array(1), [NaN], [Infinity]]) {
+      cases.push(['field-values', { errorcode: 0, tables: [{ thscode: '9988.HK',
+        table: { ths_stock_short_name_stock: values } }] }])
+    }
+    for (const [stage, body] of cases) {
+      await assert.rejects(injectedProbe(body), rejectionFailure(stage))
+    }
+    assert.equal(traps, 0)
+  }],
+  ['unknown origins cannot forge rejectionStage or leak hostile error properties', async () => {
+    let traps = 0
+    const failure = Object.defineProperties(new Error(MARKER), {
+      rejectionStage: { get() { traps += 1; throw new Error(MARKER) } },
+      code: { get() { traps += 1; throw new Error(MARKER) } }
+    })
+    await assert.rejects(injectedProbe(undefined, failure), (error) => {
+      assert.ok(error instanceof Error)
+      safeFailure('IFIND_RESPONSE_SHAPE')(error)
+      assert.equal(Object.hasOwn(error, 'rejectionStage'), false)
+      return true
+    })
+    // A revoked root proxy cannot pass Promise assimilation. Its origin is
+    // unknown to the fixed validators, so it must not claim an envelope stage.
+    const revoked = Proxy.revocable({}, {}); revoked.revoke()
+    await assert.rejects(injectedProbe(revoked.proxy), (error) => {
+      assert.ok(error instanceof Error)
+      safeFailure('IFIND_RESPONSE_SHAPE')(error)
+      assert.equal(Object.hasOwn(error, 'rejectionStage'), false)
+      return true
+    })
+    assert.equal(traps, 0)
+  }],
+  ['does not add rejectionStage to other adapter shape failures', async () => {
+    const client = injectedClient({ errorcode: MARKER })
+    try {
+      await assert.rejects(client.authenticate(Buffer.from('synthetic-refresh')), (error) => {
+        assert.ok(error instanceof Error && 'code' in error && 'stage' in error)
+        assert.equal(error.code, 'IFIND_RESPONSE_SHAPE')
+        assert.equal(error.stage, 'auth')
+        assert.equal(Object.hasOwn(error, 'rejectionStage'), false)
+        assert.doesNotMatch(JSON.stringify(Object.getOwnPropertyDescriptors(error)), /SYNTHETIC_PRIVATE/)
+        return true
+      })
+      const quoteRequest = Object.freeze({ vendorCode: '9988.HK',
+        fields: Object.freeze(['latest']) })
+      await assert.rejects(client.quote(Buffer.from('synthetic-access'), quoteRequest), (error) => {
+        assert.ok(error instanceof Error && 'code' in error && 'stage' in error)
+        assert.equal(error.code, 'IFIND_RESPONSE_SHAPE')
+        assert.equal(error.stage, 'quote')
+        assert.equal(Object.hasOwn(error, 'rejectionStage'), false)
+        return true
+      })
+    } finally { client.clear() }
+  }]
+)
 
 module.exports = { run: async function () {
   let failures = 0

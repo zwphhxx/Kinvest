@@ -11,11 +11,12 @@ const FAILED = 'IFIND_MARKET_PROBE_FAILED'
 const UNAVAILABLE = 'IFIND_MARKET_PROBE_UNAVAILABLE'
 const RESULT_KEYS = Object.freeze(['proposalId', 'caseId', 'displayCode', 'status', 'availability', 'verification',
   'observations', 'requestCount', 'businessRequestCount', 'dataVol', 'attemptedAt',
-  'errorCode', 'failureStage'])
+  'errorCode', 'failureStage', 'rejectionStage'])
 const VERIFICATION_KEYS = Object.freeze(['issuerIdentityStatus', 'vendorCodeStatus',
   'entitlementStatus', 'currencyStatus', 'unitStatus', 'reportPeriodStatus', 'scopeStatus'])
 const STAGES = Object.freeze(['identity', 'quote', 'financial'])
 const FAILURE_STAGES = new Set(['provider', 'auth', ...STAGES, 'lease'])
+const REJECTION_STAGES = new Set(['envelope', 'tables', 'returned-code', 'indicator-fields', 'field-values'])
 const IDLE_STATUSES = new Set(['ready', 'busy', 'cooldown', 'daily-limit'])
 const AVAILABILITIES = new Set([...IDLE_STATUSES, 'unavailable'])
 const FAILURE_CODES = new Set([FAILED, 'IFIND_AUTH_REJECTED', 'IFIND_PERMISSION_REJECTED',
@@ -110,13 +111,17 @@ function createInitialIfindMarketProbeResult() {
     dataVol: null,
     attemptedAt: null,
     errorCode: null,
-    failureStage: null
+    failureStage: null,
+    rejectionStage: null
   }
 }
 
 function copyIfindMarketProbeResult(value) {
   try {
     const input = record(value, RESULT_KEYS)
+    if (input.rejectionStage !== null && (input.status !== 'failed' ||
+        input.errorCode !== 'IFIND_RESPONSE_SHAPE' || !STAGES.includes(input.failureStage) ||
+        !REJECTION_STAGES.has(input.rejectionStage))) invalid()
     if (input.proposalId !== PROPOSAL_ID || input.caseId !== CASE_ID ||
         input.displayCode !== DISPLAY_CODE || !AVAILABILITIES.has(input.availability)) invalid()
     const verification = record(input.verification, VERIFICATION_KEYS)
@@ -166,7 +171,8 @@ function copyIfindMarketProbeResult(value) {
       dataVol: input.dataVol,
       attemptedAt: input.attemptedAt,
       errorCode: input.errorCode,
-      failureStage: input.failureStage
+      failureStage: input.failureStage,
+      rejectionStage: input.rejectionStage
     }
   } catch {
     throw new IfindMarketProbeResultContractError()

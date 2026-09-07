@@ -270,7 +270,8 @@ function readyMarketProbeResult() {
     dataVol: null,
     attemptedAt: null,
     errorCode: null,
-    failureStage: null
+    failureStage: null,
+    rejectionStage: null
   }
 }
 
