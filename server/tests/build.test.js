@@ -64,6 +64,7 @@ async function runBuildArtifactsExist() {
     'server/domain/ifind-indicator-id.js',
     'server/domain/ifind-market-probe-proposals.js',
     'server/domain/ifind-market-probe-result.js',
+    'server/domain/ifind-probe-envelope-summary.js',
     'server/domain/ifind-market-template-evidence.js',
     'server/domain/ifind-calibration.js',
     'server/domain/ifind-report-period-evidence.js',

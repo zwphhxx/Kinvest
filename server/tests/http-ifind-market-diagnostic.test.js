@@ -271,7 +271,8 @@ function readyMarketProbeResult() {
     attemptedAt: null,
     errorCode: null,
     failureStage: null,
-    rejectionStage: null
+    rejectionStage: null,
+    envelopeSummary: null
   }
 }
 

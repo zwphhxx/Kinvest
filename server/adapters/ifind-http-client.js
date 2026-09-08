@@ -3,6 +3,7 @@ const { TextDecoder, types } = require('node:util')
 const { isIfindIndicatorId } = require('../domain/ifind-indicator-id')
 const { CALIBRATION_REQUEST } = require('../domain/ifind-calibration')
 const { getIfindMarketProbeProposal } = require('../domain/ifind-market-probe-proposals')
+const { createIfindProbeEnvelopeSummary } = require('../domain/ifind-probe-envelope-summary')
 const { assertReportPeriodDiagnosticJson } = require('./ifind-report-period-json')
 const { summarizeReportPeriodResponse } = require('../domain/ifind-report-period-failure')
 const {
@@ -30,6 +31,8 @@ const SAFE_ERRORS = new WeakSet()
 const DIAGNOSTIC_REFERENCE_DATE = '2022-07-05'
 
 /** @typedef {'envelope' | 'tables' | 'returned-code' | 'indicator-fields' | 'field-values'} FixedProbeRejectionStage */
+/** @typedef {import('../domain/ifind-probe-envelope-summary').IfindProbeEnvelopeRejectionRule} FixedProbeEnvelopeRejectionRule */
+/** @typedef {import('../domain/ifind-probe-envelope-summary').IfindProbeEnvelopeSummary} FixedProbeEnvelopeSummary */
 
 /**
  * @typedef {Error & {
@@ -40,6 +43,7 @@ const DIAGNOSTIC_REFERENCE_DATE = '2022-07-05'
  *   dataVol?: number,
  *   requestCount?: number,
  *   rejectionStage?: FixedProbeRejectionStage,
+ *   envelopeSummary?: FixedProbeEnvelopeSummary,
  *   stage?: 'auth' | 'probe' | 'quote' | 'financial'
  * }} IfindClientError
  */
@@ -808,6 +812,9 @@ const FIXED_PROBE_DANGEROUS_KEYS = new Set(['__proto__', 'prototype', 'construct
 // Response fields evidenced by docs/operations/ifind-admin-diagnostic-contract.md.
 // Request indicator names do not establish additional response-envelope fields.
 const FIXED_PROBE_METADATA_KEYS = Object.freeze(['errmsg', 'perf', 'datatype', 'inputParams'])
+/** @type {Readonly<Record<string, FixedProbeEnvelopeRejectionRule>>} */
+const FIXED_PROBE_METADATA_RULES = Object.freeze({ errmsg: 'metadata-errmsg', perf: 'metadata-perf',
+  datatype: 'metadata-datatype', inputParams: 'metadata-inputParams' })
 
 function assertFixedProbeMetadata(value, budget, depth = 0) {
   budget.remaining -= 1
@@ -833,13 +840,20 @@ function assertFixedProbeMetadata(value, budget, depth = 0) {
   for (const key of keys) assertFixedProbeMetadata(record[key], budget, depth + 1)
 }
 
-function projectFixedProbeEnvelope(response) {
+/** @param {<T>(stage: FixedProbeRejectionStage, read: () => T, rule?: FixedProbeEnvelopeRejectionRule) => T} validate */
+function projectFixedProbeEnvelope(response, validate) {
   const payloadKeys = ['errorcode', 'tables', 'dataVol']
-  const envelope = fixedProbeRecord(response, [...payloadKeys, ...FIXED_PROBE_METADATA_KEYS],
-    ['errorcode'])
+  validate('envelope', () => {
+    if (types.isProxy(response) || !isRecord(response)) throw new Error('invalid response')
+    const prototype = Reflect.getPrototypeOf(response)
+    if (prototype !== Object.prototype && prototype !== null) throw new Error('invalid response')
+  }, 'envelope-record')
+  const envelope = validate('envelope', () => fixedProbeRecord(response,
+    [...payloadKeys, ...FIXED_PROBE_METADATA_KEYS], ['errorcode']), 'envelope-fields')
   const budget = { remaining: 128 }
   for (const key of FIXED_PROBE_METADATA_KEYS) {
-    if (Object.hasOwn(envelope, key)) assertFixedProbeMetadata(envelope[key], budget)
+    if (Object.hasOwn(envelope, key)) validate('envelope', () =>
+      assertFixedProbeMetadata(envelope[key], budget), FIXED_PROBE_METADATA_RULES[key])
   }
   // Only the original payload contract reaches the unchanged success sanitizer.
   const projected = {}
@@ -906,10 +920,10 @@ function boundedProbeArray(value) {
   return Object.freeze(snapshot)
 }
 
-/** @param {<T>(stage: FixedProbeRejectionStage, read: () => T) => T} validate */
+/** @param {<T>(stage: FixedProbeRejectionStage, read: () => T, rule?: FixedProbeEnvelopeRejectionRule) => T} validate */
 function sanitizeFixedProbeSuccess(response, requestContract, validate) {
   const envelope = validate('envelope', () => fixedProbeRecord(response,
-    ['errorcode', 'tables', 'dataVol'], ['errorcode', 'tables']))
+    ['errorcode', 'tables', 'dataVol'], ['errorcode', 'tables']), 'success-envelope')
   const providerTable = validate('tables', () => fixedProbeRecord(
     fixedProbeArray(envelope.tables, 1, 1)[0], ['thscode', 'table']))
   const returnedCode = validate('returned-code', () => {
@@ -1399,19 +1413,24 @@ function createIfindHttpClient({
     let requestCount = 0
     /** @type {FixedProbeRejectionStage | null} */
     let rejectionStage = null
+    /** @type {FixedProbeEnvelopeRejectionRule | null} */
+    let rejectionRule = null
+    let responseForSummary
     /**
      * @template T
      * @param {FixedProbeRejectionStage} boundary
      * @param {() => T} read
+     * @param {FixedProbeEnvelopeRejectionRule | null} [rule]
      * @returns {T}
      */
-    function validate(boundary, read) {
+    function validate(boundary, read, rule = null) {
       try {
         return read()
       } catch (error) {
         // Record only the validator that actually rejected, never vendor text
         // or properties of the thrown value. This state belongs to one probe.
         rejectionStage = boundary
+        rejectionRule = boundary === 'envelope' ? rule : null
         throw error
       }
     }
@@ -1432,17 +1451,18 @@ function createIfindHttpClient({
       requestCount = 1
       const response = await requestJson(request, fixed.endpoint,
         { access_token: accessToken, ifindlang: 'cn' }, fixed.body, setTimer, clearTimer)
+      responseForSummary = response
       requireCurrentGeneration(operationGeneration)
       let responseEnvelope
       try {
-        responseEnvelope = validate('envelope', () => projectFixedProbeEnvelope(response))
+        responseEnvelope = projectFixedProbeEnvelope(response, validate)
       } catch {
         throw safeError('IFIND_RESPONSE_SHAPE', 'API', 'iFinD response shape was invalid')
       }
-      const responseErrorCode = validate('envelope', () => protocolErrorCode(responseEnvelope))
+      const responseErrorCode = validate('envelope', () => protocolErrorCode(responseEnvelope), 'errorcode-type')
       if (responseErrorCode !== 0) {
         const errorClass = classifyProbeFailure(responseErrorCode)
-        const volume = validate('envelope', () => protocolDataVol(responseEnvelope))
+        const volume = validate('envelope', () => protocolDataVol(responseEnvelope), 'data-volume-type')
         const dataVol = volume.present ? volume.value : undefined
         // Error envelopes may omit tables or use null. Non-null tables remain strict.
         if (Object.hasOwn(responseEnvelope, 'tables') && responseEnvelope.tables !== null) {
@@ -1459,7 +1479,7 @@ function createIfindHttpClient({
       }
       let dataVol
       try {
-        const volume = validate('envelope', () => protocolDataVol(responseEnvelope))
+        const volume = validate('envelope', () => protocolDataVol(responseEnvelope), 'data-volume-type')
         dataVol = volume.present ? volume.value : null
         const probePayload = sanitizeFixedProbeSuccess(responseEnvelope, fixed, validate)
         return Object.freeze({ stage: fixed.stage, payload: probePayload, requestCount: 1, dataVol })
@@ -1473,6 +1493,16 @@ function createIfindHttpClient({
         Object.defineProperty(sanitized, 'rejectionStage', {
           value: rejectionStage, enumerable: true, configurable: false, writable: false
         })
+        if (rejectionStage === 'envelope' && rejectionRule !== null) {
+          try {
+            Object.defineProperty(sanitized, 'envelopeSummary', {
+              value: createIfindProbeEnvelopeSummary(responseForSummary, rejectionRule),
+              enumerable: true, configurable: false, writable: false
+            })
+          } catch {
+            // Optional structural evidence must not replace the branded failure.
+          }
+        }
       }
       throw withRequestCount(withStage(sanitized, 'probe'), requestCount)
     }

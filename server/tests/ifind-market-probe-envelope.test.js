@@ -78,9 +78,10 @@ function safeFailure(code, errorClass = 'API', vendorErrorCode = null, dataVol =
     assert.equal(error.requestCount, 1)
     assert.equal(error.dataVol, dataVol)
     const allowed = ['stack', 'message', 'code', 'class', 'failureCode',
-      'vendorErrorCode', 'stage', 'requestCount', 'dataVol', 'rejectionStage']
+      'vendorErrorCode', 'stage', 'requestCount', 'dataVol', 'rejectionStage', 'envelopeSummary']
     assert.ok(Object.getOwnPropertyNames(error).every((key) => allowed.includes(key)))
     if (code !== 'IFIND_RESPONSE_SHAPE') assert.equal(Object.hasOwn(error, 'rejectionStage'), false)
+    if (code !== 'IFIND_RESPONSE_SHAPE') assert.equal(Object.hasOwn(error, 'envelopeSummary'), false)
     assert.doesNotMatch(JSON.stringify(Object.getOwnPropertyDescriptors(error)),
       /SYNTHETIC_PRIVATE_VENDOR_TEXT|synthetic-access|RequestId|rawResponse|cause/)
     return true
@@ -234,6 +235,7 @@ function rejectionFailure(rejectionStage, dataVol = undefined) {
     })
     assert.equal(error.message, 'iFinD response shape was invalid')
     assert.equal(Object.getOwnPropertySymbols(error).length, 0)
+    if (rejectionStage !== 'envelope') assert.equal(Object.hasOwn(error, 'envelopeSummary'), false)
     return true
   }
 }
@@ -404,6 +406,158 @@ tests.push(
         return true
       })
     } finally { client.clear() }
+  }]
+)
+
+
+const SUMMARY_FIELDS = ['errorcode', 'tables', 'dataVol', 'errmsg', 'perf', 'datatype',
+  'inputParams', 'indicators', 'time', 'thscode', 'data']
+function summaryApi() { return require('../domain/ifind-probe-envelope-summary') }
+function expectedEnvelopeSummary(rule, envelopeType = 'object', overrides = {}, count = 0) {
+  return { rejectionRule: rule, envelopeType,
+    fields: Object.fromEntries(SUMMARY_FIELDS.map((key) => [key, overrides[key] || 'missing'])),
+    unknownFieldCount: count }
+}
+function envelopeFailure(rule, expected) {
+  return (error) => {
+    rejectionFailure('envelope')(error)
+    assert.deepEqual(error.envelopeSummary, expected)
+    assert.equal(error.envelopeSummary.rejectionRule, rule)
+    assert.deepEqual(Object.keys(error.envelopeSummary.fields), SUMMARY_FIELDS)
+    assert.deepEqual(Object.getOwnPropertyDescriptor(error, 'envelopeSummary'), {
+      value: expected, enumerable: true, configurable: false, writable: false
+    })
+    frozenTree(error.envelopeSummary)
+    return true
+  }
+}
+
+tests.push(
+  ['summary classifies all outer rules without changing the rejecting boundary', async () => {
+    for (const body of [null, true, 1, 1.5, MARKER, []]) {
+      const type = body === null ? 'null' : Array.isArray(body) ? 'array'
+        : typeof body === 'number' ? Number.isInteger(body) ? 'integer' : 'number' : typeof body
+      await assert.rejects(probe(JSON.stringify(body)), envelopeFailure('envelope-record',
+        expectedEnvelopeSummary('envelope-record', type, {}, Array.isArray(body) ? 1 : null)))
+    }
+    await assert.rejects(probe({ errorcode: 0, [MARKER]: MARKER }),
+      envelopeFailure('envelope-fields', expectedEnvelopeSummary('envelope-fields',
+        'object', { errorcode: 'integer' }, 1)))
+    for (const key of ['errmsg', 'perf', 'datatype', 'inputParams']) {
+      const rule = 'metadata-' + key
+      await assert.rejects(probe({ errorcode: 0, [key]: MARKER.repeat(300) }),
+        envelopeFailure(rule, expectedEnvelopeSummary(rule, 'object',
+          { errorcode: 'integer', [key]: 'string' })))
+    }
+    await assert.rejects(probe({ errorcode: MARKER }), envelopeFailure('errorcode-type',
+      expectedEnvelopeSummary('errorcode-type', 'object', { errorcode: 'string' })))
+    for (const value of [null, MARKER]) {
+      for (const errorcode of [0, -403]) {
+        await assert.rejects(probe({ errorcode, dataVol: value }),
+          envelopeFailure('data-volume-type', expectedEnvelopeSummary('data-volume-type',
+            'object', { errorcode: 'integer', dataVol: value === null ? 'null' : 'string' })))
+      }
+    }
+    await assert.rejects(probe({ errorcode: 0 }), envelopeFailure('success-envelope',
+      expectedEnvelopeSummary('success-envelope', 'object', { errorcode: 'integer' })))
+  }],
+  ['observation-only keys stay rejected while reporting their fixed type flags', async () => {
+    /** @type {Array<[string, unknown, string]>} */
+    const cases = [
+      ['indicators', [MARKER], 'array'], ['time', MARKER, 'string'],
+      ['thscode', MARKER, 'string'], ['data', { secret: MARKER }, 'object']
+    ]
+    for (const [key, value, type] of cases) {
+      await assert.rejects(probe({ errorcode: 0, [key]: value }),
+        envelopeFailure('envelope-fields', expectedEnvelopeSummary('envelope-fields',
+          'object', { errorcode: 'integer', [key]: type })))
+    }
+  }],
+  ['capture has exact ordered keys, bounded unknown count and no raw values', async () => {
+    const { createIfindProbeEnvelopeSummary: capture } = summaryApi()
+    const body = { errorcode: 0, tables: [], dataVol: null, errmsg: MARKER, perf: 0.01,
+      datatype: true, inputParams: {}, indicators: [MARKER], time: undefined,
+      thscode: Symbol(MARKER), data: 1n }
+    const result = capture(body, 'envelope-fields')
+    assert.deepEqual(result, expectedEnvelopeSummary('envelope-fields', 'object', {
+      errorcode: 'integer', tables: 'array', dataVol: 'null', errmsg: 'string', perf: 'number',
+      datatype: 'boolean', inputParams: 'object', indicators: 'array', time: 'other',
+      thscode: 'other', data: 'other'
+    }))
+    assert.deepEqual(Object.keys(result), ['rejectionRule', 'envelopeType', 'fields', 'unknownFieldCount'])
+    assert.doesNotMatch(JSON.stringify(result), /SYNTHETIC_PRIVATE|secret/)
+    frozenTree(result)
+    for (const count of [0, 1, 64, 65, 100]) {
+      const unknown = Object.fromEntries(Array.from({ length: count }, (_, i) => [MARKER + i, MARKER]))
+      assert.equal(capture({ ...body, ...unknown }, 'envelope-fields').unknownFieldCount,
+        Math.min(65, count))
+    }
+    const hidden = Object.defineProperty({}, MARKER, { value: MARKER })
+    hidden[Symbol(MARKER)] = MARKER
+    assert.equal(capture(hidden, 'envelope-fields').unknownFieldCount, 2)
+    assert.throws(() => capture(body, MARKER), { code: 'IFIND_PROBE_ENVELOPE_SUMMARY_INVALID' })
+  }],
+  ['capture and adapter descriptor rules never execute proxies or accessors', async () => {
+    const { createIfindProbeEnvelopeSummary: capture } = summaryApi()
+    let traps = 0
+    const trap = () => { traps += 1; throw new Error(MARKER) }
+    const proxy = new Proxy({}, { get: trap, ownKeys: trap,
+      getPrototypeOf: trap, getOwnPropertyDescriptor: trap })
+    const revoked = Proxy.revocable({}, {}); revoked.revoke()
+    for (const value of [proxy, revoked.proxy]) {
+      assert.deepEqual(capture(value, 'envelope-record'),
+        expectedEnvelopeSummary('envelope-record', 'uninspectable',
+          Object.fromEntries(SUMMARY_FIELDS.map((key) => [key, 'uninspectable'])), null))
+    }
+    const body = Object.defineProperty({ errorcode: 0, tables: proxy }, 'dataVol',
+      { enumerable: true, get: trap })
+    assert.deepEqual(capture(body, 'envelope-fields'),
+      expectedEnvelopeSummary('envelope-fields', 'object',
+        { errorcode: 'integer', tables: 'uninspectable', dataVol: 'accessor' }))
+    await assert.rejects(injectedProbe(body), envelopeFailure('envelope-fields',
+      expectedEnvelopeSummary('envelope-fields', 'object',
+        { errorcode: 'integer', tables: 'uninspectable', dataVol: 'accessor' })))
+    const custom = Object.create(proxy)
+    Object.defineProperty(custom, 'errorcode', { value: 0, enumerable: true })
+    assert.deepEqual(capture(custom, 'envelope-record'),
+      expectedEnvelopeSummary('envelope-record', 'object', { errorcode: 'integer' }))
+    // Avoid Promise assimilation of this prototype proxy; test capture directly.
+    const plainCustom = Object.assign(Object.create({}), { errorcode: 0 })
+    await assert.rejects(injectedProbe(plainCustom), envelopeFailure('envelope-record',
+      expectedEnvelopeSummary('envelope-record', 'object', { errorcode: 'integer' })))
+    assert.equal(traps, 0)
+  }],
+  ['summary copier validates exact safe DTOs and deep copies without reading hostile properties', async () => {
+    const { createIfindProbeEnvelopeSummary: capture, copyIfindProbeEnvelopeSummary: copy } = summaryApi()
+    const original = capture({ errorcode: 0 }, 'success-envelope')
+    const copied = copy(original)
+    assert.deepEqual(copied, original)
+    assert.notEqual(copied, original)
+    assert.notEqual(copied.fields, original.fields)
+    let traps = 0
+    const trap = () => { traps += 1; throw new Error(MARKER) }
+    const proxy = new Proxy({}, { get: trap, ownKeys: trap,
+      getPrototypeOf: trap, getOwnPropertyDescriptor: trap })
+    const invalid = [null, [], proxy, { ...original, secret: MARKER },
+      { ...original, rejectionRule: MARKER }, { ...original, envelopeType: 'missing' },
+      { ...original, envelopeType: 'accessor' }, { ...original, fields: proxy },
+      { ...original, fields: { ...original.fields, secret: MARKER } },
+      { ...original, fields: { ...original.fields, errmsg: proxy } },
+      { ...original, fields: { ...original.fields, errmsg: MARKER } },
+      Object.defineProperty({ ...original }, 'fields', { get: trap }),
+      { ...original, fields: Object.defineProperty({ ...original.fields }, 'errmsg', { get: trap }) },
+      Object.create(original)]
+    const missing = { ...original.fields }; Reflect.deleteProperty(missing, 'data')
+    invalid.push({ ...original, fields: missing })
+    for (const count of [-1, 66, 0.5, NaN, Infinity, '0', undefined]) {
+      invalid.push({ ...original, unknownFieldCount: count })
+    }
+    for (const value of invalid) assert.throws(() => copy(value),
+      { code: 'IFIND_PROBE_ENVELOPE_SUMMARY_INVALID' })
+    for (const count of [0, 64, 65, null]) {
+      assert.equal(copy({ ...original, unknownFieldCount: count }).unknownFieldCount, count)
+    }
+    assert.equal(traps, 0)
   }]
 )
 
