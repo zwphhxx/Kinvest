@@ -74,7 +74,8 @@ function probeResult(status = 'ready') {
     dataVol: observed ? 3 : null, attemptedAt: observed ? '2026-09-02T08:08:00.000Z' : null,
     errorCode: observed ? 'IFIND_MARKET_PROBE_OBSERVED_UNVERIFIED' : null,
     failureStage: null,
-    rejectionStage: null
+    rejectionStage: null,
+    envelopeSummary: null
   }
 }
 

@@ -12,7 +12,7 @@
   const INVALID = 'IFIND_MARKET_PROBE_RESULT_INVALID'
   const RESULT_KEYS = ['proposalId', 'caseId', 'displayCode', 'status', 'verification',
     'observations', 'requestCount', 'businessRequestCount', 'dataVol', 'attemptedAt',
-    'errorCode', 'failureStage', 'availability', 'rejectionStage']
+    'errorCode', 'failureStage', 'availability', 'rejectionStage', 'envelopeSummary']
   const VERIFICATION_KEYS = ['issuerIdentityStatus', 'vendorCodeStatus', 'entitlementStatus',
     'currencyStatus', 'unitStatus', 'reportPeriodStatus', 'scopeStatus']
   const STAGES = ['identity', 'quote', 'financial']
@@ -20,6 +20,22 @@
   const REJECTION_STAGES = new Set(['envelope', 'tables', 'returned-code', 'indicator-fields', 'field-values'])
   const REJECTION_LABELS = { envelope: '响应外层', tables: '数据表结构',
     'returned-code': '返回证券代码', 'indicator-fields': '指标字段', 'field-values': '字段值类型或范围' }
+  const ENVELOPE_FIELDS = ['errorcode', 'tables', 'dataVol', 'errmsg', 'perf', 'datatype',
+    'inputParams', 'indicators', 'time', 'thscode', 'data']
+  const ENVELOPE_TYPES = new Set(['null', 'boolean', 'integer', 'number', 'string', 'array',
+    'object', 'other', 'uninspectable'])
+  const FIELD_TYPES = new Set([...ENVELOPE_TYPES, 'missing', 'accessor'])
+  const RULE_LABELS = {
+    'envelope-record': '外层对象形态', 'envelope-fields': '外层字段契约',
+    'metadata-errmsg': 'errmsg附加元数据', 'metadata-perf': 'perf附加元数据',
+    'metadata-datatype': 'datatype附加元数据', 'metadata-inputParams': 'inputParams附加元数据',
+    'errorcode-type': '错误码字段类型', 'data-volume-type': '用量字段类型',
+    'success-envelope': '成功响应必需字段'
+  }
+  const ENVELOPE_RULES = new Set(Object.keys(RULE_LABELS))
+  const TYPE_LABELS = { missing: '缺失', null: '空值', boolean: '布尔', integer: '整数',
+    number: '数值', string: '字符串', array: '数组', object: '对象', accessor: '访问器',
+    other: '其他类型', uninspectable: '无法安全检查' }
   const IDLE = new Set(['ready', 'busy', 'cooldown', 'daily-limit'])
   const AVAILABILITY = new Set([...IDLE, 'unavailable'])
   const FAILURE_CODES = new Set(['IFIND_MARKET_PROBE_FAILED', 'IFIND_AUTH_REJECTED',
@@ -130,9 +146,25 @@
     }
   }
 
+  function copyEnvelopeSummary(value) {
+    const input = record(value, ['rejectionRule', 'envelopeType', 'fields', 'unknownFieldCount'])
+    if (!ENVELOPE_RULES.has(input.rejectionRule) || !ENVELOPE_TYPES.has(input.envelopeType) ||
+        (input.unknownFieldCount !== null && (!Number.isSafeInteger(input.unknownFieldCount) ||
+          input.unknownFieldCount < 0 || input.unknownFieldCount > 65))) invalid()
+    const fields = record(input.fields, ENVELOPE_FIELDS)
+    for (const key of ENVELOPE_FIELDS) if (!FIELD_TYPES.has(fields[key])) invalid()
+    return { rejectionRule: input.rejectionRule, envelopeType: input.envelopeType,
+      fields: Object.fromEntries(ENVELOPE_FIELDS.map((key) => [key, fields[key]])),
+      unknownFieldCount: input.unknownFieldCount }
+  }
+
   function copyResult(value) {
     try {
       const input = record(value, RESULT_KEYS)
+      const envelopeSummary = input.envelopeSummary === null ? null : copyEnvelopeSummary(input.envelopeSummary)
+      if (envelopeSummary !== null && (input.status !== 'failed' ||
+          input.errorCode !== 'IFIND_RESPONSE_SHAPE' || input.rejectionStage !== 'envelope' ||
+          !STAGES.includes(input.failureStage))) invalid()
       if (input.rejectionStage !== null && (input.status !== 'failed' ||
           input.errorCode !== 'IFIND_RESPONSE_SHAPE' || !STAGES.includes(input.failureStage) ||
           !REJECTION_STAGES.has(input.rejectionStage))) invalid()
@@ -178,7 +210,7 @@
         observations, requestCount: input.requestCount,
         businessRequestCount: input.businessRequestCount, dataVol: input.dataVol,
         attemptedAt: input.attemptedAt, errorCode: input.errorCode, failureStage: input.failureStage,
-        rejectionStage: input.rejectionStage
+        rejectionStage: input.rejectionStage, envelopeSummary
       }
     } catch {
       invalid()
@@ -253,7 +285,20 @@
       }
       const location = value.rejectionStage === null ? ''
         : ` 拒绝位置：${REJECTION_LABELS[value.rejectionStage]}。`
-      return `${STAGE_LABELS[value.failureStage]}阶段：${errorMessage(value.errorCode)} (${value.errorCode})${location}`
+      let structure = ''
+      if (value.envelopeSummary !== null) {
+        const summary = value.envelopeSummary
+        const present = ENVELOPE_FIELDS.filter((key) => summary.fields[key] !== 'missing')
+          .map((key) => `${key}=${TYPE_LABELS[summary.fields[key]]}`)
+        const missing = ENVELOPE_FIELDS.filter((key) => summary.fields[key] === 'missing')
+        const count = summary.unknownFieldCount === null ? '无法安全检查'
+          : summary.unknownFieldCount === 65 ? '至少65' : String(summary.unknownFieldCount)
+        structure = ` 具体规则：${RULE_LABELS[summary.rejectionRule]}。` +
+          ` 外层类型：${TYPE_LABELS[summary.envelopeType]}。` +
+          ` 字段类型：${present.join('；') || '无'}。缺失字段：${missing.join('、') || '无'}。` +
+          ` 其他字段数量：${count}。结构摘要不代表字段已被接受。`
+      }
+      return `${STAGE_LABELS[value.failureStage]}阶段：${errorMessage(value.errorCode)} (${value.errorCode})${location}${structure}`
     }
 
     function buttonState() {

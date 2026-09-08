@@ -16,7 +16,7 @@ const PROPOSAL_ID = 'HK_ALIBABA_9988_V1'
 const VERSION = 'v20260901-001'
 const RESULT_KEYS = ['proposalId', 'caseId', 'displayCode', 'status', 'availability', 'verification',
   'observations', 'requestCount', 'businessRequestCount', 'dataVol', 'attemptedAt',
-  'errorCode', 'failureStage', 'rejectionStage']
+  'errorCode', 'failureStage', 'rejectionStage', 'envelopeSummary']
 const VERIFICATION_KEYS = ['issuerIdentityStatus', 'vendorCodeStatus', 'entitlementStatus',
   'currencyStatus', 'unitStatus', 'reportPeriodStatus', 'scopeStatus']
 const STAGES = ['identity', 'quote', 'financial']
@@ -246,7 +246,7 @@ const tests = [
       verification: Object.fromEntries(VERIFICATION_KEYS.map((key) => [key, 'unverified'])),
       observations: { identity: null, quote: null, financial: null }, requestCount: 0,
       businessRequestCount: 0, dataVol: null, attemptedAt: null, errorCode: null,
-      failureStage: null, rejectionStage: null })
+      failureStage: null, rejectionStage: null, envelopeSummary: null })
     assertSafeResult(initial)
     for (const status of ['ready', 'busy', 'cooldown', 'daily-limit']) {
       assertSafeResult({ ...initial, status, availability: status })
@@ -1071,6 +1071,100 @@ const tests = [
     })
   }]
 ]
+
+
+tests.push(
+  ['envelope summary crosses actual adapter, service and strict DTO only in its exact context', async () => {
+    const { createIfindProbeEnvelopeSummary: capture } = require('../domain/ifind-probe-envelope-summary')
+    for (let sequence = 1; sequence <= 3; sequence += 1) await using(async (value) => {
+      const wire = { errorcode: 0, indicators: ['DROP_ME'], dataVol: null }
+      const expected = capture(wire, 'envelope-fields')
+      const responses = STAGES.slice(0, sequence - 1).map((stage) => providerPayload(stage))
+      const stub = createRequestStub([...responses, wire])
+      const adapter = createIfindHttpClient({ request: stub.request })
+      value.client.probeFixed = adapter.probeFixed.bind(adapter)
+      const service = value.service()
+      const result = await service.run()
+      assertSafeResult(result)
+      assert.deepEqual(result.envelopeSummary, expected)
+      assert.deepEqual([result.status, result.errorCode, result.rejectionStage, result.failureStage],
+        ['failed', 'IFIND_RESPONSE_SHAPE', 'envelope', STAGES[sequence - 1]])
+      assert.deepEqual([result.requestCount, result.businessRequestCount, stub.calls.length],
+        [sequence + 1, sequence, sequence])
+      const baseline = service.describe()
+      result.envelopeSummary.fields.indicators = 'missing'
+      assert.deepEqual(service.describe(), baseline)
+      assert.equal((await service.run()).envelopeSummary, null)
+      assert.deepEqual(service.describe(), baseline)
+      assert.equal(service.clear().envelopeSummary, null)
+      assert.equal(service.describe().envelopeSummary, null)
+      const missing = { ...baseline }; Reflect.deleteProperty(missing, 'envelopeSummary')
+      for (const invalid of [missing, { ...baseline, rejectionStage: 'tables' },
+        { ...baseline, failureStage: 'auth' }, { ...baseline, failureStage: 'lease' },
+        { ...baseline, errorCode: 'IFIND_TIMEOUT' },
+        { ...domain.createInitialIfindMarketProbeResult(), envelopeSummary: expected }]) {
+        assert.throws(() => domain.copyIfindMarketProbeResult(invalid),
+          { code: 'IFIND_MARKET_PROBE_RESULT_INVALID' })
+      }
+      assert.doesNotMatch(JSON.stringify(value.rows()), /envelopeSummary|envelope-fields|indicators|DROP_ME/)
+      assertClean(value)
+    })
+  }],
+  ['hostile or invalid error summary falls back to null without losing the legitimate failure', async () => {
+    let traps = 0
+    const trap = () => { traps += 1; throw new Error('DROP_ME') }
+    const proxy = new Proxy({}, { get: trap, ownKeys: trap, getOwnPropertyDescriptor: trap })
+    /** @type {Array<{code: string, rejectionStage: string, envelopeSummary?: unknown}>} */
+    const errors = [undefined, null, {}, proxy, { rejectionRule: 'DROP_ME' }].map((envelopeSummary) => ({
+      code: 'IFIND_RESPONSE_SHAPE', rejectionStage: 'envelope', envelopeSummary
+    }))
+    errors.push(Object.defineProperty({ code: 'IFIND_RESPONSE_SHAPE', rejectionStage: 'envelope' },
+      'envelopeSummary', { get: trap }))
+    for (const error of errors) await using(async (value) => {
+      value.client.probeFixed = async () => { throw error }
+      const result = await value.service().run()
+      assertSafeResult(result)
+      assert.deepEqual([result.errorCode, result.failureStage, result.rejectionStage, result.envelopeSummary],
+        ['IFIND_RESPONSE_SHAPE', 'identity', 'envelope', null])
+      assert.equal(value.rows()[0].failure_code, 'IFIND_RESPONSE_SHAPE')
+      assertClean(value)
+    })
+    assert.equal(traps, 0)
+  }],
+  ['envelope summary is cleared on settlement conflict, lease invalidation and cleanup-time clear', async () => {
+    const { createIfindProbeEnvelopeSummary: capture } = require('../domain/ifind-probe-envelope-summary')
+    for (const mode of ['settlement', 'lease', 'cleanup']) await using(async (value) => {
+      const failure = { code: 'IFIND_RESPONSE_SHAPE', rejectionStage: 'envelope',
+        envelopeSummary: capture({ dataVol: null }, 'envelope-fields') }
+      const gate = deferred(); const entered = deferred()
+      value.client.probeFixed = async () => {
+        if (mode === 'lease') { entered.resolve(); await gate.promise }
+        throw failure
+      }
+      if (mode === 'cleanup') value.client.clear = async () => {
+        value.state.clears += 1; entered.resolve(); await gate.promise
+      }
+      const overrides = mode === 'settlement' ? { repository: {
+        reserve: value.repository.reserve.bind(value.repository),
+        quotaStatus: value.repository.quotaStatus.bind(value.repository),
+        fail() { return { status: 'conflict' } }
+      } } : {}
+      const service = value.service(overrides)
+      const running = service.run()
+      if (mode !== 'settlement') {
+        await entered.promise
+        service.clear()
+        gate.resolve()
+      }
+      const result = await running
+      assertSafeResult(result)
+      assert.equal(result.envelopeSummary, null)
+      assert.equal(service.describe().envelopeSummary, null)
+      if (mode !== 'cleanup') assert.equal(result.failureStage, 'lease')
+      assertClean(value)
+    })
+  }]
+)
 
 module.exports = { run: async function () {
   for (const [name, operation] of tests) {

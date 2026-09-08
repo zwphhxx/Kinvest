@@ -1,6 +1,7 @@
 'use strict'
 
 const { types } = require('node:util')
+const { copyIfindProbeEnvelopeSummary } = require('./ifind-probe-envelope-summary')
 
 const IFIND_MARKET_PROBE_RESULT_INVALID = 'IFIND_MARKET_PROBE_RESULT_INVALID'
 const PROPOSAL_ID = 'HK_ALIBABA_9988_V1'
@@ -11,7 +12,7 @@ const FAILED = 'IFIND_MARKET_PROBE_FAILED'
 const UNAVAILABLE = 'IFIND_MARKET_PROBE_UNAVAILABLE'
 const RESULT_KEYS = Object.freeze(['proposalId', 'caseId', 'displayCode', 'status', 'availability', 'verification',
   'observations', 'requestCount', 'businessRequestCount', 'dataVol', 'attemptedAt',
-  'errorCode', 'failureStage', 'rejectionStage'])
+  'errorCode', 'failureStage', 'rejectionStage', 'envelopeSummary'])
 const VERIFICATION_KEYS = Object.freeze(['issuerIdentityStatus', 'vendorCodeStatus',
   'entitlementStatus', 'currencyStatus', 'unitStatus', 'reportPeriodStatus', 'scopeStatus'])
 const STAGES = Object.freeze(['identity', 'quote', 'financial'])
@@ -112,13 +113,19 @@ function createInitialIfindMarketProbeResult() {
     attemptedAt: null,
     errorCode: null,
     failureStage: null,
-    rejectionStage: null
+    rejectionStage: null,
+    envelopeSummary: /** @type {import('./ifind-probe-envelope-summary').IfindProbeEnvelopeSummary | null} */ (null)
   }
 }
 
 function copyIfindMarketProbeResult(value) {
   try {
     const input = record(value, RESULT_KEYS)
+    if (input.envelopeSummary !== null && (input.status !== 'failed' ||
+        input.errorCode !== 'IFIND_RESPONSE_SHAPE' || input.rejectionStage !== 'envelope' ||
+        !STAGES.includes(input.failureStage))) invalid()
+    const envelopeSummary = input.envelopeSummary === null ? null
+      : copyIfindProbeEnvelopeSummary(input.envelopeSummary)
     if (input.rejectionStage !== null && (input.status !== 'failed' ||
         input.errorCode !== 'IFIND_RESPONSE_SHAPE' || !STAGES.includes(input.failureStage) ||
         !REJECTION_STAGES.has(input.rejectionStage))) invalid()
@@ -172,7 +179,8 @@ function copyIfindMarketProbeResult(value) {
       attemptedAt: input.attemptedAt,
       errorCode: input.errorCode,
       failureStage: input.failureStage,
-      rejectionStage: input.rejectionStage
+      rejectionStage: input.rejectionStage,
+      envelopeSummary
     }
   } catch {
     throw new IfindMarketProbeResultContractError()

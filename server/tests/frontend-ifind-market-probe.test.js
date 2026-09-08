@@ -33,6 +33,7 @@ function readyResult(overrides = {}) {
     errorCode: null,
     failureStage: null,
     rejectionStage: null,
+    envelopeSummary: null,
     ...overrides
   }
 }
@@ -646,6 +647,67 @@ async function rejectionLocationRenderingTest() {
   assert.equal(traps, 0)
 }
 
+async function envelopeSummaryRenderingTest() {
+  const fields = { errorcode: 'integer', tables: 'array', dataVol: 'string',
+    errmsg: 'string', perf: 'number', datatype: 'object', inputParams: 'object',
+    indicators: 'array', time: 'missing', thscode: 'missing', data: 'missing' }
+  const envelopeSummary = { rejectionRule: 'data-volume-type', envelopeType: 'object',
+    fields, unknownFieldCount: 0 }
+  const result = readyResult({ status: 'failed', availability: 'cooldown',
+    failureStage: 'identity', errorCode: 'IFIND_RESPONSE_SHAPE', rejectionStage: 'envelope',
+    envelopeSummary, requestCount: 2, businessRequestCount: 1,
+    attemptedAt: '2026-09-08T00:00:00.000Z' })
+  const fixture = controllerFixture({ responses: [readyResult(), result, result] })
+  await fixture.controller.refresh()
+  await fixture.get('ifind-market-probe-run').click()
+  assert.deepEqual(fixture.errors, [])
+  const text = fixture.get('ifind-market-probe-error').textContent
+  assert.ok(text.includes('具体规则：用量字段类型'))
+  assert.ok(text.includes('dataVol=字符串'))
+  assert.ok(text.includes('indicators=数组'))
+  assert.ok(text.includes('缺失字段：time、thscode、data'))
+  assert.ok(text.includes('其他字段数量：0'))
+  assert.ok(fixture.live[0].message.includes('dataVol=字符串'))
+  assert.equal(fixture.calls.filter(({ url }) => url === RUN_PATH).length, 1)
+  assert.equal(fixture.get('ifind-market-probe-run').disabled, true)
+  let traps = 0
+  const accessor = Object.defineProperty({ ...envelopeSummary }, 'fields', {
+    enumerable: true, get() { traps += 1; throw new Error('UNTRUSTED_DETAIL') } })
+  const badSummaries = [
+    { ...envelopeSummary, rejectionRule: 'UNTRUSTED_DETAIL' },
+    { ...envelopeSummary, envelopeType: 'UNTRUSTED_DETAIL' },
+    { ...envelopeSummary, unknownFieldCount: -1 },
+    { ...envelopeSummary, unknownFieldCount: 66 },
+    { ...envelopeSummary, unknownFieldCount: 0.5 },
+    { ...envelopeSummary, fields: { ...fields, dataVol: 'UNTRUSTED_DETAIL' } },
+    { ...envelopeSummary, fields: { ...fields, extra: 'string' } },
+    { ...envelopeSummary, rawResponse: 'UNTRUSTED_DETAIL' }, accessor
+  ]
+  for (const summary of badSummaries) {
+    const rejected = controllerFixture({ responses: [{ ...result, envelopeSummary: summary }] })
+    await rejected.controller.refresh()
+    assert.equal(rejected.errors[0].code, 'IFIND_MARKET_PROBE_RESULT_INVALID')
+    assert.doesNotMatch(rejected.get('ifind-market-probe-error').textContent, /UNTRUSTED_DETAIL/)
+    assert.equal(rejected.get('ifind-market-probe-run').disabled, true)
+  }
+  for (const bad of [
+    { ...readyResult(), envelopeSummary }, { ...observedResult(), envelopeSummary },
+    { ...result, rejectionStage: 'tables' }, { ...result, failureStage: 'auth' },
+    { ...result, errorCode: 'IFIND_TIMEOUT' }
+  ]) {
+    const rejected = controllerFixture({ responses: [bad] })
+    await rejected.controller.refresh()
+    assert.equal(rejected.errors[0].code, 'IFIND_MARKET_PROBE_RESULT_INVALID')
+  }
+  const capped = controllerFixture({ responses: [{ ...result,
+    envelopeSummary: { ...envelopeSummary, unknownFieldCount: 65 } }] })
+  await capped.controller.refresh()
+  assert.ok(capped.get('ifind-market-probe-error').textContent.includes('其他字段数量：至少65'))
+  fixture.controller.reset()
+  assert.equal(fixture.get('ifind-market-probe-error').textContent, '无')
+  assert.equal(traps, 0)
+}
+
 async function run() {
   for (const test of [moduleSurfaceTest, offlineRefreshAndRenderTest, confirmationAndSingleFlightTest,
     runOutcomeMessagingTest, trustedResultSurvivesTransportAndApiFailureTest,
@@ -654,7 +716,8 @@ async function run() {
     staleGenerationSettlementsStaySilentTest, latestStatusRequestWinsOutOfOrderTest,
     externalGetCannotCancelRunningPostTest, externalGetCannotHidePostFailureTest,
     hostileDtoTest, failureMappingTest, terminalResultRecoveryTest,
-    blockedPostDoesNotAnnouncePreviousSuccessTest, boundedFailureDetailsTest, rejectionLocationRenderingTest, htmlContractTest]) {
+    blockedPostDoesNotAnnouncePreviousSuccessTest, boundedFailureDetailsTest, rejectionLocationRenderingTest,
+    envelopeSummaryRenderingTest, htmlContractTest]) {
     await test()
     console.log(`PASS frontend-market-probe: ${test.name}`)
   }
